@@ -15,7 +15,10 @@ use super::{
     ApiEnv, ApiSchema, Call, Decoded, KafkaApi, Rejection, RequestBody, RequestHeader,
     ResponseBody, TopicPartitions,
 };
-use crate::kafka::constants::{ERROR_CORRUPT_MESSAGE, ERROR_INVALID_REQUIRED_ACKS, ERROR_NONE};
+use crate::kafka::constants::{
+    ERROR_CORRUPT_MESSAGE, ERROR_INVALID_REQUIRED_ACKS, ERROR_NONE,
+    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::error::KafkaError;
 use crate::kafka::handlers;
@@ -161,7 +164,11 @@ impl KafkaApi for ProduceApi {
         }
 
         let zstd_allowed = header.api_version >= MIN_ZSTD_VERSION;
-        let decode = decode_all_records(&wire.topic_data, zstd_allowed);
+        let decode = decode_all_records(
+            &wire.topic_data,
+            zstd_allowed,
+            wire.transactional_id.is_some(),
+        );
         let transactional_id = wire.transactional_id.map(|s| s.to_string());
         let (DecodedTopics(topic_data, refused, decoded), pending) = match decode {
             Ok(Decode::Done(done)) => (done, None),
@@ -296,7 +303,8 @@ enum DecodeFailure {
     TimedOut,
     /// The decoder panicked.
     Panicked,
-    /// A first batch Kafka cannot size: this code on every partition.
+    /// Refused before any partition is looked at (a first batch Kafka cannot size, a
+    /// transactional batch without a transactional id): this code on every partition.
     Rejected(i16),
 }
 
@@ -445,15 +453,27 @@ fn decode_records(
 /// What Kafka 3.7 reads of the request before it looks at any partition
 /// (`RequestUtils.hasTransactionalRecords`, [`first_batch_is_transactional`]): the first
 /// batch of each partition, in order, until one is transactional. One whose length or
-/// magic cannot be read fails the whole request with CORRUPT_MESSAGE.
-fn check_first_batches(topics: &[WireTopicProduceData]) -> Result<(), DecodeFailure> {
+/// magic cannot be read fails the whole request with CORRUPT_MESSAGE. A transactional
+/// one in a request without a transactional id fails it with
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED (`KafkaApis.handleProduceRequest` authorizes
+/// the transactional id of such a request, and a null one never is).
+fn check_first_batches(
+    topics: &[WireTopicProduceData],
+    has_transactional_id: bool,
+) -> Result<(), DecodeFailure> {
     for topic in topics {
         for partition in &topic.partition_data {
             let Some(batch) = &partition.records else {
                 continue;
             };
             match first_batch_is_transactional(batch) {
-                Ok(true) => return Ok(()),
+                Ok(true) if has_transactional_id => return Ok(()),
+                Ok(true) => {
+                    warn!("Refusing a transactional Produce request without a transactional id");
+                    return Err(DecodeFailure::Rejected(
+                        ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                    ));
+                }
                 Ok(false) => {}
                 Err(code) => {
                     warn!(
@@ -516,8 +536,9 @@ fn record_bytes(topics: &[WireTopicProduceData]) -> usize {
 fn decode_all_records(
     topics: &[WireTopicProduceData],
     zstd_allowed: bool,
+    has_transactional_id: bool,
 ) -> Result<Decode, DecodeFailure> {
-    check_first_batches(topics)?;
+    check_first_batches(topics, has_transactional_id)?;
     if declared_memory(topics, zstd_allowed) > INLINE_DECODE_BYTES {
         return Ok(Decode::Pending(Wait::Slot));
     }
@@ -761,8 +782,17 @@ mod tests {
     /// What a request of `data` (one batch per partition) decodes to; `Err` for a request
     /// refused whole.
     fn outcome(data: Vec<bytes::Bytes>, zstd_allowed: bool) -> Result<Outcome, DecodeFailure> {
+        outcome_of(data, zstd_allowed, false)
+    }
+
+    /// [`outcome`] of a request with a transactional id or without.
+    fn outcome_of(
+        data: Vec<bytes::Bytes>,
+        zstd_allowed: bool,
+        has_transactional_id: bool,
+    ) -> Result<Outcome, DecodeFailure> {
         let Decode::Done(DecodedTopics(topic_data, refused, _)) =
-            decode_all_records(&topics(data), zstd_allowed)?
+            decode_all_records(&topics(data), zstd_allowed, has_transactional_id)?
         else {
             panic!("a small request decodes inline");
         };
@@ -825,7 +855,7 @@ mod tests {
         // A topic all of whose partitions are refused is not passed on (nor created).
         let bad = bytes::Bytes::from_static(b"short");
         let Ok(Decode::Done(DecodedTopics(topic_data, refused, _))) =
-            decode_all_records(&topics(vec![bad]), true)
+            decode_all_records(&topics(vec![bad]), true, false)
         else {
             panic!("decodes inline");
         };
@@ -866,8 +896,49 @@ mod tests {
             },
         );
         assert_eq!(
-            outcome(vec![transactional, short_length.into()], true),
+            outcome_of(vec![transactional, short_length.into()], true, true),
             Ok((vec![0], vec![(1, ERROR_CORRUPT_MESSAGE)]))
+        );
+    }
+
+    /// A batch of one record, transactional.
+    fn transactional_batch() -> bytes::Bytes {
+        batch_with(
+            &record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"t", &v(0)]),
+            1,
+            Header {
+                attributes: 0x10,
+                producer_id: 7,
+                producer_epoch: 0,
+                base_sequence: 0,
+                ..Header::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_transactional_batch_needs_a_transactional_id() {
+        // Kafka 3.7 refuses the request on every partition, wherever the batch is.
+        for data in [
+            vec![transactional_batch(), batch_of(1, 1)],
+            vec![batch_of(1, 1), transactional_batch()],
+        ] {
+            assert_eq!(
+                outcome_of(data.clone(), true, false),
+                Err(DecodeFailure::Rejected(
+                    ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+                ))
+            );
+            assert_eq!(outcome_of(data, true, true), Ok((vec![0, 1], vec![])));
+        }
+        // Only the first batch of each partition is read for it, as Kafka reads it.
+        let after = bytes::Bytes::from([&batch_of(1, 1)[..], &transactional_batch()[..]].concat());
+        assert_eq!(
+            outcome(vec![after], true),
+            Ok((
+                vec![],
+                vec![(0, crate::kafka::constants::ERROR_INVALID_RECORD)]
+            ))
         );
     }
 
@@ -963,14 +1034,14 @@ mod tests {
     fn requests_that_cannot_decode_inline_are_left_pending() {
         let small = topics(vec![batch_of(15, 1000)]);
         assert!(matches!(
-            decode_all_records(&small, true),
+            decode_all_records(&small, true, false),
             Ok(Decode::Done(_))
         ));
         // 3000 records of 1000 bytes declare more than the inline limit.
         let large = topics(vec![batch_of(3000, 1000)]);
         assert!(declared_memory(&large, true) > INLINE_DECODE_BYTES);
         assert!(matches!(
-            decode_all_records(&large, true),
+            decode_all_records(&large, true, false),
             Ok(Decode::Pending(Wait::Slot))
         ));
     }
@@ -1019,7 +1090,7 @@ mod tests {
             let data = topics(vec![batch_of(1, 1), bomb]);
             assert!(declared_memory(&data, true) <= INLINE_DECODE_BYTES);
             let Ok(Decode::Done(DecodedTopics(_, refused, charge))) =
-                decode_all_records(&data, true)
+                decode_all_records(&data, true, false)
             else {
                 panic!("decodes inline");
             };

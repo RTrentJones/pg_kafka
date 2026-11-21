@@ -1191,3 +1191,65 @@ pub async fn test_the_decode_limit_refuses_partitions_on_their_own() -> TestResu
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+
+/// A Produce carrying a transactional batch without a transactional id is refused on every
+/// partition with TRANSACTIONAL_ID_AUTHORIZATION_FAILED and nothing of it is written, as
+/// Kafka 3.7 refuses it (`KafkaApis.handleProduceRequest`). Its records were written as
+/// committed, outside any transaction.
+pub async fn test_transactional_batches_need_a_transactional_id() -> TestResult {
+    use crate::wire::records::batch;
+    use crate::wire::Wire;
+    println!("=== Test: transactional batches need a transactional id ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-txn-noid").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let txn = format!("{topic}-txn");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, 0);
+    let added = wire
+        .add_partitions(&txn, producer_id, epoch, &[(&topic, &[0, 1])])
+        .await?;
+    assert!(added.iter().all(|(_, _, code)| *code == 0), "{added:?}");
+    let transactional = || batch(&["t"], producer_id, epoch, 0, true, None);
+    let good = || plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+
+    println!("Step 1: a transactional batch without a transactional id, first or second");
+    for parts in [
+        vec![(0, transactional()), (1, good())],
+        vec![(0, good()), (1, transactional())],
+    ] {
+        let codes = partition_codes(&mut wire, &topic, parts, None).await?;
+        assert_eq!(codes, vec![TRANSACTIONAL_ID_AUTHORIZATION_FAILED; 2]);
+    }
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ TRANSACTIONAL_ID_AUTHORIZATION_FAILED on every partition; nothing written");
+
+    println!("Step 2: acks=0 closes the connection and writes nothing");
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let request = produce_request(&topic, vec![(0, good()), (1, transactional())], 0);
+    s.write_all(&request_frame(7, 1, &request)).await?;
+    assert!(
+        time_until_closed(&mut s, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the connection closes"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ closed; nothing written");
+
+    println!("Step 3: with its transactional id the same batch is written in the transaction");
+    let codes = partition_codes(&mut wire, &topic, vec![(0, transactional())], Some(&txn)).await?;
+    assert_eq!(codes, vec![0]);
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, true).await?, 0);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ written and committed");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

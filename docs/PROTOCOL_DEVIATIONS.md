@@ -135,7 +135,10 @@ pg_kafka.compression_type = 'gzip'
   (outside 0-2) cannot be read fails the whole request, CORRUPT_MESSAGE on every
   partition, as Kafka reads every partition's first batch before it looks at any
   partition (it stops at the first transactional batch, and so does pg_kafka); past a
-  partition's first batch, the same data refuses that partition only. Where Kafka 3.7
+  partition's first batch, the same data refuses that partition only. A request whose
+  first transactional batch comes without a transactional id is answered
+  TRANSACTIONAL_ID_AUTHORIZATION_FAILED (53) on every partition and nothing of it is
+  written (an acks=0 one closes its connection), as Kafka refuses it. Where Kafka 3.7
   answers UNKNOWN_SERVER_ERROR (an unknown codec id, a zstd window past 2^27, data that
   does not decompress) pg_kafka answers CORRUPT_MESSAGE on that partition; Kafka fails the
   whole request for an unknown codec id on Produce v3-v6.

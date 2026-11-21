@@ -291,6 +291,9 @@ pub const ERROR_INVALID_TXN_STATE: i16 = 48;
 pub const ERROR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
 /// CONCURRENT_TRANSACTIONS: the producer has another transaction completing.
 pub const ERROR_CONCURRENT_TRANSACTIONS: i16 = 51;
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED: a Produce carrying a transactional batch without a
+/// transactional id (Kafka answers it on every partition).
+pub const ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 /// OPERATION_NOT_ATTEMPTED: the request failed for another of its entries.
 pub const ERROR_OPERATION_NOT_ATTEMPTED: i16 = 55;
 /// KAFKA_STORAGE_ERROR (retriable): the broker cannot read, write or serve the partition's log.

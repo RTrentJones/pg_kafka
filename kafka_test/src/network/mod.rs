@@ -173,6 +173,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_batch_checks_run_in_kafkas_order: sequential,
         produce_decoding::test_produce_validation_answers_each_partition: sequential,
         produce_decoding::test_the_decode_limit_refuses_partitions_on_their_own: sequential,
+        produce_decoding::test_transactional_batches_need_a_transactional_id: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
