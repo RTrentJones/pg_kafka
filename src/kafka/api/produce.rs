@@ -758,11 +758,13 @@ fn one_entry_per_index(
     // `source[i]`: the entry that takes the place of entry `i`, none when it goes.
     let mut source = vec![u32::MAX; entries.len()];
     for group in by_index.chunk_by(|a, b| a.0 == b.0) {
-        // An entry without records is refused like any other invalid one (see
-        // `decode_records`).
-        let refusal = |&(_, p): &(i32, u32)| match entries[at(p)].records.as_ref() {
-            Some(batch) => validate_produce_records(batch, zstd_allowed).err(),
-            None => Some(ERROR_UNKNOWN_SERVER_ERROR),
+        // An entry without records passes this check, as in Kafka: it takes part in
+        // "the last entry wins" and is refused only as it decodes (`decode_records`).
+        let refusal = |&(_, p): &(i32, u32)| {
+            entries[at(p)]
+                .records
+                .as_ref()
+                .and_then(|batch| validate_produce_records(batch, zstd_allowed).err())
         };
         let (index, first) = group[0];
         let last = group[group.len() - 1].1;
@@ -2088,8 +2090,12 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_entry_without_records_is_refused_like_an_invalid_one() {
-        let (a, b) = (value_batch(b"a"), value_batch(b"b"));
+    fn a_repeated_entry_without_records_takes_part_in_last_entry_wins() {
+        // Kafka 3.7 does not refuse a null entry in validateRecords: the last entry wins,
+        // and a null last entry fails as it is appended (nothing written for the
+        // partition).
+        let a = value_batch(b"a");
+        let mut data = topics(vec![batch_of(1, 1)]);
         let entry = |records: Option<bytes::Bytes>| {
             WirePartitionProduceData::default()
                 .with_index(0)
@@ -2101,18 +2107,25 @@ mod tests {
             let kept: Vec<Option<bytes::Bytes>> = kept.into_iter().map(|e| e.records).collect();
             (kept, refused)
         };
-        // A null entry after a valid one: the valid one is written, the null one answers.
         assert_eq!(
             kept(vec![entry(Some(a.clone())), entry(None)]),
-            (vec![Some(a)], vec![(0, ERROR_UNKNOWN_SERVER_ERROR)])
+            (vec![None], vec![])
         );
-        // A null entry before a valid one: likewise.
         assert_eq!(
-            kept(vec![entry(None), entry(Some(b.clone()))]),
-            (vec![Some(b)], vec![(0, ERROR_UNKNOWN_SERVER_ERROR)])
+            kept(vec![entry(None), entry(Some(a.clone()))]),
+            (vec![Some(a)], vec![])
         );
-        // Only null entries: the last one is kept, and refused when it decodes.
-        assert_eq!(kept(vec![entry(None), entry(None)]), (vec![None], vec![]));
+        // The kept null entry is refused -1 when the records decode, and nothing of the
+        // partition is written.
+        data[0].partition_data[0].records = None;
+        let DecodedTopics(decoded, refused, _) =
+            decode_records(&data, true, inline_budget(), OverLimit::Refuse).unwrap();
+        assert!(decoded.iter().all(|t| t.partitions.is_empty()));
+        let refused: Vec<(i32, i16)> = refused
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(refused, vec![(0, ERROR_UNKNOWN_SERVER_ERROR)]);
     }
 
     #[test]
