@@ -2032,8 +2032,10 @@ mod tests {
                 Bytes::from([&short_v2[..], &ok[..]].concat()),
                 ERROR_CORRUPT_MESSAGE,
             ),
-            // Kafka checks the base offset before the batch's size and CRC, and the codec
-            // before the header fields.
+            // Kafka checks the base offset before the batch's size and CRC. The codec is
+            // checked before the header fields here too; an unknown codec id is
+            // CORRUPT_MESSAGE, where Kafka answers UNKNOWN_SERVER_ERROR whatever the header
+            // fields hold (a documented deviation).
             (
                 "a base offset other than 0 and a bad CRC",
                 Bytes::from(base_5_bad_crc),
