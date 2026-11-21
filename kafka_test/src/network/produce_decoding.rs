@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 const MESSAGE_TOO_LARGE: i16 = 10;
 /// CORRUPT_MESSAGE (Java's CorruptRecordException).
 const CORRUPT_MESSAGE: i16 = 2;
+/// INVALID_TIMESTAMP (Java's InvalidTimestampException).
+const INVALID_TIMESTAMP: i16 = 32;
 /// INVALID_RECORD (Java's InvalidRecordException).
 const INVALID_RECORD: i16 = 87;
 
@@ -197,6 +199,8 @@ pub(crate) struct BatchHeader {
     /// `None`: one less than the record count (at least 0).
     pub(crate) last_offset_delta: Option<i32>,
     pub(crate) base_timestamp: i64,
+    /// `None`: the base timestamp.
+    pub(crate) max_timestamp: Option<i64>,
     pub(crate) producer_id: i64,
     pub(crate) producer_epoch: i16,
     pub(crate) base_sequence: i32,
@@ -209,6 +213,7 @@ impl Default for BatchHeader {
             attributes: 0,
             last_offset_delta: None,
             base_timestamp: 0,
+            max_timestamp: None,
             producer_id: -1,
             producer_epoch: -1,
             base_sequence: -1,
@@ -228,7 +233,7 @@ pub(crate) fn batch_with(records: &[u8], record_count: i32, header: BatchHeader)
             .unwrap_or_else(|| record_count.max(1) - 1),
     );
     tail.put_i64(header.base_timestamp); // baseTimestamp
-    tail.put_i64(header.base_timestamp); // maxTimestamp
+    tail.put_i64(header.max_timestamp.unwrap_or(header.base_timestamp));
     tail.put_i64(header.producer_id);
     tail.put_i16(header.producer_epoch);
     tail.put_i32(header.base_sequence);
@@ -774,6 +779,295 @@ pub async fn test_record_batches_are_read_as_kafka_reads_them() -> TestResult {
     assert_eq!(wire.produce(&topic, 2, trailing, None).await?, (0, 0));
     assert_eq!(stored_rows(ctx.db(), &topic).await?, 24);
     println!("✅ refused as Kafka refuses them; 5 trailing bytes ignored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A batch's checks run in Kafka 3.7's order (`UnifiedLog.analyzeAndValidateRecords`, then
+/// `LogValidator`): its base offset before its size and CRC, its codec before its header
+/// fields; and a batch that sets the LogAppendTime bit without a maxTimestamp is
+/// INVALID_TIMESTAMP once its records are read. Nothing refused is written.
+pub async fn test_batch_checks_run_in_kafkas_order() -> TestResult {
+    use crate::wire::Wire;
+    println!("=== Test: batch checks in Kafka 3.7's order, LogAppendTime ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-order").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let x = record(&[
+        &[0],
+        &varint(0),
+        &varint(0),
+        &varint(-1),
+        &varint(1),
+        b"x",
+        &varint(0),
+    ]);
+    let with = |header: BatchHeader| batch_with(&x, 1, header);
+    let mut base_5_bad_crc = with(BatchHeader {
+        base_offset: 5,
+        ..BatchHeader::default()
+    })
+    .to_vec();
+    base_5_bad_crc[17..21].copy_from_slice(&[0; 4]);
+    // A complete batch of 42 bytes, shorter than a v2 header (61), at base offset 5.
+    let mut short_at_5 = 5i64.to_be_bytes().to_vec();
+    short_at_5.extend_from_slice(&30i32.to_be_bytes());
+    short_at_5.extend_from_slice(&[0, 0, 0, 0, 2]);
+    short_at_5.extend_from_slice(&[0; 25]);
+    let log_append_time = |attributes: i16| {
+        with(BatchHeader {
+            attributes: attributes | 0x08,
+            max_timestamp: Some(-1),
+            ..BatchHeader::default()
+        })
+    };
+    let cases: Vec<(&str, Bytes, i16)> = vec![
+        (
+            "base offset 5 and a bad CRC",
+            base_5_bad_crc.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "a short batch at base offset 5",
+            short_at_5.into(),
+            INVALID_RECORD,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp",
+            log_append_time(0),
+            INVALID_TIMESTAMP,
+        ),
+        (
+            "LogAppendTime without a maxTimestamp, a control batch",
+            log_append_time(0x20),
+            INVALID_RECORD,
+        ),
+    ];
+    for (what, data, expected) in cases {
+        let (code, _) = wire.produce(&topic, 0, data, None).await?;
+        assert_eq!(code, expected, "{what}");
+        println!("  {what}: {code}");
+    }
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        0,
+        "nothing is written"
+    );
+    println!("✅ refused as Kafka refuses them");
+
+    let with_max = with(BatchHeader {
+        attributes: 0x08,
+        base_timestamp: 1_000,
+        max_timestamp: Some(2_000),
+        ..BatchHeader::default()
+    });
+    assert_eq!(wire.produce(&topic, 0, with_max, None).await?, (0, 0));
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ the LogAppendTime bit with a maxTimestamp is accepted");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// UNKNOWN_TOPIC_OR_PARTITION.
+const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+
+/// Whether the broker has a topic named `topic`.
+async fn topic_exists(db: &tokio_postgres::Client, topic: &str) -> DynResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT count(*) FROM kafka.topics WHERE name = $1",
+            &[&topic],
+        )
+        .await?
+        .get::<_, i64>(0)
+        == 1)
+}
+
+/// Produce validation answers each partition, as Kafka 3.7 does
+/// (`KafkaApis.handleProduceRequest`): a partition whose data fails validation gets its own
+/// error and the request's valid partitions are written; a partition of an unknown topic,
+/// or outside its topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data (the topic is not
+/// created for it). Only a first batch whose length or magic Kafka cannot read
+/// (`RequestUtils.hasTransactionalRecords`) fails the whole request, CORRUPT_MESSAGE on
+/// every partition. A refused partition leaves an idempotent producer's sequence and a
+/// transaction alone, and an acks=0 request with one closes the connection after its
+/// valid partitions are written.
+pub async fn test_produce_validation_answers_each_partition() -> TestResult {
+    use crate::wire::records::batch;
+    use crate::wire::Wire;
+    println!("=== Test: Produce validation answers each partition ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-per-part").await;
+    let unknown = ctx.unique_topic("net-per-part-unknown").await;
+    let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let good = || plain_batch(&[Bytes::from_static(b"v")], Compression::None);
+    let bad_crc = |batch: Bytes| {
+        let mut b = batch.to_vec();
+        *b.last_mut().expect("not empty") ^= 1;
+        Bytes::from(b)
+    };
+    // A batch length under 14: Kafka cannot size the batch.
+    let mut unsizable = 0i64.to_be_bytes().to_vec();
+    unsizable.extend_from_slice(&13i32.to_be_bytes());
+    unsizable.extend_from_slice(&[0; 14]);
+    let unsizable = Bytes::from(unsizable);
+
+    println!("Step 1: one request, partitions refused for different reasons");
+    let two_batches = Bytes::from([&good()[..], &good()[..]].concat());
+    let got = wire
+        .produce_many(
+            &[
+                (
+                    &topic,
+                    vec![
+                        (0, bad_crc(good())),
+                        (1, good()),
+                        (2, two_batches),
+                        (7, bad_crc(good())),
+                    ],
+                ),
+                (&unknown, vec![(0, bad_crc(good()))]),
+            ],
+            None,
+        )
+        .await?;
+    let codes: Vec<(String, i32, i16)> =
+        got.iter().map(|(t, p, c, _)| (t.clone(), *p, *c)).collect();
+    let mut expected = vec![
+        (topic.clone(), 0, CORRUPT_MESSAGE),
+        (topic.clone(), 1, 0),
+        (topic.clone(), 2, INVALID_RECORD),
+        (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+        (unknown.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+    ];
+    expected.sort();
+    assert_eq!(codes, expected);
+    assert_eq!(
+        stored_rows(ctx.db(), &topic).await?,
+        1,
+        "the valid partition"
+    );
+    assert!(!topic_exists(ctx.db(), &unknown).await?, "not created");
+    println!("✅ {codes:?}; the valid partition stored, the unknown topic not created");
+
+    println!("Step 2: a first batch Kafka cannot size fails the whole request");
+    for other in [&topic, &unknown] {
+        let got = wire
+            .produce_many(
+                &[
+                    (other, vec![(0, unsizable.clone())]),
+                    (&topic, vec![(1, good())]),
+                ],
+                None,
+            )
+            .await?;
+        assert!(
+            got.iter().all(|(_, _, code, _)| *code == CORRUPT_MESSAGE),
+            "{got:?}"
+        );
+    }
+    let trailing = Bytes::from([&good()[..], &unsizable[..12]].concat());
+    let got = wire
+        .produce_many(&[(&topic, vec![(0, trailing), (1, good())])], None)
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(
+        codes,
+        vec![CORRUPT_MESSAGE, 0],
+        "after the first batch: that partition"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 2);
+    println!("✅ every partition CORRUPT_MESSAGE; past the first batch only its partition");
+
+    println!("Step 3: zstd on Produce v3 is refused on its partition only");
+    let zstd = batch_with(
+        &good()[61..],
+        1,
+        BatchHeader {
+            attributes: 4,
+            ..BatchHeader::default()
+        },
+    );
+    let mut request = produce_request(&topic, vec![(0, zstd), (1, good())], -1);
+    request.timeout_ms = 10_000;
+    let response: kafka_protocol::messages::ProduceResponse = wire.call(3, &request).await?;
+    let mut codes: Vec<(i32, i16)> = response.responses[0]
+        .partition_responses
+        .iter()
+        .map(|p| (p.index, p.error_code))
+        .collect();
+    codes.sort_unstable();
+    assert_eq!(codes, vec![(0, UNSUPPORTED_COMPRESSION_TYPE), (1, 0)]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 3);
+    println!("✅ {codes:?}");
+
+    println!("Step 4: an idempotent producer's refused partition keeps its sequence");
+    let (code, producer_id, epoch) = wire.init_producer_id(None, 60_000).await?;
+    assert_eq!(code, 0);
+    let seq0 = || batch(&["i"], producer_id, epoch, 0, false, None);
+    let got = wire
+        .produce_many(&[(&topic, vec![(0, bad_crc(seq0())), (1, seq0())])], None)
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(codes, vec![CORRUPT_MESSAGE, 0]);
+    assert_eq!(
+        wire.produce(&topic, 0, seq0(), None).await?.0,
+        0,
+        "sequence 0 on p0"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 5);
+    println!("✅ refused, then its sequence 0 accepted");
+
+    println!("Step 5: a transaction writes its valid partition");
+    let txn = format!("{topic}-txn");
+    let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
+    assert_eq!(code, 0);
+    let added = wire
+        .add_partitions(&txn, producer_id, epoch, &[(&topic, &[0, 1])])
+        .await?;
+    assert!(added.iter().all(|(_, _, code)| *code == 0), "{added:?}");
+    let txn_batch = || batch(&["t"], producer_id, epoch, 0, true, None);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, txn_batch()), (1, bad_crc(txn_batch()))])],
+            Some(&txn),
+        )
+        .await?;
+    let codes: Vec<i16> = got.iter().map(|(_, _, code, _)| *code).collect();
+    assert_eq!(codes, vec![0, CORRUPT_MESSAGE]);
+    assert_eq!(wire.end_txn(&txn, producer_id, epoch, true).await?, 0);
+    let committed: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT count(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id \
+             WHERE t.name = $1 AND m.txn_state IS NULL",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(committed, 6, "the transaction's valid partition committed");
+    println!("✅ [0, CORRUPT_MESSAGE]; the transaction commits its partition");
+
+    println!("Step 6: acks=0 writes the valid partition, then closes");
+    let mut s = TcpStream::connect(("127.0.0.1", PORT)).await?;
+    let request = produce_request(&topic, vec![(0, bad_crc(good())), (1, good())], 0);
+    s.write_all(&request_frame(7, 1, &request)).await?;
+    assert!(
+        time_until_closed(&mut s, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the connection closes"
+    );
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 7);
+    println!("✅ closed; the valid partition stored");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

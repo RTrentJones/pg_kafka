@@ -8,11 +8,11 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::messages::{ProducerMetadata, Record, TopicProduceData};
+use crate::kafka::messages::{ProducerMetadata, Record, RefusedPartition, TopicProduceData};
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::response_builders::build_produce_partition_error_response;
 use crate::kafka::storage::{
-    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck,
+    batch_last_sequence, KafkaStore, LogStore, ProducerBatch, SequenceCheck, TopicStore,
 };
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
@@ -67,6 +67,54 @@ pub fn handle_produce(
         .map(|topic| produce_topic(ctx, topic, producer_metadata, transactional_id))
         .collect();
     Ok(kafka_response)
+}
+
+/// Answer the partitions whose records failed validation, by topic: as Kafka 3.7 does
+/// (`KafkaApis.handleProduceRequest`), a partition of a topic that does not exist, or
+/// outside its topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data; any other gets the
+/// error validation found. Looks the topics up without creating them, in one statement.
+pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
+    store: &S,
+    refused: &[RefusedPartition],
+) -> Result<Vec<TopicProduceResponse>> {
+    if refused.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<String> = Vec::new();
+    for partition in refused {
+        if !names.contains(&partition.topic) {
+            names.push(partition.topic.clone());
+        }
+    }
+    let partition_counts: HashMap<String, i32> = store
+        .get_topic_metadata(Some(&names))?
+        .into_iter()
+        .map(|t| (t.name, t.partition_count))
+        .collect();
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let count = partition_counts.get(&name).copied();
+            let mut topic = TopicProduceResponse::default();
+            topic.partition_responses = refused
+                .iter()
+                .filter(|p| p.topic == name)
+                .map(|p| {
+                    let exists = count.is_some_and(|count| (0..count).contains(&p.partition));
+                    failed_partition(
+                        p.partition,
+                        if exists {
+                            p.error_code
+                        } else {
+                            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                        },
+                    )
+                })
+                .collect();
+            topic.name = TopicName(name.into());
+            topic
+        })
+        .collect())
 }
 
 /// Write one topic's records and answer for its partitions. A failure to resolve (or
@@ -528,6 +576,65 @@ mod tests {
         assert_eq!(
             (p.error_code, p.base_offset, p.log_start_offset),
             (ERROR_NONE, 4, -1)
+        );
+    }
+
+    /// A refused partition is UNKNOWN_TOPIC_OR_PARTITION when its topic does not exist or
+    /// it is outside its topic, as in Kafka 3.7, and otherwise gets its validation error;
+    /// the topics are looked up, never created, in one call.
+    #[test]
+    fn refused_partitions_of_unknown_topics_are_unknown_topic_or_partition() {
+        use crate::kafka::constants::ERROR_CORRUPT_MESSAGE;
+        use crate::kafka::storage::TopicMetadata;
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata()
+            .times(1)
+            .returning(|names| {
+                assert_eq!(names, Some(&["t".to_string(), "gone".to_string()][..]));
+                Ok(vec![TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 2,
+                }])
+            });
+        let refused = |topic: &str, partition| RefusedPartition {
+            topic: topic.to_string(),
+            partition,
+            error_code: ERROR_CORRUPT_MESSAGE,
+        };
+        let answered = answer_refused_partitions(
+            &mock,
+            &[
+                refused("t", 1),
+                refused("gone", 0),
+                refused("t", 2),
+                refused("t", -1),
+            ],
+        )
+        .unwrap();
+        let got: Vec<(String, i32, i16)> = answered
+            .iter()
+            .flat_map(|t| {
+                t.partition_responses
+                    .iter()
+                    .map(|p| (t.name.to_string(), p.index, p.error_code))
+            })
+            .collect();
+        let t = |p, code| ("t".to_string(), p, code);
+        assert_eq!(
+            got,
+            vec![
+                t(1, ERROR_CORRUPT_MESSAGE),
+                t(2, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                t(-1, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+                ("gone".to_string(), 0, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            ]
+        );
+        assert_eq!(
+            answer_refused_partitions(&MockKafkaStore::new(), &[])
+                .unwrap()
+                .len(),
+            0
         );
     }
 

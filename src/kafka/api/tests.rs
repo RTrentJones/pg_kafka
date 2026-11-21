@@ -448,6 +448,7 @@ fn commit_failure_echo_reports_every_produce_partition() {
     let body = RequestBody::Produce(ProduceRequestData {
         acks: 1,
         timeout_ms: 1000,
+        refused: Vec::new(),
         topic_data: vec![crate::kafka::messages::TopicProduceData {
             name: "t".to_string(),
             partitions: vec![crate::kafka::messages::PartitionProduceData {

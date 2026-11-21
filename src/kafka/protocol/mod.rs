@@ -24,6 +24,7 @@ pub use decode_budget::{DecodeBudget, DecodedCharge};
 pub use decoding::{finish_request, parse_request};
 pub use encoding::encode_response;
 pub use recordbatch::{
-    least_decoded_memory, parse_record_batch, parse_record_batch_with_metadata,
-    validate_produce_records, ParsedRecordBatch, HEADER_MEMORY, RECORD_MEMORY,
+    first_batch_is_transactional, least_decoded_memory, parse_record_batch,
+    parse_record_batch_with_metadata, validate_produce_records, ParsedRecordBatch, HEADER_MEMORY,
+    RECORD_MEMORY,
 };

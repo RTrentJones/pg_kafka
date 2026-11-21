@@ -110,6 +110,19 @@ pub struct TopicProduceData {
     pub partitions: Vec<PartitionProduceData>,
 }
 
+/// A Produce partition whose data failed Kafka's validation before or while it decoded:
+/// nothing of it is written, and it is answered with its own error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedPartition {
+    /// Topic name
+    pub topic: String,
+    /// Partition ID
+    pub partition: i32,
+    /// The error validation found (UNKNOWN_TOPIC_OR_PARTITION takes its place when the
+    /// topic or partition does not exist).
+    pub error_code: i16,
+}
+
 /// Data for producing to a partition
 #[derive(Debug, Clone)]
 pub struct PartitionProduceData {
@@ -426,6 +439,7 @@ mod tests {
             body: RequestBody::Produce(ProduceRequestData {
                 acks: 1,
                 timeout_ms: 1000,
+                refused: Vec::new(),
                 topic_data: vec![],
                 transactional_id: None,
                 decoded: crate::kafka::protocol::DecodedCharge::default(),

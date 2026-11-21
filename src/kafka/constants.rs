@@ -258,6 +258,9 @@ pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// REBALANCE_IN_PROGRESS.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
+/// INVALID_TIMESTAMP: a record's timestamp is refused (a client batch that sets the
+/// LogAppendTime type without a maxTimestamp).
+pub const ERROR_INVALID_TIMESTAMP: i16 = 32;
 /// UNSUPPORTED_SASL_MECHANISM: the requested SASL mechanism is not enabled.
 pub const ERROR_UNSUPPORTED_SASL_MECHANISM: i16 = 33;
 /// ILLEGAL_SASL_STATE: a SASL request arrived in the wrong state.
@@ -424,6 +427,7 @@ mod tests {
         assert_eq!(ERROR_UNKNOWN_SERVER_ERROR, -1);
         assert_eq!(ERROR_CORRUPT_MESSAGE, 2);
         assert_eq!(ERROR_UNKNOWN_TOPIC_OR_PARTITION, 3);
+        assert_eq!(ERROR_INVALID_TIMESTAMP, 32);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
         assert_eq!(ERROR_INVALID_PARTITIONS, 37);
 

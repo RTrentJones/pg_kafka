@@ -36,7 +36,7 @@ pub use fetch::{handle_fetch, handle_fetch_with_max_bytes, handle_list_offsets};
 pub use helpers::{resolve_topic_id, topic_resolution_error_code, TopicResolution};
 pub use init_producer_id::{handle_init_producer_id, TRANSACTION_MAX_TIMEOUT_MS};
 pub use metadata::{handle_api_versions, handle_metadata};
-pub use produce::handle_produce;
+pub use produce::{answer_refused_partitions, handle_produce};
 pub use transaction::{
     handle_add_offsets_to_txn, handle_add_partitions_to_txn, handle_end_txn,
     handle_txn_offset_commit, txn_offset_commit_error_response,

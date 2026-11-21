@@ -15,9 +15,14 @@
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
 //!
-//! What a decode holds at its peak (the decompressed section and the records' copies of
-//! it) is at most twice its charge; once the section is dropped it holds no more than its
-//! charge.
+//! What a decode holds at any moment (the decompressed section as it grows, then the section
+//! and the records' copies of it) is at most twice what it has charged by then: the
+//! section's buffer is charged by its capacity before it grows, and shrunk to its bytes
+//! once decoded, the spare capacity given back. Measured for every codec, at most 2.0
+//! times, besides the decompressors' fixed state (`recordbatch`'s
+//! `a_decode_holds_at_most_twice_its_charge`). The charge a decoded request keeps (its
+//! section's bytes) may be half the most it charged while the section grew; once the
+//! section is dropped the request holds no more than that charge.
 //!
 //! Decoding is also kept off the two tokio I/O threads once it is large: at most
 //! [`LARGE_DECODE_SLOTS`] such decodes run at once, each on a blocking-pool thread
@@ -154,6 +159,7 @@ pub struct DecodeBudget {
     pool: &'static DecodePool,
     limit: usize,
     charged: Cell<usize>,
+    most: Cell<usize>,
     exhausted: Cell<Option<Exhausted>>,
     wanted: Cell<usize>,
 }
@@ -170,6 +176,7 @@ impl DecodeBudget {
             pool,
             limit,
             charged: Cell::new(0),
+            most: Cell::new(0),
             exhausted: Cell::new(None),
             wanted: Cell::new(0),
         }
@@ -187,6 +194,7 @@ impl DecodeBudget {
             Err(Exhausted::Global)
         } else {
             self.charged.set(total);
+            self.most.set(self.most.get().max(total));
             Ok(())
         };
         if let Err(which) = result {
@@ -213,9 +221,21 @@ impl DecodeBudget {
         self.pool.give_back(n);
     }
 
+    /// Bytes this budget may still charge before its limit (the process-wide budget may
+    /// hold fewer).
+    pub fn room(&self) -> usize {
+        self.limit.saturating_sub(self.charged.get())
+    }
+
     /// Bytes charged so far.
     pub fn charged(&self) -> usize {
         self.charged.get()
+    }
+
+    /// The most bytes charged at once so far (what is given back lowers [`Self::charged`],
+    /// not this).
+    pub fn most_charged(&self) -> usize {
+        self.most.get()
     }
 
     /// Hand what is charged to the decoded request, which gives it back when dropped.
