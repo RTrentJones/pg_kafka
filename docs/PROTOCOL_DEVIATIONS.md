@@ -391,7 +391,9 @@ pg_kafka.compression_type = 'gzip'
   generation (also -1 from a member); a generation >= 0 for a group without members gets
   UNKNOWN_MEMBER_ID when the group has committed offsets (Kafka holds it as an Empty group,
   also when none of its members joined since the worker started) and ILLEGAL_GENERATION when
-  it has neither members nor offsets. (TxnOffsetCommit keeps its own rules.)
+  it has neither members nor offsets. A refused commit answers a partition that does not
+  exist UNKNOWN_TOPIC_OR_PARTITION, its code going only to the partitions that exist, as Kafka
+  filters those out before it asks the coordinator. (TxnOffsetCommit keeps its own rules.)
 - ✅ The empty group id follows Kafka 3.7 (`GroupCoordinator.isValidGroupId`, checked against a
   3.7 broker): OffsetCommit, OffsetFetch, DescribeGroups and DeleteGroups accept `""` like any
   other group id, and FindCoordinator and AddOffsetsToTxn take it too; JoinGroup, SyncGroup,

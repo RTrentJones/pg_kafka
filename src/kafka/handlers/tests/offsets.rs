@@ -52,7 +52,8 @@ fn test_handle_offset_commit_rejects_stale_generation() {
     // A commit with a stale generation for a live group is rejected per-partition with
     // ILLEGAL_GENERATION before any store write (the mock has no commit_offset expectation, so a
     // write attempt would panic the test).
-    let mock = MockKafkaStore::new();
+    let mut mock = MockKafkaStore::new();
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 1))));
     let coordinator = GroupCoordinator::new();
     let joined = std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = joined.clone();
@@ -239,6 +240,7 @@ fn test_handle_offset_fetch_all_offsets() {
 fn test_handle_offset_commit_generation_for_offsets_only_group() {
     let commit = |has_offsets: bool, generation: i32, member: &str| {
         let mut mock = MockKafkaStore::new();
+        crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 1))));
         mock.expect_groups_with_offsets()
             .withf(|groups| groups == ["offsets-only".to_string()])
             .times(1)
@@ -269,4 +271,47 @@ fn test_handle_offset_commit_generation_for_offsets_only_group() {
     assert_eq!(commit(true, 5, "zz"), ERROR_UNKNOWN_MEMBER_ID);
     assert_eq!(commit(true, 0, ""), ERROR_UNKNOWN_MEMBER_ID);
     assert_eq!(commit(false, 5, "zz"), ERROR_ILLEGAL_GENERATION);
+}
+
+/// A refused OffsetCommit answers a partition that does not exist
+/// UNKNOWN_TOPIC_OR_PARTITION and the refusal's code only on the partitions that exist, as
+/// Kafka 3.7 does (it filters unknown partitions out before it asks the coordinator).
+#[test]
+fn test_handle_offset_commit_refusal_spares_unknown_partitions() {
+    let mut mock = MockKafkaStore::new();
+    crate::testing::expect_topics(&mut mock, |name| Ok((name == "t").then_some((1, 2))));
+    mock.expect_groups_with_offsets()
+        .returning(|_| Ok(std::collections::HashSet::new()));
+    mock.expect_commit_offset().never();
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let partition = |partition_index| OffsetCommitPartitionData {
+        partition_index,
+        committed_offset: 10,
+        metadata: None,
+    };
+    let topics = vec![
+        OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: vec![partition(0), partition(7)],
+        },
+        OffsetCommitTopicData {
+            name: "missing".to_string(),
+            partitions: vec![partition(0)],
+        },
+    ];
+    let response = consumer::handle_offset_commit(&ctx, "no-such-group", 5, "zz", topics).unwrap();
+    let codes: Vec<i16> = response
+        .topics
+        .iter()
+        .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ERROR_ILLEGAL_GENERATION,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION
+        ]
+    );
 }

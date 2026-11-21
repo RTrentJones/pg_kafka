@@ -91,5 +91,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_empty_group_id_is_invalid_group_id,
         kafka_parity::test_refused_txn_offset_commit_answers_unknown_partitions,
         kafka_parity::test_offset_commit_generation_for_offsets_only_group,
+        kafka_parity::test_refused_offset_commit_answers_unknown_partitions,
     ]
 }

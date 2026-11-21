@@ -772,3 +772,35 @@ pub async fn test_offset_commit_generation_for_offsets_only_group() -> TestResul
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A refused OffsetCommit answers a partition that does not exist
+/// UNKNOWN_TOPIC_OR_PARTITION and the refusal's code only on the partitions that exist, as
+/// Kafka 3.7 does (it filters unknown partitions out before it asks the coordinator).
+pub async fn test_refused_offset_commit_answers_unknown_partitions() -> TestResult {
+    println!("=== Test: a refused OffsetCommit answers unknown partitions 3 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-commit-refused")
+        .build()
+        .await?
+        .name;
+    let missing = ctx.unique_topic("parity-commit-refused-missing").await;
+    let group = ctx.unique_group("parity-commit-refused").await;
+    let entries: [(&str, &[i32]); 2] = [(&topic, &[0, 7]), (&missing, &[0])];
+    let answered = |code| {
+        vec![
+            (topic.clone(), 0, code),
+            (topic.clone(), 7, UNKNOWN_TOPIC_OR_PARTITION),
+            (missing.clone(), 0, UNKNOWN_TOPIC_OR_PARTITION),
+        ]
+    };
+    let mut wire = Wire::connect().await?;
+
+    let unknown = offset_commit_v8(&mut wire, &group, 5, "zz", 1, &entries).await?;
+    assert_eq!(unknown, answered(ILLEGAL_GENERATION), "no such group");
+    assert_eq!(committed_offset(&ctx, &group, &topic).await?, -1);
+    println!("✅ ILLEGAL_GENERATION only where the partition exists\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
