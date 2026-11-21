@@ -25,7 +25,7 @@ use crate::kafka::error::KafkaError;
 use crate::kafka::handlers;
 use crate::kafka::messages::{
     KafkaRequest, KafkaResponse, PartitionProduceData, ProducerMetadata, RefusedPartition,
-    TopicProduceData,
+    TopicPlaces, TopicProduceData,
 };
 use crate::kafka::notifications::InternalNotification;
 use crate::kafka::protocol::decode_budget::{
@@ -247,19 +247,15 @@ impl KafkaApi for ProduceApi {
         // Topic names are unique in `topic_data`; a refused partition joins its topic's
         // entry through a map, so a request of many topics echoes in linear time. A
         // partition both written and refused (for another of its entries) is echoed once.
-        let mut topic_at: std::collections::HashMap<String, usize> = echo
-            .iter()
-            .enumerate()
-            .map(|(at, (name, _))| (name.clone(), at))
-            .collect();
+        let mut topic_at = TopicPlaces::of(echo.iter().map(|(name, _)| name.as_str()));
         let mut echoed: std::collections::HashSet<(usize, i32)> = echo
             .iter()
             .enumerate()
             .flat_map(|(at, (_, partitions))| partitions.iter().map(move |&p| (at, p)))
             .collect();
         for refused in &request.refused {
-            let at = *topic_at.entry(refused.topic.clone()).or_insert_with(|| {
-                echo.push((refused.topic.clone(), Vec::new()));
+            let at = topic_at.place(&refused.topic, || {
+                echo.push((refused.topic.to_string(), Vec::new()));
                 echo.len() - 1
             });
             if echoed.insert((at, refused.partition)) {
@@ -485,17 +481,14 @@ fn decode_records(
     let mut refused = Vec::new();
     for topic in topics {
         let name = topic.name.to_string();
+        let mut refusals = Refusals::new(&name, &mut refused);
         let mut partitions = Vec::with_capacity(topic.partition_data.len());
         for partition in &topic.partition_data {
             // Null records: Kafka 3.7 fails the partition UNKNOWN_SERVER_ERROR (its append
             // has no batch to read) and writes the others. Refused here, it never reaches
             // the handler, so no producer state is taken from it.
             let Some(batch) = &partition.records else {
-                refused.push(RefusedPartition {
-                    topic: name.clone(),
-                    partition: partition.index,
-                    error_code: ERROR_UNKNOWN_SERVER_ERROR,
-                });
+                refusals.push(partition.index, ERROR_UNKNOWN_SERVER_ERROR);
                 continue;
             };
             let (records, producer_metadata) =
@@ -505,15 +498,7 @@ fn decode_records(
                         producer_metadata,
                     }) => (records, Some(producer_metadata)),
                     Err(error_code) => {
-                        warn!(
-                        "Refusing the records of topic={name}, partition={}: error {error_code}",
-                        partition.index
-                    );
-                        refused.push(RefusedPartition {
-                            topic: name.clone(),
-                            partition: partition.index,
-                            error_code,
-                        });
+                        refusals.push_invalid(partition.index, error_code);
                         continue;
                     }
                 };
@@ -523,11 +508,77 @@ fn decode_records(
                 producer_metadata,
             });
         }
+        drop(refusals);
         if !partitions.is_empty() || topic.partition_data.is_empty() {
             topic_data.push(TopicProduceData { name, partitions });
         }
     }
     Ok(DecodedTopics(topic_data, refused, budget.into_charge()))
+}
+
+/// The refused partitions of one topic entry: they share one copy of its name, made at the
+/// first refusal, and the refusals of records that did not decode are logged once for the
+/// topic when it is done (a line per partition would write the name per partition).
+struct Refusals<'a> {
+    name: &'a str,
+    shared: Option<Arc<str>>,
+    refused: &'a mut Vec<RefusedPartition>,
+    invalid: usize,
+    first_invalid: Option<(i32, i16)>,
+}
+
+impl<'a> Refusals<'a> {
+    fn new(name: &'a str, refused: &'a mut Vec<RefusedPartition>) -> Self {
+        Self {
+            name,
+            shared: None,
+            refused,
+            invalid: 0,
+            first_invalid: None,
+        }
+    }
+
+    /// Refuse `partition` with `error_code`.
+    fn push(&mut self, partition: i32, error_code: i16) {
+        let topic = Arc::clone(self.shared.get_or_insert_with(|| Arc::from(self.name)));
+        self.refused.push(RefusedPartition {
+            topic,
+            partition,
+            error_code,
+        });
+    }
+
+    /// Refuse `partition`, whose records did not decode, with `error_code`.
+    fn push_invalid(&mut self, partition: i32, error_code: i16) {
+        self.invalid += 1;
+        self.first_invalid.get_or_insert((partition, error_code));
+        self.push(partition, error_code);
+    }
+}
+
+impl Drop for Refusals<'_> {
+    fn drop(&mut self) {
+        if let Some((partition, error_code)) = self.first_invalid {
+            warn!(
+                "Refusing the records of {} partition(s) of topic={} (partition={partition}: error {error_code})",
+                self.invalid,
+                log_name(self.name)
+            );
+        }
+    }
+}
+
+/// The longest topic name a log line shows whole; a longer one (Kafka refuses topics of more
+/// than 249 characters) is cut, so a line stays short whatever the request sent.
+const LOGGED_NAME_CHARS: usize = 249;
+
+/// `name` as a log line shows it: whole, or its first [`LOGGED_NAME_CHARS`] characters and
+/// its length in bytes.
+fn log_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.char_indices().nth(LOGGED_NAME_CHARS) {
+        None => name.into(),
+        Some((cut, _)) => format!("{}... ({} bytes)", &name[..cut], name.len()).into(),
+    }
 }
 
 /// What Kafka 3.7 reads of the request before it looks at any partition
@@ -558,7 +609,7 @@ fn check_first_batches(
                 Err(code) => {
                     warn!(
                         "Refusing a Produce request: the first batch of topic={}, partition={} cannot be sized",
-                        topic.name.0.as_str(),
+                        log_name(topic.name.0.as_str()),
                         partition.index
                     );
                     return Err(DecodeFailure::Rejected(code));
@@ -713,13 +764,10 @@ fn last_entry_per_partition(
     for topic in &mut topics {
         let name = topic.name.0.as_str();
         let partitions = std::mem::take(&mut topic.partition_data);
+        let mut refusals = Refusals::new(name, &mut refused_entries);
         topic.partition_data =
             one_entry_per_index(partitions, zstd_allowed, |index, error_code| {
-                refused_entries.push(RefusedPartition {
-                    topic: name.to_string(),
-                    partition: index,
-                    error_code,
-                });
+                refusals.push(index, error_code);
             });
     }
     OneEntryPerPartition {
@@ -804,13 +852,23 @@ fn with_refused_entries(
     if entries.is_empty() {
         return refused;
     }
-    let mut at: std::collections::HashMap<(String, i32), usize> = refused
+    // Partitions are keyed by their topic's place, so a name is hashed once per topic
+    // ([`TopicPlaces`]), not once per partition.
+    let mut topics = TopicPlaces::default();
+    let mut placed = 0;
+    let mut place = |topic: &Arc<str>| {
+        topics.place(topic, || {
+            placed += 1;
+            placed - 1
+        })
+    };
+    let mut at: std::collections::HashMap<(usize, i32), usize> = refused
         .iter()
         .enumerate()
-        .map(|(i, r)| ((r.topic.clone(), r.partition), i))
+        .map(|(i, r)| ((place(&r.topic), r.partition), i))
         .collect();
     for entry in entries {
-        match at.entry((entry.topic.clone(), entry.partition)) {
+        match at.entry((place(&entry.topic), entry.partition)) {
             std::collections::hash_map::Entry::Occupied(i) => {
                 refused[*i.get()].error_code = entry.error_code;
             }
@@ -838,11 +896,12 @@ fn invalid_acks_answers(
     topics
         .iter()
         .flat_map(|topic| {
+            let name: Arc<str> = Arc::from(topic.name.0.as_str());
             topic
                 .partition_data
                 .iter()
-                .map(|partition| RefusedPartition {
-                    topic: topic.name.to_string(),
+                .map(move |partition| RefusedPartition {
+                    topic: Arc::clone(&name),
                     partition: partition.index,
                     error_code: partition
                         .records
@@ -1320,12 +1379,12 @@ mod tests {
         }];
         produce.refused = vec![
             RefusedPartition {
-                topic: "a".to_string(),
+                topic: "a".into(),
                 partition: 1,
                 error_code: 2,
             },
             RefusedPartition {
-                topic: "b".to_string(),
+                topic: "b".into(),
                 partition: 0,
                 error_code: 2,
             },
@@ -1377,7 +1436,7 @@ mod tests {
                 .collect();
             produce.refused = (n / 2..2 * n)
                 .map(|i| RefusedPartition {
-                    topic: name(i),
+                    topic: name(i).into(),
                     partition: 0,
                     error_code: 2,
                 })
@@ -2053,7 +2112,7 @@ mod tests {
             }],
         }];
         produce.refused = vec![RefusedPartition {
-            topic: "t".to_string(),
+            topic: "t".into(),
             partition: 1,
             error_code: 87,
         }];
@@ -2148,7 +2207,7 @@ mod tests {
         assert_eq!(written, vec![(0, 1, true)]);
         let refused: Vec<(&str, i32, i16)> = refused
             .iter()
-            .map(|r| (r.topic.as_str(), r.partition, r.error_code))
+            .map(|r| (&*r.topic, r.partition, r.error_code))
             .collect();
         assert_eq!(refused, vec![("t", 1, ERROR_UNKNOWN_SERVER_ERROR)]);
 
@@ -2189,6 +2248,121 @@ mod tests {
         assert_eq!(
             check_first_batches(&topics(vec![good, transactional_batch()]), false).unwrap_err(),
             DecodeFailure::Rejected(ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        );
+    }
+
+    /// A Produce of one long topic name (32,000 bytes, as long as a frame allows) and many
+    /// partition entries of 8 bytes each: decoding it, echoing it and answering its refused
+    /// partitions hold the name once per topic, not once per partition (5,000 copies would
+    /// be 160 MB), whichever way the partitions are refused.
+    #[test]
+    fn refused_partitions_hold_their_topic_name_once() {
+        use crate::testing::heap_peak;
+        /// An entry's partition index and whether it has records, by its place.
+        type Entry = fn(i32) -> (i32, bool);
+        const NAME_BYTES: usize = 32_000;
+        const ENTRIES: i32 = 5_000;
+        let one_byte = bytes::Bytes::from_static(&[0]);
+        let shapes: [(&str, i16, Entry); 4] = [
+            ("null records", 1, |i| (i, false)),
+            ("records that do not decode", 1, |i| (i, true)),
+            ("invalid acks", 5, |i| (i, true)),
+            // Two entries per partition, the earlier one refused: answered for the later.
+            ("repeated entries", 1, |i| (i / 2, i % 2 == 0)),
+        ];
+        for (shape, acks, entry) in shapes {
+            let mut topic = WireTopic::default();
+            topic.name = kafka_protocol::messages::TopicName("n".repeat(NAME_BYTES).into());
+            topic.partition_data = (0..ENTRIES)
+                .map(|i| {
+                    let (index, records) = entry(i);
+                    let mut p = WirePartition::default();
+                    p.index = index;
+                    p.records = records.then(|| one_byte.clone());
+                    p
+                })
+                .collect();
+            let mut wire = ProduceRequest::default();
+            wire.acks = acks;
+            wire.timeout_ms = 30_000;
+            wire.topic_data = vec![topic];
+            let header = RequestHeader {
+                api_key: 0,
+                api_version: 7,
+                correlation_id: 1,
+                client_id: None,
+            };
+            let mut store = crate::testing::mocks::MockKafkaStore::new();
+            store
+                .expect_get_topic_metadata()
+                .returning(|_| Ok(Vec::new()));
+            let (answers, peak) = heap_peak(|| {
+                let request = ProduceApi::decode(wire, &header).expect("decodes");
+                let echo = ProduceApi::echo(&request);
+                let answered = handlers::answer_refused_partitions(&store, &request.refused);
+                (
+                    request.refused.len(),
+                    echo.len(),
+                    answered.map(|a| a.len()).ok(),
+                )
+            });
+            let expected =
+                usize::try_from(ENTRIES / if shape == "repeated entries" { 2 } else { 1 }).unwrap();
+            assert_eq!(answers, (expected, 1, Some(1)), "{shape}");
+            assert!(peak < 2 << 20, "{shape}: decoding held {peak} bytes");
+        }
+    }
+
+    /// Decoding and echoing a request of many refused partitions of one long topic name
+    /// takes about as long as of a short one: the name is hashed and copied once per topic,
+    /// not once per partition (which would take some 200 MB of hashing here).
+    #[test]
+    fn refused_partitions_hash_their_topic_name_once() {
+        let request = |name_bytes: usize| {
+            let mut topic = WireTopic::default();
+            topic.name = kafka_protocol::messages::TopicName("n".repeat(name_bytes).into());
+            topic.partition_data = (0..12_000)
+                .map(|i| {
+                    let mut p = WirePartition::default();
+                    // Two entries per partition, the first refused (`with_refused_entries`).
+                    p.index = i / 2;
+                    p.records = (i % 2 == 0).then(|| bytes::Bytes::from_static(&[0]));
+                    p
+                })
+                .collect();
+            let mut wire = ProduceRequest::default();
+            wire.acks = 1;
+            wire.topic_data = vec![topic];
+            wire
+        };
+        let header = RequestHeader {
+            api_key: 0,
+            api_version: 7,
+            correlation_id: 1,
+            client_id: None,
+        };
+        let time = |name_bytes: usize| {
+            let wire = request(name_bytes);
+            (0..3)
+                .map(|_| {
+                    crate::testing::cpu_time(|| {
+                        for _ in 0..5 {
+                            let request =
+                                ProduceApi::decode(wire.clone(), &header).expect("decodes");
+                            assert_eq!(ProduceApi::echo(&request)[0].1.len(), 6_000);
+                        }
+                    })
+                    .1
+                })
+                .min()
+                .unwrap_or_default()
+                .max(std::time::Duration::from_micros(1))
+        };
+        let short = time(1);
+        let long = time(32_000);
+        assert!(
+            long < 4 * short,
+            "a 32,000-byte name took {long:?}, a 1-byte one {short:?}"
         );
     }
 }

@@ -261,3 +261,38 @@ async fn a_panicking_decode_is_reported_and_frees_its_slot() {
     );
     assert_eq!(SLOTS.run(deadline, || 1).await, Ok(1));
 }
+
+/// The time limit counts the decoding thread's CPU time: time the thread spends off the
+/// CPU (here asleep; on a busy machine, waiting for a CPU) does not count against it, and
+/// time on the CPU does.
+#[test]
+fn the_time_limit_counts_the_threads_cpu_time() {
+    static POOL: DecodePool = DecodePool::new(100);
+    let limit = Duration::from_millis(20);
+    let budget = DecodeBudget::with_pool(100, &POOL).limit_time(limit);
+    std::thread::sleep(3 * limit);
+    assert_eq!(
+        budget.check_time(),
+        Ok(()),
+        "time off the CPU does not count"
+    );
+    let spinning = std::time::Instant::now();
+    while budget.check_time().is_ok() {
+        assert!(
+            spinning.elapsed() < Duration::from_secs(10),
+            "the CPU time never ran out"
+        );
+        std::hint::black_box(0..1000).for_each(drop);
+    }
+    assert!(budget.out_of_time());
+    assert_eq!(budget.exhausted(), Some(Exhausted::Time));
+    // The CPU time the thread spent between the budget's start and the spin (setting
+    // up, entering and leaving the sleep) counts too, so the spin itself may be a
+    // little shorter than the limit; it cannot be much shorter, since off-CPU time
+    // does not count.
+    assert!(
+        spinning.elapsed() >= limit * 3 / 4,
+        "ran out after {:?}",
+        spinning.elapsed()
+    );
+}

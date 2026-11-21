@@ -1282,6 +1282,7 @@ dependencies = [
  "flate2",
  "futures",
  "kafka-protocol",
+ "libc",
  "lz4",
  "mockall",
  "murmur2",

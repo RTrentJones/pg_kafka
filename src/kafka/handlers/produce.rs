@@ -9,7 +9,9 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::messages::{ProducerMetadata, Record, RefusedPartition, TopicProduceData};
+use crate::kafka::messages::{
+    ProducerMetadata, Record, RefusedPartition, TopicPlaces, TopicProduceData,
+};
 use crate::kafka::partitioner::compute_partition;
 use crate::kafka::response_builders::build_produce_partition_error_response;
 use crate::kafka::storage::{
@@ -174,11 +176,11 @@ pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
     if refused.is_empty() {
         return Ok(Vec::new());
     }
-    let mut topic_at: HashMap<&str, usize> = HashMap::new();
+    let mut topic_at = TopicPlaces::default();
     let mut by_topic: Vec<(&str, Vec<&RefusedPartition>)> = Vec::new();
     for partition in refused {
-        let at = *topic_at.entry(partition.topic.as_str()).or_insert_with(|| {
-            by_topic.push((partition.topic.as_str(), Vec::new()));
+        let at = topic_at.place(&partition.topic, || {
+            by_topic.push((&partition.topic, Vec::new()));
             by_topic.len() - 1
         });
         by_topic[at].1.push(partition);
@@ -994,7 +996,7 @@ mod tests {
                 }])
             });
         let refused = |topic: &str, partition| RefusedPartition {
-            topic: topic.to_string(),
+            topic: topic.into(),
             partition,
             error_code: ERROR_CORRUPT_MESSAGE,
         };
@@ -1056,7 +1058,7 @@ mod tests {
         let refused = |n: usize| -> Vec<RefusedPartition> {
             (0..n)
                 .map(|i| RefusedPartition {
-                    topic: format!("q{i:07}"),
+                    topic: format!("q{i:07}").into(),
                     partition: 0,
                     error_code: ERROR_CORRUPT_MESSAGE,
                 })

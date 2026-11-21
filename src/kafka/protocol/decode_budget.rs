@@ -18,8 +18,9 @@
 //!   refused partition decoded is freed, but the time spent decoding it is not, so a request
 //!   of many partitions that each decode much and are then refused cannot decode without
 //!   end;
-//! * per request, the decoding time ([`DecodeBudget::limit_time`]), checked between chunks
-//!   of compressed input and between partitions: what a decode charges bounds the work its
+//! * per request, the decoding thread's CPU time ([`DecodeBudget::limit_time`]), checked
+//!   between chunks of compressed input and between partitions: what a decode charges
+//!   bounds the work its
 //!   output takes, not the work its input takes, and input can cost much while decoding to
 //!   nothing (gzip of empty dynamic-Huffman blocks, some 200 ns per byte, or snappy and
 //!   zstd framing of empty blocks or frames);
@@ -95,30 +96,34 @@ pub const INLINE_DECODE_BYTES: usize = 2 * 1024 * 1024;
 const WORK_PER_KEPT_BYTE: usize = 3;
 
 /// The most decoding work (everything charged, given back or not) a decode on an I/O thread
-/// may do; past it the request decodes again under a large-decode slot. Some 10 ms of
-/// decoding output-bound data (gzip of 1 KB records decodes at about 650 MB/s in a release
-/// build); a legitimate 1 MB request decodes in about 1 ms.
+/// may do; past it the request decodes again under a large-decode slot. Some 50 ms of
+/// decoding gzip-compressed 1 KB records of hex digits (compressed about 1.75:1, they
+/// decode at some 170 MB/s in a release build), so a decode on an I/O thread usually stops
+/// at [`INLINE_DECODE_TIME`] first; a 1 MB request of them decodes in about 5 ms.
 pub const INLINE_DECODE_WORK_BYTES: usize = WORK_PER_KEPT_BYTE * INLINE_DECODE_BYTES;
 
 /// The most decoding work a request may do under a large-decode slot: what a request that
 /// fits may take, and as much again for partitions refused after they decoded (one refused
 /// at the request limit, or many smaller). Past it the request's other partitions are
-/// refused MESSAGE_TOO_LARGE without decoding: decoding this much output takes some 0.6 s
-/// (80 MB of gzip-compressed 1 KB records decode in 0.13 s in a release build). Input
-/// that decodes to little is bounded by [`SLOT_DECODE_TIME`] instead.
+/// refused MESSAGE_TOO_LARGE without decoding (a request at the request limit, 85 MB of
+/// gzip-compressed 1 KB records of hex digits, decodes in about 0.5 s in a release build).
+/// Input that decodes to little is bounded by [`SLOT_DECODE_TIME`] instead.
 pub const SLOT_DECODE_WORK_BYTES: usize = (WORK_PER_KEPT_BYTE + 1) * MAX_DECODED_REQUEST_BYTES;
 
-/// The longest a decode on an I/O thread may run; past it the request decodes again under
-/// a large-decode slot. The work limit bounds what a decode charges, not what its input
-/// costs, which may decode to nothing: this bounds that too, checked between chunks of
-/// input ([`DecodeBudget::check_time`]). An I/O thread decodes for at most this and one
-/// chunk (some 3 ms of the slowest input), twice what a decode at its work limit takes.
+/// The most CPU time a decode on an I/O thread may take; past it the request decodes again
+/// under a large-decode slot. The work limit bounds what a decode charges, not what its
+/// input costs, which may decode to nothing: this bounds that too, checked between chunks
+/// of input ([`DecodeBudget::check_time`]). An I/O thread decodes for at most this and one
+/// chunk (some 3 ms of the slowest input); a 1 MB request of gzip-compressed 1 KB records
+/// decodes in about 5 ms.
 pub const INLINE_DECODE_TIME: Duration = Duration::from_millis(20);
 
-/// The longest a decode under a large-decode slot may run; past it the partition decoding
-/// and those after it are refused REQUEST_TIMED_OUT (UNKNOWN_TOPIC_OR_PARTITION for those
-/// of an unknown topic), so no request holds a slot longer than this and one chunk of
-/// input: some three times what a decode at [`SLOT_DECODE_WORK_BYTES`] takes.
+/// The most CPU time a decode under a large-decode slot may take; past it the partition
+/// decoding and those after it are refused REQUEST_TIMED_OUT (UNKNOWN_TOPIC_OR_PARTITION
+/// for those of an unknown topic), so no request decodes for longer than this and one chunk
+/// of input: some four times what a request at the request limit takes (0.5 s for 85 MB of
+/// gzip-compressed 1 KB records). Counted in CPU time, a busy machine stretches the slot's
+/// hold in wall-clock time but refuses no legitimate request.
 pub const SLOT_DECODE_TIME: Duration = Duration::from_secs(2);
 
 /// How many large decodes may run at once.
@@ -221,7 +226,7 @@ pub struct DecodeBudget {
     work: Cell<usize>,
     work_limit: usize,
     work_exhausted: Cell<bool>,
-    deadline: Option<std::time::Instant>,
+    clock: Option<CpuClock>,
     out_of_time: Cell<bool>,
 }
 
@@ -243,7 +248,7 @@ impl DecodeBudget {
             work: Cell::new(0),
             work_limit: usize::MAX,
             work_exhausted: Cell::new(false),
-            deadline: None,
+            clock: None,
             out_of_time: Cell::new(false),
         }
     }
@@ -256,11 +261,13 @@ impl DecodeBudget {
         self
     }
 
-    /// Limit the decode to `limit` from now: [`Self::check_time`] fails once it has passed.
+    /// Limit the decode to `limit` of the calling thread's CPU time from now:
+    /// [`Self::check_time`] fails once the thread has run that long on the CPU (time it
+    /// waits for one does not count). The decode runs on the thread that sets the limit.
     /// Unlimited by default.
     #[must_use]
     pub fn limit_time(mut self, limit: Duration) -> Self {
-        self.deadline = Some(std::time::Instant::now() + limit);
+        self.clock = Some(CpuClock::start(limit));
         self
     }
 
@@ -270,10 +277,7 @@ impl DecodeBudget {
     /// bounds only the work its output takes; this bounds the work its input takes, which
     /// may decode to nothing (a gzip stream of empty blocks costs some 200 ns per byte).
     pub fn check_time(&self) -> Result<(), Exhausted> {
-        let passed = self.out_of_time.get()
-            || self
-                .deadline
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let passed = self.out_of_time.get() || self.clock.as_ref().is_some_and(CpuClock::passed);
         if passed {
             self.out_of_time.set(true);
             self.exhausted.set(Some(Exhausted::Time));
@@ -382,6 +386,94 @@ impl Drop for DecodeBudget {
     fn drop(&mut self) {
         self.pool.give_back(self.charged.get());
     }
+}
+
+/// The CPU time a decode may spend, on the thread that runs it.
+///
+/// A decode's time limit bounds the work its input costs, so it counts the decoding thread's
+/// CPU time (`CLOCK_THREAD_CPUTIME_ID`), not wall-clock time: on a busy machine (other
+/// connections' decodes, the DB thread, other processes on the same CPUs) a legitimate
+/// request takes several times its CPU time in wall-clock time, and refusing it then would
+/// refuse its every retry too. A request that costs much to decode still costs as much CPU,
+/// busy machine or not. Counting the compressed input instead would bound the work only as
+/// well as a cost per byte guessed for each codec and machine fits the slowest input.
+///
+/// The thread's CPU time is read with a system call (some 0.3 us), so it is read only once
+/// the wall clock says the limit may have passed: a thread runs on the CPU no faster than
+/// the wall clock goes, so until `limit - spent` has passed in wall-clock time since the last
+/// reading, the limit cannot have passed. On an idle machine that is one reading at the end
+/// of the limit, under contention a few more, at most one per [`MIN_CPU_CLOCK_READ`].
+#[derive(Debug)]
+struct CpuClock {
+    /// The thread's CPU time when the limit was set.
+    start: Duration,
+    limit: Duration,
+    /// Before this the limit cannot have passed.
+    next_read: Cell<std::time::Instant>,
+    /// The CPU time cannot be read: the limit counts wall-clock time from `next_read`'s
+    /// first value.
+    wall_clock: bool,
+}
+
+/// The least wall-clock time between two readings of a decode's CPU time: the most it may
+/// run past its limit.
+const MIN_CPU_CLOCK_READ: Duration = Duration::from_millis(1);
+
+impl CpuClock {
+    fn start(limit: Duration) -> Self {
+        let now = std::time::Instant::now();
+        let start = thread_cpu_time();
+        Self {
+            start: start.unwrap_or_default(),
+            limit,
+            next_read: Cell::new(now + limit),
+            wall_clock: start.is_none(),
+        }
+    }
+
+    /// Whether the thread has spent the limit since the clock started.
+    fn passed(&self) -> bool {
+        let now = std::time::Instant::now();
+        if now < self.next_read.get() {
+            return false;
+        }
+        let Some(cpu) = thread_cpu_time().filter(|_| !self.wall_clock) else {
+            return true;
+        };
+        let spent = cpu.saturating_sub(self.start);
+        match self.limit.checked_sub(spent) {
+            Some(left) if !left.is_zero() => {
+                self.next_read.set(now + left.max(MIN_CPU_CLOCK_READ));
+                false
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The CPU time the calling thread has run, or `None` where it cannot be read.
+#[cfg(unix)]
+fn thread_cpu_time() -> Option<Duration> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the duration of the call, which only
+    // writes it; CLOCK_THREAD_CPUTIME_ID needs no other state.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) };
+    if read != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    ))
+}
+
+/// The CPU time the calling thread has run, or `None` where it cannot be read.
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Option<Duration> {
+    None
 }
 
 /// The decoded memory a request holds of the process-wide budget, given back when it is

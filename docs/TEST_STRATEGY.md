@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->925<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->931<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->366<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1301<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->367<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1308<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -86,9 +86,9 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `protocol` | 5 |
 | `part` | 10 |
 | `auth` | 16 |
-| `network` | 32 |
+| `network` | 33 |
 | `worker` | 6 |
-| **Total** | **366** |
+| **Total** | **367** |
 <!--/gen-->
 
 ### Running E2E Tests
@@ -113,11 +113,7 @@ cd kafka_test && cargo run --release -- --exclude performance --exclude shadow
 Other flags: `--sequential` (disable parallelism; runs are parallel by default),
 `--concurrency <N>` (default 16), `--timeout-secs <N>` (per-test timeout, default 300),
 `--json`, `--list`, `--verbose`. The runner reads
-`DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`, and
-reaches the broker through `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) only: rdkafka
-clients get the list, raw-protocol tests connect to its first address, and the `network` and
-`auth` categories (which connect from chosen loopback source addresses on the database host)
-use its port on 127.0.0.1.
+`DATABASE_URL` and falls back to `host=localhost port=28814 user=postgres dbname=postgres`.
 
 ---
 

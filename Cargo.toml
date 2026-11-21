@@ -50,6 +50,9 @@ snap = "1.1"
 zstd = { version = "0.14", features = ["with-rust-allocator"] }
 # The RecordBatch v2 checksum (CRC-32C), hardware-accelerated; the version kafka-protocol uses.
 crc32c = "0.6.4"
+# The decoding thread's CPU time (clock_gettime), which bounds a decode's time; already a
+# dependency of tokio and the rest.
+libc = "0.2"
 
 # Concurrency and synchronization
 crossbeam-channel = "0.5.15"

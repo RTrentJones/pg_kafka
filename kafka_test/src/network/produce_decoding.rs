@@ -54,7 +54,7 @@ async fn produce_codes(
 /// The listener backend's resident memory (kB), after resetting its peak, or `None` when
 /// this process cannot read the backend's /proc entry (the DB runs elsewhere, or as
 /// another user).
-async fn reset_listener_peak(ctx: &TestContext) -> DynResult<Option<(i32, u64)>> {
+pub(super) async fn reset_listener_peak(ctx: &TestContext) -> DynResult<Option<(i32, u64)>> {
     let pid: i32 = ctx
         .db()
         .query_one(
@@ -70,7 +70,7 @@ async fn reset_listener_peak(ctx: &TestContext) -> DynResult<Option<(i32, u64)>>
 }
 
 /// A `/proc/<pid>/status` field in kB.
-fn proc_kb(pid: i32, field: &str) -> Option<u64> {
+pub(super) fn proc_kb(pid: i32, field: &str) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status
         .lines()

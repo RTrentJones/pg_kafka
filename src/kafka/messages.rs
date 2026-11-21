@@ -5,6 +5,9 @@
 //! requests cross on, created in `worker::network` and handed to the listener; the remaining types
 //! are the request data the handlers take.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::kafka::api::{Lane, RequestBody, RequestHeader, ResponseBody};
 
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
@@ -114,13 +117,49 @@ pub struct TopicProduceData {
 /// nothing of it is written, and it is answered with its own error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedPartition {
-    /// Topic name
-    pub topic: String,
+    /// Topic name, one allocation shared by the refused partitions of a topic entry: a
+    /// partition entry takes 8 bytes on the wire and a name up to the whole frame, so a copy
+    /// per partition would take memory of the frame's size squared.
+    pub topic: Arc<str>,
     /// Partition ID
     pub partition: i32,
     /// The error validation found (UNKNOWN_TOPIC_OR_PARTITION takes its place when the
     /// topic or partition does not exist).
     pub error_code: i16,
+}
+
+/// The places of the topics of refused partitions in a list of topics, by name. The
+/// refused partitions of a topic entry share one name ([`RefusedPartition::topic`]) and come
+/// one after another, so a name is hashed once per such run, not once per partition: a
+/// request of a long name and many partitions would otherwise hash the name per partition,
+/// time of the frame's size squared.
+#[derive(Debug, Default)]
+pub struct TopicPlaces {
+    at: HashMap<Arc<str>, usize>,
+    last: Option<(Arc<str>, usize)>,
+}
+
+impl TopicPlaces {
+    /// Places for `names`, the first at 0.
+    pub fn of<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut places = Self::default();
+        for (at, name) in names.into_iter().enumerate() {
+            places.at.entry(Arc::from(name)).or_insert(at);
+        }
+        places
+    }
+
+    /// The place of `topic`; `add` places a name not seen yet and returns its place.
+    pub fn place(&mut self, topic: &Arc<str>, add: impl FnOnce() -> usize) -> usize {
+        if let Some((last, at)) = &self.last {
+            if Arc::ptr_eq(last, topic) {
+                return *at;
+            }
+        }
+        let at = *self.at.entry(Arc::clone(topic)).or_insert_with(add);
+        self.last = Some((Arc::clone(topic), at));
+        at
+    }
 }
 
 /// Data for producing to a partition

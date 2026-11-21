@@ -103,16 +103,15 @@ impl LongPoll {
         let read_committed =
             IsolationLevel::from_i8(self.fetch.isolation_level) == IsolationLevel::ReadCommitted;
 
+        // Registered topic by topic: the registry holds and hashes a name once per topic.
         let notify = std::sync::Arc::new(Notify::new());
-        for (topic, partition) in self.partitions() {
+        for topic in &self.fetch.topic_data {
+            let partitions = topic
+                .partitions
+                .iter()
+                .map(|p| (p.partition_index, p.fetch_offset));
             registry
-                .register(
-                    topic,
-                    partition.partition_index,
-                    partition.fetch_offset,
-                    notify.clone(),
-                    read_committed,
-                )
+                .register(&topic.name, partitions, &notify, read_committed)
                 .await;
         }
 
@@ -121,22 +120,11 @@ impl LongPoll {
             .await;
 
         // Always drop the registrations, whatever the outcome.
-        for (topic, partition) in self.partitions() {
-            registry
-                .unregister(topic, partition.partition_index, &notify)
-                .await;
+        for topic in &self.fetch.topic_data {
+            let partitions = topic.partitions.iter().map(|p| p.partition_index);
+            registry.unregister(&topic.name, partitions, &notify).await;
         }
         result
-    }
-
-    /// Every requested `(topic name, partition)`.
-    fn partitions(
-        &self,
-    ) -> impl Iterator<Item = (&str, &crate::kafka::messages::PartitionFetchData)> {
-        self.fetch
-            .topic_data
-            .iter()
-            .flat_map(|t| t.partitions.iter().map(move |p| (t.name.as_str(), p)))
     }
 
     /// The fetch / wait loop; [`run`](Self::run) owns the registration around it.
