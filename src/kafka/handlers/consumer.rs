@@ -108,7 +108,7 @@ fn offset_commit_refusal(
         return Ok(None);
     };
     if generation_id >= 0
-        && ctx.coordinator.get_group_state(group_id).is_none()
+        && !ctx.coordinator.has_group(group_id)
         && ctx
             .store
             .groups_with_offsets(&[group_id.to_string()])?

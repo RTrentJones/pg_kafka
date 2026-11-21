@@ -897,7 +897,25 @@ impl GroupCoordinator {
         removed
     }
 
-    /// A snapshot of a group's state (used by DeleteGroups, and by tests)
+    /// Whether the coordinator holds `group_id`, without copying it (a group may hold a
+    /// thousand members of up to 1 MiB of metadata each). A poisoned lock reads as not held.
+    pub fn has_group(&self, group_id: &str) -> bool {
+        self.groups
+            .read()
+            .is_ok_and(|groups| groups.contains_key(group_id))
+    }
+
+    /// Whether the held group `group_id` has no members, without copying it; `None` when
+    /// the coordinator does not hold it (or its lock is poisoned).
+    pub fn group_is_empty(&self, group_id: &str) -> Option<bool> {
+        self.groups
+            .read()
+            .ok()
+            .and_then(|groups| groups.get(group_id).map(|g| g.members.is_empty()))
+    }
+
+    /// A snapshot of a group's state, for tests: it copies the whole group.
+    #[cfg(test)]
     pub fn get_group_state(&self, group_id: &str) -> Option<ConsumerGroup> {
         self.groups
             .read()

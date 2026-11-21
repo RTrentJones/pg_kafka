@@ -438,7 +438,7 @@ pub fn handle_delete_groups(
     // lookup however many groups the request names.
     let unheld: Vec<String> = group_names
         .iter()
-        .filter(|g| coordinator.get_group_state(g).is_none())
+        .filter(|g| !coordinator.has_group(g))
         .cloned()
         .collect();
     let with_offsets = if unheld.is_empty() {
@@ -452,10 +452,10 @@ pub fn handle_delete_groups(
         result.group_id = GroupId(StrBytes::from_string(group_name.clone()));
 
         // Check if group exists and has members
-        match coordinator.get_group_state(&group_name) {
-            Some(group) => {
+        match coordinator.group_is_empty(&group_name) {
+            Some(empty) => {
                 // Check if group has active members
-                if !group.members.is_empty() {
+                if !empty {
                     result.error_code = ERROR_NON_EMPTY_GROUP;
                     // Note: DeletableGroupResult doesn't have error_message field
                     results.push(result);

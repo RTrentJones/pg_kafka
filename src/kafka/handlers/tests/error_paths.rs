@@ -488,6 +488,73 @@ fn make_empty_group(ctx: &HandlerContext, group: &str) {
     assert!(state.members.is_empty());
 }
 
+/// Join a lone member to `group` with `metadata_len` bytes of protocol metadata; its
+/// member id and generation.
+fn join_lone_member(ctx: &HandlerContext, group: &str, metadata_len: usize) -> (String, i32) {
+    let joined = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = joined.clone();
+    handle_join_group(
+        ctx,
+        crate::kafka::handlers::JoinGroupRequestData {
+            group_id: group.to_string(),
+            member_id: String::new(),
+            client_id: "client".to_string(),
+            group_instance_id: None,
+            session_timeout_ms: 30_000,
+            rebalance_timeout_ms: 60_000,
+            protocol_type: "consumer".to_string(),
+            protocols: vec![JoinGroupProtocol {
+                name: "range".to_string(),
+                metadata: vec![0; metadata_len],
+            }],
+        },
+        move |response| *slot.lock().unwrap() = Some(response),
+    );
+    let join = joined
+        .lock()
+        .unwrap()
+        .take()
+        .expect("lone join answered immediately");
+    assert_eq!(join.error_code, ERROR_NONE);
+    (join.member_id.to_string(), join.generation_id)
+}
+
+/// A refused OffsetCommit and a DeleteGroups of a live group ask the coordinator whether
+/// it holds the group (and whether it has members) without copying it: a copy of a group
+/// of 1 MiB member metadata per refused commit is a megabyte copied on the DB thread.
+#[test]
+fn group_existence_checks_do_not_copy_the_group() {
+    let mut store = MockKafkaStore::new();
+    metadata_ok_or_fail(&mut store);
+    store.expect_commit_offset().never();
+    store.expect_groups_with_offsets().never();
+    store.expect_delete_consumer_group_offsets().never();
+    let coordinator = GroupCoordinator::new();
+    with_ctx_coord(&store, &coordinator, |ctx| {
+        let (member, generation) = join_lone_member(
+            ctx,
+            "big",
+            crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES - 64,
+        );
+        let topics = vec![commit_topic("ok", &[0])];
+        let (resp, copied) = crate::testing::heap_allocated(|| {
+            handle_offset_commit(ctx, "big", generation + 5, &member, topics).unwrap()
+        });
+        assert_eq!(
+            resp.topics[0].partitions[0].error_code,
+            ERROR_ILLEGAL_GENERATION
+        );
+        assert!(copied < 64 << 10, "a refused commit copied {copied} bytes");
+
+        let (resp, copied) = crate::testing::heap_allocated(|| {
+            handle_delete_groups(ctx, vec!["big".to_string()]).unwrap()
+        });
+        assert_eq!(resp.results[0].error_code, ERROR_NON_EMPTY_GROUP);
+        assert!(copied < 64 << 10, "DeleteGroups copied {copied} bytes");
+    });
+    assert!(coordinator.has_group("big"));
+}
+
 #[test]
 fn delete_groups_offset_delete_failure_is_per_group_and_keeps_the_group() {
     let mut store = MockKafkaStore::new();
