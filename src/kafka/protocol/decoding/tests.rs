@@ -218,34 +218,45 @@ fn gzip_bomb_frame(partitions: i32, per_partition: usize, acks: i16) -> BytesMut
     frame(&req, 7, 78)
 }
 
+/// Partitions decoded and partitions refused (with their codes) of a Produce frame the DB
+/// thread is to run.
+fn decoded_and_refused(frame: BytesMut) -> (Vec<i32>, Vec<(i32, i16)>) {
+    let (tx, _rx) = channel();
+    let request = parse_request(frame, tx)
+        .unwrap()
+        .expect("the request reaches the DB thread");
+    let RequestBody::Produce(produce) = request.body else {
+        panic!("expected a Produce request");
+    };
+    (
+        produce
+            .topic_data
+            .iter()
+            .flat_map(|t| t.partitions.iter().map(|p| p.partition_index))
+            .collect(),
+        produce
+            .refused
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect(),
+    )
+}
+
 /// Two partitions of 60 MB of gzip-compressed zeros: each batch alone is legal, but the
-/// request decodes past the per-request limit. It is refused with MESSAGE_TOO_LARGE on
-/// every partition (and closes an acks=0 connection) instead of being held decoded.
+/// request decodes past the per-request limit. The first is decoded, the second refused
+/// with MESSAGE_TOO_LARGE on its own instead of being held decoded (an acks=0 request too:
+/// the DB thread writes the first, then closes the connection).
 #[test]
 fn test_produce_decoding_past_the_request_limit_is_refused() {
     let frame = gzip_bomb_frame(2, 60_000_000, 1);
     assert!(frame.len() < 1_000_000, "the bomb is small on the wire");
-    let (tx, mut rx) = channel();
-    let parsed = parse_request(frame, tx).unwrap();
-    assert!(parsed.is_none(), "the request must not reach the DB thread");
-    match rx.try_recv() {
-        Ok(KafkaResponse {
-            body: ResponseBody::Produce(response),
-            ..
-        }) => {
-            let codes: Vec<i16> = response.responses[0]
-                .partition_responses
-                .iter()
-                .map(|p| p.error_code)
-                .collect();
-            assert_eq!(codes, vec![10, 10], "MESSAGE_TOO_LARGE per partition");
-        }
-        other => panic!("expected a per-partition Produce error, got {other:?}"),
+    for acks in [1, 0] {
+        assert_eq!(
+            decoded_and_refused(gzip_bomb_frame(2, 60_000_000, acks)),
+            (vec![0], vec![(1, 10)]),
+            "MESSAGE_TOO_LARGE on the partition past the limit (acks={acks})"
+        );
     }
-
-    let (tx, mut rx) = channel();
-    assert!(parse_request(gzip_bomb_frame(2, 60_000_000, 0), tx).is_err());
-    assert!(rx.try_recv().is_err(), "acks=0 must not get a response");
 }
 
 /// A Produce frame of `partitions` partitions, each carrying `batch`.
@@ -268,29 +279,10 @@ fn produce_frame_of(batch: &bytes::Bytes, partitions: i32, acks: i16) -> BytesMu
     frame(&req, 7, 79)
 }
 
-/// Produce error codes a frame is answered with before it reaches the DB thread.
-fn refused_codes(frame: BytesMut) -> Vec<i16> {
-    let (tx, mut rx) = channel();
-    assert!(
-        parse_request(frame, tx).unwrap().is_none(),
-        "the request must not reach the DB thread"
-    );
-    match rx.try_recv() {
-        Ok(KafkaResponse {
-            body: ResponseBody::Produce(response),
-            ..
-        }) => response.responses[0]
-            .partition_responses
-            .iter()
-            .map(|p| p.error_code)
-            .collect(),
-        other => panic!("expected a per-partition Produce error, got {other:?}"),
-    }
-}
-
-/// Batches of 7-byte records: 2.4 million of them in two 100 KB gzip batches would take
-/// some 600 MB decoded into records. Their declared counts are charged first, so the
-/// request is refused with MESSAGE_TOO_LARGE before any record is built, and quickly.
+/// Batches of 7-byte records: 1.2 million of them in a 100 KB gzip batch would take some
+/// 105 MB decoded into records, more than a request may hold. Their declared counts are
+/// checked first, so each partition is refused with MESSAGE_TOO_LARGE before any record is
+/// built, and quickly.
 #[test]
 fn test_produce_of_tiny_records_past_the_request_limit_is_refused() {
     use crate::kafka::protocol::recordbatch::test_batches::{raw_batch, tiny_records};
@@ -298,8 +290,12 @@ fn test_produce_of_tiny_records_past_the_request_limit_is_refused() {
     let batch = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), true);
     let frame = produce_frame_of(&batch, 2, 1);
     assert!(frame.len() < 200_000, "{} bytes on the wire", frame.len());
-    let (codes, spent) = crate::testing::cpu_time(|| refused_codes(frame));
-    assert_eq!(codes, vec![10, 10], "MESSAGE_TOO_LARGE per partition");
+    let (outcome, spent) = crate::testing::cpu_time(|| decoded_and_refused(frame));
+    assert_eq!(
+        outcome,
+        (vec![], vec![(0, 10), (1, 10)]),
+        "MESSAGE_TOO_LARGE per partition"
+    );
     assert!(spent < std::time::Duration::from_millis(500), "{spent:?}");
 }
 

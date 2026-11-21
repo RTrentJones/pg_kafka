@@ -285,7 +285,9 @@ const MIN_ZSTD_VERSION: i16 = 7;
 /// Why a Produce request's records did not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeFailure {
-    /// They take more memory than one request may hold ([`MAX_DECODED_REQUEST_BYTES`]).
+    /// A partition takes more memory than the inline limit leaves it
+    /// ([`INLINE_DECODE_BYTES`]): the request decodes again under a large-decode slot,
+    /// where a partition that does not fit is refused on its own.
     TooLarge,
     /// The process-wide decode budget lacks room: it needs this much free in all.
     Busy(usize),
@@ -341,31 +343,54 @@ enum Decode {
 #[derive(Debug, Default)]
 struct DecodedTopics(Vec<TopicProduceData>, Vec<RefusedPartition>, DecodedCharge);
 
+/// What a decode does with a partition that does not fit in its budget's limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverLimit {
+    /// Fail the decode ([`DecodeFailure::TooLarge`]): the inline limit, past which the
+    /// request decodes again under a large-decode slot.
+    Retry,
+    /// Refuse the partition MESSAGE_TOO_LARGE and go on with the next: the request limit.
+    Refuse,
+}
+
 /// The records of one partition, or the error that refuses it: Kafka 3.7 validates each
 /// partition on its own (`KafkaApis.handleProduceRequest` answers a partition whose data
 /// `ProduceRequest.validateRecords` refuses with that error, and the log append that
-/// validates the batch fails that partition only), and writes the others.
+/// validates the batch fails that partition only), and writes the others. A partition
+/// that does not fit in what the request may still hold is, under [`OverLimit::Refuse`],
+/// refused MESSAGE_TOO_LARGE, as Kafka refuses a batch past `message.max.bytes`. A refused
+/// partition's charge is given back, so it does not count against the partitions after it;
+/// only the process-wide budget running out fails the whole decode, which then waits for
+/// room.
 fn decode_partition(
     batch: &bytes::Bytes,
     zstd_allowed: bool,
     budget: &DecodeBudget,
+    over_limit: OverLimit,
 ) -> Result<Result<ParsedRecordBatch, i16>, DecodeFailure> {
     if let Err(code) = validate_produce_records(batch, zstd_allowed) {
         return Ok(Err(code));
     }
-    match parse_record_batch_with_metadata(batch, budget) {
-        Ok(parsed) => Ok(Ok(parsed)),
-        Err(e) => match budget.exhausted() {
-            Some(Exhausted::Limit) => Err(DecodeFailure::TooLarge),
-            Some(Exhausted::Global) => Err(DecodeFailure::Busy(budget.wanted())),
-            None => Ok(Err(match e {
-                KafkaError::InvalidRecord { .. } | KafkaError::Protocol { .. } => {
-                    e.to_kafka_error_code()
-                }
-                _ => ERROR_CORRUPT_MESSAGE,
-            })),
+    let mark = budget.charged();
+    let e = match parse_record_batch_with_metadata(batch, budget) {
+        Ok(parsed) => return Ok(Ok(parsed)),
+        Err(e) => e,
+    };
+    let code = match budget.exhausted() {
+        Some(Exhausted::Global) => return Err(DecodeFailure::Busy(budget.wanted())),
+        Some(Exhausted::Limit) if over_limit == OverLimit::Retry => {
+            return Err(DecodeFailure::TooLarge)
+        }
+        Some(Exhausted::Limit) => ERROR_MESSAGE_TOO_LARGE,
+        None => match e {
+            KafkaError::InvalidRecord { .. } | KafkaError::Protocol { .. } => {
+                e.to_kafka_error_code()
+            }
+            _ => ERROR_CORRUPT_MESSAGE,
         },
-    }
+    };
+    budget.rewind(mark);
+    Ok(Err(code))
 }
 
 /// Decode the records of every partition of `topics` within `budget`. A topic all of whose
@@ -375,6 +400,7 @@ fn decode_records(
     topics: &[WireTopicProduceData],
     zstd_allowed: bool,
     budget: DecodeBudget,
+    over_limit: OverLimit,
 ) -> Result<DecodedTopics, DecodeFailure> {
     let mut topic_data = Vec::with_capacity(topics.len());
     let mut refused = Vec::new();
@@ -383,7 +409,7 @@ fn decode_records(
         let mut partitions = Vec::with_capacity(topic.partition_data.len());
         for partition in &topic.partition_data {
             let (records, producer_metadata) = match &partition.records {
-                Some(batch) => match decode_partition(batch, zstd_allowed, &budget)? {
+                Some(batch) => match decode_partition(batch, zstd_allowed, &budget, over_limit)? {
                     Ok(ParsedRecordBatch {
                         records,
                         producer_metadata,
@@ -443,15 +469,15 @@ fn check_first_batches(topics: &[WireTopicProduceData]) -> Result<(), DecodeFail
     Ok(())
 }
 
-/// The memory the batches of `topics` that pass validation take decoded by what they
-/// declare (their bytes and record counts), the least they can take.
+/// The memory the batches of `topics` take decoded by what they declare (their bytes and
+/// record counts), the least they can take. Batches refused before they decode
+/// ([`least_decoded_memory`]) take none.
 fn declared_memory(topics: &[WireTopicProduceData], zstd_allowed: bool) -> usize {
     topics
         .iter()
         .flat_map(|t| t.partition_data.iter())
         .filter_map(|p| p.records.as_ref())
-        .filter(|batch| validate_produce_records(batch, zstd_allowed).is_ok())
-        .map(|batch| least_decoded_memory(batch))
+        .map(|batch| least_decoded_memory(batch, zstd_allowed))
         .fold(0, usize::saturating_add)
 }
 
@@ -483,22 +509,24 @@ fn record_bytes(topics: &[WireTopicProduceData]) -> usize {
 /// declare ([`declared_memory`]) is decoded in place, within that budget: the common case of
 /// small (compressed or not) batches. One that declares more, or that expands past it, is
 /// left to [`finish_decode`] under a large-decode slot ([`Wait::Slot`]); one that finds the
-/// process-wide budget exhausted waits there for room ([`Wait::Budget`]). One that declares
-/// more than a request may hold ([`MAX_DECODED_REQUEST_BYTES`]) can never decode and is
-/// refused at once, never left to wait for a slot it would time out waiting for.
+/// process-wide budget exhausted waits there for room ([`Wait::Budget`]). A batch that
+/// declares more than any request may hold ([`MAX_DECODED_REQUEST_BYTES`]) can never
+/// decode: it declares nothing here and is refused as it decodes, before anything is
+/// charged, so it never leaves a request waiting for a slot it would time out waiting for.
 fn decode_all_records(
     topics: &[WireTopicProduceData],
     zstd_allowed: bool,
 ) -> Result<Decode, DecodeFailure> {
     check_first_batches(topics)?;
-    let declared = declared_memory(topics, zstd_allowed);
-    if declared > MAX_DECODED_REQUEST_BYTES {
-        return Err(DecodeFailure::TooLarge);
-    }
-    if declared > INLINE_DECODE_BYTES {
+    if declared_memory(topics, zstd_allowed) > INLINE_DECODE_BYTES {
         return Ok(Decode::Pending(Wait::Slot));
     }
-    match decode_records(topics, zstd_allowed, DecodeBudget::new(INLINE_DECODE_BYTES)) {
+    match decode_records(
+        topics,
+        zstd_allowed,
+        DecodeBudget::new(INLINE_DECODE_BYTES),
+        OverLimit::Retry,
+    ) {
         Ok(done) => Ok(Decode::Done(done)),
         Err(DecodeFailure::TooLarge) => Ok(Decode::Pending(Wait::Slot)),
         Err(DecodeFailure::Busy(wanted)) => Ok(Decode::Pending(Wait::Budget(wanted))),
@@ -522,6 +550,7 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                         topics,
                         pending.zstd_allowed,
                         DecodeBudget::new(INLINE_DECODE_BYTES),
+                        OverLimit::Retry,
                     )
                 }))
                 .unwrap_or(Err(DecodeFailure::Panicked))
@@ -535,6 +564,7 @@ async fn decode_pending(pending: &PendingRecords) -> Result<DecodedTopics, Decod
                             &topics,
                             zstd_allowed,
                             DecodeBudget::new(MAX_DECODED_REQUEST_BYTES),
+                            OverLimit::Refuse,
                         )
                     })
                     .await
@@ -700,6 +730,11 @@ mod tests {
 
     /// A batch of `n` records of a 10-byte key and a `len`-byte value.
     fn batch_of(n: usize, len: usize) -> bytes::Bytes {
+        batch_of_with(n, len, Header::default())
+    }
+
+    /// [`batch_of`] with the header fields of `header`.
+    fn batch_of_with(n: usize, len: usize, header: Header) -> bytes::Bytes {
         let value = vec![b'v'; len];
         let section: Vec<u8> = (0..n)
             .flat_map(|i| {
@@ -717,7 +752,7 @@ mod tests {
                 ])
             })
             .collect();
-        batch_with(&section, i32::try_from(n).unwrap(), Header::default())
+        batch_with(&section, i32::try_from(n).unwrap(), header)
     }
 
     /// The partitions decoded, and the partitions refused with their codes.
@@ -918,7 +953,7 @@ mod tests {
             );
             let budget = DecodeBudget::new(INLINE_DECODE_BYTES);
             assert!(
-                decode_records(&topics, true, budget).is_ok(),
+                decode_records(&topics, true, budget, OverLimit::Retry).is_ok(),
                 "{len}-byte records"
             );
         }
@@ -941,28 +976,129 @@ mod tests {
     }
 
     #[test]
-    fn requests_that_declare_more_than_a_request_may_hold_are_refused_at_once() {
-        use crate::kafka::protocol::recordbatch_test_batches::tiny_records;
-        // 2 million records of 88 bytes each declare 176 MB, past the 100 MB a request may
-        // hold: MESSAGE_TOO_LARGE without waiting for a large-decode slot, where a wait
-        // under saturation would end in REQUEST_TIMED_OUT, which the client retries.
-        let bomb = topics(vec![batch_with(
-            &tiny_records(1),
+    fn a_partition_declaring_too_many_records_is_refused_on_its_own() {
+        let x = record(&[&[0], &v(0), &v(0), &v(-1), &v(1), b"x", &v(0)]);
+        let liar = batch_with(
+            &x,
             2_000_000,
-            Header::default(),
-        )]);
-        assert!(declared_memory(&bomb, true) > MAX_DECODED_REQUEST_BYTES);
-        assert!(matches!(
-            decode_all_records(&bomb, true),
-            Err(DecodeFailure::TooLarge)
-        ));
-        assert!(matches!(
-            rejection(DecodeFailure::TooLarge, 1, Vec::new()),
-            Rejection::Reply {
-                error_code: ERROR_MESSAGE_TOO_LARGE,
-                ..
-            }
-        ));
+            Header {
+                last_offset_delta: Some(0),
+                ..Header::default()
+            },
+        );
+        assert_eq!(
+            outcome(vec![batch_of(1, 1), liar], true),
+            Ok((
+                vec![0],
+                vec![(1, crate::kafka::constants::ERROR_INVALID_RECORD)]
+            ))
+        );
+        // Consistent with its lastOffsetDelta, its one record still cannot be 2 million:
+        // Kafka answers INVALID_RECORD once it runs out of records.
+        let consistent = batch_with(&x, 2_000_000, Header::default());
+        assert_eq!(
+            outcome(vec![consistent, batch_of(1, 1)], true),
+            Ok((
+                vec![1],
+                vec![(0, crate::kafka::constants::ERROR_INVALID_RECORD)]
+            ))
+        );
+    }
+
+    #[test]
+    fn a_partition_that_can_never_decode_is_refused_at_once_on_its_own() {
+        use crate::kafka::protocol::recordbatch_test_batches::{raw_batch, tiny_records};
+        // 1.2 million 7-byte records, uncompressed and gzipped: 105 MB of records, past
+        // the 100 MB a request may hold. Refused MESSAGE_TOO_LARGE before anything decodes, so
+        // the request is not left waiting for a large-decode slot (under saturation, the
+        // wait would end in REQUEST_TIMED_OUT, which the client retries); the other
+        // partition decodes inline.
+        let n = 1_200_000;
+        for gzip in [false, true] {
+            let bomb = raw_batch(&tiny_records(n), i32::try_from(n).unwrap(), gzip);
+            let data = topics(vec![batch_of(1, 1), bomb]);
+            assert!(declared_memory(&data, true) <= INLINE_DECODE_BYTES);
+            let Ok(Decode::Done(DecodedTopics(_, refused, charge))) =
+                decode_all_records(&data, true)
+            else {
+                panic!("decodes inline");
+            };
+            assert_eq!(
+                refused[0].error_code, ERROR_MESSAGE_TOO_LARGE,
+                "gzip {gzip}"
+            );
+            assert!(
+                charge.bytes() < 1000,
+                "the refused partition holds no charge"
+            );
+        }
+    }
+
+    /// A test pool holding a request's worth: what a refused partition charged must be
+    /// given back to it too.
+    static POOL: crate::kafka::protocol::decode_budget::DecodePool =
+        crate::kafka::protocol::decode_budget::DecodePool::new(MAX_DECODED_REQUEST_BYTES);
+
+    #[test]
+    fn a_refused_partition_gives_back_what_it_charged() {
+        use crate::kafka::constants::{ERROR_INVALID_RECORD, ERROR_INVALID_TIMESTAMP};
+        use crate::kafka::protocol::recordbatch_test_batches::{raw_batch, tiny_records};
+        // Against a 3 MB request limit: each partition before the last charges some 2 MB
+        // and is refused, for its record count (10,000 declared over 150,000 records, found
+        // once they decompressed), its LogAppendTime type (once its records are read) or
+        // its size (4 MB of gzip-compressed zeros). The last needs some 1.9 MB, which it
+        // has only if each refused partition gave its charge back.
+        let limit = 3_000_000;
+        let wrong_count = raw_batch(&tiny_records(150_000), 10_000, true);
+        let log_append_time = batch_of_with(
+            1_500,
+            1000,
+            Header {
+                attributes: 0x08,
+                max_timestamp: Some(-1),
+                ..Header::default()
+            },
+        );
+        let zeros = vec![0u8; 4_000_000];
+        let too_large = raw_batch(
+            &record(&[&[0], &v(0), &v(0), &v(-1), &v(4_000_000), &zeros, &v(0)]),
+            1,
+            true,
+        );
+        let last = batch_of(5_000, 200);
+        let data = topics(vec![wrong_count, log_append_time, too_large, last]);
+        let budget = DecodeBudget::with_pool(limit, &POOL);
+        let DecodedTopics(topic_data, refused, charge) =
+            decode_records(&data, true, budget, OverLimit::Refuse).unwrap();
+        let refused: Vec<(i32, i16)> = refused
+            .iter()
+            .map(|r| (r.partition, r.error_code))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                (0, ERROR_INVALID_RECORD),
+                (1, ERROR_INVALID_TIMESTAMP),
+                (2, ERROR_MESSAGE_TOO_LARGE)
+            ]
+        );
+        assert_eq!(topic_data[0].partitions[0].partition_index, 3);
+        assert_eq!(
+            POOL.remaining(),
+            MAX_DECODED_REQUEST_BYTES - charge.bytes(),
+            "the pool holds the decoded partition's charge only"
+        );
+        drop(charge);
+        assert_eq!(POOL.remaining(), MAX_DECODED_REQUEST_BYTES);
+
+        // Inline, a partition past the limit fails the decode, to be retried under a
+        // large-decode slot.
+        let data = topics(vec![batch_of(5_000, 200), batch_of(5_000, 200)]);
+        let budget = DecodeBudget::with_pool(limit, &POOL);
+        assert_eq!(
+            decode_records(&data, true, budget, OverLimit::Retry).unwrap_err(),
+            DecodeFailure::TooLarge
+        );
     }
 
     /// A Produce request (`acks`) for two partitions whose records wait for `wait` until

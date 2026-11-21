@@ -9,8 +9,10 @@
 //! them (they write through the budget and stop at its limit; see
 //! `super::recordbatch`):
 //!
-//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; beyond
-//!   that the request is answered MESSAGE_TOO_LARGE;
+//! * per request, at most [`MAX_DECODED_REQUEST_BYTES`] across all its partitions; a
+//!   partition that does not fit in what its request may still hold is answered
+//!   MESSAGE_TOO_LARGE on its own, and what its decode charged is given back, as is the
+//!   charge of any partition refused after it began to decode;
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
@@ -219,6 +221,14 @@ impl DecodeBudget {
         let n = n.min(self.charged.get());
         self.charged.set(self.charged.get() - n);
         self.pool.give_back(n);
+    }
+
+    /// Give back everything charged since [`Self::charged`] was `mark`, and forget which
+    /// limit a charge ran into since: the decode of a refused partition, whose memory is
+    /// freed, so that it does not count against the partitions after it.
+    pub fn rewind(&self, mark: usize) {
+        self.release(self.charged.get().saturating_sub(mark));
+        self.exhausted.set(None);
     }
 
     /// Bytes this budget may still charge before its limit (the process-wide budget may
