@@ -356,3 +356,327 @@ pub async fn test_repeated_partition_entries_are_answered_once() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Topics of the many-topics request: one partition each, of empty records, some 630 KB
+/// on the wire.
+const MANY_TOPICS: usize = 30_000;
+
+/// A Produce naming 30,000 topics that do not exist, one partition of empty records each:
+/// every partition is refused and answered UNKNOWN_TOPIC_OR_PARTITION on the DB thread.
+/// Answering takes time linear in the topics, so the request is answered quickly and a
+/// produce on another connection meanwhile is not held up behind it.
+pub async fn test_a_produce_of_many_refused_topics_is_answered_quickly() -> TestResult {
+    use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
+    use kafka_protocol::messages::TopicName;
+    use kafka_protocol::protocol::StrBytes;
+    println!("=== Test: a Produce of many refused topics is answered quickly ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-many-probe").await;
+    let prefix = ctx.unique_topic("net-many").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+
+    let mut request = ProduceRequest::default();
+    request.acks = -1;
+    request.timeout_ms = 30_000;
+    request.topic_data = (0..MANY_TOPICS)
+        .map(|i| {
+            let mut p = PartitionProduceData::default();
+            p.index = 0;
+            p.records = Some(Bytes::new());
+            let mut t = TopicProduceData::default();
+            t.name = TopicName(StrBytes::from_string(format!("{prefix}-{i:06}")));
+            t.partition_data = vec![p];
+            t
+        })
+        .collect();
+    let frame = request_frame(7, 1, &request);
+    println!(
+        "Step 1: one request of {MANY_TOPICS} topics ({} bytes), produces alongside",
+        frame.len()
+    );
+    let mut probe = Wire::connect().await?;
+    let value = plain_batch(&[Bytes::from_static(b"p")], Compression::None);
+    let (code, _) = probe.produce(&topic, 0, value.clone(), None).await?;
+    assert_eq!(code, 0);
+    let many = tokio::spawn(spawned_produce(frame, 1));
+    let mut worst = Duration::ZERO;
+    let mut probes = 0;
+    while !many.is_finished() {
+        let started = Instant::now();
+        let (code, _) = probe.produce(&topic, 0, value.clone(), None).await?;
+        assert_eq!(code, 0);
+        worst = worst.max(started.elapsed());
+        probes += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (codes, answers, took) = many.await??;
+    println!("  answered {answers} partitions {codes:?} after {took:?}");
+    println!("  {probes} produces alongside, the slowest {worst:?}");
+    assert_eq!(answers, MANY_TOPICS);
+    assert_eq!(codes, BTreeSet::from([UNKNOWN_TOPIC_OR_PARTITION]));
+    assert!(took < Duration::from_secs(3), "answered after {took:?}");
+    assert!(
+        worst < Duration::from_secs(2),
+        "a produce alongside took {worst:?}"
+    );
+    let created: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT count(*) FROM kafka.topics WHERE name LIKE $1 || '-%'",
+            &[&prefix],
+        )
+        .await?
+        .get(0);
+    assert_eq!(created, 0, "no refused topic is created");
+    println!("✅ answered quickly; the produce alongside was not held up");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// TRANSACTIONAL_ID_AUTHORIZATION_FAILED.
+const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+/// INVALID_RECORD.
+const INVALID_RECORD: i16 = 87;
+
+/// The values stored in `topic`'s partition `partition`, in offset order.
+async fn stored_values(ctx: &TestContext, topic: &str, partition: i32) -> DynResult<Vec<String>> {
+    Ok(ctx
+        .db()
+        .query(
+            "SELECT convert_from(m.value, 'UTF8') FROM kafka.messages m
+             JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1 AND m.partition_id = $2 ORDER BY m.partition_offset",
+            &[&topic, &partition],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect())
+}
+
+/// Kafka 3.7 reads the first batch of every entry of a Produce as sent before it keeps
+/// one entry per partition, and of a partition's entries writes the last one
+/// `ProduceRequest.validateRecords` accepts while answering the last one it refuses:
+/// a replaced transactional batch without a transactional id, or a replaced batch whose
+/// length cannot be read, still fails the whole request; a valid entry beside one of two
+/// batches is written and answered INVALID_RECORD, in either order.
+pub async fn test_repeated_entries_are_checked_as_kafka_checks_them() -> TestResult {
+    use crate::wire::records::batch;
+    println!("=== Test: repeated partition entries are checked as Kafka checks them ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-dup-check").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut wire = Wire::connect().await?;
+    let value = |v: &str| plain_batch(&[Bytes::from(v.to_string())], Compression::None);
+    let codes = |got: Vec<(String, i32, i16, i64)>| -> Vec<(i32, i16)> {
+        got.into_iter().map(|(_, p, code, _)| (p, code)).collect()
+    };
+    let two = |b: Bytes| Bytes::from([&b[..], &b[..]].concat());
+
+    println!("Step 1: a replaced transactional batch, no transactional id");
+    let txn = batch(&["t"], 7, 0, 0, true, None);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, txn), (0, value("a")), (1, value("b"))])],
+            None,
+        )
+        .await?;
+    assert_eq!(
+        codes(got),
+        vec![
+            (0, TRANSACTIONAL_ID_AUTHORIZATION_FAILED),
+            (1, TRANSACTIONAL_ID_AUTHORIZATION_FAILED)
+        ]
+    );
+    println!("Step 2: a replaced batch of length 13");
+    let mut short = value("x").to_vec();
+    short[8..12].copy_from_slice(&13i32.to_be_bytes());
+    let got = wire
+        .produce_many(
+            &[(
+                &topic,
+                vec![(0, Bytes::from(short)), (0, value("a")), (1, value("b"))],
+            )],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, CORRUPT_MESSAGE), (1, CORRUPT_MESSAGE)]);
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 0, "nothing written");
+    println!("✅ the whole request refused; nothing written");
+
+    println!("Step 3: a valid entry, then one of two batches; then the other order");
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, value("a")), (0, two(value("b")))])],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, INVALID_RECORD)]);
+    let got = wire
+        .produce_many(
+            &[(&topic, vec![(0, two(value("c"))), (0, value("d"))])],
+            None,
+        )
+        .await?;
+    assert_eq!(codes(got), vec![(0, INVALID_RECORD)]);
+    assert_eq!(
+        stored_values(&ctx, &topic, 0).await?,
+        vec!["a".to_string(), "d".to_string()]
+    );
+    println!("✅ the valid entry written, INVALID_RECORD answered");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// REQUEST_TIMED_OUT.
+const REQUEST_TIMED_OUT: i16 = 7;
+
+/// A gzip stream of `blocks` dynamic-Huffman deflate blocks that decode to nothing (each
+/// declares its own code tables, some 11 bytes), then a final empty block: input that
+/// costs a decoder some 200 ns per byte and charges no output.
+fn gzip_of_empty_blocks(blocks: usize) -> Vec<u8> {
+    struct Bits {
+        acc: u64,
+        n: u32,
+        out: Vec<u8>,
+    }
+    impl Bits {
+        fn put(&mut self, value: u64, bits: u32) {
+            self.acc |= value << self.n;
+            self.n += bits;
+            while self.n >= 8 {
+                self.out.push((self.acc & 0xff) as u8);
+                self.acc >>= 8;
+                self.n -= 8;
+            }
+        }
+    }
+    const ORDER: [u8; 18] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1];
+    let mut bits = Bits {
+        acc: 0,
+        n: 0,
+        out: vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff],
+    };
+    for _ in 0..blocks {
+        bits.put(0, 1);
+        bits.put(2, 2);
+        bits.put(0, 5);
+        bits.put(0, 5);
+        bits.put(14, 4);
+        for symbol in ORDER {
+            bits.put(u64::from(symbol == 1 || symbol == 18), 3);
+        }
+        for (value, n) in [(0, 1), (1, 1), (127, 7), (1, 1), (106, 7), (0, 1), (0, 1)] {
+            bits.put(value, n);
+        }
+        bits.put(1, 1);
+    }
+    bits.put(1, 1);
+    bits.put(1, 2);
+    bits.put(0, 7);
+    if bits.n > 0 {
+        bits.out.push((bits.acc & 0xff) as u8);
+    }
+    bits.out.extend_from_slice(&[0; 8]);
+    bits.out
+}
+
+/// A one-record gzip batch whose section is [`gzip_of_empty_blocks`].
+fn empty_blocks_batch(blocks: usize) -> Bytes {
+    batch_with(
+        &gzip_of_empty_blocks(blocks),
+        1,
+        BatchHeader {
+            attributes: 1,
+            ..BatchHeader::default()
+        },
+    )
+}
+
+/// The decode of a Produce is bounded by time as well as by what it charges, so input that
+/// decodes to nothing cannot hold a network I/O thread or a large-decode slot. Four
+/// requests of 1.7 MB of empty gzip blocks at once (each some 0.35 s to decode) leave
+/// ApiVersions on another connection fast; two of 94 MB (some 15 s each) hold the two
+/// large-decode slots for about two seconds each and are answered REQUEST_TIMED_OUT, and a
+/// legitimate request that needs a slot (a 5 MB gzip batch) is stored behind them.
+pub async fn test_input_that_decodes_to_nothing_is_bounded_in_time() -> TestResult {
+    println!("=== Test: input that decodes to nothing is bounded in time ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-empty-blocks").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+
+    let small = produce_request(&topic, vec![(0, empty_blocks_batch(150_000))], 1);
+    println!("Step 1: four 1.7 MB requests at once, ApiVersions alongside");
+    let inline: Vec<_> = (1..=4)
+        .map(|corr| tokio::spawn(spawned_produce(request_frame(7, corr, &small), corr)))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (worst, calls) = worst_api_versions(Duration::from_secs(2)).await?;
+    println!("  ApiVersions: {calls} calls, the slowest {worst:?}");
+    for (i, task) in inline.into_iter().enumerate() {
+        let (codes, answers, took) = task.await??;
+        println!("  request {i}: {answers} answers {codes:?} after {took:?}");
+        assert_eq!(answers, 1);
+        assert!(!codes.contains(&0), "nothing decodes: {codes:?}");
+    }
+    assert!(
+        worst < Duration::from_millis(120),
+        "an ApiVersions took {worst:?} while the requests decoded"
+    );
+    println!("✅ ApiVersions stayed fast");
+
+    println!("Step 2: two 94 MB requests, then a legitimate 5 MB gzip request");
+    let mut large = produce_request(&topic, vec![(0, empty_blocks_batch(8_500_000))], 1);
+    large.timeout_ms = 30_000;
+    println!(
+        "  hostile request: {} bytes",
+        request_frame(7, 0, &large).len()
+    );
+    let hostile: Vec<_> = (11..=12)
+        .map(|corr| tokio::spawn(spawned_produce(request_frame(7, corr, &large), corr)))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut seed = 5u64;
+    let value = hex_value(&mut seed, 5_000_000);
+    let legit_batch = raw_batch(
+        &record(&[
+            &[0],
+            &varint(0),
+            &varint(0),
+            &varint(-1),
+            &varint(i64::try_from(value.len())?),
+            &value,
+            &varint(0),
+        ]),
+        1,
+    );
+    let mut legit = produce_request(&topic, vec![(0, legit_batch)], 1);
+    legit.timeout_ms = 10_000;
+    let (codes, _, took) = send_produce(request_frame(7, 50, &legit), 50).await?;
+    println!("  legitimate request: {codes:?} after {took:?}");
+    for (i, task) in hostile.into_iter().enumerate() {
+        let (codes, _, took) = task.await??;
+        println!("  hostile request {i}: {codes:?} after {took:?}");
+        assert_eq!(codes, BTreeSet::from([REQUEST_TIMED_OUT]));
+        assert!(took < Duration::from_secs(8), "answered after {took:?}");
+    }
+    assert_eq!(
+        codes,
+        BTreeSet::from([0]),
+        "the legitimate request is stored"
+    );
+    assert!(took < Duration::from_secs(5), "stored after {took:?}");
+    assert_eq!(stored_rows(ctx.db(), &topic).await?, 1);
+    println!("✅ the slots freed in time; the legitimate request stored");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

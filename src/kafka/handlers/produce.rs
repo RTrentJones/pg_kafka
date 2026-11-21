@@ -129,6 +129,8 @@ impl<'a> TransactionCheck<'a> {
 /// (`KafkaApis.handleProduceRequest`), a partition of a topic that does not exist, or
 /// outside its topic, is UNKNOWN_TOPIC_OR_PARTITION whatever its data; any other gets the
 /// error validation found. Looks the topics up without creating them, in one statement.
+/// Topics are answered in the order they are first named, in time linear in the refused
+/// partitions (a request may name hundreds of thousands of topics).
 pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
     store: &S,
     refused: &[RefusedPartition],
@@ -136,25 +138,31 @@ pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
     if refused.is_empty() {
         return Ok(Vec::new());
     }
-    let mut names: Vec<String> = Vec::new();
+    let mut topic_at: HashMap<&str, usize> = HashMap::new();
+    let mut by_topic: Vec<(&str, Vec<&RefusedPartition>)> = Vec::new();
     for partition in refused {
-        if !names.contains(&partition.topic) {
-            names.push(partition.topic.clone());
-        }
+        let at = *topic_at.entry(partition.topic.as_str()).or_insert_with(|| {
+            by_topic.push((partition.topic.as_str(), Vec::new()));
+            by_topic.len() - 1
+        });
+        by_topic[at].1.push(partition);
     }
+    let names: Vec<String> = by_topic
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
     let partition_counts: HashMap<String, i32> = store
         .get_topic_metadata(Some(&names))?
         .into_iter()
         .map(|t| (t.name, t.partition_count))
         .collect();
-    Ok(names
+    Ok(by_topic
         .into_iter()
-        .map(|name| {
-            let count = partition_counts.get(&name).copied();
+        .map(|(name, partitions)| {
+            let count = partition_counts.get(name).copied();
             let mut topic = TopicProduceResponse::default();
-            topic.partition_responses = refused
-                .iter()
-                .filter(|p| p.topic == name)
+            topic.partition_responses = partitions
+                .into_iter()
                 .map(|p| {
                     let exists = count.is_some_and(|count| (0..count).contains(&p.partition));
                     failed_partition(
@@ -167,7 +175,7 @@ pub fn answer_refused_partitions<S: TopicStore + ?Sized>(
                     )
                 })
                 .collect();
-            topic.name = TopicName(name.into());
+            topic.name = TopicName(name.to_string().into());
             topic
         })
         .collect())
@@ -873,6 +881,47 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    /// Answering refused partitions takes time linear in them: a request of tens of
+    /// thousands of topics of one refused partition each (a few hundred KB on the wire) is
+    /// answered on the DB thread at once, not in seconds.
+    #[test]
+    fn refused_partitions_are_answered_in_linear_time() {
+        use crate::kafka::constants::ERROR_CORRUPT_MESSAGE;
+        use crate::kafka::storage::TopicMetadata;
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_topic_metadata().returning(|names| {
+            Ok(names
+                .unwrap_or_default()
+                .iter()
+                .map(|name| TopicMetadata {
+                    name: name.clone(),
+                    id: 1,
+                    partition_count: 1,
+                })
+                .collect())
+        });
+        let refused = |n: usize| -> Vec<RefusedPartition> {
+            (0..n)
+                .map(|i| RefusedPartition {
+                    topic: format!("q{i:07}"),
+                    partition: 0,
+                    error_code: ERROR_CORRUPT_MESSAGE,
+                })
+                .collect()
+        };
+        let growth = crate::testing::growth(8_000, |n| {
+            let refused = refused(n);
+            let answered = answer_refused_partitions(&mock, &refused).unwrap();
+            assert_eq!(answered.len(), n);
+        });
+        assert!(growth < 8.0, "4x the topics took {growth:.1}x the time");
+        let many = refused(60_000);
+        let (answered, spent) =
+            crate::testing::cpu_time(|| answer_refused_partitions(&mock, &many).unwrap());
+        assert_eq!(answered.len(), 60_000);
+        assert!(spent < std::time::Duration::from_millis(500), "{spent:?}");
     }
 
     /// Kafka 3.7 checks only the transactional batches of a transactional Produce against

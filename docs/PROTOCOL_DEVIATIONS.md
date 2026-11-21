@@ -113,12 +113,27 @@ pg_kafka.compression_type = 'gzip'
   MESSAGE_TOO_LARGE without decoding (UNKNOWN_TOPIC_OR_PARTITION for those of an unknown
   topic). Kafka decodes every partition on its request handler threads; only a request of
   several partitions that each decode large batches and are refused is answered differently.
+- The decoding time of a request is bounded too, checked between 16 KiB chunks of compressed
+  input and between partitions, for every codec: compressed input can cost much while
+  decoding to nothing (gzip of empty dynamic-Huffman blocks costs some 200 ns per byte, so a
+  94 MB batch of them would decode for 15 s). A decode on a network I/O thread stops after
+  20 ms and decodes again off the I/O threads (a legitimate 1 MB request decodes there in
+  about 1 ms; 6 MiB of output, the work limit, in about 10 ms). Off them it stops after 2 s:
+  the partition decoding and those after it are answered REQUEST_TIMED_OUT (7), which clients
+  retry (80 MB of gzip-compressed 1 KB records decode in 0.13 s, the 400 MB work limit in
+  some 0.6 s). Measured on a release build; Kafka has no such limit.
 - As in Kafka 3.7 (`KafkaApis.handleProduceRequest` collects a request's partitions in maps),
   a partition named more than once in a request, in one topic entry or in several, is
-  answered once, for its last entry; the earlier entries are neither decoded nor written.
-  Kafka also answers the error of an earlier entry that fails `ProduceRequest.validateRecords`
-  (data that is not one RecordBatch v2, zstd before v7) while it writes the last one;
-  pg_kafka answers and writes the last entry only.
+  answered once and written at most once: the last of its entries that
+  `ProduceRequest.validateRecords` accepts (one RecordBatch v2, no zstd before v7) is decoded
+  and written, the others are neither; if any of its entries fails that check, the last such
+  failure is its answer, whether or not another entry was written (a valid entry and one of
+  two batches, in either order: the valid one written, INVALID_RECORD answered). The first
+  batch of every entry, kept or not, is read before (a transactional batch without a
+  transactional id, a batch whose length cannot be read, fail the whole request). Checked
+  against a 3.7 broker. Differences: a partition of a topic that does not exist is
+  auto-created by its written entry while answered UNKNOWN_TOPIC_OR_PARTITION for its
+  failed one (Kafka creates nothing).
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
   window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on

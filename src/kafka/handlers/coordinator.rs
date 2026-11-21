@@ -659,8 +659,13 @@ pub fn handle_list_groups(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Filter groups by state if requested (v4+)
+    // Filter groups by state if requested (v4+), case-insensitively. The filter is a set,
+    // as in Kafka, so a long filter list costs once, not once per group.
     let filter_enabled = !states_filter.is_empty();
+    let wanted_states: std::collections::HashSet<String> = states_filter
+        .iter()
+        .map(|f| f.to_ascii_lowercase())
+        .collect();
 
     let mut listed: Vec<(String, String, &'static str)> = coordinator_groups
         .iter()
@@ -687,7 +692,7 @@ pub fn handle_list_groups(
 
     for (group_id, protocol_type, state) in listed {
         // Apply state filter if provided (v4+)
-        if filter_enabled && !states_filter.iter().any(|f| f.eq_ignore_ascii_case(state)) {
+        if filter_enabled && !wanted_states.contains(&state.to_ascii_lowercase()) {
             continue;
         }
 
@@ -1238,6 +1243,30 @@ mod tests {
             empty_only.groups.len(),
             1,
             "state filter is case-insensitive"
+        );
+    }
+
+    /// ListGroups takes time linear in its groups and in its states filter together: a
+    /// filter of many entries is checked as a set, not once per group.
+    #[test]
+    fn list_groups_filters_in_linear_time() {
+        let growth = crate::testing::growth(3_000, |n| {
+            let groups: Vec<String> = (0..n).map(|i| format!("g{i:07}")).collect();
+            let mut store = MockKafkaStore::new();
+            store
+                .expect_list_offset_groups()
+                .returning(move || Ok(groups.clone()));
+            let env = TestEnv::new();
+            let filter: Vec<String> = (0..n)
+                .map(|i| format!("NotAState{i}"))
+                .chain(["EMPTY".to_string()])
+                .collect();
+            let listed = handle_list_groups(&env.ctx(&store), &filter).unwrap();
+            assert_eq!(listed.groups.len(), n);
+        });
+        assert!(
+            growth < 8.0,
+            "4x the groups and filter took {growth:.1}x the time"
         );
     }
 

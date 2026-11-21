@@ -3,6 +3,8 @@
 //! - [`mocks::MockKafkaStore`]: a storage double with mockall expectations.
 //! - [`TestEnv`]: the coordinator and broker metadata a [`HandlerContext`] borrows.
 //! - [`cpu_time`]: how long a closure ran on the CPU, for tests that bound a cost.
+//! - [`growth`]: how a closure's CPU time grows with its input, for tests that bound a
+//!   cost's growth.
 //! - [`heap_peak`]: the most heap memory a closure held at once, for tests that bound
 //!   what a decode holds.
 
@@ -32,6 +34,22 @@ pub fn cpu_time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
         _ => started.elapsed(),
     };
     (result, spent)
+}
+
+/// How much longer `run(4 * n)` takes on the CPU than `run(n)`, each the best of three runs:
+/// about 4 for work linear in its size, about 16 for quadratic work. Tests that bound how a
+/// cost grows assert it stays well under 16.
+pub fn growth(n: usize, mut run: impl FnMut(usize)) -> f64 {
+    let mut best = |size: usize| {
+        (0..3)
+            .map(|_| cpu_time(|| run(size)).1)
+            .min()
+            .unwrap_or_default()
+            .max(Duration::from_micros(1))
+    };
+    let small = best(n);
+    let large = best(4 * n);
+    large.as_secs_f64() / small.as_secs_f64()
 }
 
 fn thread_cpu() -> Option<Duration> {
