@@ -60,13 +60,29 @@ pub fn flat_growth(n: usize, run: impl FnMut(usize)) -> f64 {
 
 /// The smallest ratio of `run(4 * n)` to `run(n)` over up to `rounds` comparisons,
 /// stopping early once one is under `enough`.
+///
+/// Each measurement repeats `run(size)` for at least [`MEASURE_FOR`] and divides the CPU
+/// time by the runs: a single short run can read as no time at all where the thread's CPU
+/// clock only advances at scheduler ticks, and the ratio of two such readings means
+/// nothing.
 fn growth_under(enough: f64, rounds: usize, n: usize, mut run: impl FnMut(usize)) -> f64 {
+    let mut per_run = |size: usize| {
+        let mut runs = 0_u32;
+        let started = Instant::now();
+        let ((), spent) = cpu_time(|| {
+            while runs == 0 || started.elapsed() < MEASURE_FOR {
+                run(size);
+                runs += 1;
+            }
+        });
+        spent / runs
+    };
     let mut best = |size: usize| {
         (0..3)
-            .map(|_| cpu_time(|| run(size)).1)
+            .map(|_| per_run(size))
             .min()
             .unwrap_or_default()
-            .max(Duration::from_micros(1))
+            .max(Duration::from_nanos(1))
     };
     let mut smallest = f64::INFINITY;
     for _ in 0..rounds {
@@ -79,6 +95,10 @@ fn growth_under(enough: f64, rounds: usize, n: usize, mut run: impl FnMut(usize)
     }
     smallest
 }
+
+/// How long one [`growth`] measurement repeats its work: many scheduler ticks, so a clock
+/// that only advances at ticks still measures it to within a few percent.
+const MEASURE_FOR: Duration = Duration::from_millis(40);
 
 fn thread_cpu() -> Option<Duration> {
     let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;

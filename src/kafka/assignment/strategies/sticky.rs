@@ -824,7 +824,7 @@ mod tests {
             let mut previous = HashMap::new();
             previous.insert(
                 "m".to_string(),
-                make_assignment(vec![(name.as_str(), (0..10_000).collect())]),
+                make_assignment(vec![(name.as_str(), (0..100_000).collect())]),
             );
             let input = make_input(vec![("m", vec![name.as_str(), "t"])], vec![("t", 1)]);
             let result = StickyStrategy::with_previous(previous).assign(&input);
