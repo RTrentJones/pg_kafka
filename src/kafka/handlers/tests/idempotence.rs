@@ -83,6 +83,7 @@ fn test_handle_produce_with_idempotent_producer_success() {
         producer_id: 1000,
         producer_epoch: 0,
         base_sequence: 0,
+        is_transactional: false,
     };
 
     // Create HandlerContext AFTER setting expectations
@@ -132,6 +133,7 @@ fn test_handle_produce_insert_failure_does_not_advance_sequence() {
         producer_id: 1000,
         producer_epoch: 0,
         base_sequence: 0,
+        is_transactional: false,
     };
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -178,6 +180,7 @@ fn test_handle_produce_duplicate_sequence_rejected() {
         producer_id: 1000,
         producer_epoch: 0,
         base_sequence: 5, // Duplicate - already processed
+        is_transactional: false,
     };
 
     let env = TestEnv::new();
@@ -222,6 +225,7 @@ fn test_handle_produce_out_of_order_sequence_rejected() {
         producer_id: 1000,
         producer_epoch: 0,
         base_sequence: 15, // Gap - expected 10
+        is_transactional: false,
     };
 
     let env = TestEnv::new();
@@ -270,6 +274,7 @@ fn test_handle_produce_non_idempotent_skips_validation() {
         producer_id: -1,
         producer_epoch: -1,
         base_sequence: -1,
+        is_transactional: false,
     };
 
     let env = TestEnv::new();

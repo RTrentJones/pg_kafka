@@ -158,6 +158,9 @@ pub struct ProducerMetadata {
     pub producer_epoch: i16,
     /// Base sequence number for this batch (first record's sequence)
     pub base_sequence: i32,
+    /// Whether the batch is transactional (its records belong to the producer's
+    /// transaction).
+    pub is_transactional: bool,
 }
 
 /// Record header (key-value metadata)
@@ -694,6 +697,7 @@ mod tests {
             producer_id: 12345,
             producer_epoch: 5,
             base_sequence: 100,
+            is_transactional: false,
         };
         assert_eq!(meta.producer_id, 12345);
         assert_eq!(meta.producer_epoch, 5);
@@ -707,6 +711,7 @@ mod tests {
             producer_id: -1,
             producer_epoch: -1,
             base_sequence: -1,
+            is_transactional: false,
         };
         assert_eq!(meta.producer_id, -1);
         assert_eq!(meta.producer_epoch, -1);
@@ -719,6 +724,7 @@ mod tests {
             producer_id: 999,
             producer_epoch: 7,
             base_sequence: 42,
+            is_transactional: false,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.producer_id, meta.producer_id);
@@ -796,6 +802,7 @@ mod tests {
                 producer_id: 100,
                 producer_epoch: 1,
                 base_sequence: 0,
+                is_transactional: false,
             }),
         };
         assert_eq!(data.partition_index, 5);

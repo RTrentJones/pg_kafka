@@ -42,7 +42,8 @@ This document lists intentional deviations from the official Kafka protocol spec
   or zstd before v7 (INVALID_RECORD, UNSUPPORTED_COMPRESSION_TYPE); every other partition is
   INVALID_REQUIRED_ACKS whatever its records hold (they are not decoded)
 - Long-polling consumers are notified if write succeeds
-- Idempotency/transactional validation is intentionally skipped for acks=0
+- Idempotent sequences and transactions are checked as with acks >= 1, as in Kafka: an
+  out-of-sequence or refused transactional batch is an error, which closes the connection
 
 **Trade-offs:**
 - True fire-and-forget semantics (client doesn't wait)
@@ -227,6 +228,20 @@ pg_kafka.compression_type = 'gzip'
   INVALID_TXN_STATE (48), as Kafka 3.6+ does. AddPartitionsToTxn does not create topics: an
   unknown topic or partition is UNKNOWN_TOPIC_OR_PARTITION and the request's other
   partitions get OPERATION_NOT_ATTEMPTED (55), nothing is added
+- ✅ A transactional Produce is checked per partition, as Kafka 3.7 verifies the
+  transactional batches of a request with its transaction coordinator: a partition whose
+  batch is transactional is refused INVALID_PRODUCER_ID_MAPPING (49) when the
+  transactional id is unknown or another producer id owns it, INVALID_PRODUCER_EPOCH (47)
+  for another epoch, and INVALID_TXN_STATE (48) when the transaction does not hold the
+  partition; a plain or idempotent batch in the same request is written as it would be
+  without the transactional id (committed, outside the transaction). AddPartitionsToTxn,
+  AddOffsetsToTxn, TxnOffsetCommit and EndTxn answer another producer id
+  INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
+  transaction is not Ongoing (none was started with AddPartitionsToTxn, or it is complete)
+  refuses its transactional batches INVALID_TXN_STATE; Kafka answers so for a partition
+  the transaction does not hold, which is the same case for every client. Another epoch on
+  AddPartitionsToTxn, AddOffsetsToTxn and TxnOffsetCommit is PRODUCER_FENCED (90); Kafka 3.7
+  answers INVALID_PRODUCER_EPOCH (47)
 - ✅ InitProducerId refuses a transaction timeout <= 0 or above
   `pg_kafka.transaction_max_timeout_ms` (Kafka's `transaction.max.timeout.ms`, default
   900000) with INVALID_TRANSACTION_TIMEOUT (50)

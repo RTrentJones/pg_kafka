@@ -26,6 +26,7 @@ fn meta(base_sequence: i32) -> ProducerMetadata {
         producer_id: 1000,
         producer_epoch: 0,
         base_sequence,
+        is_transactional: false,
     }
 }
 

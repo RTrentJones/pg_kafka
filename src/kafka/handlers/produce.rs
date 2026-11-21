@@ -3,8 +3,8 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_PRODUCER_ID_MAPPING, ERROR_INVALID_TXN_STATE,
+    ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
@@ -30,6 +30,14 @@ use std::collections::HashMap;
 /// - Records become visible when the transaction commits
 /// - Records are marked 'aborted' if the transaction aborts
 ///
+/// As in Kafka 3.7 (`ReplicaManager.appendRecords` verifies the transactional batches of a
+/// request with the transaction coordinator), only a partition whose batch is transactional
+/// is checked against the transaction, on its own: its producer must own the transactional
+/// id (INVALID_PRODUCER_ID_MAPPING otherwise, for an unknown id too; INVALID_PRODUCER_EPOCH
+/// for another epoch), the transaction must be Ongoing and hold the partition
+/// (INVALID_TXN_STATE). A plain or idempotent batch in the same request is written as it is
+/// without a transactional id.
+///
 /// # Arguments
 /// * `ctx` - Handler context (store, coordinator, broker metadata, etc.)
 /// * `topic_data` - Topics and records to produce
@@ -41,32 +49,62 @@ pub fn handle_produce(
     producer_metadata: Option<&ProducerMetadata>,
     transactional_id: Option<&str>,
 ) -> Result<ProduceResponse> {
-    let store = ctx.store;
-    // ProduceResponse has no top-level error code, so a request-level failure (fenced
-    // epoch, unknown transactional id, transaction not Ongoing) is reported on every
-    // requested partition; an empty response would leave the client without the error.
-    if let (Some(txn_id), Some(meta)) = (transactional_id, producer_metadata) {
-        if meta.producer_id >= 0 {
-            if let Err(e) = validate_ongoing_transaction(
-                store,
-                txn_id,
-                meta.producer_id,
-                meta.producer_epoch,
-                "Produce",
-            ) {
-                return Ok(build_produce_partition_error_response(
-                    &topic_data,
-                    produce_error_code(&e),
-                ));
-            }
-        }
-    }
+    let mut transaction = TransactionCheck {
+        transactional_id,
+        owners: HashMap::new(),
+    };
     let mut kafka_response = crate::kafka::build_produce_response();
     kafka_response.responses = topic_data
         .into_iter()
-        .map(|topic| produce_topic(ctx, topic, producer_metadata, transactional_id))
+        .map(|topic| produce_topic(ctx, topic, producer_metadata, &mut transaction))
         .collect();
     Ok(kafka_response)
+}
+
+/// The transaction of a request's transactional batches, checked once per producer id and
+/// epoch.
+struct TransactionCheck<'a> {
+    transactional_id: Option<&'a str>,
+    /// Per producer id and epoch: the error that refuses its transactional batches, if any.
+    owners: HashMap<(i64, i16), Option<i16>>,
+}
+
+impl<'a> TransactionCheck<'a> {
+    /// The transactional id a partition's batch is written under: the request's, when the
+    /// batch is transactional.
+    fn of(&self, meta: Option<&ProducerMetadata>) -> Option<&'a str> {
+        self.transactional_id
+            .filter(|_| meta.is_some_and(|m| m.is_transactional))
+    }
+
+    /// Why the transaction of `meta`'s producer refuses its batches, if it does: the
+    /// producer does not own `txn_id`, or its transaction is not Ongoing.
+    fn refusal(
+        &mut self,
+        store: &dyn KafkaStore,
+        txn_id: &str,
+        meta: &ProducerMetadata,
+    ) -> Option<i16> {
+        *self
+            .owners
+            .entry((meta.producer_id, meta.producer_epoch))
+            .or_insert_with(|| {
+                validate_ongoing_transaction(
+                    store,
+                    txn_id,
+                    meta.producer_id,
+                    meta.producer_epoch,
+                    "Produce",
+                )
+                .err()
+                .map(|e| match e {
+                    // Kafka's coordinator answers an unknown transactional id as one the
+                    // producer does not own.
+                    KafkaError::TransactionalIdNotFound { .. } => ERROR_INVALID_PRODUCER_ID_MAPPING,
+                    e => produce_error_code(&e),
+                })
+            })
+    }
 }
 
 /// Answer the partitions whose records failed validation, by topic: as Kafka 3.7 does
@@ -123,7 +161,7 @@ fn produce_topic(
     ctx: &HandlerContext,
     topic: TopicProduceData,
     producer_metadata: Option<&ProducerMetadata>,
-    transactional_id: Option<&str>,
+    transaction: &mut TransactionCheck<'_>,
 ) -> TopicProduceResponse {
     let store = ctx.store;
     // Topic id and partition count in one query.
@@ -168,8 +206,7 @@ fn produce_topic(
             partition_index,
             &records,
             partition_meta.as_ref(),
-            producer_metadata,
-            transactional_id,
+            transaction,
         ));
     }
     topic_response
@@ -243,11 +280,13 @@ fn produce_partition(
     partition_index: i32,
     records: &[Record],
     partition_meta: Option<&ProducerMetadata>,
-    producer_metadata: Option<&ProducerMetadata>,
-    transactional_id: Option<&str>,
+    transaction: &mut TransactionCheck<'_>,
 ) -> PartitionProduceResponse {
     let topic_id = topic.id;
-    if let Some(error_code) = partition_refusal(store, topic, partition_index, transactional_id) {
+    let transactional_id = transaction.of(partition_meta);
+    if let Some(error_code) =
+        partition_refusal(store, topic, partition_index, partition_meta, transaction)
+    {
         return failed_partition(partition_index, error_code);
     }
 
@@ -281,8 +320,7 @@ fn produce_partition(
         topic_id,
         partition_index,
         records,
-        producer_metadata,
-        transactional_id,
+        partition_meta.filter(|_| transactional_id.is_some()),
     ) {
         Ok(base_offset) => base_offset,
         Err(error_code) => return failed_partition(partition_index, error_code),
@@ -304,19 +342,24 @@ fn produce_partition(
     appended_partition(store, topic_id, partition_index, base_offset)
 }
 
-/// Why a partition cannot be written, if it cannot: it is outside the topic, or a
-/// transactional producer did not add it to its transaction (AddPartitionsToTxn), which
-/// Kafka answers INVALID_TXN_STATE.
+/// Why a partition cannot be written, if it cannot: it is outside the topic, or its batch
+/// is transactional and the transaction refuses it ([`TransactionCheck::refusal`]) or does
+/// not hold the partition (AddPartitionsToTxn), which Kafka answers INVALID_TXN_STATE.
 fn partition_refusal(
     store: &dyn KafkaStore,
     topic: TargetTopic,
     partition_index: i32,
-    transactional_id: Option<&str>,
+    partition_meta: Option<&ProducerMetadata>,
+    transaction: &mut TransactionCheck<'_>,
 ) -> Option<i16> {
     if partition_index < 0 || partition_index >= topic.partition_count {
         return Some(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
-    let txn_id = transactional_id?;
+    let txn_id = transaction.of(partition_meta)?;
+    let meta = partition_meta?;
+    if let Some(code) = transaction.refusal(store, txn_id, meta) {
+        return Some(code);
+    }
     match store.txn_has_partition(txn_id, topic.id, partition_index) {
         Ok(true) => None,
         Ok(false) => Some(ERROR_INVALID_TXN_STATE),
@@ -324,31 +367,24 @@ fn partition_refusal(
     }
 }
 
-/// Insert the records (pending, for a transactional producer): their base offset, or
-/// the partition's error code.
+/// Insert the records (pending in the transaction of `transactional`, the metadata of a
+/// transactional batch): their base offset, or the partition's error code.
 fn insert_partition_records(
     store: &dyn KafkaStore,
     topic_id: i32,
     partition_index: i32,
     records: &[Record],
-    producer_metadata: Option<&ProducerMetadata>,
-    transactional_id: Option<&str>,
+    transactional: Option<&ProducerMetadata>,
 ) -> std::result::Result<i64, i16> {
-    let inserted = if transactional_id.is_some() {
-        match producer_metadata {
-            Some(meta) => store.insert_transactional_records(
-                topic_id,
-                partition_index,
-                records,
-                meta.producer_id,
-                meta.producer_epoch,
-            ),
-            None => Err(KafkaError::Internal(
-                "Transactional produce requires producer metadata".to_string(),
-            )),
-        }
-    } else {
-        store.insert_records(topic_id, partition_index, records)
+    let inserted = match transactional {
+        Some(meta) => store.insert_transactional_records(
+            topic_id,
+            partition_index,
+            records,
+            meta.producer_id,
+            meta.producer_epoch,
+        ),
+        None => store.insert_records(topic_id, partition_index, records),
     };
     inserted.map_err(|e| {
         if e.is_server_error() {
@@ -478,6 +514,7 @@ mod tests {
             producer_id: 7,
             producer_epoch: 2,
             base_sequence: 0,
+            is_transactional: true,
         }
     }
 
@@ -638,11 +675,68 @@ mod tests {
         );
     }
 
+    /// Kafka 3.7 checks only the transactional batches of a transactional Produce against
+    /// the transaction, once per producer, each partition on its own: an unknown
+    /// transactional id (or another producer's) refuses them INVALID_PRODUCER_ID_MAPPING,
+    /// and a plain batch beside them is written outside the transaction.
+    #[test]
+    fn only_transactional_batches_are_checked_against_the_transaction() {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 3)));
+        mock.expect_validate_transaction()
+            .times(1)
+            .returning(|id, _, _| Err(KafkaError::transactional_id_not_found(id)));
+        mock.expect_insert_records().times(1).returning(|_, p, _| {
+            assert_eq!(p, 2);
+            Ok(4)
+        });
+        let mut data = request(&[0, 1, 2]);
+        data[0].partitions[2].producer_metadata = Some(ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+        });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut got: Vec<(i32, i16)> = handle_produce(&ctx, data, Some(&meta()), Some("tx"))
+            .unwrap()
+            .responses
+            .iter()
+            .flat_map(|t| t.partition_responses.iter())
+            .map(|p| (p.index, p.error_code))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                (0, ERROR_INVALID_PRODUCER_ID_MAPPING),
+                (1, ERROR_INVALID_PRODUCER_ID_MAPPING),
+                (2, ERROR_NONE)
+            ]
+        );
+
+        // Another producer id owning the transactional id is the same answer.
+        let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
+        mock.expect_validate_transaction()
+            .returning(|_, pid, _| Err(KafkaError::invalid_producer_id_mapping(pid)));
+        assert_eq!(
+            run(&mock, &[0], Some("tx")),
+            vec![(0, ERROR_INVALID_PRODUCER_ID_MAPPING, -1)]
+        );
+    }
+
     /// Kafka 3.7 answers a stale epoch on Produce with INVALID_PRODUCER_EPOCH (47),
     /// for transactional producers too (was PRODUCER_FENCED, 90).
     #[test]
     fn stale_epoch_is_invalid_producer_epoch() {
         let mut mock = MockKafkaStore::new();
+        mock.expect_get_or_create_topic()
+            .returning(|_, _| Ok((1, 1)));
         mock.expect_validate_transaction()
             .returning(|_, _, _| Err(KafkaError::producer_fenced(7, 2, 3)));
         assert_eq!(

@@ -91,6 +91,7 @@ fn is_txn_error(e: &KafkaError) -> bool {
         e,
         KafkaError::TransactionalIdNotFound { .. }
             | KafkaError::ProducerFenced { .. }
+            | KafkaError::InvalidProducerIdMapping { .. }
             | KafkaError::InvalidTxnState { .. }
     )
 }

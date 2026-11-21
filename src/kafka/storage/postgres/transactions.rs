@@ -62,9 +62,13 @@ impl TxnRow {
         })
     }
 
-    /// PRODUCER_FENCED unless `producer_id`/`producer_epoch` own the transactional id.
+    /// Whether `producer_id`/`producer_epoch` own the transactional id: as in Kafka 3.7's
+    /// transaction coordinator, another producer id is INVALID_PRODUCER_ID_MAPPING, whatever
+    /// its epoch, and another epoch of the producer id PRODUCER_FENCED.
     fn check_owner(&self, producer_id: i64, producer_epoch: i16) -> Result<()> {
-        if self.producer_id == producer_id && self.producer_epoch == producer_epoch {
+        if self.producer_id != producer_id {
+            Err(KafkaError::invalid_producer_id_mapping(producer_id))
+        } else if self.producer_epoch == producer_epoch {
             Ok(())
         } else {
             Err(KafkaError::producer_fenced(

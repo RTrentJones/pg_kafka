@@ -247,9 +247,9 @@ impl KafkaApi for ProduceApi {
         );
         let store = env.ctx.store;
         if request.acks == 0 {
-            // Best effort, no response. Idempotency and transactions
-            // need acks >= 1 to mean anything, so neither is applied here. A request-level
-            // failure rolls back like the acks >= 1 path.
+            // No response. The records are checked as with acks >= 1 (an idempotent
+            // producer's sequence, a transactional batch's transaction), as Kafka checks
+            // them. A request-level failure rolls back like the acks >= 1 path.
             //
             // As in Kafka, any error (a partition error, or the whole
             // request failing) closes the connection, so the client refreshes its metadata
@@ -261,7 +261,13 @@ impl KafkaApi for ProduceApi {
                 let _ = response_tx.send(KafkaResponse::new(-1, -1, ResponseBody::CloseConnection));
             };
             let refused = !request.refused.is_empty();
-            return match handlers::handle_produce(&env.ctx, request.topic_data, None, None) {
+            let producer_metadata = extract_producer_metadata(&request.topic_data);
+            return match handlers::handle_produce(
+                &env.ctx,
+                request.topic_data,
+                producer_metadata.as_ref(),
+                request.transactional_id.as_deref(),
+            ) {
                 Ok(response) => {
                     emit_produce_notifications(&response, store, env.notify_tx);
                     if refused || acks0_must_close(&response) {

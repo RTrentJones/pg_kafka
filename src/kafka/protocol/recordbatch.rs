@@ -252,14 +252,15 @@ fn validate_batch(batch: &[u8]) -> Result<usize> {
     usize::try_from(count).map_err(|_| invalid("record batch declares a negative record count"))
 }
 
-/// The producer id, epoch and base sequence in the header of a batch that passed
-/// [`check_batch_header`].
+/// The producer id, epoch, base sequence and transactional flag in the header of a batch
+/// that passed [`check_batch_header`].
 fn extract_producer_metadata(batch: &[u8]) -> ProducerMetadata {
     let mut fields = &batch[PRODUCER_ID_OFFSET..RECORD_COUNT_OFFSET];
     ProducerMetadata {
         producer_id: fields.get_i64(),
         producer_epoch: fields.get_i16(),
         base_sequence: fields.get_i32(),
+        is_transactional: (&batch[ATTRIBUTES_OFFSET..]).get_i16() & TRANSACTIONAL_FLAG != 0,
     }
 }
 
@@ -2160,6 +2161,7 @@ mod tests {
                 producer_id: 100,
                 producer_epoch: 2,
                 base_sequence: 50,
+                is_transactional: false,
             },
         };
 

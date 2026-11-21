@@ -124,9 +124,11 @@ fn test_handle_produce_insert_error() {
 
 #[test]
 fn test_handle_produce_txn_wrong_state_rejected() {
-    // A transactional produce whose transaction is not Ongoing is rejected
-    // with INVALID_TXN_STATE before any record is inserted (produce.rs gate).
+    // A transactional produce whose transaction is not Ongoing is refused
+    // INVALID_TXN_STATE before any record is inserted.
     let mut mock = MockKafkaStore::new();
+    mock.expect_get_or_create_topic()
+        .returning(|_, _| Ok((1, 1)));
     mock.expect_validate_transaction()
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state()
@@ -144,12 +146,13 @@ fn test_handle_produce_txn_wrong_state_rejected() {
         producer_id: 100,
         producer_epoch: 0,
         base_sequence: 0,
+        is_transactional: true,
     };
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    // Reported on every requested partition, not returned as Err.
+    // Reported on the partition, not returned as Err.
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
     let codes: Vec<i16> = response
         .responses
@@ -166,9 +169,11 @@ fn test_handle_produce_txn_wrong_state_rejected() {
 
 #[test]
 fn test_handle_produce_txn_id_not_found_rejected() {
-    // A transactional produce for an unknown transactional id is rejected
-    // with TRANSACTIONAL_ID_NOT_FOUND (produce.rs gate, None arm).
+    // A transactional produce for an unknown transactional id is refused
+    // INVALID_PRODUCER_ID_MAPPING, as Kafka's coordinator answers it (no state: None arm).
     let mut mock = MockKafkaStore::new();
+    mock.expect_get_or_create_topic()
+        .returning(|_, _| Ok((1, 1)));
     mock.expect_validate_transaction()
         .returning(|_, _, _| Ok(()));
     mock.expect_get_transaction_state().returning(|_| Ok(None));
@@ -185,12 +190,13 @@ fn test_handle_produce_txn_id_not_found_rejected() {
         producer_id: 100,
         producer_epoch: 0,
         base_sequence: 0,
+        is_transactional: true,
     };
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    // Reported on every requested partition, not returned as Err.
+    // Reported on the partition, not returned as Err.
     let response = produce::handle_produce(&ctx, topic_data, Some(&meta), Some("tx1")).unwrap();
     let codes: Vec<i16> = response
         .responses
@@ -200,7 +206,9 @@ fn test_handle_produce_txn_id_not_found_rejected() {
         .collect();
     assert_ne!(codes, [] as [i16; 0]);
     assert!(
-        codes.iter().all(|c| *c == ERROR_TRANSACTIONAL_ID_NOT_FOUND),
+        codes
+            .iter()
+            .all(|c| *c == ERROR_INVALID_PRODUCER_ID_MAPPING),
         "{codes:?}"
     );
 }
