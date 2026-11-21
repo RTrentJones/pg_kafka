@@ -314,7 +314,9 @@ pg_kafka.compression_type = 'gzip'
   generation -1 whatever the member id; a group with members takes generation -1 only with
   an empty member id, and answers UNKNOWN_MEMBER_ID to a member id it does not know and
   ILLEGAL_GENERATION to one of its members; a generation >= 0 must be the current one, of a
-  member of the group
+  member of the group. The group's state is not checked: a member's current-generation
+  commit is accepted while the group is PreparingRebalance or CompletingRebalance (where a
+  plain OffsetCommit gets REBALANCE_IN_PROGRESS)
 - ✅ Read-committed isolation level filters pending/aborted messages
 - ✅ Transactional producer fencing via epoch
 

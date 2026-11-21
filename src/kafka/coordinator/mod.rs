@@ -674,11 +674,9 @@ impl GroupCoordinator {
     /// correct (the old generations are gone), not a regression; the earlier "unknown group is
     /// allowed" behavior would have let a zombie commit through.
     ///
-    /// As in Kafka, a current-generation commit is accepted while the group is
-    /// PreparingRebalance (the commit a member makes when its partitions are revoked,
-    /// before it rejoins; the generation has not moved yet) and fenced with
-    /// `RebalanceInProgress` while it is CompletingRebalance (the member's
-    /// assignment is about to change and it has not synced yet).
+    /// As in Kafka 3.7, the group's state is not checked: a current-generation commit of a
+    /// member is accepted in every state, CompletingRebalance included (where a plain
+    /// OffsetCommit gets REBALANCE_IN_PROGRESS, see [`Self::validate_offset_commit`]).
     pub fn validate_commit(
         &self,
         group_id: &str,
@@ -713,12 +711,6 @@ impl GroupCoordinator {
             ));
         }
 
-        if group.state == GroupState::CompletingRebalance {
-            return Err(KafkaError::RebalanceInProgress {
-                group_id: group_id.to_string(),
-            });
-        }
-
         Ok(())
     }
 
@@ -732,7 +724,8 @@ impl GroupCoordinator {
     ///   generation -1 / empty member id against a group that has members) and the generation
     ///   must be the current one (ILLEGAL_GENERATION); CompletingRebalance gets
     ///   REBALANCE_IN_PROGRESS, and PreparingRebalance accepts the commit of a member that has not
-    ///   rejoined yet (see [`Self::validate_commit`]).
+    ///   rejoined yet (the commit a member makes when its partitions are revoked, before it
+    ///   rejoins; the generation has not moved yet).
     ///
     /// [`Self::validate_commit`] has TxnOffsetCommit's rules, where Kafka exempts transactional
     /// commits from the Empty-group requirement.

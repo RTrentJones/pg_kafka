@@ -4,7 +4,7 @@
 use crate::common::TestResult;
 use crate::error_codes::{
     ILLEGAL_GENERATION, INVALID_GROUP_ID, INVALID_PRODUCER_EPOCH, INVALID_PRODUCER_ID_MAPPING,
-    INVALID_TXN_STATE, NONE, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
+    INVALID_TXN_STATE, NONE, REBALANCE_IN_PROGRESS, UNKNOWN_MEMBER_ID, UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::fixtures::TestTopicBuilder;
 use crate::setup::TestContext;
@@ -849,7 +849,10 @@ async fn stable_group(wire: &mut Wire, group: &str) -> crate::common::DynResult<
 /// - a group with members: generation -1 with a member id it does not know is
 ///   UNKNOWN_MEMBER_ID, with one of its members ILLEGAL_GENERATION, with no member id it
 ///   commits;
-/// - an unknown or Empty group: generation -1 commits whatever the member id.
+/// - an unknown or Empty group: generation -1 commits whatever the member id;
+/// - a CompletingRebalance group (joined, not synced): its member's current generation
+///   commits (the transactional path checks no group state), where a plain OffsetCommit
+///   is REBALANCE_IN_PROGRESS.
 pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
     use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
@@ -863,6 +866,7 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
     let live = ctx.unique_group("parity-txn-member-live").await;
     let unknown = ctx.unique_group("parity-txn-member-unknown").await;
     let empty = ctx.unique_group("parity-txn-member-empty").await;
+    let completing = ctx.unique_group("parity-txn-member-completing").await;
     let txn = ctx.unique_group("parity-txn-member-txn").await;
     let entries: [(&str, &[i32]); 1] = [(&topic, &[0])];
     let answered = |code| vec![(topic.clone(), 0, code)];
@@ -876,6 +880,10 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
     leave.member_id = StrBytes::from_string(left_member.clone());
     let left: LeaveGroupResponse = wire.call(0, &leave).await?;
     assert_eq!(left.error_code, NONE, "leave");
+    let joined = join_v5(&mut wire, &completing, "", 30_000, "consumer").await?;
+    assert_eq!(joined.error_code, NONE, "join {completing}");
+    let (completing_member, completing_generation) =
+        (joined.member_id.to_string(), joined.generation_id);
     let (code, producer_id, epoch) = wire.init_producer_id(Some(&txn), 60_000).await?;
     assert_eq!(code, NONE);
     assert_eq!(
@@ -883,7 +891,7 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
             .await?,
         vec![(topic.clone(), 0, NONE)]
     );
-    for group in [&live, &unknown, &empty] {
+    for group in [&live, &unknown, &empty, &completing] {
         assert_eq!(
             wire.add_offsets(&txn, producer_id, epoch, group).await?,
             NONE
@@ -936,7 +944,37 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
         answered(NONE),
         "Empty group, its former member"
     );
-    println!("✅ 25 / 22 / 0, and 0 without members, as Kafka answers them\n");
+
+    println!("Step 4: the current generation of a CompletingRebalance group...");
+    let plain = offset_commit_v8(
+        &mut wire,
+        &completing,
+        completing_generation,
+        &completing_member,
+        1,
+        &entries,
+    )
+    .await?;
+    assert_eq!(plain, answered(REBALANCE_IN_PROGRESS), "plain OffsetCommit");
+    let mut commit = async |group: &str, generation: i32, member: &str| {
+        txn_offset_commit_v3(
+            &mut wire,
+            &txn,
+            group,
+            producer_id,
+            epoch,
+            generation,
+            member,
+            &entries,
+        )
+        .await
+    };
+    assert_eq!(
+        commit(&completing, completing_generation, &completing_member).await?,
+        answered(NONE),
+        "TxnOffsetCommit"
+    );
+    println!("✅ 25 / 22 / 0, 0 without members and 0 while completing, as Kafka answers them\n");
 
     println!("=== Database Verification ===\n");
     let pending: Vec<String> = ctx
@@ -950,7 +988,12 @@ pub async fn test_txn_offset_commit_member_checks_match_kafka() -> TestResult {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    let mut expected = vec![live.clone(), unknown.clone(), empty.clone()];
+    let mut expected = vec![
+        live.clone(),
+        unknown.clone(),
+        empty.clone(),
+        completing.clone(),
+    ];
     expected.sort();
     assert_eq!(pending, expected, "the accepted commits are pending");
     assert_eq!(wire.end_txn(&txn, producer_id, epoch, false).await?, NONE);

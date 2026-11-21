@@ -446,9 +446,11 @@ fn test_validate_commit_by_state() {
     let c = GroupCoordinator::new();
     let a = joined(&join(&c, "g", None)).member_id;
 
-    // CompletingRebalance: fenced, the member has not synced yet.
+    // CompletingRebalance: accepted, as Kafka 3.7 accepts a transactional commit there
+    // (a plain OffsetCommit gets REBALANCE_IN_PROGRESS).
+    assert!(c.validate_commit("g", &a, 1).is_ok());
     assert!(matches!(
-        c.validate_commit("g", &a, 1),
+        c.validate_offset_commit("g", &a, 1),
         Err(KafkaError::RebalanceInProgress { .. })
     ));
     c.sync_now("g".to_string(), a.clone(), 1, vec![(a.clone(), vec![1])])
@@ -461,6 +463,7 @@ fn test_validate_commit_by_state() {
     let _b = join(&c, "g", None);
     assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
     assert!(c.validate_commit("g", &a, 1).is_ok());
+    assert!(c.validate_offset_commit("g", &a, 1).is_ok());
 
     // Zombie fencing.
     assert!(matches!(
