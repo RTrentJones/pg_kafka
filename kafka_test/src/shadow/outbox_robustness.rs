@@ -13,7 +13,9 @@
 //!   drains claim after claim;
 //! - with no external broker configured the outbox keeps its rows without
 //!   claiming them over and over (the worker stays idle) and forwards them once
-//!   one is.
+//!   one is;
+//! - a claim does not slow down with the number of rows in flight (the
+//!   in-flight exclusion is a hash lookup, not a scan per pending row).
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -875,6 +877,142 @@ pub async fn test_shadow_unconfigured_broker_does_not_spin_the_worker() -> TestR
     }
     if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_batch_size").await {
         eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_batch_size: {e}");
+    }
+    ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Rows of a topic some claim has taken (`forwarded_at` is set by the claim).
+async fn claimed(db: &Client, topic_id: i32) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(db
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.shadow_tracking \
+             WHERE topic_id = $1 AND forwarded_at IS NOT NULL",
+            &[&topic_id],
+        )
+        .await?
+        .get(0))
+}
+
+/// A claim skips the rows already in flight, and its cost must not grow with
+/// their number: with the in-flight exclusion a correlated scan of the in-flight
+/// list per pending row passed, claim k of a backlog cost O((k x batch)^2), and
+/// filling the worker's 8 192-row in-flight window took ~15-20 s (each claim
+/// stalling every request on the DB thread); with a hashed lookup it takes well
+/// under a second.
+///
+/// The backlog is written while no broker is configured (nothing is claimed),
+/// and acks are held back (`pg_kafka.test_forward_ack_delay_ms`), so every claimed
+/// row stays in flight; the test times how long the claims take to fill the window,
+/// from the first claimed row.
+pub async fn test_shadow_claims_stay_fast_with_a_full_in_flight_window() -> TestResult {
+    const RECORDS: usize = 10_000;
+    // The worker's MAX_INFLIGHT: claims stop once this many rows are in flight.
+    const WINDOW: i64 = 8_192;
+    // From the first claimed row to a full window, measured on a dev machine:
+    // 0.3-0.4 s with the hashed exclusion, 10-15 s with the old scan; CI runners
+    // are ~2x slower, so this leaves >= 3x either way.
+    const BOUND: Duration = Duration::from_secs(3);
+    const ACK_DELAY_MS: i32 = 15_000;
+    println!("=== Test: claims stay fast with a full in-flight window ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-inflight-window").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let topic_id = topic_id(ctx.db(), &topic).await?;
+    let db = create_db_client().await?;
+
+    let result = async {
+        println!("Step 1: no broker configured; produce {RECORDS} records...");
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
+        )
+        .await?;
+        let producer = bulk_producer()?;
+        let mut pending = Vec::with_capacity(RECORDS);
+        for i in 0..RECORDS {
+            let key = format!("k{}", i % 97);
+            pending.push(
+                producer
+                    .send_result(FutureRecord::to(&topic).key(key.as_bytes()).payload("v"))
+                    .map_err(|(e, _)| e)?,
+            );
+        }
+        for f in pending {
+            f.await?.map_err(|(e, _)| e)?;
+        }
+        let rows = undelivered(ctx.db(), topic_id).await?;
+        let taken = claimed(ctx.db(), topic_id).await?;
+        if rows != i64::try_from(RECORDS)? || taken != 0 {
+            return Err(format!(
+                "{rows} pending outbox rows ({taken} claimed), expected {RECORDS} unclaimed"
+            )
+            .into());
+        }
+
+        println!("Step 2: hold acks {ACK_DELAY_MS} ms, configure the broker, time the claims...");
+        alter_system(
+            &db,
+            &format!("ALTER SYSTEM SET pg_kafka.test_forward_ack_delay_ms = {ACK_DELAY_MS}"),
+        )
+        .await?;
+        // Timed from the first claimed row, so the reload's latency is not counted.
+        db.execute(
+            &format!(
+                "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+                get_internal_bootstrap_servers()
+            ),
+            &[],
+        )
+        .await?;
+        db.execute("SELECT pg_reload_conf()", &[]).await?;
+        let reloaded = Instant::now();
+        let mut first_claim: Option<Instant> = None;
+        let filled = loop {
+            let taken = claimed(ctx.db(), topic_id).await?;
+            if taken > 0 && first_claim.is_none() {
+                first_claim = Some(Instant::now());
+            }
+            if taken >= WINDOW {
+                break first_claim.map_or(Duration::ZERO, |t| t.elapsed());
+            }
+            if reloaded.elapsed() > Duration::from_secs(60) {
+                return Err(format!("only {taken} of {WINDOW} rows claimed after 60 s").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        println!("  the in-flight window ({WINDOW} rows) filled in {filled:?} (bound {BOUND:?})");
+        if filled > BOUND {
+            return Err(format!(
+                "claiming {WINDOW} rows behind a growing in-flight window took {filled:?}, \
+                 over {BOUND:?}: a claim's cost grows with the rows in flight"
+            )
+            .into());
+        }
+
+        println!("Step 3: release the acks; the backlog drains...");
+        alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(90)).await?;
+        println!("  drained {took:?} later");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await
+    {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.test_forward_ack_delay_ms: {e}");
+    }
+    if let Err(e) = restore_bootstrap_servers(&db).await {
+        eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
     }
     ctx.cleanup().await?;
     result?;
