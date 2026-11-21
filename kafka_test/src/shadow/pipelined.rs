@@ -133,8 +133,9 @@ fn read_external(
 /// report before sending the next record manages < ~100 msg/s here).
 ///
 /// The floor applies to the forward phase, from the last produce ack until every
-/// outbox row is delivered: the produce time (0.3-4 s on CI runners) says nothing
-/// about the forwarder, and next to it hardly any row is delivered. The
+/// outbox row is delivered, and to the rows still undelivered at that ack: the
+/// produce time (0.3-4 s on CI runners) says nothing about the forwarder, and the
+/// rows it delivered while the produce ran are not counted against the phase. The
 /// end-to-end rate is still printed.
 pub async fn test_shadow_forward_throughput() -> TestResult {
     const N: usize = 20_000;
@@ -162,16 +163,22 @@ pub async fn test_shadow_forward_throughput() -> TestResult {
         f.await?.map_err(|(e, _)| e)?;
     }
     let produced_in = start.elapsed();
-    println!("Produced {N} records to pg_kafka in {produced_in:?}");
+    let last_ack = Instant::now();
+    // Rows delivered while the produce ran are not the forward phase's work.
+    let (done_at_ack, _) = outbox_progress(ctx.db(), &topic).await?;
+    println!(
+        "Produced {N} records to pg_kafka in {produced_in:?}; {done_at_ack} already forwarded"
+    );
 
-    let forwarded_in =
-        wait_all_forwarded(ctx.db(), &topic, to_i64(N), Duration::from_secs(240)).await?;
+    wait_all_forwarded(ctx.db(), &topic, to_i64(N), Duration::from_secs(240)).await?;
+    let forwarded_in = last_ack.elapsed();
     let total = start.elapsed();
     let rate = to_f64(N) / total.as_secs_f64();
-    let forward_rate = to_f64(N) / forwarded_in.as_secs_f64();
+    let remaining = N - usize::try_from(done_at_ack)?;
+    let forward_rate = to_f64(remaining) / forwarded_in.as_secs_f64();
     println!(
-        "All {N} forwarded {forwarded_in:?} after the last produce ack = {forward_rate:.0} msg/s; \
-         end-to-end {total:?} = {rate:.0} msg/s"
+        "The other {remaining} forwarded {forwarded_in:?} after the last produce ack = \
+         {forward_rate:.0} msg/s; end-to-end {total:?} = {rate:.0} msg/s"
     );
     println!("SHADOW_THROUGHPUT_MSG_PER_SEC={rate:.0}");
     println!("SHADOW_FORWARD_PHASE_MSG_PER_SEC={forward_rate:.0}");
