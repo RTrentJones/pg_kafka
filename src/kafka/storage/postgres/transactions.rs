@@ -35,7 +35,7 @@ struct TxnRow {
 }
 
 impl TxnRow {
-    /// Read the row; TRANSACTIONAL_ID_NOT_FOUND when the transactional id has none.
+    /// Read the row; [`KafkaError::TransactionalIdNotFound`] when the transactional id has none.
     fn load(client: &SpiClient<'_>, transactional_id: &str) -> Result<Self> {
         let table = client.select(
             "SELECT state, producer_id, producer_epoch

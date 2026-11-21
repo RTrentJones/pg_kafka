@@ -3,8 +3,8 @@
 
 use super::helpers::validate_ongoing_transaction;
 use crate::kafka::constants::{
-    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_PRODUCER_ID_MAPPING, ERROR_INVALID_TXN_STATE,
-    ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_INVALID_PRODUCER_EPOCH, ERROR_INVALID_TXN_STATE, ERROR_NONE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
@@ -97,12 +97,7 @@ impl<'a> TransactionCheck<'a> {
                     "Produce",
                 )
                 .err()
-                .map(|e| match e {
-                    // Kafka's coordinator answers an unknown transactional id as one the
-                    // producer does not own.
-                    KafkaError::TransactionalIdNotFound { .. } => ERROR_INVALID_PRODUCER_ID_MAPPING,
-                    e => produce_error_code(&e),
-                })
+                .map(|e| produce_error_code(&e))
             })
     }
 }
@@ -484,6 +479,7 @@ fn reported_log_start_offset(store: &dyn LogStore, topic_id: i32, partition_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kafka::constants::ERROR_INVALID_PRODUCER_ID_MAPPING;
     use crate::kafka::error::KafkaError;
     use crate::kafka::messages::{PartitionProduceData, Record, TopicProduceData};
     use crate::kafka::storage::TransactionState;

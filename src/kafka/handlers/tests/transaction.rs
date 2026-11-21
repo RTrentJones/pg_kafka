@@ -150,7 +150,7 @@ fn test_add_partitions_invalid_state() {
 fn test_add_partitions_txn_not_found() {
     let codes =
         add_partitions_with_begin_error(|| KafkaError::transactional_id_not_found("unknown-txn"));
-    assert_eq!(codes, vec![ERROR_TRANSACTIONAL_ID_NOT_FOUND]);
+    assert_eq!(codes, vec![ERROR_INVALID_PRODUCER_ID_MAPPING]);
 }
 
 #[test]

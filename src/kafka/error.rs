@@ -11,8 +11,8 @@ use crate::kafka::constants::{
     ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_ID_MAPPING,
     ERROR_INVALID_RECORD, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_INVALID_TXN_STATE,
     ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
-    ERROR_TRANSACTIONAL_ID_NOT_FOUND, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
-    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// A failed request, typed by what went wrong; [`KafkaError::to_kafka_error_code`] gives the
@@ -102,7 +102,10 @@ pub enum KafkaError {
     UnknownProducerId { producer_id: i64 },
 
     // ===== Transactions =====
-    /// Transactional ID not found
+    /// The transactional id has no state. Kafka 3.7's transaction coordinator answers it
+    /// INVALID_PRODUCER_ID_MAPPING on AddPartitionsToTxn, AddOffsetsToTxn, EndTxn,
+    /// TxnOffsetCommit and a transactional Produce (TRANSACTIONAL_ID_NOT_FOUND is only for
+    /// the admin APIs that describe transactions).
     #[error("Transactional ID not found: {transactional_id}")]
     TransactionalIdNotFound { transactional_id: String },
 
@@ -167,10 +170,12 @@ impl KafkaError {
             KafkaError::DuplicateSequence { .. } => ERROR_DUPLICATE_SEQUENCE_NUMBER,
             KafkaError::OutOfOrderSequence { .. } => ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER,
             KafkaError::ProducerFenced { .. } => ERROR_PRODUCER_FENCED,
-            KafkaError::InvalidProducerIdMapping { .. } => ERROR_INVALID_PRODUCER_ID_MAPPING,
+            // Kafka's coordinator answers a transactional id without state as one the
+            // producer id does not own.
+            KafkaError::InvalidProducerIdMapping { .. }
+            | KafkaError::TransactionalIdNotFound { .. } => ERROR_INVALID_PRODUCER_ID_MAPPING,
             KafkaError::UnknownProducerId { .. } => ERROR_UNKNOWN_PRODUCER_ID,
 
-            KafkaError::TransactionalIdNotFound { .. } => ERROR_TRANSACTIONAL_ID_NOT_FOUND,
             KafkaError::InvalidTxnState { .. } => ERROR_INVALID_TXN_STATE,
 
             // Explicit protocol errors keep their code.
@@ -417,7 +422,7 @@ mod tests {
             ),
             (
                 KafkaError::transactional_id_not_found("my-txn-id"),
-                ERROR_TRANSACTIONAL_ID_NOT_FOUND,
+                ERROR_INVALID_PRODUCER_ID_MAPPING,
                 false,
                 "my-txn-id",
             ),

@@ -235,8 +235,8 @@ pg_kafka.compression_type = 'gzip'
   for another epoch, and INVALID_TXN_STATE (48) when the transaction does not hold the
   partition; a plain or idempotent batch in the same request is written as it would be
   without the transactional id (committed, outside the transaction). AddPartitionsToTxn,
-  AddOffsetsToTxn, TxnOffsetCommit and EndTxn answer another producer id
-  INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
+  AddOffsetsToTxn, TxnOffsetCommit and EndTxn answer another producer id, and a
+  transactional id without state, INVALID_PRODUCER_ID_MAPPING too, as Kafka does. **Deviation:** a transactional id whose
   transaction is not Ongoing (none was started with AddPartitionsToTxn, or it is complete)
   refuses its transactional batches INVALID_TXN_STATE; Kafka answers so for a partition
   the transaction does not hold, which is the same case for every client. Another epoch on
