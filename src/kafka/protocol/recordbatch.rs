@@ -1103,6 +1103,13 @@ mod tests {
                     peak <= 2 * charged + DECODER_STATE,
                     "{compression:?}: held {peak} bytes for a charge of {charged}"
                 );
+                // The work limits are three times what a decode keeps.
+                assert!(
+                    budget.work() <= 3 * budget.charged(),
+                    "{compression:?}: worked {} for {} kept",
+                    budget.work(),
+                    budget.charged()
+                );
                 drop(records);
             }
         }

@@ -15,6 +15,7 @@
 //! source addresses (127.0.0.2, ...) so their per-IP accounting is separate from the
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
+pub mod decode_work;
 pub mod hostile_clients;
 pub mod large_decodes;
 pub mod produce_decoding;
@@ -175,6 +176,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_the_decode_limit_refuses_partitions_on_their_own: sequential,
         produce_decoding::test_transactional_batches_need_a_transactional_id: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
+        decode_work::test_refused_partitions_do_not_hold_the_io_threads: sequential,
+        decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
+        decode_work::test_repeated_partition_entries_are_answered_once: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

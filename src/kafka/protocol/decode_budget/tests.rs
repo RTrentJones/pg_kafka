@@ -16,6 +16,33 @@ fn take_stops_at_the_limit_and_charges_nothing_past_it() {
 }
 
 #[test]
+fn work_counts_what_was_given_back_and_stays_exhausted() {
+    static POOL: DecodePool = DecodePool::new(1000);
+    let budget = DecodeBudget::with_pool(100, &POOL).limit_work(150);
+    budget.take(80).unwrap();
+    budget.rewind(0);
+    assert_eq!((budget.charged(), budget.work()), (0, 80));
+    assert_eq!(budget.room(), 70, "the work left bounds the room");
+    assert_eq!(budget.take(71), Err(Exhausted::Work));
+    assert_eq!(budget.exhausted(), Some(Exhausted::Work));
+    assert!(budget.work_exhausted());
+    budget.rewind(0);
+    assert!(
+        budget.work_exhausted(),
+        "a rewind gives back memory, not work"
+    );
+    assert_eq!(budget.exhausted(), None);
+    assert_eq!(POOL.remaining(), 1000);
+    // Unlimited by default.
+    let unlimited = DecodeBudget::with_pool(100, &POOL);
+    for _ in 0..10 {
+        unlimited.take(100).unwrap();
+        unlimited.rewind(0);
+    }
+    assert!(!unlimited.work_exhausted());
+}
+
+#[test]
 fn take_stops_at_the_global_budget_and_says_what_it_wanted() {
     static POOL: DecodePool = DecodePool::new(50);
     let budget = DecodeBudget::with_pool(100, &POOL);

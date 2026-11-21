@@ -13,6 +13,11 @@
 //!   partition that does not fit in what its request may still hold is answered
 //!   MESSAGE_TOO_LARGE on its own, and what its decode charged is given back, as is the
 //!   charge of any partition refused after it began to decode;
+//! * per request, the decoding work, counted as everything it ever charged (what is given
+//!   back still counts), stops at a limit of its own ([`DecodeBudget::limit_work`]): what a
+//!   refused partition decoded is freed, but the time spent decoding it is not, so a request
+//!   of many partitions that each decode much and are then refused cannot decode without
+//!   end;
 //! * across the process, decoded requests that the DB thread has not run yet hold at most
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
@@ -78,6 +83,24 @@ const _: () = assert!(MAX_DECODED_REQUEST_BYTES <= DECODED_BUDGET_BYTES);
 /// inline unless its records are under some 200 bytes or it is compressed.
 pub const INLINE_DECODE_BYTES: usize = 2 * 1024 * 1024;
 
+/// A decode that fits its memory limit charges each byte it keeps at most three times
+/// over its course (its output buffer's growth, a zstd window charged as it fills, then the
+/// records), so a work limit of three times the memory limit refuses only what a request's
+/// refused partitions decoded besides.
+const WORK_PER_KEPT_BYTE: usize = 3;
+
+/// The most decoding work (everything charged, given back or not) a decode on an I/O thread
+/// may do; past it the request decodes again under a large-decode slot. A few milliseconds
+/// of decoding.
+pub const INLINE_DECODE_WORK_BYTES: usize = WORK_PER_KEPT_BYTE * INLINE_DECODE_BYTES;
+
+/// The most decoding work a request may do under a large-decode slot: what a request that
+/// fits may take, and as much again for partitions refused after they decoded (one refused
+/// at the request limit, or many smaller). Past it the request's other partitions are
+/// refused MESSAGE_TOO_LARGE without decoding, so no request holds a slot for longer than
+/// decoding this much takes (a fraction of a second).
+pub const SLOT_DECODE_WORK_BYTES: usize = (WORK_PER_KEPT_BYTE + 1) * MAX_DECODED_REQUEST_BYTES;
+
 /// How many large decodes may run at once.
 pub const LARGE_DECODE_SLOTS: usize = 2;
 
@@ -102,6 +125,8 @@ pub fn decode_wait(timeout_ms: i32) -> Duration {
 pub enum Exhausted {
     /// The budget's own limit (the request limit, or the inline limit).
     Limit,
+    /// The request's decoding work ([`DecodeBudget::limit_work`]).
+    Work,
     /// The process-wide budget.
     Global,
 }
@@ -171,6 +196,9 @@ pub struct DecodeBudget {
     most: Cell<usize>,
     exhausted: Cell<Option<Exhausted>>,
     wanted: Cell<usize>,
+    work: Cell<usize>,
+    work_limit: usize,
+    work_exhausted: Cell<bool>,
 }
 
 impl DecodeBudget {
@@ -188,21 +216,37 @@ impl DecodeBudget {
             most: Cell::new(0),
             exhausted: Cell::new(None),
             wanted: Cell::new(0),
+            work: Cell::new(0),
+            work_limit: usize::MAX,
+            work_exhausted: Cell::new(false),
         }
     }
 
+    /// Limit the decoding work to `bytes`: everything ever charged, whether given back
+    /// since or not. Unlimited by default.
+    #[must_use]
+    pub fn limit_work(mut self, bytes: usize) -> Self {
+        self.work_limit = bytes;
+        self
+    }
+
     /// Charge `n` more bytes. Fails, charging nothing, when that would pass the
-    /// budget's limit or the process-wide budget; [`DecodeBudget::exhausted`] then says
-    /// which.
+    /// budget's limit, its work limit or the process-wide budget;
+    /// [`DecodeBudget::exhausted`] then says which.
     pub fn take(&self, n: usize) -> Result<(), Exhausted> {
         let total = self.charged.get().saturating_add(n);
+        let work = self.work.get().saturating_add(n);
         let result = if total > self.limit {
             Err(Exhausted::Limit)
+        } else if work > self.work_limit {
+            self.work_exhausted.set(true);
+            Err(Exhausted::Work)
         } else if !self.pool.take(n) {
             self.wanted.set(total);
             Err(Exhausted::Global)
         } else {
             self.charged.set(total);
+            self.work.set(work);
             self.most.set(self.most.get().max(total));
             Ok(())
         };
@@ -232,16 +276,29 @@ impl DecodeBudget {
 
     /// Give back everything charged since [`Self::charged`] was `mark`, and forget which
     /// limit a charge ran into since: the decode of a refused partition, whose memory is
-    /// freed, so that it does not count against the partitions after it.
+    /// freed, so that it does not count against the partitions after it. Its work still
+    /// counts ([`Self::work_exhausted`] stays set).
     pub fn rewind(&self, mark: usize) {
         self.release(self.charged.get().saturating_sub(mark));
         self.exhausted.set(None);
     }
 
-    /// Bytes this budget may still charge before its limit (the process-wide budget may
-    /// hold fewer).
+    /// Bytes this budget may still charge before its limit or its work limit (the
+    /// process-wide budget may hold fewer).
     pub fn room(&self) -> usize {
-        self.limit.saturating_sub(self.charged.get())
+        self.limit
+            .saturating_sub(self.charged.get())
+            .min(self.work_limit.saturating_sub(self.work.get()))
+    }
+
+    /// Whether a charge ran into the work limit: the request may decode nothing more.
+    pub fn work_exhausted(&self) -> bool {
+        self.work_exhausted.get()
+    }
+
+    /// The decoding work so far: every byte ever charged.
+    pub fn work(&self) -> usize {
+        self.work.get()
     }
 
     /// Bytes charged so far.

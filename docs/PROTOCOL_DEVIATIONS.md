@@ -97,6 +97,22 @@ pg_kafka.compression_type = 'gzip'
   error). Kafka has no such limit on decoding: when its request queue is full
   (`queued.max.requests`, 500) or it lacks memory for requests (`queued.max.request.bytes`,
   unbounded by default) it stops reading connections, and its clients time out on their own. An acks=0 request that times out closes its connection.
+- The decoding work of a request is bounded as well as its memory: every byte its decode
+  charged counts, given back or not, so partitions refused after they decoded (INVALID_TIMESTAMP,
+  a record count that does not match, MESSAGE_TOO_LARGE at the limit) cannot make one request
+  decode without end. On a network I/O thread a request may decode 6 MiB (three times the
+  2 MiB it may hold there); past that it decodes again off the I/O threads. There it may
+  decode 400 MB (four times the 100 MB it may hold: what a request that fits takes, and room
+  for refused partitions besides); past that its other partitions are refused
+  MESSAGE_TOO_LARGE without decoding (UNKNOWN_TOPIC_OR_PARTITION for those of an unknown
+  topic). Kafka decodes every partition on its request handler threads; only a request of
+  several partitions that each decode large batches and are refused is answered differently.
+- As in Kafka 3.7 (`KafkaApis.handleProduceRequest` collects a request's partitions in maps),
+  a partition named more than once in a request, in one topic entry or in several, is
+  answered once, for its last entry; the earlier entries are neither decoded nor written.
+  Kafka also answers the error of an earlier entry that fails `ProduceRequest.validateRecords`
+  (data that is not one RecordBatch v2, zstd before v7) while it writes the last one;
+  pg_kafka answers and writes the last entry only.
 - zstd frames may declare a window of at most 2^27 bytes (128 MiB), as in Kafka; a decoder's
   window counts toward that limit as it fills (as much again as the decoded bytes, up to the
   window). A larger window is CORRUPT_MESSAGE (Kafka 3.7: UNKNOWN_SERVER_ERROR). zstd on

@@ -36,7 +36,7 @@ const LEGIT_REQUESTS: usize = 5;
 
 /// A value of `len` hexadecimal digits from a simple generator: compresses about 2:1, like
 /// real payloads, unlike zeros.
-fn hex_value(seed: &mut u64, len: usize) -> Bytes {
+pub(super) fn hex_value(seed: &mut u64, len: usize) -> Bytes {
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
         *seed = seed
