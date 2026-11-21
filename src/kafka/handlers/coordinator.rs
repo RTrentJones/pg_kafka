@@ -18,6 +18,8 @@ use kafka_protocol::messages::sync_group_response::SyncGroupResponse;
 use kafka_protocol::messages::GroupId;
 use kafka_protocol::protocol::StrBytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Placeholder for a JoinGroup member's `client_host`. This field is informational
 /// only — echoed back in DescribeGroups member listings, never used for routing or
@@ -211,9 +213,21 @@ where
         group_instance_id: request.group_instance_id,
     };
 
+    // Whether `join_group` has returned: an error answered after that is the answer of
+    // a held JoinGroup (its member removed by a LeaveGroup or a DeleteGroups while it
+    // waited, or the join replaced by a resend), which Kafka 3.7 answers with no member
+    // id (`maybeInvokeJoinCallback(member, JoinGroupResult(UNKNOWN_MEMBER_ID, error))`).
+    // All of this runs on the DB thread; the atomic only makes the closure `Send`.
+    let returned = Arc::new(AtomicBool::new(false));
+    let held = returned.clone();
     ctx.coordinator.join_group(
         &params,
         Box::new(move |outcome| {
+            let member_id = if held.load(Ordering::Relaxed) {
+                String::new()
+            } else {
+                member_id
+            };
             respond(build_join_group_response(
                 outcome,
                 protocol_type,
@@ -222,6 +236,7 @@ where
             ));
         }),
     );
+    returned.store(true, Ordering::Relaxed);
 }
 
 /// INVALID_SESSION_TIMEOUT for a session_timeout_ms outside the broker's accepted range,
@@ -278,7 +293,8 @@ fn join_group_error_response(error_code: i16, member_id: String) -> JoinGroupRes
 
 /// Build the JoinGroup response for a coordinator outcome. Errors map to their Kafka
 /// error code (UnknownMemberId, RebalanceInProgress, GroupMaxSizeReached, ...) and carry
-/// the request's `member_id` ([`join_group_error_response`]).
+/// `member_id` ([`join_group_error_response`]): the request's for an error answered at
+/// once, empty for the error answer of a held JoinGroup.
 fn build_join_group_response(
     outcome: crate::kafka::coordinator::JoinOutcome,
     protocol_type: String,
@@ -1007,10 +1023,55 @@ mod tests {
         let first = take(&first).expect("replaced join answered");
         assert_eq!(first.error_code, ERROR_REBALANCE_IN_PROGRESS);
         assert_eq!(first.generation_id, -1);
+        assert_eq!(
+            first.member_id.as_str(),
+            "",
+            "a held join's error has no member id"
+        );
         assert!(take(&second).is_none());
         // The follower's rejoin completes the phase and answers the resend.
         let _ = f.join_now("g", &follower);
         assert_eq!(take(&second).unwrap().generation_id, gen + 1);
+    }
+
+    /// Kafka 3.7 answers a held JoinGroup whose member is removed while it waits
+    /// UNKNOWN_MEMBER_ID with member id "" (`maybeInvokeJoinCallback` with
+    /// `JoinGroupResult(UNKNOWN_MEMBER_ID, ...)`, checked against a 3.7 broker), not the
+    /// request's member id that an error answered at once echoes.
+    #[test]
+    fn test_handle_join_group_held_join_of_a_removed_member_has_no_member_id() {
+        let f = Fixture::new();
+        let leader = f.join_now("g", "").member_id.to_string();
+        let follower = f.join("g", "", 30_000);
+        let gen = f.join_now("g", &leader).generation_id;
+        assert_eq!(take(&follower).unwrap().error_code, ERROR_NONE);
+        assert_eq!(
+            take_sync(&f.sync("g", &leader, gen, vec![]))
+                .unwrap()
+                .error_code,
+            ERROR_NONE
+        );
+
+        // The leader rejoins (held: the follower has not rejoined), then an admin
+        // LeaveGroup v3+ removes it.
+        let held = f.join("g", &leader, 30_000);
+        assert!(take(&held).is_none(), "held until the follower rejoins");
+        let leave = handle_leave_group(
+            &f.ctx(),
+            "g",
+            "",
+            vec![crate::kafka::messages::MemberIdentity {
+                member_id: leader.clone(),
+                group_instance_id: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(leave.members[0].error_code, ERROR_NONE);
+        let held = take(&held).expect("answered when its member was removed");
+        assert_eq!(
+            (held.error_code, held.generation_id, held.member_id.as_str()),
+            (ERROR_UNKNOWN_MEMBER_ID, -1, "")
+        );
     }
 
     #[test]

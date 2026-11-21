@@ -806,15 +806,14 @@ pub async fn test_refused_offset_commit_answers_unknown_partitions() -> TestResu
     Ok(())
 }
 
-/// JoinGroup v5 of `group` as `member`, protocol type `protocol_type` and one "range"
+/// A JoinGroup of `group` as `member`, protocol type `protocol_type` and one "range"
 /// protocol.
-async fn join_v5(
-    wire: &mut Wire,
+fn join_request(
     group: &str,
     member: &str,
     session_timeout_ms: i32,
     protocol_type: &str,
-) -> crate::common::DynResult<kafka_protocol::messages::join_group_response::JoinGroupResponse> {
+) -> kafka_protocol::messages::join_group_request::JoinGroupRequest {
     use kafka_protocol::messages::join_group_request::{
         JoinGroupRequest, JoinGroupRequestProtocol,
     };
@@ -827,7 +826,65 @@ async fn join_v5(
     let mut protocol = JoinGroupRequestProtocol::default();
     protocol.name = StrBytes::from_static_str("range");
     join.protocols = vec![protocol];
-    wire.call(5, &join).await
+    join
+}
+
+/// JoinGroup v5 of `group` as `member` ([`join_request`]).
+async fn join_v5(
+    wire: &mut Wire,
+    group: &str,
+    member: &str,
+    session_timeout_ms: i32,
+    protocol_type: &str,
+) -> crate::common::DynResult<kafka_protocol::messages::join_group_response::JoinGroupResponse> {
+    wire.call(
+        5,
+        &join_request(group, member, session_timeout_ms, protocol_type),
+    )
+    .await
+}
+
+/// A SyncGroup v3 of `group` by `member` at `generation`, with no assignments.
+fn sync_request(
+    group: &str,
+    member: &str,
+    generation: i32,
+) -> kafka_protocol::messages::sync_group_request::SyncGroupRequest {
+    let mut sync = kafka_protocol::messages::sync_group_request::SyncGroupRequest::default();
+    sync.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    sync.generation_id = generation;
+    sync.member_id = StrBytes::from_string(member.to_string());
+    sync
+}
+
+/// A Stable two-member group `group`: member `a` (the leader, on connection `a`)
+/// and `b` (on `b`), both synced at the second generation. Their member ids.
+async fn two_member_group(
+    a: &mut tokio::net::TcpStream,
+    b: &mut tokio::net::TcpStream,
+    group: &str,
+) -> crate::common::DynResult<(String, String)> {
+    use crate::wire::{recv, roundtrip, send};
+    use kafka_protocol::messages::join_group_request::JoinGroupRequest;
+    use kafka_protocol::messages::sync_group_request::SyncGroupRequest;
+    let first = roundtrip(a, 5, 1, &join_request(group, "", 30_000, "consumer")).await?;
+    assert_eq!(first.error_code, NONE, "first join of {group}");
+    let ma = first.member_id.to_string();
+    let synced = roundtrip(a, 3, 2, &sync_request(group, &ma, first.generation_id)).await?;
+    assert_eq!(synced.error_code, NONE, "first sync of {group}");
+    // b's join is held until a rejoins.
+    send(b, 5, 1, &join_request(group, "", 30_000, "consumer")).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = roundtrip(a, 5, 3, &join_request(group, &ma, 30_000, "consumer")).await?;
+    let joined_b = recv::<JoinGroupRequest>(b, 5, 1).await?;
+    assert_eq!((second.error_code, joined_b.error_code), (NONE, NONE));
+    let mb = joined_b.member_id.to_string();
+    let generation = second.generation_id;
+    send(b, 3, 2, &sync_request(group, &mb, generation)).await?;
+    let synced = roundtrip(a, 3, 4, &sync_request(group, &ma, generation)).await?;
+    let synced_b = recv::<SyncGroupRequest>(b, 3, 2).await?;
+    assert_eq!((synced.error_code, synced_b.error_code), (NONE, NONE));
+    Ok((ma, mb))
 }
 
 /// A one-member group `group`, joined and synced (Stable): its member id and generation.
@@ -855,9 +912,11 @@ async fn stable_group(wire: &mut Wire, group: &str) -> crate::common::DynResult<
 ///   commits (the transactional path checks no group state), where a plain OffsetCommit
 ///   is REBALANCE_IN_PROGRESS.
 ///
-/// JoinGroup v5 errors carry the request's member id (pg_kafka answered ""):
-/// INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID of a new or an existing group, and
-/// INCONSISTENT_GROUP_PROTOCOL of a known member; a new member's carry none.
+/// JoinGroup v5 errors answered at once carry the request's member id (pg_kafka answered
+/// ""): INVALID_SESSION_TIMEOUT, UNKNOWN_MEMBER_ID of a new or an existing group, and
+/// INCONSISTENT_GROUP_PROTOCOL of a known member; a new member's carry none. A held
+/// JoinGroup whose member a LeaveGroup v3 removes is answered UNKNOWN_MEMBER_ID with
+/// member id "" (pg_kafka echoed the request's).
 pub async fn test_group_member_checks_match_kafka() -> TestResult {
     use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
     use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
@@ -1046,6 +1105,46 @@ pub async fn test_group_member_checks_match_kafka() -> TestResult {
         "another protocol type, new member"
     );
     println!("✅ 26 / 25 / 23 with the member id, as Kafka answers them\n");
+
+    println!("Step 6: a held JoinGroup whose member a LeaveGroup removes...");
+    {
+        use crate::wire::{recv, send};
+        use kafka_protocol::messages::join_group_request::JoinGroupRequest;
+        let held = ctx.unique_group("parity-txn-member-held").await;
+        let addr = crate::common::get_bootstrap_servers();
+        let mut a = tokio::net::TcpStream::connect(addr.as_str()).await?;
+        let mut b = tokio::net::TcpStream::connect(addr.as_str()).await?;
+        let (ma, _mb) = two_member_group(&mut a, &mut b, &held).await?;
+        // a's rejoin is held: b has not rejoined.
+        send(&mut a, 5, 9, &join_request(&held, &ma, 30_000, "consumer")).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut leave = LeaveGroupRequest::default();
+        leave.group_id = GroupId(StrBytes::from_string(held.clone()));
+        let mut identity = kafka_protocol::messages::leave_group_request::MemberIdentity::default();
+        identity.member_id = StrBytes::from_string(ma.clone());
+        leave.members = vec![identity];
+        let left: LeaveGroupResponse = wire.call(3, &leave).await?;
+        assert_eq!(
+            (left.error_code, left.members[0].error_code),
+            (NONE, NONE),
+            "leave"
+        );
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            recv::<JoinGroupRequest>(&mut a, 5, 9),
+        )
+        .await??;
+        assert_eq!(
+            (
+                answer.error_code,
+                answer.generation_id,
+                answer.member_id.to_string()
+            ),
+            (UNKNOWN_MEMBER_ID, -1, String::new()),
+            "a held JoinGroup answered after its member left has no member id (it sent {ma})"
+        );
+    }
+    println!("✅ 25 with member id \"\", as Kafka answers a held join of a removed member\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
