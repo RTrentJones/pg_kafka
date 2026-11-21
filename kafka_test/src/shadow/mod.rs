@@ -96,5 +96,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_worker_stays_idle_beside_a_blocked_partition: sequential, // Mutates shadow_bootstrap_servers; measures the worker's CPU
         outbox_robustness::test_shadow_worker_stays_idle_beside_dead_letters: sequential, // Mutates shadow_bootstrap_servers; measures the worker's CPU
         outbox_robustness::test_shadow_dead_letters_follow_the_retry_cap: sequential, // Mutates shadow_bootstrap_servers, shadow_max_retries
+        outbox_robustness::test_shadow_failure_acks_make_dead_letters: sequential, // Mutates shadow_max_retries, shadow_retry_backoff_ms
     ]
 }

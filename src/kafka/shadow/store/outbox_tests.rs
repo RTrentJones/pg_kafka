@@ -545,6 +545,92 @@ fn raising_the_retry_cap_revives_dead_letters() {
     assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
 }
 
+/// The caps the claims synced the dead flags to, emptied.
+fn dead_flag_syncs(h: &Harness) -> Vec<i64> {
+    std::mem::take(&mut h.store.db().state().dead_flag_syncs)
+}
+
+/// The full dead-flag sync runs on the worker's first claim and then only when the
+/// flags may disagree with the cap: steady-state claims skip it.
+#[test]
+fn the_dead_flag_sync_runs_once_then_only_when_the_cap_changes() {
+    let h = async_harness(16);
+    h.store.db().state().settings.max_retries = 5;
+    for _ in 0..3 {
+        h.store.poll_and_forward_outbox().unwrap();
+    }
+    assert_eq!(dead_flag_syncs(&h), vec![5], "first claim only");
+
+    // A reload changes the cap: one sync with the new cap.
+    h.store.db().state().settings.max_retries = 3;
+    h.store.poll_and_forward_outbox().unwrap();
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), vec![3]);
+
+    // A failure ack at the synced cap keeps `dead` itself: no sync.
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
+    h.store.poll_and_forward_outbox().unwrap();
+    sent_records(&h);
+    h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
+    drain(&h);
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), Vec::<i64>::new());
+
+    // The schema was found current again (dropped and recreated, upgraded).
+    h.store.forget_dead_flags_sync();
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), vec![3]);
+}
+
+/// A failure ack applied with another cap than the last sync's set `dead` by that
+/// cap, so the next claim syncs even when the cap is back to the synced one by then.
+#[test]
+fn a_failure_ack_at_another_cap_makes_the_next_claim_sync() {
+    let h = async_harness(16);
+    h.store.db().state().settings.max_retries = 5;
+    seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
+    h.store.poll_and_forward_outbox().unwrap();
+    sent_records(&h);
+    assert_eq!(dead_flag_syncs(&h), vec![5]);
+
+    h.store.db().state().settings.max_retries = 2;
+    h.acks.send(err_ack(RowKey::new(T, 0, 1))).unwrap();
+    drain(&h);
+    h.store.db().state().settings.max_retries = 5;
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), vec![5]);
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), Vec::<i64>::new());
+}
+
+/// A sync whose changes did not commit (its xid aborted) is run again; a failed
+/// claim is too. A committed one is checked once.
+#[test]
+fn a_dead_flag_sync_that_did_not_commit_runs_again() {
+    let h = async_harness(16);
+    h.store.db().state().current_xid = 41;
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h).len(), 1);
+    // xid 41 never committed (the tick rolled back).
+    h.store.db().state().current_xid = 42;
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h).len(), 1);
+    h.store.db().state().committed_xids.insert(42);
+    h.store.db().state().current_xid = 43;
+    h.store.poll_and_forward_outbox().unwrap();
+    // Known committed now; clog is not asked again.
+    h.store.db().state().committed_xids.clear();
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h), Vec::<i64>::new());
+
+    h.store.db().state().fail_claim = true;
+    assert!(h.store.poll_and_forward_outbox().is_err());
+    h.store.db().state().fail_claim = false;
+    dead_flag_syncs(&h);
+    h.store.poll_and_forward_outbox().unwrap();
+    assert_eq!(dead_flag_syncs(&h).len(), 1);
+}
+
 #[test]
 fn batch_size_bounds_the_claim_and_requests_another_poll() {
     let h = async_harness(64);

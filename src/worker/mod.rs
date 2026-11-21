@@ -297,6 +297,8 @@ impl MainLoop<'_> {
         }
         run_partition_maintenance();
         load_shadow_config(self.env.shadow_store);
+        // The outbox's dead flags may not match the retry cap on this schema.
+        self.env.shadow_store.forget_dead_flags_sync();
         self.retention_sweep.ran();
     }
 

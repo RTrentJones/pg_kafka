@@ -18,7 +18,9 @@
 //!   in-flight exclusion is a hash lookup, not a scan per pending row), with
 //!   the size of the backlog, with a tiny `work_mem`, or with JIT;
 //! - a partition behind a backing-off head, or holding dead letters, does not
-//!   make every claim read its pending rows (the worker stays idle beside it).
+//!   make every claim read its pending rows (the worker stays idle beside it);
+//! - dead letters follow `pg_kafka.shadow_max_retries` as it changes, whether
+//!   they reached the cap by failure acks or by a lowered cap.
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
@@ -32,6 +34,8 @@ use super::external_client::{
     count_external_messages, get_internal_bootstrap_servers, verify_external_kafka_ready,
 };
 use super::helpers::{enable_shadow_mode, ShadowMode, ShadowTopicConfig, SyncMode, WriteMode};
+use super::pipelined::external_admin;
+use rdkafka::admin::{AdminOptions, AlterConfig, NewTopic, ResourceSpecifier, TopicReplication};
 
 fn config(mode: ShadowMode, sync_mode: SyncMode) -> ShadowTopicConfig {
     ShadowTopicConfig {
@@ -1158,13 +1162,6 @@ pub async fn test_shadow_claims_are_not_jit_compiled() -> TestResult {
     .await
 }
 
-/// Pending rows of a partition with nothing due must cost a claim nothing: every
-/// outbox tick (every 250 ms on the DB thread, whether anything is due or not)
-/// probes each partition with pending rows for its first due row. A topic of
-/// `records` pending rows is written while no broker is configured, `stall` (SQL,
-/// `$1` the topic id) leaves none of them due, the broker is configured, and the
-/// worker's CPU over 10 s, with nothing to forward, is compared with its CPU over
-/// 10 s before, with an empty outbox. Needs the DB host's `/proc` (skipped without it).
 /// The share of a CPU the process `pid` uses over `window`; `None` if its `/proc`
 /// entry is not readable.
 async fn cpu_share(pid: i32, window: Duration) -> Option<f64> {
@@ -1177,7 +1174,30 @@ async fn cpu_share(pid: i32, window: Duration) -> Option<f64> {
     Some(used.as_secs_f64() / start.elapsed().as_secs_f64())
 }
 
-async fn idle_beside_a_stall(name: &str, records: usize, stall: &str, failure: &str) -> TestResult {
+/// How a test leaves its stalled rows not due.
+#[derive(Clone, Copy)]
+enum Stall {
+    /// This SQL (`$1` the topic id).
+    Sql(&'static str),
+    /// Every row of the topic gets `retry_count = cap`, then `pg_kafka.shadow_max_retries`
+    /// is set to `cap` (3, or 4 if it already is 3) with a reload: dead letters, as the
+    /// worker learns of them when the cap changes.
+    DeadAtCap,
+}
+
+/// Pending rows of a partition with nothing due must cost a claim nothing: every
+/// outbox tick (every 250 ms on the DB thread, whether anything is due or not)
+/// probes each partition with pending rows for its first due row. A topic of
+/// `records` pending rows is written while no broker is configured, `stall` leaves
+/// none of them due, the broker is configured, and the worker's CPU over 10 s, with
+/// nothing to forward, is compared with its CPU over 10 s before, with an empty
+/// outbox. Needs the DB host's `/proc` (skipped without it).
+async fn idle_beside_a_stall(
+    name: &str,
+    records: usize,
+    stall: Stall,
+    failure: &str,
+) -> TestResult {
     const WINDOW: Duration = Duration::from_secs(10);
     /// The share of a CPU the stalled rows may add (measured numbers at the callers).
     const MAX_EXTRA_CPU_SHARE: f64 = 0.03;
@@ -1237,8 +1257,35 @@ async fn idle_beside_a_stall(name: &str, records: usize, stall: &str, failure: &
             return Err(format!("{rows} pending outbox rows, expected {records}").into());
         }
 
-        println!("Step 2: stall them: {stall}");
-        let stalled = db.execute(stall, &[&topic_id]).await?;
+        let stalled = match stall {
+            Stall::Sql(sql) => {
+                println!("Step 2: stall them: {sql}");
+                db.execute(sql, &[&topic_id]).await?
+            }
+            Stall::DeadAtCap => {
+                let current: i32 = db
+                    .query_one(
+                        "SELECT current_setting('pg_kafka.shadow_max_retries')::int",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                let cap: i32 = if current == 3 { 4 } else { 3 };
+                println!("Step 2: retry_count = {cap}, then the cap to {cap}...");
+                let n = db
+                    .execute(
+                        "UPDATE kafka.shadow_tracking SET retry_count = $2 WHERE topic_id = $1",
+                        &[&topic_id, &cap],
+                    )
+                    .await?;
+                alter_system(
+                    &db,
+                    &format!("ALTER SYSTEM SET pg_kafka.shadow_max_retries = {cap}"),
+                )
+                .await?;
+                n
+            }
+        };
         println!("  {stalled} rows changed");
         if stalled == 0 {
             return Err("the stall changed no outbox row".into());
@@ -1291,6 +1338,11 @@ async fn idle_beside_a_stall(name: &str, records: usize, stall: &str, failure: &
     .await
     .map_err(|e| e.to_string());
 
+    if matches!(stall, Stall::DeadAtCap) {
+        if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_max_retries").await {
+            eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_max_retries: {e}");
+        }
+    }
     if let Err(e) = restore_bootstrap_servers(&db).await {
         eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
     }
@@ -1300,23 +1352,32 @@ async fn idle_beside_a_stall(name: &str, records: usize, stall: &str, failure: &
     Ok(())
 }
 
+/// The stalled rows of the idle tests. The extra CPU of reading them on every tick is
+/// about linear in their number; on PG17 here, before the fixes (d08e2d8), it was
+/// 8.8 / 10.6 points at 300 000 rows (blocked partition / dead letters), 5.4 / 6.5 at
+/// 200 000, 4.8 / 4.8 at 150 000 and 3.7 / 3.6 at 100 000, against the 3-point bound;
+/// 200 000 still fails by about 2x, and costs 2-3 s less per test than 300 000.
+const STALLED_ROWS: usize = 200_000;
+
 /// Behind a backing-off head (a failed row whose backoff has not passed) nothing of
 /// its partition is due, and the claim's probe stopped there only by a filter: it
 /// read the partition's whole backlog on every tick. Here the head of a
-/// 300 000-row backlog backs off (its last attempt stamped an hour ahead, so it
+/// 200 000-row backlog backs off (its last attempt stamped an hour ahead, so it
 /// stays blocked) and the idle worker is measured. On PG17 here the stalled rows
-/// added 9.4 points of a CPU with the filter, 0.1 with the index condition; the
-/// 3-point bound leaves >= 3x either way.
+/// added 5.4 points of a CPU with the filter (d08e2d8), at most 0.0 with the index
+/// condition; the bound is 3 points.
 pub async fn test_shadow_worker_stays_idle_beside_a_blocked_partition() -> TestResult {
     idle_beside_a_stall(
         "the worker stays idle beside a blocked partition",
-        300_000,
-        "UPDATE kafka.shadow_tracking \
+        STALLED_ROWS,
+        Stall::Sql(
+            "UPDATE kafka.shadow_tracking \
          SET retry_count = 1, attempt_open = false, forwarded_at = NOW() + interval '1 hour' \
          WHERE (topic_id, partition_id, local_offset) IN ( \
              SELECT topic_id, partition_id, MIN(local_offset) \
              FROM kafka.shadow_tracking WHERE topic_id = $1 \
              GROUP BY topic_id, partition_id)",
+        ),
         "a claim reads the backlog behind a backing-off head",
     )
     .await
@@ -1324,16 +1385,15 @@ pub async fn test_shadow_worker_stays_idle_beside_a_blocked_partition() -> TestR
 
 /// Dead letters (rows at `pg_kafka.shadow_max_retries`) stay pending until replayed
 /// or the cap is raised, and every claim read past all of them: in its probe of
-/// their partition and in its search for backing-off rows. Here 300 000 rows are
-/// dead-lettered and the idle worker is measured. On PG17 here they added 10.9
-/// points of a CPU read on every tick, at most 0.1 skipped by the dead flag.
+/// their partition and in its search for backing-off rows. Here 200 000 rows become
+/// dead letters by a lowered cap (the worker re-flags its dead letters when the cap
+/// changes) and the idle worker is measured. On PG17 here they added 6.5 points of a
+/// CPU read on every tick (d08e2d8), at most -0.4 skipped by the dead flag.
 pub async fn test_shadow_worker_stays_idle_beside_dead_letters() -> TestResult {
     idle_beside_a_stall(
         "the worker stays idle beside dead letters",
-        300_000,
-        "UPDATE kafka.shadow_tracking \
-         SET retry_count = current_setting('pg_kafka.shadow_max_retries')::int \
-         WHERE topic_id = $1",
+        STALLED_ROWS,
+        Stall::DeadAtCap,
         "a claim reads the dead letters",
     )
     .await
@@ -1460,6 +1520,157 @@ pub async fn test_shadow_dead_letters_follow_the_retry_cap() -> TestResult {
         eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
     }
     ctx.cleanup().await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The outbox rows of `topic_id` that are not yet dead letters at `cap` or still have an
+/// attempt open.
+async fn not_dead_at(
+    db: &Client,
+    topic_id: i32,
+    cap: i32,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(db
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.shadow_tracking \
+             WHERE topic_id = $1 AND external_offset IS NULL \
+               AND (retry_count < $2 OR attempt_open)",
+            &[&topic_id, &cap],
+        )
+        .await?
+        .get(0))
+}
+
+/// Wait until every outbox row of `topic_id` is a dead letter at `cap` (its failures
+/// acked, no attempt open), then check that it stays one: `retry_count` exactly `cap`,
+/// not delivered, and its `dead` flag set (the claim skips it by that flag).
+async fn dead_letters_at(db: &Client, topic_id: i32, rows: usize, cap: i32) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let left = not_dead_at(db, topic_id, cap).await?;
+        if left == 0 {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!("{left} row(s) not dead letters at cap {cap} after 120 s").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Long enough for several backoffs (100 ms base): a row still retried would show.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let row = db
+        .query_one(
+            "SELECT COUNT(*), \
+                    COUNT(*) FILTER (WHERE retry_count = $2 AND NOT attempt_open \
+                                     AND external_offset IS NULL), \
+                    COUNT(*) FILTER (WHERE dead) \
+             FROM kafka.shadow_tracking WHERE topic_id = $1",
+            &[&topic_id, &cap],
+        )
+        .await?;
+    let (all, at_cap, dead): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
+    println!("  {all} row(s): {at_cap} at retry_count {cap}, {dead} flagged dead");
+    let rows = i64::try_from(rows)?;
+    if all != rows || at_cap != rows {
+        return Err(
+            format!("{at_cap} of {all} rows ({rows} expected) are dead letters at {cap}").into(),
+        );
+    }
+    if dead != rows {
+        return Err(
+            format!("{dead} of {rows} dead letters at cap {cap} have their dead flag").into(),
+        );
+    }
+    Ok(())
+}
+
+/// Dead letters made by failure acks, while the worker runs: each failure ack that
+/// reaches `pg_kafka.shadow_max_retries` flags its row dead in the statement that
+/// counts it (the claim skips dead letters by that flag, and nothing else recomputes
+/// it while the cap stays put). A reload that raises the cap revives them: they are
+/// retried, fail again and are dead letters at the new cap; once the external topic
+/// takes them and the cap is raised again they are forwarded. The records are larger
+/// than the external topic's `max.message.bytes`, so every attempt fails.
+pub async fn test_shadow_failure_acks_make_dead_letters() -> TestResult {
+    const RECORDS: usize = 2;
+    println!("=== Test: failure acks make dead letters ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-dead-acks").await;
+    let external = format!("{topic}-ext");
+    verify_external_kafka_ready().await?;
+    let admin = external_admin()?;
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let db = create_db_client().await?;
+
+    let result = async {
+        let new_topic = NewTopic::new(&external, 1, TopicReplication::Fixed(1))
+            .set("max.message.bytes", "3000");
+        for r in admin.create_topics(&[new_topic], &opts).await? {
+            r.map_err(|(t, e)| format!("create {t}: {e}"))?;
+        }
+        println!("Step 1: cap 2, backoff 100 ms; {RECORDS} records the external topic refuses...");
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_max_retries = 2").await?;
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_retry_backoff_ms = 100",
+        )
+        .await?;
+        enable_shadow_mode(
+            ctx.db(),
+            &topic,
+            &ShadowTopicConfig {
+                external_topic_name: Some(external.clone()),
+                ..config(ShadowMode::Shadow, SyncMode::Async)
+            },
+        )
+        .await?;
+        let topic_id = topic_id(ctx.db(), &topic).await?;
+        let producer = bulk_producer()?;
+        let big = vec![b'B'; 8_000];
+        for i in 0..RECORDS {
+            let key = format!("k{i}");
+            producer
+                .send(
+                    FutureRecord::to(&topic).key(key.as_bytes()).payload(&big),
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|(e, _)| e)?;
+        }
+
+        println!("Step 2: every attempt fails; at 2 failures they are dead letters...");
+        dead_letters_at(ctx.db(), topic_id, RECORDS, 2).await?;
+
+        println!("Step 3: a reload raises the cap to 3: each is retried once more...");
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_max_retries = 3").await?;
+        dead_letters_at(ctx.db(), topic_id, RECORDS, 3).await?;
+
+        println!("Step 4: the external topic takes them; the cap to 4: they are forwarded...");
+        let alter = AlterConfig::new(ResourceSpecifier::Topic(&external))
+            .set("max.message.bytes", "1048576");
+        for r in admin.alter_configs(&[alter], &opts).await? {
+            r.map_err(|(t, e)| format!("alter {t:?}: {e}"))?;
+        }
+        alter_system(&db, "ALTER SYSTEM SET pg_kafka.shadow_max_retries = 4").await?;
+        let took = drained_within(ctx.db(), topic_id, Duration::from_secs(120)).await?;
+        println!("  forwarded in {took:?}");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    for reset in [
+        "ALTER SYSTEM RESET pg_kafka.shadow_max_retries",
+        "ALTER SYSTEM RESET pg_kafka.shadow_retry_backoff_ms",
+    ] {
+        if let Err(e) = alter_system(&db, reset).await {
+            eprintln!("⚠️  cleanup: {reset} failed: {e}");
+        }
+    }
+    ctx.cleanup().await?;
+    let _ = admin.delete_topics(&[&external], &opts).await;
     result?;
     println!("✅ Test PASSED\n");
     Ok(())

@@ -78,6 +78,9 @@ pub struct State {
     pub raise_in_apply_delivered: bool,
     /// Make `claim_due_outbox_rows` fail.
     pub fail_claim: bool,
+    /// The cap of every claim that ran the full dead-flag sync, in order. (The fake
+    /// does not model the `dead` column: its claim filters on `retry_count`.)
+    pub dead_flag_syncs: Vec<i64>,
     /// What `current_transaction_id` returns.
     pub current_xid: u32,
     /// Xids `transaction_committed` reports as committed.
@@ -352,9 +355,13 @@ impl ShadowDb for InMemoryShadowDb {
             return Err(KafkaError::Internal("claim failed".to_string()));
         }
         let now = s.now_ms;
+        let mut out = ClaimedRows::default();
+        if claim.sync_dead_flags {
+            s.dead_flag_syncs.push(claim.max_retries);
+            out.dead_flags_synced = Some(s.current_xid);
+        }
         let candidates = s.claim_candidates(claim, now);
         let (due, share) = due_rows(&candidates, claim.batch_limit);
-        let mut out = ClaimedRows::default();
         for (key, restart) in due {
             s.open_attempt(key, now);
             // The JOIN with kafka.topics drops a row whose topic is gone.

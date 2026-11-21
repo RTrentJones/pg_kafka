@@ -888,9 +888,13 @@ CREATE TABLE kafka.shadow_tracking (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE,
     -- A claim opens an attempt; its ack closes it.
     attempt_open BOOLEAN NOT NULL DEFAULT false,
-    -- retry_count >= pg_kafka.shadow_max_retries (a dead letter), as of the last
-    -- outbox claim, which sets it before it claims. It keys the indexes below, so a
-    -- claim skips the dead letters by an index condition instead of reading them.
+    -- retry_count >= pg_kafka.shadow_max_retries (a dead letter). It keys the indexes
+    -- below, so a claim skips the dead letters by an index condition instead of
+    -- reading them. Invariant: before every claim, every pending row has dead =
+    -- (retry_count >= the claim's cap). The worker sets it in the statements that
+    -- change retry_count (a failure ack, a lost attempt counted by the claim), replay
+    -- clears it with retry_count, and a full sync runs at worker start and when the
+    -- cap changes (DEAD_LETTER_SYNC_SQL in src/kafka/shadow/outbox.rs).
     dead BOOLEAN NOT NULL DEFAULT false
 );
 
@@ -1058,7 +1062,7 @@ COMMENT ON TABLE kafka.shadow_metrics IS 'Aggregated shadow mode metrics per top
 COMMENT ON VIEW kafka.shadow_status IS 'Unified view of shadow mode health, lag, and error counts.';
 COMMENT ON COLUMN kafka.shadow_tracking.retry_count IS 'Failed delivery attempts. At pg_kafka.shadow_max_retries the row is a dead letter (pending, never retried) until replayed or the cap is raised.';
 COMMENT ON COLUMN kafka.shadow_tracking.attempt_open IS 'True while a forward of the row is in flight (claimed, not yet acked).';
-COMMENT ON COLUMN kafka.shadow_tracking.dead IS 'retry_count >= pg_kafka.shadow_max_retries as of the last outbox claim (kept current by the worker; indexed so claims skip dead letters).';
+COMMENT ON COLUMN kafka.shadow_tracking.dead IS 'retry_count >= pg_kafka.shadow_max_retries on pending rows, kept by the worker (failure acks, lost attempts, replay, and a full sync at worker start and when the cap changes); indexed so claims skip dead letters.';
 COMMENT ON VIEW kafka.shadow_partition_status IS 'Per-partition shadow forwarding state: lag (records still to forward), dead letters, in-flight forwards, metrics.';
 
 -- replay_shadow_messages writes the outbox with the caller's rights, so it is not

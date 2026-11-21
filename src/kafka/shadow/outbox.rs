@@ -84,6 +84,11 @@ pub struct OutboxClaim {
     pub backoff_max_ms: i64,
     /// In-flight row keys, excluded from the claim.
     pub inflight: KeyColumns,
+    /// Run the full dead-flag sync ([`DEAD_LETTER_SYNC_SQL`]) with `max_retries`
+    /// before the claim: the flags may not agree with this cap (the worker's first
+    /// claim, a changed cap, an earlier sync that did not commit). See
+    /// [`ClaimedRows::dead_flags_synced`].
+    pub sync_dead_flags: bool,
 }
 
 /// How many due rows of one partition a claim of `batch_limit` rows takes
@@ -115,6 +120,10 @@ pub struct ClaimedRows {
     /// The claim's [`per_partition_claim_cap`] (0 when nothing was claimed): a
     /// partition that got this many rows may have more due.
     pub partition_share: i64,
+    /// Set when the claim ran the dead-flag sync ([`OutboxClaim::sync_dead_flags`]):
+    /// the xid of the (sub)transaction that wrote its changes, 0 when it changed
+    /// nothing. The flags agree with the cap once that xid committed.
+    pub dead_flags_synced: Option<u32>,
 }
 
 impl ClaimedRows {
@@ -215,7 +224,8 @@ pub trait ShadowDb {
     fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize>;
 
     /// Record failed attempts: `retry_count + 1`, the error, attempt closed,
-    /// `forwarded_at` = now (start of the backoff); counted in
+    /// `forwarded_at` = now (start of the backoff), `dead` = the new `retry_count`
+    /// at `max_retries` or above (see `DEAD_LETTER_SYNC_SQL`); counted in
     /// `kafka.shadow_metrics.messages_failed` when `metrics`.
     fn apply_failed(
         &self,
@@ -317,15 +327,34 @@ macro_rules! pending_partitions {
 }
 
 /// Make `kafka.shadow_tracking.dead` equal `retry_count >= $1` (the retry cap) on
-/// every pending row, run before each claim. `dead` keys both pending indexes, so the
-/// claim skips a partition's dead letters by an index condition instead of reading
-/// them on every claim; this statement keeps it current when a failure reaches the
-/// cap, when the cap is raised (dead letters below it are due again) or lowered, and
-/// after a replay or a hand edit of `retry_count`. It reads only the rows it changes,
-/// found by two index ranges per partition of idx_shadow_tracking_retrying
-/// (`topic_id, partition_id, dead, retry_count, ...`), so it costs O(partitions) when
-/// nothing changed, whatever the number of dead letters. The rows are updated by ctid
-/// (a TID scan), never by a join the planner could turn into a scan of the table.
+/// every pending row. `dead` keys both pending indexes, so the claim skips a
+/// partition's dead letters by an index condition instead of reading them on every
+/// claim.
+///
+/// The invariant: before every claim, every pending row has `dead = (retry_count >=
+/// cap)` for the cap that claim uses. It is kept where `retry_count` or the cap
+/// changes, not by a statement per claim (this one costs a skip scan of the
+/// partitions with pending rows, 8-12 ms per claim with 2 000 of them):
+/// - a failure ack (`apply_failed`) and a lost attempt counted by the claim set
+///   `dead` in the UPDATE that raises `retry_count`, with the cap of that tick;
+/// - `kafka.replay_shadow_messages` sets `retry_count = 0, dead = false`; new rows
+///   start at 0 and false;
+/// - this statement runs once when the cap may disagree with the flags: the
+///   worker's first claim (an upgraded schema, rows changed while no worker ran),
+///   the first claim on a schema found current again (`forget_dead_flags_sync`),
+///   a claim whose cap differs from the cap of the last sync (a reload changed
+///   `pg_kafka.shadow_max_retries`) or of a failure ack applied since, and a claim
+///   after a sync that did not commit (`ShadowStore::dead_flags_current`).
+///
+/// A hand edit of `retry_count` outside these paths is picked up at the next worker
+/// start or cap change: until then a dead letter lowered below the cap by hand (not
+/// by replay) is not claimed, and a row raised to the cap by hand is not claimed
+/// either (the claim keeps its `retry_count < cap` filter) but is still read.
+///
+/// It reads only the rows it changes, found by two index ranges per partition of
+/// idx_shadow_tracking_retrying (`topic_id, partition_id, dead, retry_count, ...`),
+/// whatever the number of dead letters. The rows are updated by ctid (a TID scan),
+/// never by a join the planner could turn into a scan of the table.
 const DEAD_LETTER_SYNC_SQL: &str = concat!(
     r"
         WITH RECURSIVE",
@@ -379,8 +408,8 @@ const DEAD_LETTER_SYNC_SQL: &str = concat!(
 /// Every condition that bounds the scan is an index condition of
 /// `idx_shadow_tracking_pending` (`topic_id, partition_id, dead, local_offset`), so
 /// the scan starts at the partition's first live row and stops at its first blocked
-/// one: `NOT st.dead` skips the dead letters ([`DEAD_LETTER_SYNC_SQL`] has just made
-/// `dead` equal `retry_count >= $2`; the `retry_count` test stays as a filter), and the
+/// one: `NOT st.dead` skips the dead letters (`dead` equals `retry_count >= $2` before
+/// every claim, see [`DEAD_LETTER_SYNC_SQL`]; the `retry_count` test stays as a filter), and the
 /// blocked bound is a `COALESCE` with the largest `int8` (`local_offset` is NOT NULL,
 /// so it means `b.first_blocked IS NULL OR st.local_offset < b.first_blocked`). Written
 /// as that `OR` it was a filter: behind a backing-off head the probe walked the
@@ -543,7 +572,9 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
             UPDATE kafka.shadow_tracking st
             SET forwarded_at = NOW(),
                 attempt_open = true,
-                retry_count = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END
+                retry_count = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END,
+                -- Keeps dead = (retry_count >= cap) (see DEAD_LETTER_SYNC_SQL).
+                dead = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END >= $2
             FROM due
             LEFT JOIN heads h
               ON h.topic_id = due.topic_id AND h.partition_id = due.partition_id
@@ -618,17 +649,24 @@ const RESTORE_CLAIM_SETTINGS_SQL: &str =
     "SELECT set_config('work_mem', $1, true), set_config('jit', $2, true)";
 
 impl SpiShadowDb {
-    /// Run [`DEAD_LETTER_SYNC_SQL`], then [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in
-    /// [`ShadowDb::claim_due_outbox_rows`]).
+    /// Run [`DEAD_LETTER_SYNC_SQL`] if the claim asks for it, then
+    /// [`CLAIM_DUE_OUTBOX_ROWS_SQL`] (parameters in [`ShadowDb::claim_due_outbox_rows`]).
     fn run_claim(
+        self,
         client: &mut pgrx::spi::SpiClient<'_>,
         claim: &OutboxClaim,
         backoff_base_ms: f64,
         backoff_max_ms: f64,
     ) -> Result<ClaimedRows> {
-        // A statement of its own: the claim's CTEs would read `dead` as it was
-        // before an UPDATE in the same statement.
-        client.update(DEAD_LETTER_SYNC_SQL, None, &[claim.max_retries.into()])?;
+        let mut dead_flags_synced = None;
+        if claim.sync_dead_flags {
+            // A statement of its own: the claim's CTEs would read `dead` as it was
+            // before an UPDATE in the same statement.
+            client.update(DEAD_LETTER_SYNC_SQL, None, &[claim.max_retries.into()])?;
+            // The claim's subtransaction has written nothing before it, so an xid is
+            // assigned only if the sync changed a row.
+            dead_flags_synced = Some(self.current_transaction_id());
+        }
         let table = client.update(
             CLAIM_DUE_OUTBOX_ROWS_SQL,
             None,
@@ -643,7 +681,10 @@ impl SpiShadowDb {
             ],
         )?;
 
-        let mut claimed = ClaimedRows::default();
+        let mut claimed = ClaimedRows {
+            dead_flags_synced,
+            ..ClaimedRows::default()
+        };
         for row in table {
             claimed.partition_share = row.get_by_name("share")?.unwrap_or(0);
             let headers_json: Option<String> = row.get_by_name("headers_json")?;
@@ -842,7 +883,7 @@ impl ShadowDb for SpiShadowDb {
             let saved = saved.first();
             let work_mem: Option<String> = saved.get_by_name("work_mem")?;
             let jit: Option<String> = saved.get_by_name("jit")?;
-            let claimed = Self::run_claim(client, claim, backoff_base_ms, backoff_max_ms);
+            let claimed = self.run_claim(client, claim, backoff_base_ms, backoff_max_ms);
             client.update(
                 RESTORE_CLAIM_SETTINGS_SQL,
                 None,
@@ -926,7 +967,8 @@ impl ShadowDb for SpiShadowDb {
                  failed AS ( \
                      UPDATE kafka.shadow_tracking st \
                      SET retry_count = st.retry_count + 1, error_message = a.e, \
-                         forwarded_at = NOW(), attempt_open = false \
+                         forwarded_at = NOW(), attempt_open = false, \
+                         dead = st.retry_count + 1 >= $6 \
                      FROM a \
                      WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
                        AND st.external_offset IS NULL \
@@ -949,6 +991,7 @@ impl ShadowDb for SpiShadowDb {
                     keys.local_offsets.into(),
                     errors.into(),
                     metrics.into(),
+                    max_retries.into(),
                 ],
             )?;
             let mut out = FailedApplied::default();
@@ -1166,9 +1209,9 @@ mod tests {
         assert!(sync.contains(&parts));
     }
 
-    /// The sync before each claim makes `dead` equal `retry_count >= cap` on every
-    /// pending row whose flag is wrong, reading only those rows (an index range each
-    /// way per partition) and updating them by ctid.
+    /// The full sync makes `dead` equal `retry_count >= cap` on every pending row
+    /// whose flag is wrong, reading only those rows (an index range each way per
+    /// partition) and updating them by ctid.
     #[test]
     fn the_dead_flag_sync_reads_only_the_rows_it_changes() {
         let sync = DEAD_LETTER_SYNC_SQL
@@ -1183,6 +1226,21 @@ mod tests {
         assert!(sync.contains("WHERE st.ctid = ANY (ARRAY(SELECT stale.ctid FROM stale))"));
         assert!(sync.contains("AND st.dead IS DISTINCT FROM (st.retry_count >= $1)"));
         assert_eq!(sync.matches("st.external_offset IS NULL").count(), 5);
+    }
+
+    /// Between full syncs, the claim keeps `dead` itself where it raises
+    /// `retry_count` (a lost attempt), with the claim's cap.
+    #[test]
+    fn the_claim_keeps_the_dead_flag_of_a_lost_attempt() {
+        let claim = CLAIM_DUE_OUTBOX_ROWS_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(claim.contains(
+            "retry_count = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END, \
+             -- Keeps dead = (retry_count >= cap) (see DEAD_LETTER_SYNC_SQL). \
+             dead = st.retry_count + CASE WHEN st.attempt_open THEN 1 ELSE 0 END >= $2"
+        ));
     }
 
     /// The claim runs with a `work_mem` floor and without JIT, set transaction-locally

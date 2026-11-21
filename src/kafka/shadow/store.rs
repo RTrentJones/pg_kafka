@@ -198,6 +198,21 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// What the current tick's ack application did, made final by
     /// `commit_applied_acks` once its transaction committed.
     staged_acks: Mutex<Option<StagedAcks>>,
+    /// The last full dead-flag sync: `kafka.shadow_tracking.dead` agrees with
+    /// this cap on every pending row, once its xid committed. `None` until the
+    /// first claim, and whenever the flags may disagree with the cap the claims
+    /// use (see `DEAD_LETTER_SYNC_SQL` in `outbox.rs`).
+    dead_flags: Mutex<Option<DeadFlagsSync>>,
+}
+
+/// A full dead-flag sync ([`ShadowStore::dead_flags_current`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DeadFlagsSync {
+    /// The retry cap it synced the flags to.
+    cap: i64,
+    /// The xid that wrote its changes; 0 once known committed, or when it changed
+    /// nothing.
+    xid: u32,
 }
 
 /// The effects of one ack application that must wait for its transaction's
@@ -267,6 +282,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             outbox_failures: Mutex::new(TickFailures::default()),
             unapplied_acks: Mutex::new(Vec::new()),
             staged_acks: Mutex::new(None),
+            dead_flags: Mutex::new(None),
         }
     }
 
@@ -711,10 +727,19 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 backoff_base_ms: settings.retry_backoff_ms,
                 backoff_max_ms: OUTBOX_MAX_BACKOFF_MS,
                 inflight: self.inflight.live_keys(),
+                sync_dead_flags: !self.dead_flags_current(settings.max_retries),
             })
             .map_err(|e: KafkaError| {
+                // Whatever it wrote is rolled back or unknown: sync again.
+                self.forget_dead_flags_sync();
                 super::error::ShadowError::DatabaseError(format!("outbox poll failed: {e}"))
             })?;
+        if let Some(xid) = claim.dead_flags_synced {
+            *lock(&self.dead_flags) = Some(DeadFlagsSync {
+                cap: settings.max_retries,
+                xid,
+            });
+        }
         let more_due = claim.more_due(limit);
         let records = claim.records;
 
@@ -752,6 +777,36 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             self.request_poll();
         }
         Ok(dispatched)
+    }
+
+    /// Whether `kafka.shadow_tracking.dead` agrees with `cap` on every pending row,
+    /// so the claim can skip the full sync: the last sync used `cap`, it committed
+    /// (or changed nothing), and no failure ack used another cap since. Every other
+    /// change of `retry_count` keeps `dead` in its own statement. Called inside the
+    /// tick's transaction, about a sync of an earlier, finished one.
+    fn dead_flags_current(&self, cap: i64) -> bool {
+        let mut synced = lock(&self.dead_flags);
+        match *synced {
+            Some(DeadFlagsSync { cap: c, xid }) if c == cap => {
+                if xid == 0 {
+                    return true;
+                }
+                if self.db.transaction_committed(xid) {
+                    // Checked once: an old xid's clog may be truncated later.
+                    *synced = Some(DeadFlagsSync { cap, xid: 0 });
+                    return true;
+                }
+                *synced = None;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Make the next claim run the full dead-flag sync: the flags may disagree with
+    /// the cap (the schema was dropped, recreated or upgraded under the worker).
+    pub fn forget_dead_flags_sync(&self) {
+        *lock(&self.dead_flags) = None;
     }
 
     /// Drain the currently-available forward acks and finalize their outbox
@@ -872,6 +927,14 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
         let mut failed_ok = true;
+        if !failed.is_empty() {
+            // The failures set `dead` with this tick's cap: if the last sync used
+            // another one, the next claim must sync (even if the cap reverts first).
+            let mut synced = lock(&self.dead_flags);
+            if synced.is_some_and(|s| s.cap != settings.max_retries) {
+                *synced = None;
+            }
+        }
         match self
             .db
             .apply_failed(&failed, settings.max_retries, settings.metrics_enabled)

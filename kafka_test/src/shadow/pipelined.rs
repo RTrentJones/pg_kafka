@@ -53,7 +53,9 @@ fn bulk_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
         .create()?)
 }
 
-fn external_admin() -> Result<AdminClient<DefaultClientContext>, Box<dyn std::error::Error>> {
+/// An admin client of the external broker.
+pub(super) fn external_admin(
+) -> Result<AdminClient<DefaultClientContext>, Box<dyn std::error::Error>> {
     Ok(ClientConfig::new()
         .set("bootstrap.servers", get_external_bootstrap_servers())
         .set("broker.address.family", "v4")

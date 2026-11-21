@@ -201,7 +201,7 @@ behave like async ones.
 
 `kafka.shadow_tracking` columns: `external_offset` (set = delivered), `forwarded_at` (last claim or
 failure), `retry_count` (failed delivery attempts), `attempt_open` (claimed, ack not yet applied),
-`dead` (`retry_count` at the retry cap as of the last claim; an index key, see below),
+`dead` (`retry_count` at the retry cap; an index key, see below),
 `error_message` (last failure; withheld from `pgkafka_reader`).
 
 The claim (`SpiShadowDb::claim_due_outbox_rows`) takes, in row-key order, up to
@@ -214,9 +214,14 @@ timestamp, external topic name and the `restart` flag. It reads the pending inde
 index `idx_shadow_tracking_retrying`. Both indexes are keyed `(topic_id, partition_id, dead, ...)`
 and every probe bounds its scan by index conditions (`dead = false`, `local_offset` below the
 partition's first backing-off row), so neither a backing-off head nor dead letters make a claim read
-the rows behind them. Before each claim one statement sets `dead = (retry_count >= cap)` where it
-differs, found by two index ranges per partition: rows that reached the cap, dead letters revived by
-a raised cap, and rows a lowered cap kills. A full claim requests another tick at once (at least 5 ms after
+the rows behind them. Every pending row has `dead = (retry_count >= cap)` before every claim: the
+statements that raise `retry_count` (a failure ack, a lost attempt counted by the claim) set `dead`
+with it, replay clears both, and a full sync (two index ranges per partition, so
+O(partitions with pending rows)) runs only when the flags may disagree with the cap: on the worker's
+first claim, on a schema found current again, after a reload that changed `shadow_max_retries` (dead
+letters below a raised cap are due again, rows at a lowered one stop), and after a sync that did not
+commit. A dead letter whose `retry_count` is lowered by hand (not by replay) is claimed again only after
+the next worker start or cap change. A full claim requests another tick at once (at least 5 ms after
 the last), unless every ack the tick applied was `NotAttempted`: the forwarder is answering without
 sending, and the rows it gave back are due again at once, so an immediate tick would only claim them
 again. While `pg_kafka.shadow_bootstrap_servers` is empty nothing is claimed at all (the forwarder
