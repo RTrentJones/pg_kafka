@@ -342,6 +342,12 @@ const BACKLOG_DELIVERY_TIMEOUT_MS: u64 = 100_000;
 /// (and claimed again) before the producer's generation times out (before
 /// the large topic's head counts a failed attempt), which only the backlog
 /// does, once less than a quarter of its delivery timeout is left.
+///
+/// The small topic's head is answered from the backlog too, but NotAttempted:
+/// it found no room only because the large topic's older records filled the
+/// queue, so it counts no failed attempt there. It is claimed again, goes out
+/// on the replacement producer once the first generation times out, and fails
+/// one delivery timeout after that second dispatch.
 pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires(
 ) -> TestResult {
     const BIG: usize = 80;
@@ -444,19 +450,36 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
         }
         let mut tail_answered_after = None;
 
-        // The in-flight entries expire 150 s after the dispatch: watch a
-        // little past that. Only the partition's head may count failed
-        // attempts; a lost attempt counted by a claim of a still-held record
-        // shows on the records behind it too.
+        let small_head_claimed: Option<String> = ctx
+            .db()
+            .query_one(
+                "SELECT forwarded_at::text FROM kafka.shadow_tracking \
+                 WHERE topic_id = $1 AND local_offset = 0",
+                &[&small_id],
+            )
+            .await?
+            .get(0);
+
+        // The in-flight entries expire 150 s after each dispatch: watch a
+        // little past that, and until the small topic's head failed its
+        // second attempt (one timeout after its second dispatch). Only the
+        // partition's head may count failed attempts; a lost attempt counted
+        // by a claim of a still-held record shows on the records behind it
+        // too.
         let watch = Duration::from_secs(165);
-        println!("Step 3: watch the retry counts for {watch:?}...");
+        let watch_max =
+            Duration::from_millis(2 * BACKLOG_DELIVERY_TIMEOUT_MS) + Duration::from_secs(20);
+        println!("Step 3: watch the retry counts for {watch:?} (at most {watch_max:?})...");
         let mut head_failed_after = None;
-        while dispatched.elapsed() < watch {
+        let mut head_reclaimed_after = None;
+        while dispatched.elapsed() < watch
+            || (head_failed_after.is_none() && dispatched.elapsed() < watch_max)
+        {
             let rows = ctx
                 .db()
                 .query(
-                    "SELECT local_offset, retry_count FROM kafka.shadow_tracking \
-                     WHERE topic_id = $1 ORDER BY local_offset",
+                    "SELECT local_offset, retry_count, forwarded_at::text \
+                     FROM kafka.shadow_tracking WHERE topic_id = $1 ORDER BY local_offset",
                     &[&small_id],
                 )
                 .await?;
@@ -464,7 +487,33 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
             if retries.len() != SMALL {
                 return Err(format!("expected {SMALL} outbox rows, got {retries:?}").into());
             }
+            let head_claimed: Option<String> = rows[0].get(2);
+            if head_reclaimed_after.is_none() && head_claimed != small_head_claimed {
+                if retries[0].1 > 0 {
+                    return Err(format!(
+                        "the small topic's head counted a failed attempt after {:?} on its \
+                         first dispatch, while the large topic's older records filled the \
+                         queue: {retries:?}",
+                        dispatched.elapsed()
+                    )
+                    .into());
+                }
+                head_reclaimed_after = Some(dispatched.elapsed());
+                println!(
+                    "  head answered NotAttempted from the backlog and claimed again after {:?}",
+                    dispatched.elapsed()
+                );
+            }
             if head_failed_after.is_none() && retries[0].1 > 0 {
+                if head_reclaimed_after.is_none() {
+                    return Err(format!(
+                        "the small topic's head counted a failed attempt after {:?} on its \
+                         first dispatch, while the large topic's older records filled the \
+                         queue",
+                        dispatched.elapsed()
+                    )
+                    .into());
+                }
                 head_failed_after = Some(dispatched.elapsed());
                 println!("  head failed an attempt after {:?}", dispatched.elapsed());
             }
@@ -505,17 +554,27 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        let head_reclaimed_after = head_reclaimed_after
+            .ok_or("the small topic's head was never answered: the queue did not hold it back")?;
         let head_failed_after = head_failed_after
-            .ok_or("the small topic's head never timed out: the queue did not hold it back")?;
+            .ok_or("the small topic's head never timed out on the replacement producer")?;
         tail_answered_after.ok_or(
             "the large topic's last record was never answered from the backlog: the small \
              records did not wait behind it",
         )?;
-        // Timed from its dispatch, it fails one delivery timeout later.
+        // Each attempt is answered within one delivery timeout of its dispatch:
+        // the first from the backlog, the second by the replacement
+        // producer's timeout, timed from that dispatch.
+        let timeout = Duration::from_millis(BACKLOG_DELIVERY_TIMEOUT_MS);
         assert!(
-            head_failed_after
-                < Duration::from_millis(BACKLOG_DELIVERY_TIMEOUT_MS) + Duration::from_secs(10),
-            "the head failed {head_failed_after:?} after its dispatch, more than the \
+            head_reclaimed_after < timeout,
+            "the head's first attempt was answered {head_reclaimed_after:?} after its \
+             dispatch, more than the delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
+        );
+        let second = head_failed_after.saturating_sub(head_reclaimed_after);
+        assert!(
+            second < timeout + Duration::from_secs(10),
+            "the head failed {second:?} after its second dispatch, more than the \
              delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
         );
         Ok::<(), Box<dyn std::error::Error>>(())
