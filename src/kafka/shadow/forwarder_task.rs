@@ -95,6 +95,15 @@
 //! `shadow_max_retries` cycles; the records behind it are not penalized, and
 //! the next one becomes the head once it is dead-lettered.
 //!
+//! The "fair window" is measured from a record's receipt, which includes its time
+//! in the backlog, not from its hand-off to a producer. A head that waited in the
+//! backlog and reached a producer late, seconds before its generation times out,
+//! is still charged when that generation's purge fails it. This is deliberate: a
+//! record that spent any time on a producer and was not delivered means its own
+//! broker or partition is unreachable (a healthy partition's records are delivered
+//! in milliseconds and are never purged), and in a persistent outage it brings the
+//! dead letter forward by at most one cycle of `shadow_max_retries`.
+//!
 //! Purging in-flight records cannot reorder a partition either: the old
 //! producer's in-flight requests may still be written by the broker (the purge
 //! only voids their acks), but the broker writes a producer's records in

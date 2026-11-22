@@ -38,7 +38,11 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    (`reconnect.backoff.ms`, up to `reconnect.backoff.max.ms`) until step 3. Keep the window between the restart and step 3
    short. The worker runs no maintenance in the meantime;
    `pg_kafka_run_retention_sweep()` still works from SQL (row by row on the
-   unpartitioned 0.0.0 `kafka.messages`).
+   unpartitioned 0.0.0 `kafka.messages`). Until step 3 runs, PUBLIC can still
+   execute it (the 0.0.0 schema predates the REVOKE), so any role could hold the
+   extension's lock in it and make `DROP EXTENSION` wait; step 3 revokes it and is
+   not blocked by such a caller. Run step 3 promptly, or `REVOKE EXECUTE ON FUNCTION
+   pg_kafka_run_retention_sweep(int, bigint) FROM PUBLIC` by hand first.
 
 3. In the database named by `pg_kafka.database`, run:
 
