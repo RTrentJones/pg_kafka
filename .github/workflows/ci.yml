@@ -220,7 +220,7 @@ jobs:
 
       - name: Shadow mode E2E tests
         if: matrix.pg == 14
-        # The category takes ~12-13 min locally (its slowest tests wait out delivery
+        # The category takes ~16 min locally (its slowest tests wait out delivery
         # timeouts and measure idle CPU); 25 leaves room for a slower runner.
         timeout-minutes: 25
         working-directory: kafka_test

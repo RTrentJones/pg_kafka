@@ -334,6 +334,14 @@ const BACKLOG_DELIVERY_TIMEOUT_MS: u64 = 100_000;
 /// The claim then takes them again while they are still held, counts a lost
 /// attempt for every one of them (not only the partition's head) and sends
 /// a second copy beside the first.
+///
+/// The small records must really wait in the backlog (not on the producer),
+/// or the test would pass without exercising it. The backlog is in arrival
+/// order, so they do if the large topic's last record was still there when
+/// they were dispatched: it is, if it was unanswered then and is answered
+/// (and claimed again) before the producer's generation times out (before
+/// the large topic's head counts a failed attempt), which only the backlog
+/// does, once less than a quarter of its delivery timeout is left.
 pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires(
 ) -> TestResult {
     const BIG: usize = 80;
@@ -359,6 +367,7 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
     )
     .await?;
     let small_id = topic_id(ctx.db(), &small_topic).await?;
+    let big_id = topic_id(ctx.db(), &big_topic).await?;
     let db = create_db_client().await?;
     alter_system(
         &db,
@@ -377,6 +386,9 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
         println!("Step 1: {BIG} records of {RECORD_BYTES} bytes fill the producer queue...");
         let producer = bulk_producer()?;
         let payload = vec![b'q'; RECORD_BYTES];
+        // No large record reaches the forwarder before this, so the generation
+        // holding them cannot time out before `big_started` + the timeout.
+        let big_started = Instant::now();
         for i in 0..BIG {
             producer
                 .send(
@@ -402,6 +414,35 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
                 .map_err(|(e, _)| format!("small record {i}: {e}"))?;
         }
         let dispatched = Instant::now();
+        // The large topic's last record and head: (retry_count, attempt_open,
+        // when it was last claimed).
+        let big_state = |offset: i64| {
+            let db = ctx.db();
+            async move {
+                let row = db
+                    .query_one(
+                        "SELECT retry_count, attempt_open, forwarded_at::text \
+                         FROM kafka.shadow_tracking WHERE topic_id = $1 AND local_offset = $2",
+                        &[&big_id, &offset],
+                    )
+                    .await?;
+                Ok::<(i32, bool, Option<String>), Box<dyn std::error::Error>>((
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                ))
+            }
+        };
+        let big_last = i64::try_from(BIG)? - 1;
+        let (tail_retries, tail_open, tail_claimed) = big_state(big_last).await?;
+        if tail_retries != 0 || !tail_open {
+            return Err(format!(
+                "the large topic's last record must still be held when the small records \
+                 are dispatched (retries {tail_retries}, attempt open {tail_open})"
+            )
+            .into());
+        }
+        let mut tail_answered_after = None;
 
         // The in-flight entries expire 150 s after the dispatch: watch a
         // little past that. Only the partition's head may count failed
@@ -427,6 +468,32 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
                 head_failed_after = Some(dispatched.elapsed());
                 println!("  head failed an attempt after {:?}", dispatched.elapsed());
             }
+            if tail_answered_after.is_none() && big_state(big_last).await?.2 != tail_claimed {
+                let (head_retries, _, _) = big_state(0).await?;
+                if head_retries != 0 {
+                    return Err(format!(
+                        "the large topic's last record was answered only with the producer's \
+                         generation (its head has {head_retries} failed attempt(s)): it was \
+                         not in the forwarder's backlog, so neither were the small records"
+                    )
+                    .into());
+                }
+                let since_big = big_started.elapsed();
+                let generation_timeout = Duration::from_millis(BACKLOG_DELIVERY_TIMEOUT_MS);
+                if since_big + Duration::from_secs(5) >= generation_timeout {
+                    return Err(format!(
+                        "the large topic's last record was answered {since_big:?} after the \
+                         first large record was sent, too late to tell the backlog's answer \
+                         from the generation's timeout ({generation_timeout:?})"
+                    )
+                    .into());
+                }
+                tail_answered_after = Some(dispatched.elapsed());
+                println!(
+                    "  the large topic's last record was answered from the backlog after {:?}",
+                    dispatched.elapsed()
+                );
+            }
             if retries[1..].iter().any(|&(_, n)| n > 0) {
                 return Err(format!(
                     "a record behind the partition's head counted a failed attempt after \
@@ -440,6 +507,10 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
         }
         let head_failed_after = head_failed_after
             .ok_or("the small topic's head never timed out: the queue did not hold it back")?;
+        tail_answered_after.ok_or(
+            "the large topic's last record was never answered from the backlog: the small \
+             records did not wait behind it",
+        )?;
         // Timed from its dispatch, it fails one delivery timeout later.
         assert!(
             head_failed_after
