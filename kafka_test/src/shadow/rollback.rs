@@ -120,10 +120,22 @@ pub async fn test_sync_forward_skips_rolled_back_request() -> TestResult {
     .map_err(|e| e.to_string());
 
     // Drop the trigger before asserting so a failure cannot leave it behind.
+    //
+    // kafka.messages is locked first: DROP TRIGGER on a partitioned table takes only
+    // ACCESS SHARE on the parent, then ACCESS EXCLUSIVE on each leaf's clone of the
+    // trigger, newest leaf first, while every worker statement reading through the
+    // parent locks the leaves oldest first. Racing such a statement (the outbox
+    // claim, Fetch, an offset probe) it deadlocks: the DROP holds a newer leaf and
+    // waits for an older one the worker holds, and the worker waits for the newer
+    // one. Holding the parent ACCESS EXCLUSIVE first, the DROP waits for the worker's
+    // transactions to end and then takes the leaves unopposed.
     ctx.db()
         .batch_execute(&format!(
-            "DROP TRIGGER IF EXISTS test_fail_partition_one_{topic_id} ON kafka.messages; \
-             DROP FUNCTION IF EXISTS {function}();"
+            "BEGIN; \
+             LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE; \
+             DROP TRIGGER IF EXISTS test_fail_partition_one_{topic_id} ON kafka.messages; \
+             DROP FUNCTION IF EXISTS {function}(); \
+             COMMIT;"
         ))
         .await?;
     let (codes, stored_after_failure, ok_code) = outcome?;

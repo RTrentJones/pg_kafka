@@ -170,6 +170,19 @@ Maintenance can run in the worker and, at the same time, in any session
   the same leaf, the second waits for the first's locks; afterwards
   `drop_message_partition` (and `message_partition_contents`) find the leaf gone and
   return `dropped = false` (NULL contents) instead of erroring on the vanished OID.
+* **Maintenance locks the parent before any leaf.** Every worker statement on
+  `kafka.messages` locks the parent first and then its leaves in bound order, and
+  `ensure_message_partitions` takes `ACCESS SHARE` on `kafka.messages` before it reads
+  `kafka.messages_default`: a leaf locked without the parent would close a cycle with a
+  session that holds the parent and waits for that leaf.
+* **Your own DDL on `kafka.messages`: lock the parent first.** `CREATE TRIGGER`,
+  `ALTER TABLE` and the like lock the parent before the leaves, but `DROP TRIGGER` on a
+  partitioned table takes only `ACCESS SHARE` on the parent, then `ACCESS EXCLUSIVE` on
+  each leaf (DEFAULT first, then newest first), so it can deadlock with any worker read
+  that spans leaves (Fetch, the outbox claim), and Postgres may abort the worker's request
+  rather than the DDL. Run such DDL as `BEGIN; LOCK TABLE kafka.messages IN ACCESS
+  EXCLUSIVE MODE; ...; COMMIT;`, which waits for the worker instead (as
+  `kafka_test/src/shadow/rollback.rs` does).
 * The worker's own lock waits are bounded by `pg_kafka.worker_lock_timeout_ms` (default
   5 s), which applies to these locks too.
 

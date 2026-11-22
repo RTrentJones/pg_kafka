@@ -425,6 +425,20 @@ BEGIN
         RAISE WARNING 'pg_kafka: partition maintenance skipped: another session holds the maintenance lock; will retry';
         RETURN 0;
     END IF;
+    -- kafka.messages before any of its leaves, the order every statement through the
+    -- parent takes them in: the reads of kafka.messages_default below lock only that
+    -- leaf, and a pass holding it without the parent then waits (in lock_message_tables)
+    -- for kafka.messages behind a session that already holds it ACCESS EXCLUSIVE and
+    -- waits for the leaf (LOCK TABLE kafka.messages, ALTER TABLE, partition DDL): a
+    -- lock cycle, which deadlock detection breaks by failing that session, or which
+    -- holds it until this pass's lock_timeout gives up the leaf. ACCESS SHARE on the
+    -- parent alone (ONLY) conflicts with no worker statement.
+    BEGIN
+        LOCK TABLE ONLY kafka.messages IN ACCESS SHARE MODE;
+    EXCEPTION WHEN lock_not_available THEN
+        RAISE WARNING 'pg_kafka: partition maintenance skipped: kafka.messages is locked (lock timeout); will retry';
+        RETURN 0;
+    END;
     -- Rows in the DEFAULT leaf are moved by some leaf of this pass, and a move needs the
     -- schema lock EXCLUSIVE (see create_message_partition). Queue for it here, bounded
     -- by lock_timeout, before any leaf locks kafka.messages: this transaction holds no
