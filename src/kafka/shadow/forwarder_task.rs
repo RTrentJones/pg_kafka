@@ -52,13 +52,25 @@
 //! partitions at once, so each partition restarts at its first undelivered
 //! record on a new producer.
 //!
+//! A record's clock starts when the forwarder receives it, not when librdkafka
+//! accepts it: the time it waits in the backlog (see Backpressure) counts, and a
+//! record still in the backlog when its timeout runs out is answered there
+//! ([`ForwarderCore::expire_backlog`]). Every record the DB thread dispatches is
+//! therefore answered within about [`DELIVERY_TIMEOUT`] of its dispatch, which
+//! the DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER` in `store.rs`)
+//! relies on: an entry evicted while its record was still held here would let
+//! the outbox claim the row again (counting a lost attempt that never failed)
+//! and send it a second time beside the first.
+//!
 //! Which of the purged records count as failed attempts: the lowest outstanding
 //! record of each local partition (the one the partition waits on) that has been
-//! outstanding for at least half the timeout. The records behind it are
-//! collateral (the fence would hold them back anyway), and so is a head that
-//! has not had a fair window yet (sent less than half a timeout ago, for
-//! example a healthy partition whose records were flowing). In a persistent
-//! outage every stuck partition's head is outstanding for close to a whole
+//! held for at least half the timeout. The records behind it are collateral
+//! (the fence would hold them back anyway), and so is a head that has not had a
+//! fair window yet (received less than half a timeout ago, for example a
+//! healthy partition whose records were flowing). A record that runs out of
+//! time in the backlog counts the same way: it fails if it is the first record
+//! its partition waits on, and is collateral behind an earlier failure. In a
+//! persistent outage every stuck partition's head is held for close to a whole
 //! timeout at each retirement (the outbox backoff, at most 30 s, is under half
 //! of it), so it fails once per cycle and is dead-lettered after
 //! `shadow_max_retries` cycles; the records behind it are not penalized, and
@@ -75,10 +87,10 @@
 //! ## Backpressure
 //!
 //! When librdkafka's local queue is full, the record and every later one wait,
-//! in order, in the forwarder's backlog, retried on a timer of their own. The
-//! loop keeps serving delivery reports, held-response timeouts, the ack flush
-//! and the settings check meanwhile, so a full queue delays only the records
-//! behind it.
+//! in order, in the forwarder's backlog, retried on a timer of their own (and
+//! answered there if the delivery timeout runs out first). The loop keeps
+//! serving delivery reports, held-response timeouts, the ack flush and the
+//! settings check meanwhile, so a full queue delays only the records behind it.
 //!
 //! ## Held sync-mode responses
 //!
@@ -116,6 +128,9 @@ const MAX_BACKLOG: usize = 16_384;
 const BRIDGE_POLL: Duration = Duration::from_millis(100);
 /// Hold ticks between checks for changed producer settings (~0.5 s).
 const SETTINGS_CHECK_TICKS: u64 = 25;
+/// Producer generations timed out per hold tick at most (more than one at
+/// once is rare: a producer replaced while it still holds records).
+const MAX_TIMEOUTS_PER_TICK: usize = 8;
 
 /// What to do with an incoming record.
 #[derive(Debug, PartialEq)]
@@ -130,7 +145,16 @@ pub(crate) enum Admit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Outstanding {
     generation: u64,
-    sent_at: Instant,
+    /// When the forwarder received it: the start of its delivery timeout.
+    received_at: Instant,
+}
+
+/// A record received from the DB thread, waiting in the backlog for room in
+/// librdkafka's queue, with when it was received (its delivery timeout runs
+/// from then).
+pub(crate) struct Queued {
+    pub(crate) record: ForwardRecord,
+    pub(crate) received_at: Instant,
 }
 
 struct HoldState {
@@ -151,7 +175,7 @@ pub(crate) struct ForwarderCore {
     /// change (its outstanding records were purged).
     collateral_generations: BTreeSet<u64>,
     /// Records handed to a producer whose delivery has not resolved, with the
-    /// generation that holds them and when they were handed over.
+    /// generation that holds them and when the forwarder received them.
     outstanding: HashMap<RowKey, Outstanding>,
     /// The same records, oldest first (the delivery timeout's queue).
     by_age: BTreeSet<(Instant, RowKey)>,
@@ -196,21 +220,54 @@ impl ForwarderCore {
         *fence = (*fence).min(key.local_offset);
     }
 
-    /// `key` was handed to the producer of `generation` at `now`.
-    pub(crate) fn sent(&mut self, key: RowKey, generation: u64, now: Instant) {
+    /// `key`, received at `received_at`, was handed to the producer of
+    /// `generation`. Its delivery timeout runs from `received_at`, so the time
+    /// it waited in the backlog counts.
+    pub(crate) fn sent(&mut self, key: RowKey, generation: u64, received_at: Instant) {
         let entry = Outstanding {
             generation,
-            sent_at: now,
+            received_at,
         };
         if let Some(old) = self.outstanding.insert(key, entry) {
-            self.by_age.remove(&(old.sent_at, key));
+            self.by_age.remove(&(old.received_at, key));
         }
-        self.by_age.insert((now, key));
+        self.by_age.insert((received_at, key));
     }
 
     fn resolved(&mut self, key: RowKey) {
         if let Some(old) = self.outstanding.remove(&key) {
-            self.by_age.remove(&(old.sent_at, key));
+            self.by_age.remove(&(old.received_at, key));
+        }
+    }
+
+    /// Answer every record at the front of `backlog` whose delivery timeout ran
+    /// out by `now` while it waited for room in librdkafka's queue (see the
+    /// module docs). The backlog is in the order the records were received, so
+    /// these are a prefix of it. A record behind an earlier failure of its
+    /// partition is collateral; otherwise it is the record its partition waits
+    /// on and its attempt failed: it fences its partition, so the records behind
+    /// it wait for its retry.
+    pub(crate) fn expire_backlog(
+        &mut self,
+        backlog: &mut VecDeque<Queued>,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        while let Some(queued) = backlog.pop_front() {
+            if now.saturating_duration_since(queued.received_at) < timeout {
+                backlog.push_front(queued);
+                return;
+            }
+            let key = queued.record.row;
+            if self.admit(&queued.record) == Admit::Fenced {
+                self.not_attempted(key, "an earlier record of the partition failed");
+                continue;
+            }
+            self.fence(key);
+            self.acks.push_back(ForwardAck::new(
+                key,
+                ForwardOutcome::Failed(format!("not delivered within {timeout:?}")),
+            ));
         }
     }
 
@@ -218,13 +275,13 @@ impl ForwarderCore {
     /// `now`, if any. Generations already retired are skipped: their records
     /// were purged and resolve on their own.
     pub(crate) fn expired_generation(&self, now: Instant, timeout: Duration) -> Option<u64> {
-        let (sent_at, key) = self.by_age.iter().find(|(_, key)| {
+        let (received_at, key) = self.by_age.iter().find(|(_, key)| {
             self.outstanding
                 .get(key)
                 .is_some_and(|o| !self.collateral_generations.contains(&o.generation))
         })?;
         let generation = self.outstanding.get(key)?.generation;
-        (now.saturating_duration_since(*sent_at) >= timeout).then_some(generation)
+        (now.saturating_duration_since(*received_at) >= timeout).then_some(generation)
     }
 
     /// `generation` ran out of delivery time at `now`: fence its partitions,
@@ -236,14 +293,14 @@ impl ForwarderCore {
             if o.generation != generation {
                 continue;
             }
-            let head = heads.entry(key.partition()).or_insert((key, o.sent_at));
+            let head = heads.entry(key.partition()).or_insert((key, o.received_at));
             if key.local_offset < head.0.local_offset {
-                *head = (key, o.sent_at);
+                *head = (key, o.received_at);
             }
         }
         let reason = format!("not delivered within {timeout:?}");
-        for (key, sent_at) in heads.into_values() {
-            if now.saturating_duration_since(sent_at) >= timeout / 2 {
+        for (key, received_at) in heads.into_values() {
+            if now.saturating_duration_since(received_at) >= timeout / 2 {
                 self.timed_out.insert(key, (generation, reason.clone()));
             }
         }
@@ -618,7 +675,7 @@ pub(crate) async fn run_shadow_forwarder(
     let mut tick = tokio::time::interval(HOLD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut backlog: VecDeque<ForwardRecord> = VecDeque::new();
+    let mut backlog: VecDeque<Queued> = VecDeque::new();
     loop {
         if !core.flush_acks(&ack_tx) {
             info!("Forward ack channel closed, stopping shadow forwarder");
@@ -630,10 +687,13 @@ pub(crate) async fn run_shadow_forwarder(
                     info!("Forward channel disconnected, stopping shadow forwarder");
                     break;
                 };
+                let received_at = Instant::now();
                 for message in batch {
                     match message {
-                        ForwardRequest::Hold(hold) => core.add_hold(hold, Instant::now()),
-                        ForwardRequest::Record(record) => backlog.push_back(record),
+                        ForwardRequest::Hold(hold) => core.add_hold(hold, received_at),
+                        ForwardRequest::Record(record) => {
+                            backlog.push_back(Queued { record, received_at });
+                        }
                     }
                 }
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
@@ -654,9 +714,17 @@ pub(crate) async fn run_shadow_forwarder(
                 let now = Instant::now();
                 core.expire_holds(now);
                 let timeout = delivery_timeout(&runtime_context.config());
-                if let Some(generation) = core.expired_generation(now, timeout) {
+                // A retired generation is skipped by the next lookup; bounded
+                // well below the retired generations `ForwarderCore` keeps.
+                for _ in 0..MAX_TIMEOUTS_PER_TICK {
+                    let Some(generation) = core.expired_generation(now, timeout) else {
+                        break;
+                    };
                     slot.time_out(&mut core, generation, now, timeout);
                 }
+                // After the generations, so a record behind a timed-out one
+                // of its partition is collateral, not a second failure.
+                core.expire_backlog(&mut backlog, now, timeout);
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
                 // A settings change rebuilds the producer (and purges its
                 // outstanding records) even when no new record arrives to
@@ -710,15 +778,15 @@ fn bridge_requests(
 /// Hand the backlog to the producer, in order, until it is empty or
 /// librdkafka's queue is full (the rest then waits for the next attempt).
 fn pump(
-    backlog: &mut VecDeque<ForwardRecord>,
+    backlog: &mut VecDeque<Queued>,
     runtime_context: &crate::kafka::RuntimeContext,
     core: &mut ForwarderCore,
     slot: &mut ProducerSlot,
     deliveries: &mut Deliveries,
 ) {
-    while let Some(record) = backlog.pop_front() {
-        if let Some(record) = forward_one(record, runtime_context, core, slot, deliveries) {
-            backlog.push_front(record);
+    while let Some(queued) = backlog.pop_front() {
+        if let Some(queued) = forward_one(queued, runtime_context, core, slot, deliveries) {
+            backlog.push_front(queued);
             return;
         }
     }
@@ -727,12 +795,13 @@ fn pump(
 /// Send one record (or answer it without sending). Returns the record when
 /// librdkafka's queue is full, so it is retried before any later record.
 fn forward_one(
-    record: ForwardRecord,
+    queued: Queued,
     runtime_context: &crate::kafka::RuntimeContext,
     core: &mut ForwarderCore,
     slot: &mut ProducerSlot,
     deliveries: &mut Deliveries,
-) -> Option<ForwardRecord> {
+) -> Option<Queued> {
+    let record = &queued.record;
     let key = record.row;
     let config = runtime_context.config();
     if !config.shadow_mode_enabled || config.shadow_bootstrap_servers.is_empty() {
@@ -750,13 +819,13 @@ fn forward_one(
     };
     // Checked on every attempt: a record that waited for queue room is fenced
     // if an earlier record of its partition failed meanwhile.
-    if core.admit(&record) == Admit::Fenced {
+    if core.admit(record) == Admit::Fenced {
         core.not_attempted(key, "an earlier record of the partition failed");
         return None;
     }
-    match producer.enqueue(&record) {
+    match producer.enqueue(record) {
         Ok(future) => {
-            core.sent(key, generation, Instant::now());
+            core.sent(key, generation, queued.received_at);
             // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
             // production): delay the ack past the outbox retry lease. Only
             // this delivery's own future waits; the pipeline keeps going.
@@ -783,7 +852,7 @@ fn forward_one(
         Err(EnqueueError::QueueFull) => {
             // Backpressure: serve librdkafka's callbacks so its queue drains.
             producer.poll(Duration::ZERO);
-            Some(record)
+            Some(queued)
         }
         Err(EnqueueError::Refused(e)) => {
             let fatal = producer.fatal_error().is_some();
@@ -1071,6 +1140,200 @@ mod tests {
         assert_eq!(core.expired_generation(t0 + TIMEOUT, TIMEOUT), None);
         core.on_result(RowKey::new(1, 0, 1), 2, Ok(0), false);
         assert!(core.by_age.is_empty() && core.outstanding.is_empty());
+    }
+
+    fn queued(p: i32, o: i64, received_at: Instant) -> Queued {
+        Queued {
+            record: rec(p, o, false),
+            received_at,
+        }
+    }
+
+    /// The in-flight eviction of the DB thread (`INFLIGHT_EVICT_AFTER`).
+    const EVICT: Duration = Duration::from_secs(150);
+
+    /// A record that waited in the backlog behind a full queue keeps the time
+    /// it waited: once it reaches a replacement producer it times out at its
+    /// arrival + the timeout, not a whole timeout after it got room. Timed
+    /// from the enqueue it would stay outstanding until about two timeouts
+    /// after its dispatch (240 s), past the DB thread's in-flight eviction
+    /// (150 s), and the outbox would claim and send it a second time.
+    #[test]
+    fn a_record_that_waited_in_the_backlog_keeps_its_arrival_as_its_deadline() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        // Partition 0 fills the queue of generation 1; partition 1 waits.
+        core.sent(RowKey::new(1, 0, 1), 1, t0);
+        let mut backlog = VecDeque::from([queued(1, 1, t0 + secs(1)), queued(1, 2, t0 + secs(1))]);
+        let now = t0 + TIMEOUT;
+        assert_eq!(core.expired_generation(now, TIMEOUT), Some(1));
+        core.time_out_generation(1, now, TIMEOUT);
+        core.expire_backlog(&mut backlog, now, TIMEOUT);
+        assert_eq!(backlog.len(), 2, "1 s of their timeout is left");
+        // Generation 2 takes them (forward_one passes the arrival time).
+        for q in backlog.drain(..) {
+            assert_eq!(core.admit(&q.record), Admit::Send);
+            core.sent(q.record.row, 2, q.received_at);
+        }
+        let deadline = t0 + secs(1) + TIMEOUT;
+        assert_eq!(
+            core.expired_generation(
+                t0 + secs(1) + TIMEOUT.saturating_sub(Duration::from_millis(1)),
+                TIMEOUT
+            ),
+            None
+        );
+        assert_eq!(core.expired_generation(deadline, TIMEOUT), Some(2));
+        assert!(deadline - (t0 + secs(1)) < EVICT);
+        core.time_out_generation(2, deadline, TIMEOUT);
+        core.on_result(RowKey::new(1, 1, 2), 2, Err("purged".into()), true);
+        core.on_result(RowKey::new(1, 1, 1), 2, Err("purged".into()), true);
+        let got = outcomes(&mut core);
+        assert!(
+            matches!(got[0].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert_eq!(
+            got[1].1,
+            ForwardOutcome::Failed("not delivered within 120s".into()),
+            "the partition's head waited a whole timeout: a failed attempt"
+        );
+    }
+
+    /// A record whose timeout runs out while it still waits in the backlog is
+    /// answered there: the first record a partition waits on fails and fences
+    /// the partition, the records behind it (or behind an earlier failure)
+    /// are collateral, and younger records keep waiting.
+    #[test]
+    fn a_record_whose_timeout_runs_out_in_the_backlog_is_answered_there() {
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        // Partition 2 already waits for the retry of its offset 1.
+        core.on_result(RowKey::new(1, 2, 1), 1, Err("boom".into()), false);
+        outcomes(&mut core);
+        let mut backlog = VecDeque::from([
+            queued(0, 5, t0),
+            queued(0, 6, t0),
+            queued(2, 4, t0),
+            queued(1, 3, t0 + secs(10)),
+        ]);
+        core.expire_backlog(
+            &mut backlog,
+            t0 + TIMEOUT.saturating_sub(Duration::from_millis(1)),
+            TIMEOUT,
+        );
+        assert!(core.acks.is_empty());
+        assert_eq!(backlog.len(), 4);
+        core.expire_backlog(&mut backlog, t0 + TIMEOUT, TIMEOUT);
+        let got = outcomes(&mut core);
+        assert_eq!(
+            got[0],
+            (
+                RowKey::new(1, 0, 5),
+                ForwardOutcome::Failed("not delivered within 120s".into())
+            )
+        );
+        assert!(
+            matches!(got[1].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert!(
+            matches!(got[2].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert_eq!(got.len(), 3);
+        assert_eq!(backlog.len(), 1, "partition 1's record has 10 s left");
+        // Partition 0 restarts at 5, not at a later record.
+        assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
+        assert_eq!(core.admit(&rec(1, 3, false)), Admit::Send);
+    }
+
+    /// A persistent outage behind a queue that holds only a few records:
+    /// whatever waits in the backlog, every record the DB thread dispatches is
+    /// answered within the timeout of its arrival (plus the 20 ms check), so
+    /// before its in-flight entry is evicted. A model of the forwarder's loop
+    /// (`pump`, the tick's timeout checks, the purge) over the real core.
+    #[test]
+    fn every_record_is_answered_within_the_timeout_of_its_arrival() {
+        const QUEUE: usize = 3;
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut generation = 1u64;
+        let mut backlog: VecDeque<Queued> = VecDeque::new();
+        // Row -> when it was dispatched (the DB thread's in-flight entry).
+        let mut dispatched: HashMap<RowKey, Instant> = HashMap::new();
+        // Row -> when it may be dispatched again (the outbox backoff).
+        let mut due: Vec<(RowKey, Instant)> = (0..4)
+            .flat_map(|p| (0..5).map(move |o| (RowKey::new(1, p, o), t0)))
+            .collect();
+        let mut longest = Duration::ZERO;
+        while now < t0 + TIMEOUT * 10 {
+            // The DB thread dispatches the due rows, partition by partition.
+            due.sort_by_key(|(k, _)| *k);
+            let (ready, later): (Vec<_>, Vec<_>) = due.drain(..).partition(|&(_, at)| at <= now);
+            due = later;
+            for (key, _) in ready {
+                dispatched.insert(key, now);
+                backlog.push_back(Queued {
+                    record: rec(key.partition_id, key.local_offset, false),
+                    received_at: now,
+                });
+            }
+            // The tick.
+            while let Some(g) = core.expired_generation(now, TIMEOUT) {
+                core.time_out_generation(g, now, TIMEOUT);
+                let purged: Vec<RowKey> = core
+                    .outstanding
+                    .iter()
+                    .filter(|(_, o)| o.generation == g)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for key in purged {
+                    core.on_result(key, g, Err("purged".into()), true);
+                }
+                generation += 1;
+            }
+            core.expire_backlog(&mut backlog, now, TIMEOUT);
+            // `pump`: nothing is ever delivered, so the queue only frees up
+            // when its generation is purged.
+            while let Some(q) = backlog.pop_front() {
+                if core.admit(&q.record) == Admit::Fenced {
+                    core.not_attempted(q.record.row, "fenced");
+                    continue;
+                }
+                let on_queue = core
+                    .outstanding
+                    .values()
+                    .filter(|o| o.generation == generation)
+                    .count();
+                if on_queue == QUEUE {
+                    backlog.push_front(q);
+                    break;
+                }
+                core.sent(q.record.row, generation, q.received_at);
+            }
+            // The acks reach the DB thread; a failed row backs off 1 s.
+            for (key, outcome) in outcomes(&mut core) {
+                let started = dispatched.remove(&key).expect("one answer per dispatch");
+                longest = longest.max(now - started);
+                let backoff = if matches!(outcome, ForwardOutcome::Failed(_)) {
+                    secs(1)
+                } else {
+                    Duration::ZERO
+                };
+                due.push((key, now + backoff));
+            }
+            now += HOLD_TICK;
+        }
+        println!("longest attempt: {longest:?}");
+        assert!(longest >= TIMEOUT, "the queue must have held records back");
+        assert!(
+            longest <= TIMEOUT + HOLD_TICK,
+            "an attempt took {longest:?}"
+        );
+        assert!(longest < EVICT);
     }
 
     #[test]

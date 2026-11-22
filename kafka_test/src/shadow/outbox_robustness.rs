@@ -3,6 +3,9 @@
 //! - one topic's backlog does not starve another topic's records;
 //! - a full librdkafka queue holds back only the records behind it, not the
 //!   sync-mode response timeouts;
+//! - a record that waits behind a full queue is answered within the delivery
+//!   timeout of its dispatch, so its in-flight entry never expires while it is
+//!   still held (no lost attempt counted, no second copy sent);
 //! - the transaction-timeout sweep drops the forward buffers of the
 //!   transactions it aborts;
 //! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
@@ -311,6 +314,151 @@ pub async fn test_shadow_full_producer_queue_does_not_block_sync_timeouts() -> T
     // Delete the topics (and their outbox rows) before the real cluster is back.
     ctx.cleanup().await?;
     alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_sync_timeout_ms").await?;
+    restore_bootstrap_servers(&db).await?;
+    result?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Shortened shadow delivery timeout for the backlog test: long enough that a
+/// record timed from its enqueue (up to two timeouts after its dispatch) would
+/// outlive the DB thread's in-flight eviction (150 s), which is fixed.
+const BACKLOG_DELIVERY_TIMEOUT_MS: u64 = 100_000;
+
+/// With the external cluster unreachable, one topic's records fill
+/// librdkafka's queue and another topic's records wait in the forwarder's
+/// backlog. Their delivery timeout must run from their dispatch, backlog
+/// included: timed from the enqueue, they would reach the replacement
+/// producer when the first producer times out and stay outstanding for
+/// another whole timeout, past the DB thread's in-flight eviction (150 s).
+/// The claim then takes them again while they are still held, counts a lost
+/// attempt for every one of them (not only the partition's head) and sends
+/// a second copy beside the first.
+pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires(
+) -> TestResult {
+    const BIG: usize = 80;
+    const RECORD_BYTES: usize = 900_000;
+    const SMALL: usize = 3;
+    println!(
+        "=== Test: backlogged records are answered before their in-flight entry expires ===\n"
+    );
+    let ctx = TestContext::new().await?;
+    let big_topic = ctx.unique_topic("shadow-fill-queue").await;
+    let small_topic = ctx.unique_topic("shadow-behind-queue").await;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &big_topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &small_topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let small_id = topic_id(ctx.db(), &small_topic).await?;
+    let db = create_db_client().await?;
+    alter_system(
+        &db,
+        "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '127.0.0.1:1'",
+    )
+    .await?;
+    alter_system(
+        &db,
+        &format!(
+            "ALTER SYSTEM SET pg_kafka.test_shadow_delivery_timeout_ms = {BACKLOG_DELIVERY_TIMEOUT_MS}"
+        ),
+    )
+    .await?;
+
+    let result = async {
+        println!("Step 1: {BIG} records of {RECORD_BYTES} bytes fill the producer queue...");
+        let producer = bulk_producer()?;
+        let payload = vec![b'q'; RECORD_BYTES];
+        for i in 0..BIG {
+            producer
+                .send(
+                    FutureRecord::<(), _>::to(&big_topic)
+                        .payload(&payload[..])
+                        .partition(0),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| format!("big record {i}: {e}"))?;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("Step 2: {SMALL} records of another topic wait behind them...");
+        for i in 0..SMALL {
+            producer
+                .send(
+                    FutureRecord::<(), _>::to(&small_topic)
+                        .payload("small")
+                        .partition(0),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|(e, _)| format!("small record {i}: {e}"))?;
+        }
+        let dispatched = Instant::now();
+
+        // The in-flight entries expire 150 s after the dispatch: watch a
+        // little past that. Only the partition's head may count failed
+        // attempts; a lost attempt counted by a claim of a still-held record
+        // shows on the records behind it too.
+        let watch = Duration::from_secs(165);
+        println!("Step 3: watch the retry counts for {watch:?}...");
+        let mut head_failed_after = None;
+        while dispatched.elapsed() < watch {
+            let rows = ctx
+                .db()
+                .query(
+                    "SELECT local_offset, retry_count FROM kafka.shadow_tracking \
+                     WHERE topic_id = $1 ORDER BY local_offset",
+                    &[&small_id],
+                )
+                .await?;
+            let retries: Vec<(i64, i32)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+            if retries.len() != SMALL {
+                return Err(format!("expected {SMALL} outbox rows, got {retries:?}").into());
+            }
+            if head_failed_after.is_none() && retries[0].1 > 0 {
+                head_failed_after = Some(dispatched.elapsed());
+                println!("  head failed an attempt after {:?}", dispatched.elapsed());
+            }
+            if retries[1..].iter().any(|&(_, n)| n > 0) {
+                return Err(format!(
+                    "a record behind the partition's head counted a failed attempt after \
+                     {:?} (its in-flight entry expired while the forwarder still held it): \
+                     {retries:?}",
+                    dispatched.elapsed()
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let head_failed_after = head_failed_after
+            .ok_or("the small topic's head never timed out: the queue did not hold it back")?;
+        // Timed from its dispatch, it fails one delivery timeout later.
+        assert!(
+            head_failed_after
+                < Duration::from_millis(BACKLOG_DELIVERY_TIMEOUT_MS) + Duration::from_secs(10),
+            "the head failed {head_failed_after:?} after its dispatch, more than the \
+             delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+
+    // Delete the topics (and their outbox rows) before the real cluster is back.
+    ctx.cleanup().await?;
+    alter_system(
+        &db,
+        "ALTER SYSTEM RESET pg_kafka.test_shadow_delivery_timeout_ms",
+    )
+    .await?;
     restore_bootstrap_servers(&db).await?;
     result?;
     println!("✅ Test PASSED\n");

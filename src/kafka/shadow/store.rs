@@ -126,10 +126,15 @@ const MAX_ACKS_PER_TICK: usize = 20_000;
 
 /// How long an in-flight forward blocks re-dispatch of its outbox row before
 /// the entry is presumed lost and evicted. Sized above the forwarder's delivery
-/// timeout (`shadow::producer::DELIVERY_TIMEOUT`, 120 s), after which every send
-/// has produced a delivery report; an entry older than this means the ack
-/// itself was lost (forwarder crash) and the row is claimed again, counting the
-/// lost attempt.
+/// timeout (`shadow::producer::DELIVERY_TIMEOUT`, 120 s), which runs from when
+/// the forwarder receives the record, so it covers the time the record waits in
+/// the forwarder's backlog for room in librdkafka's queue as well as its time on
+/// a producer: by then every dispatched record has been answered. An entry older
+/// than this means the ack itself was lost (forwarder crash) and the row is
+/// claimed again, counting the lost attempt. The margin covers the channel hops
+/// and the forwarder's 20 ms timeout check; were an entry evicted while its
+/// record was still held by the forwarder, the claim would count an attempt
+/// that never failed and send the record a second time beside the first.
 const INFLIGHT_EVICT_AFTER: Duration = Duration::from_secs(150);
 const _: () = assert!(
     INFLIGHT_EVICT_AFTER.as_secs() > super::producer::DELIVERY_TIMEOUT.as_secs(),

@@ -8,8 +8,9 @@
 //! its ack, and the claim counts that lost attempt as a failure.
 //!
 //! Delivery stays at-least-once: entries are evicted after `evict_after`
-//! (sized above the forwarder's delivery timeout, after which a delivery report,
-//! success or failure, has been produced), so a genuinely
+//! (sized above the forwarder's delivery timeout, which runs from when the
+//! forwarder receives the record, backlog included, so by then the forwarder has
+//! answered it, success or failure), so a genuinely
 //! lost ack (network-thread crash) only delays the re-claim, never prevents it.
 //! The tracker is in memory: a worker restart forgets it, and the open
 //! attempts in the table drive recovery.

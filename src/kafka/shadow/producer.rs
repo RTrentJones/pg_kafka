@@ -51,11 +51,12 @@ const PRODUCER_REQUEST_TIMEOUT_MS: &str = "30000";
 /// retry. The forwarder enforces [`DELIVERY_TIMEOUT`] itself instead, failing
 /// every record outstanding on the producer at once (see `forwarder_task`).
 const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "0";
-/// How long a record may stay undelivered on a producer before the forwarder
-/// fails it together with every other record outstanding on that producer.
-/// One outbox attempt therefore resolves (delivered or failed) within about
-/// this long, which the DB thread's in-flight eviction (`INFLIGHT_EVICT_AFTER`,
-/// 150 s) relies on. `pg_kafka.test_shadow_delivery_timeout_ms` shortens it for
+/// How long a record may stay undelivered after the forwarder received it
+/// (waiting in its backlog for queue room, then on a producer) before the
+/// forwarder fails it, together with every other record outstanding on that
+/// producer. One outbox attempt therefore resolves (delivered or failed) within
+/// about this long of its dispatch, which the DB thread's in-flight eviction
+/// (`INFLIGHT_EVICT_AFTER`, 150 s) relies on. `pg_kafka.test_shadow_delivery_timeout_ms` shortens it for
 /// tests.
 pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// librdkafka's local queue, in KiB (its default is 1 GiB). The queue lives in

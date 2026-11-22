@@ -84,6 +84,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_max_retries_refuses_zero: sequential,
         outbox_robustness::test_shadow_backlog_does_not_starve_other_topics: sequential,
         outbox_robustness::test_shadow_full_producer_queue_does_not_block_sync_timeouts: sequential,
+        outbox_robustness::test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires: sequential, // Mutates shadow_bootstrap_servers, test_shadow_delivery_timeout_ms
         outbox_robustness::test_shadow_timed_out_transaction_buffer_is_dropped: sequential,
         outbox_robustness::test_shadow_ack_application_error_loses_no_ack: sequential,
         outbox_robustness::test_shadow_failed_tick_commit_loses_no_ack: sequential,
