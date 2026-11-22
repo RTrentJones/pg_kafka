@@ -1,6 +1,7 @@
 //! Time-partitioned `kafka.messages` and retention by dropping whole time partitions
 //! (ADR-001).
 
+mod drop_extension;
 mod lock_order;
 mod lock_races;
 mod sweep_concurrency;
@@ -20,6 +21,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lock_races::test_wide_maintenance_moving_default_rows_under_load: sequential,
         lock_races::test_rows_reaching_default_during_leaf_lock_wait: sequential,
         lock_order::test_partition_maintenance_locks_parent_before_leaves: sequential,
+        drop_extension::test_partition_maintenance_vs_drop_extension: sequential,
+        drop_extension::test_retention_sweep_waits_for_drop_extension_first: sequential,
         sweep_concurrency::test_concurrent_sweeps_and_maintenance_do_not_deadlock: sequential,
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
     ]

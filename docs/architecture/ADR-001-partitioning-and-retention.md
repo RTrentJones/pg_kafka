@@ -106,6 +106,25 @@ timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dro
 Maintenance can run in the worker and, at the same time, in any session
 (`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`). The rules:
 
+* **Everything that locks member tables takes the extension lock first.** `DROP EXTENSION
+  pg_kafka` takes `ACCESS EXCLUSIVE` on the extension object and then locks its members
+  one by one (the schema `kafka`, then `kafka.topics`, ..., `kafka.messages`), and partition
+  DDL locks the extension too (`CREATE TABLE` in schema `kafka` locks the schema, `ALTER
+  EXTENSION ... ADD/DROP TABLE` the extension). A pass that held a member table when DROP
+  started (maintenance takes `ACCESS SHARE` on `kafka.messages` first, a sweep deletes rows)
+  and then needed one DROP already held formed a lock cycle, and Postgres aborted DROP or
+  the pass with `deadlock detected`. So every worker transaction and both SQL functions
+  (`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`) start with
+  `ACCESS SHARE` on the extension object (`worker::txn::lock_extension`), before any table
+  lock: a pass either waits for a DROP in progress (bounded by the session's `lock_timeout`;
+  if the extension is gone afterwards, the function fails) or makes DROP wait until it
+  commits; the pass's own `ALTER EXTENSION ... ADD/DROP TABLE` (`SHARE UPDATE EXCLUSIVE`)
+  then never waits for DROP. The SQL functions do not take the schema lock: they serialize
+  with the worker's maintenance through the maintenance lock, and a move takes it EXCLUSIVE
+  as below. `kafka.ensure_message_partitions` and `kafka.drop_message_partition` called
+  directly (only superusers and `pgkafka_worker` may) cannot take the extension lock from
+  SQL, so they keep the deadlock with a concurrent DROP EXTENSION: operators call the
+  `pg_kafka_run_*` functions instead.
 * **Moving rows out of the DEFAULT leaf never overlaps a worker transaction.** The move
   (`DELETE` from `kafka.messages_default` + `INSERT` into the new leaf, in
   `create_message_partition`) would otherwise race the worker's UPDATEs of `kafka.messages`

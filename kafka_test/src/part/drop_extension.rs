@@ -1,0 +1,190 @@
+//! The SQL maintenance functions against a concurrent DROP EXTENSION: they lock the
+//! extension object before any member table, as every worker transaction does.
+
+use super::lock_order::{backend_pid, drop_furthest_leaf, wait_until};
+use crate::common::TestResult;
+use crate::worker::{boxed, into_test_result, session, wait_for_serving_listener, SendResult};
+use std::time::Duration;
+use tokio_postgres::Client;
+
+/// What a backend waits for: the relation, the catalog of a database object
+/// (`pg_extension`), or the lock type.
+const WAITS_FOR: &str = "SELECT CASE locktype WHEN 'relation' THEN relation::regclass::text
+                                              WHEN 'object' THEN classid::regclass::text
+                                              ELSE locktype END
+                         FROM pg_locks WHERE pid = $1 AND NOT granted";
+
+const WAITING: &str = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)";
+
+async fn waits_for(db: &Client, pid: i32) -> SendResult<Option<String>> {
+    Ok(db
+        .query_opt(WAITS_FOR, &[&pid])
+        .await
+        .map_err(boxed)?
+        .map(|r| r.get(0)))
+}
+
+/// `pg_kafka_run_partition_maintenance()` must take the extension lock before any
+/// member table. DROP EXTENSION locks the extension and then its members (kafka.topics
+/// before kafka.messages); the pass locked ONLY kafka.messages ACCESS SHARE first and
+/// then waited (in `lock_message_tables`) for kafka.topics, so a DROP that arrived in
+/// between took kafka.topics and waited for kafka.messages: a lock cycle, which
+/// Postgres broke with "deadlock detected" in DROP (or, had the pass got to its
+/// `ALTER EXTENSION ... ADD TABLE`, which locks the extension, in either).
+///
+/// The race, made deterministic: the worker's furthest leaf ahead is dropped so the
+/// pass has one to create, and a session holds kafka.topics ROW EXCLUSIVE, so the pass
+/// stops in `lock_message_tables`. Then `BEGIN; DROP EXTENSION pg_kafka CASCADE;
+/// ROLLBACK` runs in another session, and kafka.topics is released.
+///
+/// Asserts: DROP waits for the extension object (the pass holds it), not for a member
+/// table; then the pass recreates the leaf and DROP succeeds (and is rolled back).
+pub async fn test_partition_maintenance_vs_drop_extension() -> TestResult {
+    into_test_result(maintenance_vs_drop().await)
+}
+
+async fn maintenance_vs_drop() -> SendResult<()> {
+    println!("=== Test: partition maintenance against a concurrent DROP EXTENSION ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    let leaf = drop_furthest_leaf(&db).await?;
+
+    let result = maintenance_race(&db).await;
+
+    // Whatever happened, leave the worker's layout as it was.
+    db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
+        .await
+        .map_err(boxed)?;
+    let (drop_waited_for, drop_result, created) = result?;
+
+    assert_eq!(
+        drop_waited_for.as_deref(),
+        Some("pg_extension"),
+        "DROP EXTENSION must wait for the pass's extension lock, not hold a member table \
+         the pass needs and wait for another"
+    );
+    drop_result.map_err(|e| format!("DROP EXTENSION failed: {e}"))?;
+    assert_eq!(created, Ok(1), "the pass must recreate {leaf}");
+    println!("✅ DROP EXTENSION waited for the pass, and both succeeded");
+    Ok(())
+}
+
+/// DROP's lock wait, DROP's outcome, the pass's outcome.
+type MaintenanceRace = (Option<String>, Result<(), String>, Result<i64, String>);
+
+async fn maintenance_race(db: &Client) -> SendResult<MaintenanceRace> {
+    let blocker = session().await?;
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE kafka.topics IN ROW EXCLUSIVE MODE")
+        .await
+        .map_err(boxed)?;
+    println!("Step 1: a session holds kafka.topics ROW EXCLUSIVE");
+
+    let maintainer = session().await?;
+    maintainer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let maintainer_pid = backend_pid(&maintainer).await?;
+    let pass = tokio::spawn(async move {
+        maintainer
+            .query_one("SELECT pg_kafka_run_partition_maintenance()", &[])
+            .await
+            .map(|r| r.get::<_, i64>(0))
+            .map_err(|e| format!("{e:?}"))
+    });
+    let stopped = wait_until(
+        db,
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted
+                        AND locktype = 'relation' AND relation = 'kafka.topics'::regclass)",
+        maintainer_pid,
+        Duration::from_secs(5),
+    )
+    .await?;
+    println!("Step 2: the pass waits for kafka.topics: {stopped}");
+
+    let dropper = session().await?;
+    dropper
+        .batch_execute("SET lock_timeout = '20s'; SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let dropper_pid = backend_pid(&dropper).await?;
+    let drop = tokio::spawn(async move {
+        dropper
+            .batch_execute("BEGIN; DROP EXTENSION pg_kafka CASCADE; ROLLBACK")
+            .await
+            .map_err(|e| format!("{e:?}"))
+    });
+    let drop_waited_for = if wait_until(db, WAITING, dropper_pid, Duration::from_secs(5)).await? {
+        waits_for(db, dropper_pid).await?
+    } else {
+        None
+    };
+    println!("Step 3: DROP EXTENSION waits for {drop_waited_for:?}");
+
+    blocker.batch_execute("COMMIT").await.map_err(boxed)?;
+    println!("Step 4: kafka.topics released");
+    let created = pass.await.map_err(boxed)?;
+    let drop_result = drop.await.map_err(boxed)?;
+    println!("Step 5: the pass returned {created:?}, DROP EXTENSION {drop_result:?}");
+    if !stopped {
+        return Err("the pass never waited for kafka.topics".into());
+    }
+    Ok((drop_waited_for, drop_result, created))
+}
+
+/// `pg_kafka_run_retention_sweep()` must take the extension lock before any member
+/// table too: a session holding an uncommitted DROP EXTENSION makes the sweep wait for
+/// the extension object, not for kafka.messages (which, with the extension, it would
+/// otherwise reach after taking the maintenance lock, the order that deadlocks with a
+/// DROP still walking the members). The DROP is rolled back and the sweep then runs.
+pub async fn test_retention_sweep_waits_for_drop_extension_first() -> TestResult {
+    into_test_result(sweep_vs_drop().await)
+}
+
+async fn sweep_vs_drop() -> SendResult<()> {
+    println!("=== Test: the retention sweep waits for DROP EXTENSION's extension lock ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+
+    let dropper = session().await?;
+    dropper
+        .batch_execute("SET lock_timeout = '10s'; BEGIN; DROP EXTENSION pg_kafka CASCADE")
+        .await
+        .map_err(boxed)?;
+    println!("Step 1: a session ran DROP EXTENSION pg_kafka CASCADE, uncommitted");
+
+    let sweeper = session().await?;
+    sweeper
+        .batch_execute("SET lock_timeout = '20s'; SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let sweeper_pid = backend_pid(&sweeper).await?;
+    let sweep = tokio::spawn(async move {
+        sweeper
+            .query("SELECT * FROM pg_kafka_run_retention_sweep()", &[])
+            .await
+            .map(|rows| rows.len())
+            .map_err(|e| format!("{e:?}"))
+    });
+    let waited = if wait_until(&db, WAITING, sweeper_pid, Duration::from_secs(5)).await? {
+        waits_for(&db, sweeper_pid).await?
+    } else {
+        None
+    };
+    println!("Step 2: the sweep waits for {waited:?}");
+
+    dropper.batch_execute("ROLLBACK").await.map_err(boxed)?;
+    println!("Step 3: DROP EXTENSION rolled back");
+    let swept = sweep.await.map_err(boxed)?;
+    println!("Step 4: the sweep returned {swept:?}");
+
+    assert_eq!(
+        waited.as_deref(),
+        Some("pg_extension"),
+        "the sweep must wait for the extension lock before locking any member table"
+    );
+    swept.map_err(|e| format!("the sweep failed: {e}"))?;
+    println!("✅ the sweep waited for the extension first, then ran");
+    Ok(())
+}

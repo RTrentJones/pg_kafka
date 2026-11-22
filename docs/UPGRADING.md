@@ -71,7 +71,9 @@ on a large `kafka.messages` requests fail retriably for most of it.
 
 `DROP EXTENSION pg_kafka` while the worker runs is safe too: every worker transaction
 first takes a share lock on the extension object, which DROP EXTENSION locks before any
-member table, so the two cannot deadlock. Once the extension is gone the worker keeps
+member table, so the two cannot deadlock. So do `pg_kafka_run_partition_maintenance()`
+and `pg_kafka_run_retention_sweep()` (ADR-001, "Concurrency with the worker and with manual
+maintenance"); call them in a transaction of their own. Once the extension is gone the worker keeps
 the Kafka port open, answers every request with the retriable `KAFKA_STORAGE_ERROR`,
 and resumes (partition maintenance, shadow configuration, role) as soon as `CREATE
 EXTENSION pg_kafka` has run, without a restart.

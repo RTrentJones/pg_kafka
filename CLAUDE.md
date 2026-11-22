@@ -407,7 +407,7 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 | **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
 | **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
-| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, maintenance locking kafka.messages before its leaves, EndTxn during the default-leaf move, offsets kept after retention empties a partition, concurrent sweeps against maintenance, the worker's sweep skipping while the maintenance lock is held, least privilege |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, maintenance locking kafka.messages before its leaves, maintenance and sweeps against a concurrent DROP EXTENSION, EndTxn during the default-leaf move, offsets kept after retention empties a partition, concurrent sweeps against maintenance, the worker's sweep skipping while the maintenance lock is held, least privilege |
 | **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane, heartbeats inside group-commit batches |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |

@@ -27,7 +27,7 @@ pub async fn test_partition_maintenance_locks_parent_before_leaves() -> TestResu
 }
 
 /// The worker's furthest leaf ahead, `[b + 2w, b + 3w)` for the current bucket `b`.
-async fn furthest_leaf(db: &Client) -> SendResult<Option<String>> {
+pub(super) async fn furthest_leaf(db: &Client) -> SendResult<Option<String>> {
     Ok(db
         .query_opt(
             "SELECT p.partition_oid::regclass::text
@@ -45,7 +45,12 @@ async fn furthest_leaf(db: &Client) -> SendResult<Option<String>> {
 
 /// Poll `sql` (one bool column, parameter `$1` = `pid`) until it is true or `limit`
 /// passes; returns whether it became true.
-async fn wait_until(db: &Client, sql: &str, pid: i32, limit: Duration) -> SendResult<bool> {
+pub(super) async fn wait_until(
+    db: &Client,
+    sql: &str,
+    pid: i32,
+    limit: Duration,
+) -> SendResult<bool> {
     let deadline = Instant::now() + limit;
     loop {
         if db.query_one(sql, &[&pid]).await.map_err(boxed)?.get(0) {
@@ -58,7 +63,7 @@ async fn wait_until(db: &Client, sql: &str, pid: i32, limit: Duration) -> SendRe
     }
 }
 
-async fn backend_pid(db: &Client) -> SendResult<i32> {
+pub(super) async fn backend_pid(db: &Client) -> SendResult<i32> {
     Ok(db
         .query_one("SELECT pg_backend_pid()", &[])
         .await
@@ -66,20 +71,17 @@ async fn backend_pid(db: &Client) -> SendResult<i32> {
         .get(0))
 }
 
-async fn parent_before_leaves() -> SendResult<()> {
-    println!("=== Test: partition maintenance locks kafka.messages before its leaves ===\n");
-    let db = session().await?;
-    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
-
-    // Step 0: give the pass a leaf to create. A pass first (right after a bucket
-    // boundary the worker may not have made the new furthest leaf yet); the drop
-    // returns false while the worker's own maintenance holds the maintenance lock.
-    let mut dropped = None;
+/// Step 0 of the tests that race a maintenance pass: give the pass a leaf to create by
+/// dropping the worker's furthest leaf ahead. A pass first (right after a bucket
+/// boundary the worker may not have made the new furthest leaf yet); the drop returns
+/// false while the worker's own maintenance holds the maintenance lock. Returns the
+/// dropped leaf.
+pub(super) async fn drop_furthest_leaf(db: &Client) -> SendResult<String> {
     for _ in 0..10 {
         db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
             .await
             .map_err(boxed)?;
-        let leaf = furthest_leaf(&db)
+        let leaf = furthest_leaf(db)
             .await?
             .ok_or("no leaf two widths ahead; did the worker run its partition maintenance?")?;
         let ok: bool = db
@@ -91,13 +93,20 @@ async fn parent_before_leaves() -> SendResult<()> {
             .map_err(boxed)?
             .get(0);
         if ok {
-            dropped = Some(leaf);
-            break;
+            println!("Step 0: dropped {leaf}; the next pass recreates it");
+            return Ok(leaf);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let leaf = dropped.ok_or("could not drop the furthest leaf ahead")?;
-    println!("Step 0: dropped {leaf}; the next pass recreates it");
+    Err("could not drop the furthest leaf ahead".into())
+}
+
+async fn parent_before_leaves() -> SendResult<()> {
+    println!("=== Test: partition maintenance locks kafka.messages before its leaves ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+
+    let leaf = drop_furthest_leaf(&db).await?;
 
     let result = race(&db).await;
 

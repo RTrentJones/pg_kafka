@@ -91,13 +91,39 @@ fn advisory_locktag(database: pg_sys::Oid, key: i64) -> pg_sys::LOCKTAG {
     }
 }
 
+/// Take `AccessShareLock` on the pg_kafka extension object, the first lock of every
+/// worker transaction and of the SQL maintenance functions (`pg_kafka_run_*` in
+/// `lib.rs`). DROP EXTENSION (and ALTER EXTENSION ... ADD/DROP, which partition
+/// maintenance runs for each leaf it creates or drops) lock it before touching any
+/// member, so a transaction that takes it before any member table never holds a member
+/// while DROP waits for it and vice versa (a lock-order deadlock). The wait is bounded
+/// by the session's `lock_timeout`. After the wait the extension is looked up again:
+/// returns its OID, or `None` if it does not exist or was dropped (or dropped and
+/// re-created) meanwhile.
+///
+/// Must be called inside a transaction; the lookups and the lock raise Postgres ERRORs.
+pub(crate) fn lock_extension() -> Option<pg_sys::Oid> {
+    let name = c"pg_kafka";
+    #[expect(clippy::cast_possible_wrap, reason = "lock modes are small constants")]
+    let access_share = pg_sys::AccessShareLock as pg_sys::LOCKMODE;
+    // SAFETY: called inside a transaction (the caller's contract); the catalog lookups
+    // and the lock call raise Postgres ERRORs, which the caller handles.
+    unsafe {
+        let oid = pg_sys::get_extension_oid(name.as_ptr(), true);
+        if oid == pg_sys::Oid::INVALID {
+            return None;
+        }
+        pg_sys::LockDatabaseObject(pg_sys::ExtensionRelationId, oid, 0, access_share);
+        // LockDatabaseObject processed the invalidations of whatever we waited for;
+        // look the extension up again with a fresh catalog snapshot.
+        pg_sys::InvalidateCatalogSnapshot();
+        (pg_sys::get_extension_oid(name.as_ptr(), true) == oid).then_some(oid)
+    }
+}
+
 /// Take the locks every worker transaction starts with, in this order:
 ///
-/// 1. `AccessShareLock` on the pg_kafka extension object. DROP EXTENSION (and ALTER
-///    EXTENSION ... ADD/DROP) lock it before touching any member, so the worker never
-///    holds a member table while DROP waits for it and vice versa (a lock-order
-///    deadlock). After the wait the extension is looked up again: if it was dropped (or
-///    dropped and re-created) meanwhile, report it gone.
+/// 1. `AccessShareLock` on the pg_kafka extension object ([`lock_extension`]).
 /// 2. The schema advisory lock ([`SCHEMA_LOCK_KEY`]) in SHARE mode: ALTER EXTENSION
 ///    UPDATE's script and the move of rows out of the DEFAULT leaf take it exclusive,
 ///    so neither overlaps a worker transaction (EndTxn's or DeleteRecords' statements
@@ -107,33 +133,25 @@ fn advisory_locktag(database: pg_sys::Oid, key: i64) -> pg_sys::LOCKTAG {
 /// Returns false if the extension does not exist, or was re-created since the worker
 /// initialised against it ([`KNOWN_EXTENSION_OID`]).
 fn lock_schema() -> bool {
-    let name = c"pg_kafka";
+    let Some(oid) = lock_extension() else {
+        return false;
+    };
+    let known = KNOWN_EXTENSION_OID.load(Ordering::SeqCst);
+    if known == 0 {
+        KNOWN_EXTENSION_OID.store(oid.to_u32(), Ordering::SeqCst);
+    } else if known != oid.to_u32() {
+        return false; // re-created since the worker initialised
+    }
     #[expect(clippy::cast_possible_wrap, reason = "lock modes are small constants")]
-    let (access_share, share) = (
-        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-        pg_sys::ShareLock as pg_sys::LOCKMODE,
+    let share = pg_sys::ShareLock as pg_sys::LOCKMODE;
+    let tag = advisory_locktag(
+        // SAFETY: MyDatabaseId is set once the worker connected to its database.
+        unsafe { pg_sys::MyDatabaseId },
+        SCHEMA_LOCK_KEY,
     );
-    // SAFETY: called inside a transaction (worker_transaction); the catalog lookups and
-    // lock calls raise Postgres ERRORs, which the caller's catch_unwind handles.
+    // SAFETY: inside the worker transaction; a lock wait ERROR (lock_timeout) is
+    // handled by worker_transaction's catch_unwind.
     unsafe {
-        let oid = pg_sys::get_extension_oid(name.as_ptr(), true);
-        if oid == pg_sys::Oid::INVALID {
-            return false;
-        }
-        pg_sys::LockDatabaseObject(pg_sys::ExtensionRelationId, oid, 0, access_share);
-        // LockDatabaseObject processed the invalidations of whatever we waited for;
-        // look the extension up again with a fresh catalog snapshot.
-        pg_sys::InvalidateCatalogSnapshot();
-        if pg_sys::get_extension_oid(name.as_ptr(), true) != oid {
-            return false;
-        }
-        let known = KNOWN_EXTENSION_OID.load(Ordering::SeqCst);
-        if known == 0 {
-            KNOWN_EXTENSION_OID.store(oid.to_u32(), Ordering::SeqCst);
-        } else if known != oid.to_u32() {
-            return false; // re-created since the worker initialised
-        }
-        let tag = advisory_locktag(pg_sys::MyDatabaseId, SCHEMA_LOCK_KEY);
         pg_sys::LockAcquire(&raw const tag, share, false, false);
     }
     true

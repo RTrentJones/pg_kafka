@@ -123,6 +123,7 @@ fn pg_kafka_run_retention_sweep(
         message_retention_hours.unwrap_or_else(|| config::MESSAGE_RETENTION_HOURS.get());
     let grace = std::time::Duration::from_secs(u64::try_from(aborted_grace_seconds).unwrap_or(0));
 
+    lock_extension_for_maintenance("pg_kafka_run_retention_sweep");
     let stats = PostgresStore::new()
         .run_retention_sweep(
             retention_hours,
@@ -155,14 +156,34 @@ fn pg_kafka_run_retention_sweep(
 /// retention interval. Returns the number of leaves created.
 ///
 /// * `partition_minutes`: NULL (default) uses `pg_kafka.message_partition_minutes`.
+///
+/// Like the sweep, call it in a transaction of its own: it takes the extension lock
+/// first ([`lock_extension_for_maintenance`]), which only helps while it holds no member
+/// table yet.
 #[pg_extern(volatile)]
 fn pg_kafka_run_partition_maintenance(partition_minutes: default!(Option<i32>, "NULL")) -> i64 {
     use crate::kafka::storage::postgres::PostgresStore;
 
     let minutes = partition_minutes.unwrap_or_else(|| config::MESSAGE_PARTITION_MINUTES.get());
+    lock_extension_for_maintenance("pg_kafka_run_partition_maintenance");
     PostgresStore::new()
         .ensure_time_partitions(minutes)
         .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_partition_maintenance failed: {}", e))
+}
+
+/// The first lock of the SQL maintenance functions, before any member table: the share
+/// lock on the extension object every worker transaction also starts with
+/// (`worker::txn::lock_extension`). DROP EXTENSION locks the extension and then its
+/// members, and the partition DDL runs ALTER EXTENSION ... ADD/DROP TABLE, which locks
+/// the extension too; a pass that already held kafka.messages when DROP took the
+/// extension would wait for DROP (for kafka.topics, or the extension itself) while DROP
+/// waited for kafka.messages: "deadlock detected" in one of them. Taken first, the
+/// pass waits for a DROP in progress (bounded by the session's `lock_timeout`) or makes
+/// DROP wait for it. A pass whose extension was dropped meanwhile fails.
+fn lock_extension_for_maintenance(function: &str) {
+    if worker::txn::lock_extension().is_none() {
+        pgrx::error!("{function}: the pg_kafka extension was dropped");
+    }
 }
 
 // The kafka schema, tables, roles and functions CREATE EXTENSION installs.

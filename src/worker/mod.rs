@@ -18,7 +18,7 @@ mod lifecycle;
 mod maintenance;
 mod network;
 mod schema;
-mod txn;
+pub(crate) mod txn;
 
 pub(crate) use lifecycle::WORKER_RESTART_INTERVAL;
 
