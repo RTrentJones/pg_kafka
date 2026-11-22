@@ -211,8 +211,8 @@ pub async fn test_external_only_mode() -> TestResult {
         .await?;
     println!("✅ Message found in external Kafka\n");
 
-    // 3b. Local DB: the record IS stored locally (durability / replay), unlike
-    // the old ExternalOnly which skipped the local write.
+    // 3b. Local DB: in external_only mode too the record IS stored locally
+    // (durability / replay).
     println!("Checking local database (stored for durability)...");
     assert_local_message_count(ctx.db(), &topic, 1).await?;
     println!("✅ Message stored locally\n");
@@ -227,13 +227,12 @@ pub async fn test_external_only_mode() -> TestResult {
     let mut received = 0;
     for _ in 0..5 {
         if let Some(Ok(_)) = consumer.poll(Duration::from_secs(1)) {
-            received += 1
+            received += 1;
         }
     }
     if received != 0 {
         return Err(format!(
-            "external-primary read suppression failed: pg_kafka returned {} message(s)",
-            received
+            "external-primary read suppression failed: pg_kafka returned {received} message(s)"
         )
         .into());
     }
@@ -311,10 +310,9 @@ pub async fn test_local_only_mode() -> TestResult {
 
 /// Test that a reload drops a DELETED topic config from the cache (SH-3)
 ///
-/// Regression: the in-memory topic config cache was only ever *updated* on
-/// reload, never cleared, so a `kafka.shadow_config` row that was DELETED kept
-/// forwarding forever. After the fix the cache is replaced on each successful
-/// reload, so a deleted topic stops forwarding (but is still stored locally).
+/// The in-memory topic config cache is replaced on each successful reload, not only
+/// updated, so a topic whose `kafka.shadow_config` row was DELETED stops forwarding (but
+/// is still stored locally).
 pub async fn test_reload_clears_deleted_topic_config() -> TestResult {
     println!("=== Test: Reload Clears Deleted Topic Config (SH-3) ===\n");
 
@@ -362,11 +360,11 @@ pub async fn test_reload_clears_deleted_topic_config() -> TestResult {
     println!("Step 4: Deleting shadow_config row and reloading...");
     ctx.db()
         .execute(
-            r#"
+            r"
             DELETE FROM kafka.shadow_config sc
             USING kafka.topics t
             WHERE sc.topic_id = t.id AND t.name = $1
-            "#,
+            ",
             &[&topic],
         )
         .await?;
@@ -459,13 +457,13 @@ pub async fn test_outbox_row_written_and_finalized() -> TestResult {
         let row = ctx
             .db()
             .query_one(
-                r#"
+                r"
                 SELECT COUNT(*) FILTER (WHERE st.external_offset IS NOT NULL) AS done,
                        COUNT(*) AS total
                 FROM kafka.shadow_tracking st
                 JOIN kafka.topics t ON t.id = st.topic_id
                 WHERE t.name = $1
-                "#,
+                ",
                 &[&topic],
             )
             .await?;

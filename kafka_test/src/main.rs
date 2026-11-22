@@ -29,6 +29,10 @@
 //!
 //! # List available tests
 //! cargo run --release -- --list
+//!
+//! # Per-test timeout (default 300 s); a hung or panicking test is reported
+//! # FAILED and the run continues
+//! cargo run --release -- --timeout-secs 120
 //! ```
 //!
 //! ## Exit Codes
@@ -36,272 +40,24 @@
 //! - 0: All tests passed
 //! - 1: One or more tests failed
 
-use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 
-// Import all test functions
-use kafka_test::{
-    // Transaction atomicity tests
-    test_abort_transaction_discards_pending_offsets,
-    // Shadow mode tests (Phase 11)
-    test_aborted_transaction_not_forwarded,
-    test_active_idempotent_producer_survives_retention_sweep,
-    test_add_partitions_to_txn_idempotent,
-    test_api_versions_above_range_negotiates_down,
-    // Protocol compliance tests (Phase 4)
-    test_api_versions_negotiation,
-    // Shadow outbox duplicate-delivery guard (issue #93)
-    test_async_forwarding_no_duplicates_on_slow_ack,
-    test_auto_create_rejects_invalid_topic_name,
-    // Edge case tests
-    test_batch_1000_messages,
-    // Producer tests
-    test_batch_produce,
-    // Performance tests
-    test_batch_vs_single_performance,
-    // Error path tests
-    test_commit_new_group,
-    test_commit_offset_zero,
-    test_commit_then_fetch_offset,
-    test_committed_transaction_forwarded,
-    test_committed_transaction_forwards_without_ram_buffer,
-    test_committed_transaction_uses_durable_outbox,
-    test_committed_txn_leaves_no_orphan_outbox_rows,
-    // Compression tests
-    test_compressed_producer_gzip,
-    test_compressed_producer_lz4,
-    test_compressed_producer_snappy,
-    test_compressed_producer_zstd,
-    test_compression_incompressible_data,
-    test_compression_mixed_formats,
-    test_compression_ratio_verification,
-    test_compression_roundtrip,
-    test_compression_small_message_overhead,
-    // Concurrent tests
-    test_concurrent_connection_scaling,
-    test_concurrent_producers_different_partitions,
-    test_concurrent_producers_same_topic,
-    test_concurrent_transactions_same_producer,
-    // Negative tests
-    test_connection_refused,
-    test_consume_empty_partition,
-    test_consume_empty_topic,
-    test_consume_throughput_baseline,
-    // Consumer tests
-    test_consumer_basic,
-    test_consumer_catches_up,
-    test_consumer_from_offset,
-    test_consumer_group_empty,
-    // Consumer group tests
-    test_consumer_group_lifecycle,
-    test_consumer_group_two_members,
-    test_consumer_multiple_messages,
-    test_consumer_receives_headers,
-    test_consumer_rejoin_after_leave,
-    test_coordinator_state_race,
-    test_correlation_id_preserved,
-    test_corrupt_acks0_produce_sends_no_reply,
-    // Admin tests
-    test_create_multiple_topics,
-    test_create_partitions,
-    test_create_partitions_cannot_decrease,
-    test_create_partitions_not_found,
-    test_create_topic,
-    test_create_topic_already_exists,
-    test_create_topic_invalid_name,
-    test_create_topic_invalid_partitions,
-    test_create_topic_with_config,
-    test_create_topics_default_and_zero_partitions,
-    test_delete_group_after_leave,
-    test_delete_group_empty,
-    test_delete_group_idempotent,
-    test_delete_group_non_empty,
-    test_delete_records_truncates_partition,
-    test_delete_topic,
-    test_delete_topic_not_found,
-    test_describe_configs_reports_topic_configs,
-    test_deterministic_routing,
-    test_dialup_0_percent,
-    test_dialup_100_percent,
-    test_dialup_10_percent,
-    test_dialup_25_percent,
-    test_dialup_50_percent,
-    test_dialup_75_percent,
-    test_dual_write_async,
-    test_dual_write_external_down,
-    test_dual_write_sync,
-    test_duplicate_consumer_join,
-    test_empty_group_id,
-    test_empty_vs_null_key_routing,
-    test_end_txn_retry_is_idempotent,
-    test_external_only_fallback,
-    test_external_only_mode,
-    test_external_primary_dead_letter_serves_local,
-    test_fenced_producer_cannot_write,
-    test_fetch_advertised_minimum_is_usable,
-    test_fetch_after_offset_reset,
-    test_fetch_bad_partition_or_offset_returns_error,
-    test_fetch_committed_no_history,
-    test_fetch_from_new_partition,
-    test_fetch_into_cleaned_up_aborted_rows_is_in_range,
-    test_fetch_invalid_partition,
-    test_fetch_isolation_level_enforcement,
-    // Offset management tests
-    test_fetch_offset_new_group,
-    test_fetch_offset_out_of_range,
-    test_fetch_respects_min_one_message,
-    test_fetch_uncommitted_offset,
-    test_fetch_unknown_topic,
-    test_fetch_with_deleted_topic,
-    test_fifty_percent_forwarding,
-    // Coordinator state tests
-    test_find_coordinator_bootstrap,
-    test_frame_budget_released_on_mid_frame_disconnect,
-    test_group_rebalance_keeps_old_generation_usable,
-    test_group_rejoin_race,
-    test_group_state_transitions,
-    test_headers_keep_their_order,
-    // Rebalancing edge case tests
-    test_heartbeat_after_leave,
-    test_heartbeat_bypasses_produce_backlog,
-    test_heartbeat_during_rebalance_window,
-    test_heartbeat_keeps_membership,
-    test_high_offset_values,
-    test_high_watermark_no_regress_after_cleanup,
-    test_huge_retention_ms_does_not_break_sweep,
-    test_hundred_percent_forwarding,
-    // Idempotent producer tests
-    test_idempotent_concurrent_producers,
-    test_idempotent_high_sequence,
-    test_idempotent_multi_partition,
-    test_idempotent_producer_basic,
-    test_idempotent_producer_epoch_bump,
-    test_idempotent_producer_restart,
-    test_incremental_alter_configs_retention_roundtrip,
-    test_invalid_group_id,
-    // Partition tests
-    test_key_distribution,
-    test_key_routing_across_producers,
-    test_key_routing_after_partition_expansion,
-    test_key_routing_deterministic,
-    test_large_batch_throughput,
-    test_large_key_routing,
-    test_large_message_key,
-    test_large_message_value,
-    test_large_value_compression,
-    test_leave_during_rebalance,
-    test_list_offsets_by_timestamp,
-    test_list_offsets_empty_topic,
-    test_local_only_mode,
-    // Long polling tests
-    test_long_poll_auto_commit_interval,
-    test_long_poll_consumer_disconnect,
-    test_long_poll_cpu_efficiency,
-    test_long_poll_immediate_return,
-    test_long_poll_min_bytes_threshold,
-    test_long_poll_multiple_consumers_same_partition,
-    test_long_poll_multiple_waiters,
-    test_long_poll_per_connection_task_cap,
-    test_long_poll_producer_wakeup,
-    test_long_poll_timeout,
-    test_long_poll_timeout_precision,
-    // Metadata API tests (Phase 4)
-    test_metadata_all_topics,
-    test_metadata_nonexistent_topic,
-    test_metadata_refresh_after_create,
-    test_multi_partition_produce,
-    test_multiple_concurrent_timeouts,
-    test_multiple_consumer_groups,
-    test_multiple_consumers_same_group,
-    test_null_key_distribution,
-    test_offset_boundaries,
-    test_offset_commit_fetch,
-    test_offset_commit_multi_partition,
-    test_offset_commit_race,
-    test_offset_commit_with_metadata,
-    test_offset_no_reuse_after_cleanup,
-    test_offset_reset_policy,
-    test_offset_seek,
-    test_offset_zero_boundary,
-    test_outbox_row_written_and_finalized,
-    test_partition_assignment_race,
-    test_partition_assignment_strategies,
-    test_partition_zero,
-    test_per_topic_retention_override_enforced_by_sweep,
-    test_produce_ack_implies_committed_visibility,
-    test_produce_any_partition,
-    test_produce_consume_race,
-    test_produce_empty_batch,
-    test_produce_invalid_partition,
-    test_produce_large_key,
-    test_produce_latency_percentiles,
-    test_produce_throughput_baseline,
-    test_produce_timeout,
-    test_produce_two_batches_in_one_partition_is_rejected,
-    test_produce_while_consuming,
-    test_producer,
-    test_producer_acks_zero,
-    // Transaction tests
-    test_producer_fencing,
-    test_producer_fencing_mid_transaction,
-    test_producer_id_reallocated_on_epoch_exhaustion,
-    test_producer_restart_new_epoch_records_are_stored,
-    test_producer_timestamp_roundtrip,
-    test_protocol_request_pipelining,
-    test_rapid_rebalance_cycles,
-    test_read_committed_after_commit,
-    test_read_committed_clamped_to_lso,
-    test_read_committed_filters_pending,
-    test_read_uncommitted_sees_pending,
-    test_rebalance_after_leave,
-    test_rebalance_mixed_timeout_values,
-    test_rebalance_with_minimal_session_timeout,
-    test_reinit_aborts_in_flight_transaction,
-    test_rejoin_after_leave,
-    test_reload_clears_deleted_topic_config,
-    test_replay_historical_messages,
-    test_replay_skips_aborted_records,
-    // Pipelining tests
-    test_request_pipelining,
-    test_response_ordering_with_long_poll,
-    // Retention sweep tests (DR-1/DR-2)
-    test_retention_sweep_expires_old_messages,
-    test_retention_sweep_reclaims_aborted_messages,
-    test_sasl_password_guc_is_superuser_only,
-    test_session_timeout_rebalance,
-    test_single_partition_topic,
-    test_special_character_key_routing,
-    test_timed_out_transaction_cannot_be_resumed,
-    test_topic_name_mapping,
-    test_transaction_boundary_isolation,
-    test_transaction_honors_per_txn_timeout_ms,
-    test_transaction_partial_failure_atomicity,
-    test_transaction_timeout_auto_abort,
-    test_transactional_batch,
-    test_transactional_producer_abort,
-    test_transactional_producer_commit,
-    test_true_deduplication_manual_replay,
-    test_txn_offset_commit,
-    test_txn_offset_commit_failure_reports_partition_errors,
-    test_txn_offset_commit_visibility_timing,
-    test_unknown_api_key_handling,
-    test_zero_percent_forwarding,
-};
-
-type TestFn = fn() -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>>;
+use kafka_test::registry::{TestDef, TestFn};
 
 /// CLI Arguments
 #[derive(Parser, Debug)]
 #[command(name = "kafka_test")]
 #[command(about = "pg_kafka E2E Test Suite")]
 #[command(version)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line flag"
+)]
 struct Args {
     /// Run only tests in this category
     #[arg(short, long)]
@@ -334,15 +90,11 @@ struct Args {
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
-}
 
-/// Test definition
-struct TestDef {
-    category: &'static str,
-    name: &'static str,
-    test_fn: TestFn,
-    /// Whether this test is safe to run in parallel
-    parallel_safe: bool,
+    /// Per-test timeout in seconds; a test still running after this is
+    /// aborted and reported FAILED
+    #[arg(long, default_value_t = DEFAULT_TEST_TIMEOUT_SECS)]
+    timeout_secs: u64,
 }
 
 /// Single test result
@@ -365,1418 +117,119 @@ struct CategoryResult {
     tests: Vec<TestResult>,
 }
 
+/// Format `time` as an RFC 3339 UTC timestamp with millisecond precision
+/// (`2026-11-19T22:57:41.269Z`). Days are converted to a civil date with Howard Hinnant's
+/// `civil_from_days` algorithm, valid for every date after 1970.
+fn rfc3339_utc(time: std::time::SystemTime) -> String {
+    let since_epoch = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since_epoch.as_secs();
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let z = i64::try_from(days).expect("days since 1970 fit in i64") + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        since_epoch.subsec_millis()
+    )
+}
+
 /// Suite result for JSON output
 #[derive(Debug, Serialize)]
 struct SuiteResult {
-    timestamp: DateTime<Utc>,
+    /// When the run finished, RFC 3339 in UTC.
+    timestamp: String,
     total_passed: usize,
     total_failed: usize,
     total_duration_ms: u64,
     categories: Vec<CategoryResult>,
 }
 
-/// Wrap async test functions for dynamic dispatch
-macro_rules! wrap_test {
-    ($fn:expr) => {
-        (|| -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send>> {
-            Box::pin($fn())
-        }) as TestFn
-    };
+/// Default per-test timeout. Generous: the slowest tests (performance,
+/// session-timeout rebalances, shadow dial-up) take well under a minute; this
+/// only exists so a hung test reports FAILED instead of stalling the run.
+const DEFAULT_TEST_TIMEOUT_SECS: u64 = 300;
+
+/// `d` in whole milliseconds (saturating; no test runs for 584 million years).
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Get all test definitions
-fn get_all_tests() -> Vec<TestDef> {
-    vec![
-        // Admin API tests
-        TestDef {
-            category: "admin",
-            name: "test_create_topic",
-            test_fn: wrap_test!(test_create_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_topic_already_exists",
-            test_fn: wrap_test!(test_create_topic_already_exists),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_topic",
-            test_fn: wrap_test!(test_delete_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_topic_not_found",
-            test_fn: wrap_test!(test_delete_topic_not_found),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_partitions",
-            test_fn: wrap_test!(test_create_partitions),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_partitions_cannot_decrease",
-            test_fn: wrap_test!(test_create_partitions_cannot_decrease),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_group_empty",
-            test_fn: wrap_test!(test_delete_group_empty),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_group_non_empty",
-            test_fn: wrap_test!(test_delete_group_non_empty),
-            parallel_safe: false, // Uses shared consumer group state
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_group_after_leave",
-            test_fn: wrap_test!(test_delete_group_after_leave),
-            parallel_safe: false, // Uses shared consumer group state
-        },
-        TestDef {
-            category: "admin",
-            name: "test_describe_configs_reports_topic_configs",
-            test_fn: wrap_test!(test_describe_configs_reports_topic_configs),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_incremental_alter_configs_retention_roundtrip",
-            test_fn: wrap_test!(test_incremental_alter_configs_retention_roundtrip),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_records_truncates_partition",
-            test_fn: wrap_test!(test_delete_records_truncates_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_per_topic_retention_override_enforced_by_sweep",
-            test_fn: wrap_test!(test_per_topic_retention_override_enforced_by_sweep),
-            parallel_safe: false, // Runs the global retention sweep
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_multiple_topics",
-            test_fn: wrap_test!(test_create_multiple_topics),
-            parallel_safe: true,
-        },
-        // Admin API edge case tests
-        TestDef {
-            category: "admin",
-            name: "test_create_topic_invalid_name",
-            test_fn: wrap_test!(test_create_topic_invalid_name),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_partitions_not_found",
-            test_fn: wrap_test!(test_create_partitions_not_found),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_delete_group_idempotent",
-            test_fn: wrap_test!(test_delete_group_idempotent),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_topic_with_config",
-            test_fn: wrap_test!(test_create_topic_with_config),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "admin",
-            name: "test_create_topic_invalid_partitions",
-            test_fn: wrap_test!(test_create_topic_invalid_partitions),
-            parallel_safe: true,
-        },
-        // Producer tests
-        TestDef {
-            category: "producer",
-            name: "test_producer",
-            test_fn: wrap_test!(test_producer),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "producer",
-            name: "test_batch_produce",
-            test_fn: wrap_test!(test_batch_produce),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "producer",
-            name: "test_producer_acks_zero",
-            test_fn: wrap_test!(test_producer_acks_zero),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "producer",
-            name: "test_produce_ack_implies_committed_visibility",
-            test_fn: wrap_test!(test_produce_ack_implies_committed_visibility),
-            parallel_safe: false, // Mutates global GUC (test_pre_commit_delay_ms)
-        },
-        TestDef {
-            category: "producer",
-            name: "test_producer_timestamp_roundtrip",
-            test_fn: wrap_test!(test_producer_timestamp_roundtrip),
-            parallel_safe: true,
-        },
-        // Consumer tests
-        TestDef {
-            category: "consumer",
-            name: "test_consumer_basic",
-            test_fn: wrap_test!(test_consumer_basic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer",
-            name: "test_consumer_receives_headers",
-            test_fn: wrap_test!(test_consumer_receives_headers),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer",
-            name: "test_consumer_multiple_messages",
-            test_fn: wrap_test!(test_consumer_multiple_messages),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer",
-            name: "test_consumer_from_offset",
-            test_fn: wrap_test!(test_consumer_from_offset),
-            parallel_safe: true,
-        },
-        // Offset management tests
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_commit_fetch",
-            test_fn: wrap_test!(test_offset_commit_fetch),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_boundaries",
-            test_fn: wrap_test!(test_offset_boundaries),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_no_reuse_after_cleanup",
-            test_fn: wrap_test!(test_offset_no_reuse_after_cleanup),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_high_watermark_no_regress_after_cleanup",
-            test_fn: wrap_test!(test_high_watermark_no_regress_after_cleanup),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_list_offsets_by_timestamp",
-            test_fn: wrap_test!(test_list_offsets_by_timestamp),
-            parallel_safe: true,
-        },
-        // Offset management edge case tests
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_commit_with_metadata",
-            test_fn: wrap_test!(test_offset_commit_with_metadata),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_fetch_offset_new_group",
-            test_fn: wrap_test!(test_fetch_offset_new_group),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_reset_policy",
-            test_fn: wrap_test!(test_offset_reset_policy),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_commit_multi_partition",
-            test_fn: wrap_test!(test_offset_commit_multi_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "offset_management",
-            name: "test_offset_seek",
-            test_fn: wrap_test!(test_offset_seek),
-            parallel_safe: true,
-        },
-        // Consumer group tests
-        TestDef {
-            category: "consumer_group",
-            name: "test_consumer_group_lifecycle",
-            test_fn: wrap_test!(test_consumer_group_lifecycle),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_rebalance_after_leave",
-            test_fn: wrap_test!(test_rebalance_after_leave),
-            parallel_safe: false, // Uses shared group state
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_session_timeout_rebalance",
-            test_fn: wrap_test!(test_session_timeout_rebalance),
-            parallel_safe: false, // Has sleep delays
-        },
-        // Rebalancing edge case tests
-        TestDef {
-            category: "consumer_group",
-            name: "test_rapid_rebalance_cycles",
-            test_fn: wrap_test!(test_rapid_rebalance_cycles),
-            parallel_safe: false, // Uses shared group state
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_heartbeat_during_rebalance_window",
-            test_fn: wrap_test!(test_heartbeat_during_rebalance_window),
-            parallel_safe: false, // Uses shared group state
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_multiple_concurrent_timeouts",
-            test_fn: wrap_test!(test_multiple_concurrent_timeouts),
-            parallel_safe: false, // Has sleep delays
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_rebalance_with_minimal_session_timeout",
-            test_fn: wrap_test!(test_rebalance_with_minimal_session_timeout),
-            parallel_safe: false, // Has sleep delays
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_rebalance_mixed_timeout_values",
-            test_fn: wrap_test!(test_rebalance_mixed_timeout_values),
-            parallel_safe: false, // Has sleep delays
-        },
-        // Coordinator state machine tests
-        TestDef {
-            category: "consumer_group",
-            name: "test_find_coordinator_bootstrap",
-            test_fn: wrap_test!(test_find_coordinator_bootstrap),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_partition_assignment_strategies",
-            test_fn: wrap_test!(test_partition_assignment_strategies),
-            parallel_safe: false, // Multiple consumers
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_leave_during_rebalance",
-            test_fn: wrap_test!(test_leave_during_rebalance),
-            parallel_safe: false, // Tests rebalance timing
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_heartbeat_keeps_membership",
-            test_fn: wrap_test!(test_heartbeat_keeps_membership),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "consumer_group",
-            name: "test_group_state_transitions",
-            test_fn: wrap_test!(test_group_state_transitions),
-            parallel_safe: true,
-        },
-        // Partition tests
-        TestDef {
-            category: "partition",
-            name: "test_multi_partition_produce",
-            test_fn: wrap_test!(test_multi_partition_produce),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_key_routing_deterministic",
-            test_fn: wrap_test!(test_key_routing_deterministic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_key_distribution",
-            test_fn: wrap_test!(test_key_distribution),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_null_key_distribution",
-            test_fn: wrap_test!(test_null_key_distribution),
-            parallel_safe: true,
-        },
-        // Partition routing edge cases
-        TestDef {
-            category: "partition",
-            name: "test_large_key_routing",
-            test_fn: wrap_test!(test_large_key_routing),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_special_character_key_routing",
-            test_fn: wrap_test!(test_special_character_key_routing),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_empty_vs_null_key_routing",
-            test_fn: wrap_test!(test_empty_vs_null_key_routing),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_key_routing_after_partition_expansion",
-            test_fn: wrap_test!(test_key_routing_after_partition_expansion),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "partition",
-            name: "test_key_routing_across_producers",
-            test_fn: wrap_test!(test_key_routing_across_producers),
-            parallel_safe: true,
-        },
-        // Error path tests
-        TestDef {
-            category: "error_paths",
-            name: "test_group_rebalance_keeps_old_generation_usable",
-            test_fn: wrap_test!(test_group_rebalance_keeps_old_generation_usable),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_headers_keep_their_order",
-            test_fn: wrap_test!(test_headers_keep_their_order),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_auto_create_rejects_invalid_topic_name",
-            test_fn: wrap_test!(test_auto_create_rejects_invalid_topic_name),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_end_txn_retry_is_idempotent",
-            test_fn: wrap_test!(test_end_txn_retry_is_idempotent),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_timed_out_transaction_cannot_be_resumed",
-            test_fn: wrap_test!(test_timed_out_transaction_cannot_be_resumed),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_huge_retention_ms_does_not_break_sweep",
-            test_fn: wrap_test!(test_huge_retention_ms_does_not_break_sweep),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_corrupt_acks0_produce_sends_no_reply",
-            test_fn: wrap_test!(test_corrupt_acks0_produce_sends_no_reply),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_produce_two_batches_in_one_partition_is_rejected",
-            test_fn: wrap_test!(test_produce_two_batches_in_one_partition_is_rejected),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_advertised_minimum_is_usable",
-            test_fn: wrap_test!(test_fetch_advertised_minimum_is_usable),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_api_versions_above_range_negotiates_down",
-            test_fn: wrap_test!(test_api_versions_above_range_negotiates_down),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fenced_producer_cannot_write",
-            test_fn: wrap_test!(test_fenced_producer_cannot_write),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_active_idempotent_producer_survives_retention_sweep",
-            test_fn: wrap_test!(test_active_idempotent_producer_survives_retention_sweep),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_producer_restart_new_epoch_records_are_stored",
-            test_fn: wrap_test!(test_producer_restart_new_epoch_records_are_stored),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_into_cleaned_up_aborted_rows_is_in_range",
-            test_fn: wrap_test!(test_fetch_into_cleaned_up_aborted_rows_is_in_range),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_bad_partition_or_offset_returns_error",
-            test_fn: wrap_test!(test_fetch_bad_partition_or_offset_returns_error),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_txn_offset_commit_failure_reports_partition_errors",
-            test_fn: wrap_test!(test_txn_offset_commit_failure_reports_partition_errors),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_create_topics_default_and_zero_partitions",
-            test_fn: wrap_test!(test_create_topics_default_and_zero_partitions),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_frame_budget_released_on_mid_frame_disconnect",
-            test_fn: wrap_test!(test_frame_budget_released_on_mid_frame_disconnect),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_unknown_topic",
-            test_fn: wrap_test!(test_fetch_unknown_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_invalid_partition",
-            test_fn: wrap_test!(test_fetch_invalid_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_offset_out_of_range",
-            test_fn: wrap_test!(test_fetch_offset_out_of_range),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_consume_empty_topic",
-            test_fn: wrap_test!(test_consume_empty_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_heartbeat_after_leave",
-            test_fn: wrap_test!(test_heartbeat_after_leave),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_rejoin_after_leave",
-            test_fn: wrap_test!(test_rejoin_after_leave),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_commit_new_group",
-            test_fn: wrap_test!(test_commit_new_group),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_empty_group_id",
-            test_fn: wrap_test!(test_empty_group_id),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_multiple_consumers_same_group",
-            test_fn: wrap_test!(test_multiple_consumers_same_group),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_commit_offset_zero",
-            test_fn: wrap_test!(test_commit_offset_zero),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_uncommitted_offset",
-            test_fn: wrap_test!(test_fetch_uncommitted_offset),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_commit_then_fetch_offset",
-            test_fn: wrap_test!(test_commit_then_fetch_offset),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_produce_invalid_partition",
-            test_fn: wrap_test!(test_produce_invalid_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_produce_any_partition",
-            test_fn: wrap_test!(test_produce_any_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_produce_empty_batch",
-            test_fn: wrap_test!(test_produce_empty_batch),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_produce_large_key",
-            test_fn: wrap_test!(test_produce_large_key),
-            parallel_safe: true,
-        },
-        // Fetch API edge case tests
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_respects_min_one_message",
-            test_fn: wrap_test!(test_fetch_respects_min_one_message),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_isolation_level_enforcement",
-            test_fn: wrap_test!(test_fetch_isolation_level_enforcement),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_after_offset_reset",
-            test_fn: wrap_test!(test_fetch_after_offset_reset),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_with_deleted_topic",
-            test_fn: wrap_test!(test_fetch_with_deleted_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "error_paths",
-            name: "test_fetch_from_new_partition",
-            test_fn: wrap_test!(test_fetch_from_new_partition),
-            parallel_safe: true,
-        },
-        // Edge case tests
-        TestDef {
-            category: "edge_cases",
-            name: "test_offset_zero_boundary",
-            test_fn: wrap_test!(test_offset_zero_boundary),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_partition_zero",
-            test_fn: wrap_test!(test_partition_zero),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_single_partition_topic",
-            test_fn: wrap_test!(test_single_partition_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_high_offset_values",
-            test_fn: wrap_test!(test_high_offset_values),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_consume_empty_partition",
-            test_fn: wrap_test!(test_consume_empty_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_list_offsets_empty_topic",
-            test_fn: wrap_test!(test_list_offsets_empty_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_fetch_committed_no_history",
-            test_fn: wrap_test!(test_fetch_committed_no_history),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_consumer_group_empty",
-            test_fn: wrap_test!(test_consumer_group_empty),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_large_message_key",
-            test_fn: wrap_test!(test_large_message_key),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_large_message_value",
-            test_fn: wrap_test!(test_large_message_value),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_batch_1000_messages",
-            test_fn: wrap_test!(test_batch_1000_messages),
-            parallel_safe: true,
-        },
-        // DR-1/DR-2: retention sweep — NOT parallel safe (the grace-0 aborted pass
-        // reclaims any aborted row, racing concurrent transaction tests)
-        TestDef {
-            category: "edge_cases",
-            name: "test_retention_sweep_reclaims_aborted_messages",
-            test_fn: wrap_test!(test_retention_sweep_reclaims_aborted_messages),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "edge_cases",
-            name: "test_retention_sweep_expires_old_messages",
-            test_fn: wrap_test!(test_retention_sweep_expires_old_messages),
-            parallel_safe: false,
-        },
-        // Concurrent tests - NOT parallel safe (they test concurrency themselves)
-        TestDef {
-            category: "concurrent",
-            name: "test_heartbeat_bypasses_produce_backlog",
-            test_fn: wrap_test!(test_heartbeat_bypasses_produce_backlog),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_concurrent_producers_same_topic",
-            test_fn: wrap_test!(test_concurrent_producers_same_topic),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_concurrent_producers_different_partitions",
-            test_fn: wrap_test!(test_concurrent_producers_different_partitions),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_multiple_consumer_groups",
-            test_fn: wrap_test!(test_multiple_consumer_groups),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_consumer_group_two_members",
-            test_fn: wrap_test!(test_consumer_group_two_members),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_consumer_rejoin_after_leave",
-            test_fn: wrap_test!(test_consumer_rejoin_after_leave),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_produce_while_consuming",
-            test_fn: wrap_test!(test_produce_while_consuming),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_consumer_catches_up",
-            test_fn: wrap_test!(test_consumer_catches_up),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_request_pipelining",
-            test_fn: wrap_test!(test_request_pipelining),
-            parallel_safe: true, // Uses its own connection
-        },
-        // Race condition tests
-        TestDef {
-            category: "concurrent",
-            name: "test_produce_consume_race",
-            test_fn: wrap_test!(test_produce_consume_race),
-            parallel_safe: false, // Tests concurrent access
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_offset_commit_race",
-            test_fn: wrap_test!(test_offset_commit_race),
-            parallel_safe: false, // Tests concurrent offset commits
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_coordinator_state_race",
-            test_fn: wrap_test!(test_coordinator_state_race),
-            parallel_safe: false, // Tests coordinator state
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_partition_assignment_race",
-            test_fn: wrap_test!(test_partition_assignment_race),
-            parallel_safe: false, // Tests partition assignment
-        },
-        TestDef {
-            category: "concurrent",
-            name: "test_group_rejoin_race",
-            test_fn: wrap_test!(test_group_rejoin_race),
-            parallel_safe: false, // Tests group membership
-        },
-        // Negative tests
-        TestDef {
-            category: "negative",
-            name: "test_sasl_password_guc_is_superuser_only",
-            test_fn: wrap_test!(test_sasl_password_guc_is_superuser_only),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "negative",
-            name: "test_connection_refused",
-            test_fn: wrap_test!(test_connection_refused),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "negative",
-            name: "test_produce_timeout",
-            test_fn: wrap_test!(test_produce_timeout),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "negative",
-            name: "test_invalid_group_id",
-            test_fn: wrap_test!(test_invalid_group_id),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "negative",
-            name: "test_duplicate_consumer_join",
-            test_fn: wrap_test!(test_duplicate_consumer_join),
-            parallel_safe: true,
-        },
-        // Performance tests - NOT parallel safe (measuring throughput)
-        TestDef {
-            category: "performance",
-            name: "test_produce_throughput_baseline",
-            test_fn: wrap_test!(test_produce_throughput_baseline),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "performance",
-            name: "test_consume_throughput_baseline",
-            test_fn: wrap_test!(test_consume_throughput_baseline),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "performance",
-            name: "test_batch_vs_single_performance",
-            test_fn: wrap_test!(test_batch_vs_single_performance),
-            parallel_safe: false,
-        },
-        // Performance regression tests
-        TestDef {
-            category: "performance",
-            name: "test_large_batch_throughput",
-            test_fn: wrap_test!(test_large_batch_throughput),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "performance",
-            name: "test_produce_latency_percentiles",
-            test_fn: wrap_test!(test_produce_latency_percentiles),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "performance",
-            name: "test_concurrent_connection_scaling",
-            test_fn: wrap_test!(test_concurrent_connection_scaling),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "performance",
-            name: "test_long_poll_cpu_efficiency",
-            test_fn: wrap_test!(test_long_poll_cpu_efficiency),
-            parallel_safe: false,
-        },
-        // Long polling tests (Phase 8)
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_immediate_return",
-            test_fn: wrap_test!(test_long_poll_immediate_return),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_per_connection_task_cap",
-            test_fn: wrap_test!(test_long_poll_per_connection_task_cap),
-            parallel_safe: false, // Floods one connection; sensitive to concurrent produce wakeups
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_timeout",
-            test_fn: wrap_test!(test_long_poll_timeout),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_producer_wakeup",
-            test_fn: wrap_test!(test_long_poll_producer_wakeup),
-            parallel_safe: false, // Tests timing-sensitive behavior
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_multiple_waiters",
-            test_fn: wrap_test!(test_long_poll_multiple_waiters),
-            parallel_safe: false, // Tests timing-sensitive behavior
-        },
-        // Long polling edge case tests
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_min_bytes_threshold",
-            test_fn: wrap_test!(test_long_poll_min_bytes_threshold),
-            parallel_safe: false, // Timing-sensitive
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_timeout_precision",
-            test_fn: wrap_test!(test_long_poll_timeout_precision),
-            parallel_safe: false, // Timing-sensitive
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_consumer_disconnect",
-            test_fn: wrap_test!(test_long_poll_consumer_disconnect),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_multiple_consumers_same_partition",
-            test_fn: wrap_test!(test_long_poll_multiple_consumers_same_partition),
-            parallel_safe: false, // Multiple consumers
-        },
-        TestDef {
-            category: "long_poll",
-            name: "test_long_poll_auto_commit_interval",
-            test_fn: wrap_test!(test_long_poll_auto_commit_interval),
-            parallel_safe: false, // Timing-sensitive
-        },
-        // Compression tests (Phase 8)
-        TestDef {
-            category: "compression",
-            name: "test_compressed_producer_gzip",
-            test_fn: wrap_test!(test_compressed_producer_gzip),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compressed_producer_snappy",
-            test_fn: wrap_test!(test_compressed_producer_snappy),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compressed_producer_lz4",
-            test_fn: wrap_test!(test_compressed_producer_lz4),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compressed_producer_zstd",
-            test_fn: wrap_test!(test_compressed_producer_zstd),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compression_roundtrip",
-            test_fn: wrap_test!(test_compression_roundtrip),
-            parallel_safe: true,
-        },
-        // Compression edge case tests
-        TestDef {
-            category: "compression",
-            name: "test_large_value_compression",
-            test_fn: wrap_test!(test_large_value_compression),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compression_mixed_formats",
-            test_fn: wrap_test!(test_compression_mixed_formats),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compression_ratio_verification",
-            test_fn: wrap_test!(test_compression_ratio_verification),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compression_incompressible_data",
-            test_fn: wrap_test!(test_compression_incompressible_data),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "compression",
-            name: "test_compression_small_message_overhead",
-            test_fn: wrap_test!(test_compression_small_message_overhead),
-            parallel_safe: true,
-        },
-        // Idempotent producer tests (Phase 9)
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_producer_basic",
-            test_fn: wrap_test!(test_idempotent_producer_basic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "idempotent",
-            name: "test_true_deduplication_manual_replay",
-            test_fn: wrap_test!(test_true_deduplication_manual_replay),
-            parallel_safe: true,
-        },
-        // Idempotent producer edge case tests
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_producer_epoch_bump",
-            test_fn: wrap_test!(test_idempotent_producer_epoch_bump),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_multi_partition",
-            test_fn: wrap_test!(test_idempotent_multi_partition),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_producer_restart",
-            test_fn: wrap_test!(test_idempotent_producer_restart),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_concurrent_producers",
-            test_fn: wrap_test!(test_idempotent_concurrent_producers),
-            parallel_safe: false, // Concurrent producers
-        },
-        TestDef {
-            category: "idempotent",
-            name: "test_idempotent_high_sequence",
-            test_fn: wrap_test!(test_idempotent_high_sequence),
-            parallel_safe: true,
-        },
-        // Transaction tests (Phase 10)
-        TestDef {
-            category: "transaction",
-            name: "test_transactional_producer_commit",
-            test_fn: wrap_test!(test_transactional_producer_commit),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_transactional_producer_abort",
-            test_fn: wrap_test!(test_transactional_producer_abort),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_transactional_batch",
-            test_fn: wrap_test!(test_transactional_batch),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_producer_fencing",
-            test_fn: wrap_test!(test_producer_fencing),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_read_committed_filters_pending",
-            test_fn: wrap_test!(test_read_committed_filters_pending),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_read_uncommitted_sees_pending",
-            test_fn: wrap_test!(test_read_uncommitted_sees_pending),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_read_committed_after_commit",
-            test_fn: wrap_test!(test_read_committed_after_commit),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_reinit_aborts_in_flight_transaction",
-            test_fn: wrap_test!(test_reinit_aborts_in_flight_transaction),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_read_committed_clamped_to_lso",
-            test_fn: wrap_test!(test_read_committed_clamped_to_lso),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_txn_offset_commit",
-            test_fn: wrap_test!(test_txn_offset_commit),
-            parallel_safe: true,
-        },
-        // Transaction atomicity edge case tests
-        TestDef {
-            category: "transaction",
-            name: "test_transaction_timeout_auto_abort",
-            test_fn: wrap_test!(test_transaction_timeout_auto_abort),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_concurrent_transactions_same_producer",
-            test_fn: wrap_test!(test_concurrent_transactions_same_producer),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_producer_fencing_mid_transaction",
-            test_fn: wrap_test!(test_producer_fencing_mid_transaction),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_add_partitions_to_txn_idempotent",
-            test_fn: wrap_test!(test_add_partitions_to_txn_idempotent),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_txn_offset_commit_visibility_timing",
-            test_fn: wrap_test!(test_txn_offset_commit_visibility_timing),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_abort_transaction_discards_pending_offsets",
-            test_fn: wrap_test!(test_abort_transaction_discards_pending_offsets),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_transaction_partial_failure_atomicity",
-            test_fn: wrap_test!(test_transaction_partial_failure_atomicity),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_transaction_boundary_isolation",
-            test_fn: wrap_test!(test_transaction_boundary_isolation),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_transaction_honors_per_txn_timeout_ms",
-            test_fn: wrap_test!(test_transaction_honors_per_txn_timeout_ms),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "transaction",
-            name: "test_producer_id_reallocated_on_epoch_exhaustion",
-            test_fn: wrap_test!(test_producer_id_reallocated_on_epoch_exhaustion),
-            parallel_safe: true,
-        },
-        // Shadow mode tests (Phase 11) - NOT parallel safe (uses external Kafka)
-        // Basic forwarding tests
-        TestDef {
-            category: "shadow",
-            name: "test_dual_write_sync",
-            test_fn: wrap_test!(test_dual_write_sync),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dual_write_async",
-            test_fn: wrap_test!(test_dual_write_async),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_async_forwarding_no_duplicates_on_slow_ack",
-            test_fn: wrap_test!(test_async_forwarding_no_duplicates_on_slow_ack),
-            parallel_safe: false, // Mutates global GUC (test_forward_ack_delay_ms)
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_external_only_mode",
-            test_fn: wrap_test!(test_external_only_mode),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_local_only_mode",
-            test_fn: wrap_test!(test_local_only_mode),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_reload_clears_deleted_topic_config",
-            test_fn: wrap_test!(test_reload_clears_deleted_topic_config),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_outbox_row_written_and_finalized",
-            test_fn: wrap_test!(test_outbox_row_written_and_finalized),
-            parallel_safe: false,
-        },
-        // Percentage routing tests
-        TestDef {
-            category: "shadow",
-            name: "test_zero_percent_forwarding",
-            test_fn: wrap_test!(test_zero_percent_forwarding),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_hundred_percent_forwarding",
-            test_fn: wrap_test!(test_hundred_percent_forwarding),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_fifty_percent_forwarding",
-            test_fn: wrap_test!(test_fifty_percent_forwarding),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_deterministic_routing",
-            test_fn: wrap_test!(test_deterministic_routing),
-            parallel_safe: false,
-        },
-        // Dial-up tests (high volume)
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_0_percent",
-            test_fn: wrap_test!(test_dialup_0_percent),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_10_percent",
-            test_fn: wrap_test!(test_dialup_10_percent),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_25_percent",
-            test_fn: wrap_test!(test_dialup_25_percent),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_50_percent",
-            test_fn: wrap_test!(test_dialup_50_percent),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_75_percent",
-            test_fn: wrap_test!(test_dialup_75_percent),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_dialup_100_percent",
-            test_fn: wrap_test!(test_dialup_100_percent),
-            parallel_safe: false,
-        },
-        // Topic mapping test
-        TestDef {
-            category: "shadow",
-            name: "test_topic_name_mapping",
-            test_fn: wrap_test!(test_topic_name_mapping),
-            parallel_safe: false,
-        },
-        // Transaction integration tests
-        TestDef {
-            category: "shadow",
-            name: "test_committed_transaction_forwards_without_ram_buffer",
-            test_fn: wrap_test!(test_committed_transaction_forwards_without_ram_buffer),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_committed_transaction_forwarded",
-            test_fn: wrap_test!(test_committed_transaction_forwarded),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_aborted_transaction_not_forwarded",
-            test_fn: wrap_test!(test_aborted_transaction_not_forwarded),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_committed_transaction_uses_durable_outbox",
-            test_fn: wrap_test!(test_committed_transaction_uses_durable_outbox),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_committed_txn_leaves_no_orphan_outbox_rows",
-            test_fn: wrap_test!(test_committed_txn_leaves_no_orphan_outbox_rows),
-            parallel_safe: false,
-        },
-        // Error handling tests
-        TestDef {
-            category: "shadow",
-            name: "test_dual_write_external_down",
-            test_fn: wrap_test!(test_dual_write_external_down),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_external_only_fallback",
-            test_fn: wrap_test!(test_external_only_fallback),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_external_primary_dead_letter_serves_local",
-            test_fn: wrap_test!(test_external_primary_dead_letter_serves_local),
-            parallel_safe: false,
-        },
-        // Replay test
-        TestDef {
-            category: "shadow",
-            name: "test_replay_historical_messages",
-            test_fn: wrap_test!(test_replay_historical_messages),
-            parallel_safe: false,
-        },
-        TestDef {
-            category: "shadow",
-            name: "test_replay_skips_aborted_records",
-            test_fn: wrap_test!(test_replay_skips_aborted_records),
-            parallel_safe: false,
-        },
-        // ==================== METADATA API TESTS (Phase 4) ====================
-        TestDef {
-            category: "metadata",
-            name: "test_metadata_all_topics",
-            test_fn: wrap_test!(test_metadata_all_topics),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "metadata",
-            name: "test_metadata_nonexistent_topic",
-            test_fn: wrap_test!(test_metadata_nonexistent_topic),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "metadata",
-            name: "test_metadata_refresh_after_create",
-            test_fn: wrap_test!(test_metadata_refresh_after_create),
-            parallel_safe: true,
-        },
-        // ==================== PROTOCOL COMPLIANCE TESTS (Phase 4) ====================
-        TestDef {
-            category: "protocol",
-            name: "test_api_versions_negotiation",
-            test_fn: wrap_test!(test_api_versions_negotiation),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "protocol",
-            name: "test_correlation_id_preserved",
-            test_fn: wrap_test!(test_correlation_id_preserved),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "protocol",
-            name: "test_unknown_api_key_handling",
-            test_fn: wrap_test!(test_unknown_api_key_handling),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "protocol",
-            name: "test_protocol_request_pipelining",
-            test_fn: wrap_test!(test_protocol_request_pipelining),
-            parallel_safe: true,
-        },
-        TestDef {
-            category: "protocol",
-            name: "test_response_ordering_with_long_poll",
-            test_fn: wrap_test!(test_response_ordering_with_long_poll),
-            parallel_safe: false, // timing-sensitive: asserts long-poll wait duration
-        },
-    ]
+/// `ms` milliseconds in seconds, for display.
+fn secs(ms: u64) -> f64 {
+    Duration::from_millis(ms).as_secs_f64()
+}
+
+/// Extract a readable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Run one test function in its own task, bounded by `timeout`.
+///
+/// The test runs in a spawned task so that a failed `assert!` (a panic) is
+/// caught by the task boundary and reported as a FAILED result with its
+/// message, instead of unwinding through the runner and aborting the whole
+/// suite with no summary. On timeout the task is aborted (at its next await
+/// point) and the test is reported FAILED. Returns `(passed, error)`.
+async fn execute_test_fn(test_fn: TestFn, timeout: Duration) -> (bool, Option<String>) {
+    // `Box<dyn Error>` is not `Send`, so stringify inside the task.
+    let handle = tokio::spawn(async move { (test_fn)().await.map_err(|e| e.to_string()) });
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(()))) => (true, None),
+        Ok(Ok(Err(e))) => (false, Some(e)),
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            let payload = join_err.into_panic();
+            (
+                false,
+                Some(format!("panicked: {}", panic_message(payload.as_ref()))),
+            )
+        }
+        Ok(Err(join_err)) => (false, Some(format!("test task failed: {join_err}"))),
+        Err(_) => {
+            abort.abort();
+            (
+                false,
+                Some(format!("timed out after {}s", timeout.as_secs_f64())),
+            )
+        }
+    }
 }
 
 /// Run a single test
-async fn run_single_test(test: &TestDef, verbose: bool) -> TestResult {
+async fn run_single_test(test: &TestDef, verbose: bool, timeout: Duration) -> TestResult {
     let start = Instant::now();
-    let future = (test.test_fn)();
-    let result = future.await;
+    let (passed, error) = execute_test_fn(test.test_fn, timeout).await;
     let duration = start.elapsed();
 
-    let (passed, error) = match result {
-        Ok(()) => (true, None),
-        Err(e) => {
-            if verbose {
-                println!("   Error: {}", e);
-            }
-            (false, Some(e.to_string()))
+    if verbose {
+        if let Some(ref e) = error {
+            println!("   Error: {e}");
         }
-    };
+    }
 
     TestResult {
         category: test.category.to_string(),
         name: test.name.to_string(),
         passed,
-        duration_ms: duration.as_millis() as u64,
+        duration_ms: millis(duration),
         error,
     }
 }
@@ -1801,6 +254,17 @@ fn print_test_list(tests: &[TestDef]) {
     }
 }
 
+/// Categories in registry order, each listed once
+fn unique_categories<'a>(tests: impl Iterator<Item = &'a TestDef>) -> Vec<&'static str> {
+    let mut categories: Vec<&'static str> = Vec::new();
+    for test in tests {
+        if !categories.contains(&test.category) {
+            categories.push(test.category);
+        }
+    }
+    categories
+}
+
 /// Print category header
 fn print_category_header(category: &str) {
     let upper = category.to_uppercase().replace('_', " ");
@@ -1819,14 +283,17 @@ fn print_text_summary(suite_result: &SuiteResult) {
         println!("{}:", cat.name);
         for test in &cat.tests {
             let status = if test.passed { "PASSED" } else { "FAILED" };
-            let duration = format!("({:.2}s)", test.duration_ms as f64 / 1000.0);
+            let duration = format!("({:.2}s)", secs(test.duration_ms));
             println!("  {} - {} {}", test.name, status, duration);
+            if let Some(error) = &test.error {
+                println!("      error: {error}");
+            }
         }
         println!(
             "  Category: {}/{} passed in {:.2}s\n",
             cat.passed,
             cat.passed + cat.failed,
-            cat.duration_ms as f64 / 1000.0
+            secs(cat.duration_ms)
         );
     }
 
@@ -1835,7 +302,7 @@ fn print_text_summary(suite_result: &SuiteResult) {
         "Total: {} passed, {} failed in {:.2}s",
         suite_result.total_passed,
         suite_result.total_failed,
-        suite_result.total_duration_ms as f64 / 1000.0
+        secs(suite_result.total_duration_ms)
     );
 
     if suite_result.total_failed == 0 {
@@ -1849,17 +316,19 @@ fn print_text_summary(suite_result: &SuiteResult) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let all_tests = get_all_tests();
+    let all_tests = kafka_test::all_tests();
 
     // Handle --list
     if args.list {
         println!("Available tests:\n");
         print_test_list(&all_tests);
-        println!("\nCategories: admin, producer, consumer, offset_management, consumer_group,");
+        let categories = unique_categories(all_tests.iter());
         println!(
-            "            partition, error_paths, edge_cases, concurrent, negative, performance,"
+            "\n{} tests in {} categories: {}",
+            all_tests.len(),
+            categories.len(),
+            categories.join(", ")
         );
-        println!("            long_poll, compression, idempotent, transaction, shadow");
         return Ok(());
     }
 
@@ -1890,10 +359,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if tests_to_run.is_empty() {
         eprintln!("No tests match the specified criteria");
         if let Some(ref cat) = args.category {
-            eprintln!("Category: {}", cat);
+            eprintln!("Category: {cat}");
         }
         if let Some(ref test_name) = args.test {
-            eprintln!("Test: {}", test_name);
+            eprintln!("Test: {test_name}");
         }
         std::process::exit(1);
     }
@@ -1923,7 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut attempts = 0;
     let max_attempts = 5;
     loop {
-        match kafka_test::setup::verify_server_ready().await {
+        match kafka_test::setup::verify_server_ready() {
             Ok(()) => {
                 if !args.json {
                     println!("OK");
@@ -1933,21 +402,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 attempts += 1;
                 if attempts >= max_attempts {
-                    eprintln!("FAILED after {} attempts: {}", max_attempts, e);
+                    eprintln!("FAILED after {max_attempts} attempts: {e}");
                     std::process::exit(1);
                 }
                 if !args.json {
-                    print!("retry {}... ", attempts);
+                    print!("retry {attempts}... ");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
 
     let suite_start = Instant::now();
+    let test_timeout = Duration::from_secs(args.timeout_secs);
 
-    let all_results: Vec<TestResult> = if !args.sequential {
+    let all_results: Vec<TestResult> = if args.sequential {
+        // Sequential execution mode (original behavior)
+        let mut results = Vec::new();
+        let mut current_category = "";
+
+        for test in &tests_to_run {
+            if test.category != current_category {
+                current_category = test.category;
+                if !args.json {
+                    print_category_header(current_category);
+                }
+            }
+
+            let result = run_single_test(test, args.verbose, test_timeout).await;
+            if !args.json {
+                let status = if result.passed { "PASSED" } else { "FAILED" };
+                let duration = format!("({:.2}s)", secs(result.duration_ms));
+                println!("  {} - {} {}", test.name, status, duration);
+            }
+            results.push(result);
+        }
+        results
+    } else {
         // Parallel execution mode
         let (parallel_tests, sequential_tests): (Vec<_>, Vec<_>) =
             tests_to_run.iter().partition(|t| t.parallel_safe);
@@ -1971,39 +463,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|test: &&TestDef| {
                 let sem = semaphore.clone();
                 let print_lock = print_mutex.clone();
-                let test_name = test.name.to_string();
-                let test_category = test.category.to_string();
-                let test_fn = test.test_fn;
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let start = Instant::now();
-                    let result: Result<(), Box<dyn std::error::Error>> = (test_fn)().await;
-                    let duration = start.elapsed();
-                    let (passed, error) = match result {
-                        Ok(()) => (true, None),
-                        Err(e) => (false, Some(e.to_string())),
-                    };
+                    let result = run_single_test(test, false, test_timeout).await;
 
                     // Print result atomically (one test at a time)
                     if !json_mode {
                         let _lock = print_lock.lock().await;
-                        let icon = if passed { "✓" } else { "✗" };
-                        let duration_str = format!("{:.2}s", duration.as_secs_f64());
-                        println!("  {} {} ({})", icon, test_name, duration_str);
-                        if !passed {
-                            if let Some(ref e) = error {
-                                eprintln!("    Error: {}", e);
-                            }
+                        let icon = if result.passed { "✓" } else { "✗" };
+                        let duration_str = format!("{:.2}s", secs(result.duration_ms));
+                        println!("  {} {} ({})", icon, result.name, duration_str);
+                        if let Some(ref e) = result.error {
+                            eprintln!("    Error: {e}");
                         }
                     }
 
-                    TestResult {
-                        category: test_category,
-                        name: test_name,
-                        passed,
-                        duration_ms: duration.as_millis() as u64,
-                        error,
-                    }
+                    result
                 }
             })
             .buffer_unordered(args.concurrency)
@@ -2017,10 +492,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut sequential_results: Vec<TestResult> = Vec::new();
         for test in sequential_tests {
-            let result = run_single_test(test, args.verbose).await;
+            let result = run_single_test(test, args.verbose, test_timeout).await;
             if !args.json {
                 let status = if result.passed { "PASSED" } else { "FAILED" };
-                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
+                let duration = format!("({:.2}s)", secs(result.duration_ms));
                 println!("  {} - {} {}", test.name, status, duration);
             }
             sequential_results.push(result);
@@ -2031,28 +506,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter()
             .chain(sequential_results)
             .collect()
-    } else {
-        // Sequential execution mode (original behavior)
-        let mut results = Vec::new();
-        let mut current_category = "";
-
-        for test in &tests_to_run {
-            if test.category != current_category {
-                current_category = test.category;
-                if !args.json {
-                    print_category_header(current_category);
-                }
-            }
-
-            let result = run_single_test(test, args.verbose).await;
-            if !args.json {
-                let status = if result.passed { "PASSED" } else { "FAILED" };
-                let duration = format!("({:.2}s)", result.duration_ms as f64 / 1000.0);
-                println!("  {} - {} {}", test.name, status, duration);
-            }
-            results.push(result);
-        }
-        results
     };
 
     // Group results by category
@@ -2066,17 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build category results in consistent order
-    let categories: Vec<&str> = tests_to_run
-        .iter()
-        .map(|t| t.category)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .fold(Vec::new(), |mut acc, cat| {
-            if !acc.contains(&cat) {
-                acc.push(cat);
-            }
-            acc
-        });
+    let categories = unique_categories(tests_to_run.iter().copied());
 
     let mut category_results: Vec<CategoryResult> = Vec::new();
     for cat in categories {
@@ -2099,10 +542,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_failed: usize = category_results.iter().map(|c| c.failed).sum();
 
     let suite_result = SuiteResult {
-        timestamp: Utc::now(),
+        timestamp: rfc3339_utc(std::time::SystemTime::now()),
         total_passed,
         total_failed,
-        total_duration_ms: suite_start.elapsed().as_millis() as u64,
+        total_duration_ms: millis(suite_start.elapsed()),
         categories: category_results,
     };
 
@@ -2119,4 +562,170 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    use kafka_test::registry::TestFuture;
+
+    macro_rules! wrap_test {
+        ($test:ident) => {
+            (|| -> TestFuture { Box::pin($test()) }) as TestFn
+        };
+    }
+
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
+    async fn passes() -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
+    async fn returns_err() -> Result<(), Box<dyn std::error::Error>> {
+        Err("expected failure".into())
+    }
+
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
+    async fn panics_with_str() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(1, 2, "assertion inside test");
+        Ok(())
+    }
+
+    #[expect(clippy::unused_async, reason = "a registered test is an async fn")]
+    async fn panics_with_static_str() -> Result<(), Box<dyn std::error::Error>> {
+        panic!("plain panic");
+    }
+
+    async fn hangs() -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(())
+    }
+
+    fn def(name: &'static str, test_fn: TestFn) -> TestDef {
+        TestDef {
+            category: "runner",
+            name,
+            test_fn,
+            parallel_safe: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn passing_test_is_passed() {
+        let r = run_single_test(
+            &def("ok", wrap_test!(passes)),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(r.passed);
+        assert!(r.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn err_is_failed_with_message() {
+        let r = run_single_test(
+            &def("err", wrap_test!(returns_err)),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(!r.passed);
+        assert_eq!(r.error.as_deref(), Some("expected failure"));
+    }
+
+    #[tokio::test]
+    async fn panic_is_failed_with_message_and_runner_survives() {
+        let r = run_single_test(
+            &def("panic", wrap_test!(panics_with_str)),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(!r.passed);
+        let e = r.error.expect("panic must produce an error message");
+        assert!(e.starts_with("panicked: "), "{e}");
+        assert!(e.contains("assertion inside test"), "{e}");
+
+        let r = run_single_test(
+            &def("panic2", wrap_test!(panics_with_static_str)),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(!r.passed);
+        assert_eq!(r.error.as_deref(), Some("panicked: plain panic"));
+
+        // The runner keeps going after a panic.
+        let r = run_single_test(
+            &def("ok", wrap_test!(passes)),
+            false,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(r.passed);
+    }
+
+    #[tokio::test]
+    async fn hang_is_failed_after_timeout() {
+        let start = Instant::now();
+        let r = run_single_test(
+            &def("hang", wrap_test!(hangs)),
+            false,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(!r.passed);
+        assert!(start.elapsed() < Duration::from_secs(10));
+        let e = r.error.expect("timeout must produce an error message");
+        assert!(e.starts_with("timed out after"), "{e}");
+    }
+
+    #[test]
+    fn categories_are_unique_and_ordered() {
+        let tests = [
+            TestDef {
+                category: "b",
+                ..def("1", wrap_test!(passes))
+            },
+            TestDef {
+                category: "a",
+                ..def("2", wrap_test!(passes))
+            },
+            TestDef {
+                category: "b",
+                ..def("3", wrap_test!(passes))
+            },
+        ];
+        assert_eq!(unique_categories(tests.iter()), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn registry_names_are_unique() {
+        let tests = kafka_test::all_tests();
+        let mut names: Vec<&str> = tests.iter().map(|t| t.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate test name in registry");
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::rfc3339_utc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn formats_known_instants_as_rfc3339_utc() {
+        for (secs, millis, expected) in [
+            (0, 0, "1970-01-01T00:00:00.000Z"),
+            (951_782_400, 5, "2000-02-29T00:00:00.005Z"),
+            (1_795_129_061, 269, "2026-11-19T22:57:41.269Z"),
+            (4_102_444_799, 999, "2099-12-31T23:59:59.999Z"),
+        ] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(millis);
+            assert_eq!(rfc3339_utc(t), expected);
+        }
+    }
 }

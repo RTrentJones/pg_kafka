@@ -5,7 +5,9 @@
 //! - REBALANCE_IN_PROGRESS error forces client to rejoin
 //! - Remaining consumers receive new assignments
 
-use crate::common::{create_producer, TestResult};
+use crate::common::{create_producer, get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
+use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
@@ -23,20 +25,21 @@ use std::time::Duration;
 pub async fn test_rebalance_after_leave() -> TestResult {
     println!("=== Test: Rebalance After Leave ===\n");
 
-    let topic = "rebalance-leave-test-topic";
-    let group_id = "rebalance-leave-test-group";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("rebalance-leave-test-topic").await;
+    let group_id = ctx.unique_group("rebalance-leave-test-group").await;
 
     // 1. Produce test messages
     println!("Step 1: Producing test messages...");
     let producer = create_producer()?;
 
     for i in 0..5 {
-        let value = format!("Rebalance test message {}", i);
+        let value = format!("Rebalance test message {i}");
         producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -47,15 +50,16 @@ pub async fn test_rebalance_after_leave() -> TestResult {
     // 2. Consumer 1 joins and consumes some messages
     println!("\nStep 2: Consumer 1 joining group and consuming...");
     let consumer1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create()?;
 
-    consumer1.subscribe(&[topic])?;
+    let consumer1 = Member::new(consumer1);
+    consumer1.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 1 subscribed");
 
     // Consume at least one message to ensure group is active
@@ -74,33 +78,34 @@ pub async fn test_rebalance_after_leave() -> TestResult {
                 );
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 1 error: {}", e);
+                println!("   ⚠️  Consumer 1 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
             }
         }
     }
-    println!("✅ Consumer 1 received {} messages", received);
+    println!("✅ Consumer 1 received {received} messages");
 
     // 3. Consumer 1 leaves group (triggers LeaveGroup API)
     println!("\nStep 3: Consumer 1 leaving group...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     println!("✅ Consumer 1 left (LeaveGroup sent)");
 
     // 4. Consumer 2 joins the same group - should work cleanly
     println!("\nStep 4: Consumer 2 joining same group...");
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create()?;
 
-    consumer2.subscribe(&[topic])?;
+    let consumer2 = Member::new(consumer2);
+    consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 2 subscribed");
 
     // Consumer 2 should receive remaining messages
@@ -115,17 +120,18 @@ pub async fn test_rebalance_after_leave() -> TestResult {
                 println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 2 error: {}", e);
+                println!("   ⚠️  Consumer 2 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
             }
         }
     }
-    println!("✅ Consumer 2 received {} messages", received2);
+    println!("✅ Consumer 2 received {received2} messages");
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
+    ctx.cleanup().await?;
     println!("\n✅ Rebalance after leave test PASSED\n");
     Ok(())
 }
@@ -142,20 +148,21 @@ pub async fn test_rebalance_after_leave() -> TestResult {
 pub async fn test_session_timeout_rebalance() -> TestResult {
     println!("=== Test: Session Timeout Rebalance ===\n");
 
-    let topic = "timeout-rebalance-test-topic";
-    let group_id = "timeout-rebalance-test-group";
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("timeout-rebalance-test-topic").await;
+    let group_id = ctx.unique_group("timeout-rebalance-test-group").await;
 
     // 1. Produce test messages
     println!("Step 1: Producing test messages...");
     let producer = create_producer()?;
 
     for i in 0..3 {
-        let value = format!("Timeout test message {}", i);
+        let value = format!("Timeout test message {i}");
         producer
             .send(
-                FutureRecord::to(topic)
+                FutureRecord::to(&topic)
                     .payload(&value)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -166,15 +173,16 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 2. Consumer joins with short session timeout
     println!("\nStep 2: Consumer joining with short session timeout...");
     let consumer1: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "6000") // 6 second timeout
         .set("heartbeat.interval.ms", "2000")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create()?;
 
-    consumer1.subscribe(&[topic])?;
+    let consumer1 = Member::new(consumer1);
+    consumer1.subscribe(&[topic.as_str()])?;
 
     // Poll once to ensure membership is established
     let _ = tokio::time::timeout(Duration::from_secs(3), consumer1.recv()).await;
@@ -183,7 +191,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 3. Drop consumer (simulates crash - no LeaveGroup sent)
     // We drop without calling consumer.close() to simulate abrupt failure
     println!("\nStep 3: Simulating consumer crash (no LeaveGroup)...");
-    std::mem::drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
 
     // Note: In a real crash, the TCP connection would close without LeaveGroup
     // rdkafka may still send LeaveGroup on drop, but the timeout mechanism
@@ -197,15 +205,16 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
     // 5. New consumer joins - should work if member was removed
     println!("\nStep 5: New consumer joining group...");
     let consumer2: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
-        .set("group.id", group_id)
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("group.id", &group_id)
         .set("session.timeout.ms", "10000")
         .set("heartbeat.interval.ms", "1000")
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .create()?;
 
-    consumer2.subscribe(&[topic])?;
+    let consumer2 = Member::new(consumer2);
+    consumer2.subscribe(&[topic.as_str()])?;
     println!("✅ Consumer 2 subscribed successfully");
 
     // Verify consumer 2 can receive messages
@@ -220,7 +229,7 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
                 println!("   Consumer 2 received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
-                println!("   ⚠️  Consumer 2 error: {}", e);
+                println!("   ⚠️  Consumer 2 error: {e}");
             }
             Err(_) => {
                 println!("   (polling...)");
@@ -228,8 +237,9 @@ pub async fn test_session_timeout_rebalance() -> TestResult {
         }
     }
 
-    drop(consumer2);
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
+    ctx.cleanup().await?;
     println!("\n✅ Session timeout rebalance test PASSED\n");
     Ok(())
 }

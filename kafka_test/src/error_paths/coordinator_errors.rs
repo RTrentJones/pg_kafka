@@ -6,6 +6,7 @@
 use crate::assertions::{assert_no_committed_offset, assert_offset_committed};
 use crate::common::{create_stream_consumer, TestResult};
 use crate::fixtures::{generate_messages, TestTopicBuilder};
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::consumer::Consumer;
 use std::time::Duration;
@@ -29,6 +30,7 @@ pub async fn test_heartbeat_after_leave() -> TestResult {
     let consumer = create_stream_consumer(&group_id)?;
 
     println!("Subscribing consumer to topic...");
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
 
     // Poll to join the group and consume. With auto.offset.reset=earliest and 3 pre-produced
@@ -41,7 +43,7 @@ pub async fn test_heartbeat_after_leave() -> TestResult {
     }
 
     println!("Consumer joined group (received {received}), now dropping (LeaveGroup)...");
-    drop(consumer);
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     // Small delay for LeaveGroup to process
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -75,6 +77,7 @@ pub async fn test_rejoin_after_leave() -> TestResult {
     // First consumer
     println!("Creating first consumer...");
     let consumer1 = create_stream_consumer(&group_id)?;
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
 
     // Poll to join
@@ -83,13 +86,14 @@ pub async fn test_rejoin_after_leave() -> TestResult {
     }
 
     println!("First consumer joined, leaving...");
-    drop(consumer1);
+    consumer1.close(CLOSE_TIMEOUT).await?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Second consumer with same group ID
     println!("Creating second consumer with same group ID...");
     let consumer2 = create_stream_consumer(&group_id)?;
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
 
     // Poll to verify rejoin works
@@ -101,10 +105,10 @@ pub async fn test_rejoin_after_leave() -> TestResult {
         match tokio::time::timeout(Duration::from_secs(2), consumer2.recv()).await {
             Ok(Ok(_)) => {
                 received += 1;
-                println!("   Second consumer received message {}", received);
+                println!("   Second consumer received message {received}");
             }
             Ok(Err(e)) => {
-                println!("   Consumer error: {}", e);
+                println!("   Consumer error: {e}");
             }
             Err(_) => {
                 // Timeout, continue
@@ -114,6 +118,7 @@ pub async fn test_rejoin_after_leave() -> TestResult {
 
     println!("Second consumer received {received} messages after rejoining");
 
+    consumer2.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     // QA-3: the first consumer left without committing (auto-commit off), so a second consumer in the
     // same group must rejoin and, starting from earliest, consume the still-available messages.
@@ -127,6 +132,9 @@ pub async fn test_rejoin_after_leave() -> TestResult {
 ///
 /// Should handle gracefully (either succeed or return appropriate error).
 pub async fn test_commit_new_group() -> TestResult {
+    // Assign partition manually
+    use rdkafka::TopicPartitionList;
+
     println!("=== Test: Commit Offset for New Group ===\n");
 
     let ctx = TestContext::new().await?;
@@ -143,8 +151,6 @@ pub async fn test_commit_new_group() -> TestResult {
     // Create consumer and commit without first joining
     let consumer = crate::common::create_manual_commit_consumer(&group_id)?;
 
-    // Assign partition manually
-    use rdkafka::TopicPartitionList;
     let mut assignment = TopicPartitionList::new();
     assignment.add_partition_offset(&topic.name, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&assignment)?;
@@ -161,7 +167,7 @@ pub async fn test_commit_new_group() -> TestResult {
     // either way is consistency between the reported outcome and storage: a reported success means
     // offset 1 is actually persisted, a reported failure means nothing was written.
     match &commit_result {
-        Ok(_) => {
+        Ok(()) => {
             println!("   Commit succeeded; verifying offset 1 is persisted");
             assert_offset_committed(ctx.db(), &group_id, &topic.name, 0, 1).await?;
         }
@@ -190,7 +196,7 @@ pub async fn test_empty_group_id() -> TestResult {
     // Try to create consumer with empty group ID
     // This might fail at client level or server level
     let result: Result<rdkafka::consumer::StreamConsumer, _> = rdkafka::config::ClientConfig::new()
-        .set("bootstrap.servers", "localhost:9092")
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
         .set("group.id", "") // Empty group ID
         .set("session.timeout.ms", "6000")
         .create();
@@ -198,22 +204,24 @@ pub async fn test_empty_group_id() -> TestResult {
     // QA-3: group membership requires a group.id, so an empty one must be rejected — either at
     // create or at subscribe. It must never yield a consumer that successfully subscribes to a
     // consumer group.
-    let subscribe_succeeded = match result {
+    // The consumer is closed off this thread when dropped: its close is no part of what this
+    // test checks.
+    let subscribe_succeeded = match result.map(Member::new) {
         Ok(consumer) => {
             println!("Consumer created with empty group ID, trying to subscribe...");
             match consumer.subscribe(&[&topic.name]) {
-                Ok(_) => {
+                Ok(()) => {
                     println!("   Subscribe unexpectedly succeeded with empty group.id");
                     true
                 }
                 Err(e) => {
-                    println!("   Subscribe failed (expected): {}", e);
+                    println!("   Subscribe failed (expected): {e}");
                     false
                 }
             }
         }
         Err(e) => {
-            println!("   Consumer creation failed (expected): {}", e);
+            println!("   Consumer creation failed (expected): {e}");
             false
         }
     };
@@ -246,6 +254,7 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
 
     println!("Creating first consumer...");
     let consumer1 = create_stream_consumer(&group_id)?;
+    let consumer1 = Member::new(consumer1);
     consumer1.subscribe(&[&topic.name])?;
 
     // Let first consumer join
@@ -255,6 +264,7 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
 
     println!("Creating second consumer (triggers rebalance)...");
     let consumer2 = create_stream_consumer(&group_id)?;
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
 
     // Let both consumers participate
@@ -280,11 +290,13 @@ pub async fn test_multiple_consumers_same_group() -> TestResult {
         }
     }
 
-    println!(
-        "   Consumer 1 received: {}, Consumer 2 received: {}",
-        c1_received, c2_received
-    );
+    println!("   Consumer 1 received: {c1_received}, Consumer 2 received: {c2_received}");
 
+    close_all(
+        vec![consumer1.closing(), consumer2.closing()],
+        CLOSE_TIMEOUT,
+    )
+    .await?;
     ctx.cleanup().await?;
     // QA-3: two consumers in one group over a 2-partition topic with 10 earliest messages must,
     // between them, actually consume something — a rebalance that delivered nothing to either member

@@ -10,12 +10,28 @@
 mod basic;
 mod deduplication;
 mod edge_cases;
-pub mod protocol_encoding;
+mod kafka_model;
+mod null_records;
+mod unknown_producer;
 
-pub use basic::test_idempotent_producer_basic;
-pub use deduplication::test_true_deduplication_manual_replay;
-pub use edge_cases::{
-    test_idempotent_concurrent_producers, test_idempotent_high_sequence,
-    test_idempotent_multi_partition, test_idempotent_producer_epoch_bump,
-    test_idempotent_producer_restart,
-};
+/// The `idempotent` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["idempotent";
+        basic::test_idempotent_producer_basic,
+        deduplication::test_true_deduplication_manual_replay,
+        edge_cases::test_idempotent_producer_epoch_bump,
+        edge_cases::test_idempotent_multi_partition,
+        edge_cases::test_idempotent_producer_restart,
+        edge_cases::test_idempotent_concurrent_producers: sequential, // Concurrent producers
+        edge_cases::test_idempotent_high_sequence,
+        kafka_model::test_idempotent_duplicates_and_epochs_follow_kafka: sequential,
+        kafka_model::test_idempotent_sequence_wraps_at_i32_max,
+        kafka_model::test_idempotent_producer_state_is_per_partition,
+        null_records::test_null_records_partition_is_refused,
+        unknown_producer::test_unknown_producer_is_accepted_as_new: sequential, // reads the id sequence
+        unknown_producer::test_idempotent_producer_survives_pruned_state,
+        unknown_producer::test_pruned_producer_resumes_on_every_partition,
+        unknown_producer::test_producer_id_allocation_skips_recorded_ids: sequential, // reads the id sequence
+        unknown_producer::test_producer_ids_start_from_creation_time,
+    ]
+}

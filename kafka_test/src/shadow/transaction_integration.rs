@@ -213,13 +213,13 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
         let row = ctx
             .db()
             .query_one(
-                r#"
+                r"
                 SELECT COUNT(*) FILTER (WHERE st.external_offset IS NOT NULL) AS done,
                        COUNT(*) AS total
                 FROM kafka.shadow_tracking st
                 JOIN kafka.topics t ON t.id = st.topic_id
                 WHERE t.name = $1
-                "#,
+                ",
                 &[&topic],
             )
             .await?;
@@ -243,12 +243,11 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
 }
 
 /// B1: a transactional commit must not enqueue outbox pointers for message rows
-/// that no longer exist. This reproduces the mid-txn rollback leak black-box: the
+/// that do not exist any more. This reproduces the mid-txn rollback leak black-box: the
 /// pending message row is deleted after it is written but before commit, while the
-/// worker's in-RAM forward buffer still holds the offset. The old code enqueued an
-/// orphan `kafka.shadow_tracking` row (never claimable by the poll's EXISTS guard,
-/// never cleaned → slow leak). The existence-checked enqueue must drop it.
-/// Fails before the fix; passes after.
+/// worker's in-RAM forward buffer still holds the offset. The existence-checked
+/// enqueue drops it; an orphan `kafka.shadow_tracking` row would never be claimable by
+/// the poll's EXISTS guard and never cleaned (a slow leak).
 pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     println!("=== Test: Committed Txn Leaves No Orphan Outbox Rows (B1) ===\n");
 
@@ -288,11 +287,11 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     let deleted = ctx
         .db()
         .execute(
-            r#"
+            r"
             DELETE FROM kafka.messages m
             USING kafka.topics t
             WHERE m.topic_id = t.id AND t.name = $1 AND m.txn_state = 'pending'
-            "#,
+            ",
             &[&topic],
         )
         .await?;
@@ -306,7 +305,7 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     let row = ctx
         .db()
         .query_one(
-            r#"
+            r"
             SELECT COUNT(*) AS orphans
             FROM kafka.shadow_tracking st
             JOIN kafka.topics t ON t.id = st.topic_id
@@ -317,15 +316,14 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
                   AND m.partition_id = st.partition_id
                   AND m.partition_offset = st.local_offset
               )
-            "#,
+            ",
             &[&topic],
         )
         .await?;
     let orphans: i64 = row.get("orphans");
     assert_eq!(
         orphans, 0,
-        "commit enqueued {} orphan shadow_tracking row(s) with no backing message",
-        orphans
+        "commit enqueued {orphans} orphan shadow_tracking row(s) with no backing message"
     );
     println!("✅ No orphan outbox rows after commit\n");
 

@@ -1,11 +1,17 @@
-// Configuration management handlers (DescribeConfigs 32, IncrementalAlterConfigs 44)
-// and log management (DeleteRecords 21).
-//
-// Honest-minimal implementations: DescribeConfigs reports the configs pg_kafka
-// actually honors (with real values and correct sources); IncrementalAlterConfigs
-// accepts only the keys it can enforce (`retention.ms`) and rejects everything
-// else with INVALID_CONFIG rather than silently accepting; DeleteRecords
-// truncates partitions below an offset and reports the new low watermark.
+//! Configuration management handlers (DescribeConfigs 32, IncrementalAlterConfigs 44)
+//! and log management (DeleteRecords 21).
+//!
+//! DescribeConfigs reports the configs pg_kafka
+//! actually honors (with real values and correct sources); IncrementalAlterConfigs
+//! accepts only the keys it can enforce (`retention.ms`) and rejects everything
+//! else with INVALID_CONFIG rather than silently accepting; DeleteRecords
+//! truncates partitions below an offset and reports the new low watermark.
+//!
+//! None of the three handlers returns `Err`: their responses have no top-level
+//! error code, and the request-level error builders used on `Err`
+//! (`build_*_error_response`) can only produce an empty, error-free response. Every
+//! failure, storage failures included, is reported on the resource or partition it
+//! affects, and the other items in the request are still processed.
 
 use kafka_protocol::messages::delete_records_response::{
     DeleteRecordsPartitionResult, DeleteRecordsResponse, DeleteRecordsTopicResult,
@@ -19,9 +25,14 @@ use kafka_protocol::messages::incremental_alter_configs_response::{
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 
-use crate::kafka::constants::*;
-use crate::kafka::error::Result;
+use super::helpers::{merge_by_partition, resolve_topics};
+use crate::kafka::constants::{
+    ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
+use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
+use std::collections::{HashMap, HashSet};
 
 /// Kafka resource type for topics (DescribeConfigs/IncrementalAlterConfigs).
 const RESOURCE_TYPE_TOPIC: i8 = 2;
@@ -40,6 +51,7 @@ const OP_SET: i8 = 0;
 const OP_DELETE: i8 = 1;
 
 /// One reportable topic config: (name, value, source, type).
+#[derive(Clone)]
 struct TopicConfigEntry {
     name: &'static str,
     value: String,
@@ -64,7 +76,7 @@ fn effective_topic_configs(
         Some(_) => ("-1".to_string(), CONFIG_SOURCE_DYNAMIC_TOPIC),
         None => {
             let value = if global_retention_hours > 0 {
-                (global_retention_hours as i64 * 60 * 60 * 1000).to_string()
+                (i64::from(global_retention_hours) * 60 * 60 * 1000).to_string()
             } else {
                 "-1".to_string()
             };
@@ -100,6 +112,17 @@ pub fn handle_describe_configs(
     global_retention_hours: i32,
 ) -> Result<DescribeConfigsResponse> {
     let mut results = Vec::with_capacity(resources.len());
+    // The topics in one lookup, and each topic's configs read once however often the
+    // request names it (Kafka answers every entry).
+    let topics = resolve_topics(
+        ctx.store,
+        resources
+            .iter()
+            .filter(|(resource_type, _, _)| *resource_type == RESOURCE_TYPE_TOPIC)
+            .map(|(_, name, _)| name.as_str()),
+    );
+    let mut configs_of: HashMap<i32, std::result::Result<Vec<TopicConfigEntry>, (i16, String)>> =
+        HashMap::new();
 
     for (resource_type, resource_name, requested_keys) in resources {
         let mut result = DescribeConfigsResult::default()
@@ -115,9 +138,28 @@ pub fn handle_describe_configs(
             continue;
         }
 
-        match ctx.store.get_topic_id(&resource_name)? {
-            Some(topic_id) => {
-                let configs = effective_topic_configs(ctx, topic_id, global_retention_hours)?;
+        // A storage failure is reported on this resource only (error_code + message);
+        // a handler `Err` would reach the client as an empty, error-free response.
+        let lookup = match &topics {
+            Ok(found) => match found.get(&resource_name) {
+                Some(&(topic_id, _)) => configs_of
+                    .entry(topic_id)
+                    .or_insert_with(|| {
+                        effective_topic_configs(ctx, topic_id, global_retention_hours).map_err(
+                            |e| {
+                                warn_if_server_error("describe configs for", &resource_name, &e);
+                                (e.to_kafka_error_code(), e.to_string())
+                            },
+                        )
+                    })
+                    .clone()
+                    .map(Some),
+                None => Ok(None),
+            },
+            Err(code) => Err((*code, format!("Failed to look up topic '{resource_name}'"))),
+        };
+        match lookup {
+            Ok(Some(configs)) => {
                 let wanted = |name: &str| match &requested_keys {
                     Some(keys) if !keys.is_empty() => keys.iter().any(|k| k == name),
                     _ => true,
@@ -137,12 +179,15 @@ pub fn handle_describe_configs(
                     .collect();
                 result.error_code = ERROR_NONE;
             }
-            None => {
+            Ok(None) => {
                 result.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
                 result.error_message = Some(StrBytes::from_string(format!(
-                    "Unknown topic '{}'",
-                    resource_name
+                    "Unknown topic '{resource_name}'"
                 )));
+            }
+            Err((error_code, message)) => {
+                result.error_code = error_code;
+                result.error_message = Some(StrBytes::from_string(message));
             }
         }
         results.push(result);
@@ -178,80 +223,142 @@ pub fn handle_incremental_alter_configs(
     resources: crate::kafka::messages::AlterConfigsResources,
     validate_only: bool,
 ) -> Result<IncrementalAlterConfigsResponse> {
-    let mut responses = Vec::with_capacity(resources.len());
-
-    for (resource_type, resource_name, configs) in resources {
-        let mut resp = AlterConfigsResourceResponse::default()
-            .with_resource_type(resource_type)
-            .with_resource_name(StrBytes::from_string(resource_name.clone()));
-
-        if resource_type != RESOURCE_TYPE_TOPIC {
-            resp.error_code = ERROR_INVALID_REQUEST;
-            resp.error_message = Some(StrBytes::from_static_str(
-                "pg_kafka only supports TOPIC resources",
-            ));
-            responses.push(resp);
-            continue;
-        }
-
-        let topic_id = match ctx.store.get_topic_id(&resource_name)? {
-            Some(id) => id,
-            None => {
-                resp.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                resp.error_message = Some(StrBytes::from_string(format!(
-                    "Unknown topic '{}'",
-                    resource_name
-                )));
-                responses.push(resp);
-                continue;
-            }
-        };
-
-        // Validate everything first (all-or-nothing per resource).
-        let mut planned: Vec<Option<i64>> = Vec::new();
-        let mut validation_error: Option<String> = None;
-        for (name, op, value) in &configs {
-            if name != "retention.ms" {
-                validation_error = Some(format!(
-                    "Unsupported config '{}' (pg_kafka honors: retention.ms)",
-                    name
-                ));
-                break;
-            }
-            match *op {
-                OP_SET => match parse_retention_ms(value.as_deref()) {
-                    Ok(ms) => planned.push(Some(ms)),
-                    Err(msg) => {
-                        validation_error = Some(msg.to_string());
-                        break;
-                    }
-                },
-                OP_DELETE => planned.push(None),
-                _ => {
-                    validation_error =
-                        Some("Unsupported operation (only SET and DELETE)".to_string());
-                    break;
+    // Kafka 3.7 refuses every entry of a resource named more than once, without acting
+    // on any of them.
+    let mut named: HashMap<(i8, &str), usize> = HashMap::new();
+    for (resource_type, resource_name, _) in &resources {
+        *named.entry((*resource_type, resource_name)).or_default() += 1;
+    }
+    let repeated: HashSet<(i8, String)> = named
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|((resource_type, name), _)| (resource_type, name.to_string()))
+        .collect();
+    let topics = resolve_topics(
+        ctx.store,
+        resources
+            .iter()
+            .filter(|(resource_type, _, _)| *resource_type == RESOURCE_TYPE_TOPIC)
+            .map(|(_, name, _)| name.as_str()),
+    );
+    let responses = resources
+        .into_iter()
+        .map(|(resource_type, resource_name, configs)| {
+            let mut resp = AlterConfigsResourceResponse::default()
+                .with_resource_type(resource_type)
+                .with_resource_name(StrBytes::from_string(resource_name.clone()));
+            let resource = Resource {
+                kind: resource_type,
+                name: &resource_name,
+                topic: topics
+                    .as_ref()
+                    .map(|found| found.get(&resource_name).map(|&(id, _)| id))
+                    .map_err(|&code| code),
+            };
+            let outcome = if repeated.contains(&(resource_type, resource_name.clone())) {
+                Err((
+                    ERROR_INVALID_REQUEST,
+                    "Each resource must appear at most once.".to_string(),
+                ))
+            } else {
+                alter_topic_configs(ctx, resource, &configs, validate_only)
+            };
+            match outcome {
+                Ok(()) => resp.error_code = ERROR_NONE,
+                Err((error_code, message)) => {
+                    resp.error_code = error_code;
+                    resp.error_message = Some(StrBytes::from_string(message));
                 }
             }
-        }
-
-        if let Some(msg) = validation_error {
-            resp.error_code = ERROR_INVALID_CONFIG;
-            resp.error_message = Some(StrBytes::from_string(msg));
-            responses.push(resp);
-            continue;
-        }
-
-        if !validate_only {
-            for retention_ms in planned {
-                ctx.store.set_topic_retention_ms(topic_id, retention_ms)?;
-            }
-        }
-        resp.error_code = ERROR_NONE;
-        responses.push(resp);
-    }
+            resp
+        })
+        .collect();
 
     Ok(IncrementalAlterConfigsResponse::default().with_responses(responses))
+}
+
+/// Validate one resource's alterations and, unless `validate_only`, apply them: the
+/// resource's error code and message if it is refused.
+fn alter_topic_configs(
+    ctx: &HandlerContext,
+    resource: Resource<'_>,
+    configs: &[(String, i8, Option<String>)],
+    validate_only: bool,
+) -> std::result::Result<(), (i16, String)> {
+    let Resource {
+        kind: resource_type,
+        name: resource_name,
+        topic,
+    } = resource;
+    if resource_type != RESOURCE_TYPE_TOPIC {
+        return Err((
+            ERROR_INVALID_REQUEST,
+            "pg_kafka only supports TOPIC resources".to_string(),
+        ));
+    }
+    let storage_error = |e: KafkaError| {
+        warn_if_server_error("alter configs for", resource_name, &e);
+        (e.to_kafka_error_code(), e.to_string())
+    };
+    let topic_id = topic
+        .map_err(|code| (code, format!("Failed to look up topic '{resource_name}'")))?
+        .ok_or_else(|| {
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                format!("Unknown topic '{resource_name}'"),
+            )
+        })?;
+    let planned = plan_retention_change(configs).map_err(|msg| (ERROR_INVALID_CONFIG, msg))?;
+    if let (false, Some(change)) = (validate_only, planned) {
+        let retention_ms = match change {
+            RetentionChange::Set(ms) => Some(ms),
+            RetentionChange::Delete => None,
+        };
+        ctx.store
+            .set_topic_retention_ms(topic_id, retention_ms)
+            .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+/// An IncrementalAlterConfigs resource: its type, its name and, for a topic, the topic's
+/// id (`None` for a topic that does not exist) or the error code of a failed lookup.
+#[derive(Clone, Copy)]
+struct Resource<'a> {
+    kind: i8,
+    name: &'a str,
+    topic: std::result::Result<Option<i32>, i16>,
+}
+
+/// A topic's `retention.ms` alteration.
+#[derive(Clone, Copy)]
+enum RetentionChange {
+    Set(i64),
+    Delete,
+}
+
+/// Validate a resource's alterations before any is applied (all-or-nothing per resource):
+/// the `retention.ms` change (`None` for no change), or why they are refused. Every supported alteration targets the same column, so applying them in
+/// order is the same as applying the last one, and the resource is applied with one write.
+fn plan_retention_change(
+    configs: &[(String, i8, Option<String>)],
+) -> std::result::Result<Option<RetentionChange>, String> {
+    let mut planned = None;
+    for (name, op, value) in configs {
+        if name != "retention.ms" {
+            return Err(format!(
+                "Unsupported config '{name}' (pg_kafka honors: retention.ms)"
+            ));
+        }
+        planned = match *op {
+            OP_SET => Some(RetentionChange::Set(
+                parse_retention_ms(value.as_deref()).map_err(str::to_string)?,
+            )),
+            OP_DELETE => Some(RetentionChange::Delete),
+            _ => return Err("Unsupported operation (only SET and DELETE)".to_string()),
+        };
+    }
+    Ok(planned)
 }
 
 /// Handle DeleteRecords (API 21).
@@ -264,50 +371,46 @@ pub fn handle_delete_records(
     ctx: &HandlerContext,
     topics: Vec<(String, Vec<(i32, i64)>)>,
 ) -> Result<DeleteRecordsResponse> {
+    // Kafka 3.7 collects the partitions into a map: a repeated partition is truncated
+    // once, to its last entry's offset, and answered once.
+    let topics = merge_by_partition(topics, |&(partition, _)| partition);
+    // The topics in one lookup. Unknown topic and a storage failure are both reported on
+    // every requested partition of the topic (`Err` holds the error code).
+    let found = resolve_topics(ctx.store, topics.iter().map(|(name, _)| name.as_str()));
     let mut topic_results = Vec::with_capacity(topics.len());
 
     for (topic_name, partitions) in topics {
-        let topic_id = ctx.store.get_topic_id(&topic_name)?;
-        let partition_count = ctx.store.get_topic_partition_count(&topic_name)?;
+        let resolved: std::result::Result<(i32, i32), i16> = match &found {
+            Ok(found) => found
+                .get(&topic_name)
+                .copied()
+                .ok_or(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+            Err(code) => Err(*code),
+        };
         let mut partition_results = Vec::with_capacity(partitions.len());
 
         for (partition_id, requested_offset) in partitions {
             let mut pr = DeleteRecordsPartitionResult::default()
                 .with_partition_index(partition_id)
                 .with_low_watermark(-1);
-
-            let (topic_id, partition_count) = match (topic_id, partition_count) {
-                (Some(id), Some(count)) => (id, count),
-                _ => {
-                    pr.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                    partition_results.push(pr);
-                    continue;
+            pr.error_code = match resolved {
+                Ok((topic_id, partition_count)) => {
+                    match delete_partition_records(
+                        ctx,
+                        topic_id,
+                        partition_count,
+                        partition_id,
+                        requested_offset,
+                    ) {
+                        Ok(low_watermark) => {
+                            pr.low_watermark = low_watermark;
+                            ERROR_NONE
+                        }
+                        Err(code) => code,
+                    }
                 }
+                Err(code) => code,
             };
-            if partition_id < 0 || partition_id >= partition_count {
-                pr.error_code = ERROR_UNKNOWN_TOPIC_OR_PARTITION;
-                partition_results.push(pr);
-                continue;
-            }
-
-            let high_watermark = ctx.store.get_high_watermark(topic_id, partition_id)?;
-            // -1 = "truncate everything" (to the HWM), per Kafka semantics.
-            let before_offset = if requested_offset == -1 {
-                high_watermark
-            } else {
-                requested_offset
-            };
-            if before_offset < 0 || before_offset > high_watermark {
-                pr.error_code = ERROR_OFFSET_OUT_OF_RANGE;
-                partition_results.push(pr);
-                continue;
-            }
-
-            let low_watermark =
-                ctx.store
-                    .delete_records_before(topic_id, partition_id, before_offset)?;
-            pr.error_code = ERROR_NONE;
-            pr.low_watermark = low_watermark;
             partition_results.push(pr);
         }
 
@@ -319,4 +422,49 @@ pub fn handle_delete_records(
     }
 
     Ok(DeleteRecordsResponse::default().with_topics(topic_results))
+}
+
+/// DeleteRecords for one partition of a resolved topic: the new low watermark, or
+/// the partition's error code. Storage failures are per-partition, like the rest.
+fn delete_partition_records(
+    ctx: &HandlerContext,
+    topic_id: i32,
+    partition_count: i32,
+    partition_id: i32,
+    requested_offset: i64,
+) -> std::result::Result<i64, i16> {
+    if partition_id < 0 || partition_id >= partition_count {
+        return Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    let on_err = |e: KafkaError| {
+        warn_if_server_error(
+            "delete records from",
+            &format!("topic_id={topic_id} partition={partition_id}"),
+            &e,
+        );
+        e.to_kafka_error_code()
+    };
+    let high_watermark = ctx
+        .store
+        .get_high_watermark(topic_id, partition_id)
+        .map_err(on_err)?;
+    // -1 = "truncate everything" (to the HWM), per Kafka semantics.
+    let before_offset = if requested_offset == -1 {
+        high_watermark
+    } else {
+        requested_offset
+    };
+    if before_offset < 0 || before_offset > high_watermark {
+        return Err(ERROR_OFFSET_OUT_OF_RANGE);
+    }
+    ctx.store
+        .delete_records_before(topic_id, partition_id, before_offset)
+        .map_err(on_err)
+}
+
+/// Log a storage failure that is being reported to the client per item.
+fn warn_if_server_error(action: &str, target: &str, e: &KafkaError) {
+    if e.is_server_error() {
+        crate::pg_warning!("Failed to {} '{}': {}", action, target, e);
+    }
 }

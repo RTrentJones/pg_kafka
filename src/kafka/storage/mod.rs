@@ -1,15 +1,38 @@
-// Storage abstraction layer for pg_kafka
-//
-// This module defines the KafkaStore trait that abstracts data persistence operations.
-// By separating storage concerns from protocol logic, we achieve:
-// 1. Testability - handlers can be tested with mock stores
-// 2. Clean separation of concerns - protocol logic doesn't know about SQL
-// 3. Transaction safety - transaction boundaries remain explicit in worker.rs
+//! The storage layer: the contract between the Kafka protocol handlers and the store.
+//!
+//! The contract is split into role traits ([`TopicStore`], [`LogStore`],
+//! [`OffsetStore`], [`ProducerStore`], [`TransactionStore`], [`MaintenanceStore`]);
+//! [`KafkaStore`] is their sum and is what handlers see. Each role groups the methods
+//! one concern needs, so a wrapper (`ShadowStore`) can forward the roles it does not
+//! change wholesale (the `delegate_*_store!` macros) and code that needs one concern
+//! can take just that role. Handlers stay testable against `MockKafkaStore`, and
+//! transaction boundaries stay with the caller: every method assumes it runs inside a
+//! transaction the background worker (or a SQL function) manages.
+//!
+//! [`PostgresStore`] is the implementation; the pure logic it relies on (header
+//! encoding, sequence validation, retention planning, the role grants) lives in
+//! submodules that unit tests reach without a database.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use super::error::Result;
 use super::messages::Record;
+
+mod delegate;
+mod headers;
+mod sequence;
+
+pub(crate) use delegate::{
+    delegate_log_store, delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
+    delegate_topic_store, delegate_transaction_store,
+};
+pub use headers::{decode_headers_json, encode_headers_json};
+pub use sequence::{
+    batch_last_sequence, next_sequence, transactional_epoch_is_stale, validate_sequence,
+    validate_unknown_producer, CachedBatch, PartitionSequence, ProducerBatch, SequenceCheck,
+    SequenceValidation, PRODUCER_BATCH_CACHE,
+};
 
 /// Metadata about a topic (storage layer representation)
 ///
@@ -39,55 +62,31 @@ pub struct FetchedMessage {
     pub value: Option<Vec<u8>>,
     /// Timestamp (milliseconds since epoch)
     pub timestamp: i64,
-    /// Record headers, decoded from JSONB storage (DR-8, DEEP-REVIEW-2026-07).
-    /// Before DR-8, headers were written on every produce but never selected on
-    /// fetch, so consumers silently received empty headers. Headers are stored as
-    /// an ordered array of pairs, so their order survives; duplicate keys do not,
-    /// because the kafka-protocol record type holds headers in a map (documented
-    /// in PROTOCOL_DEVIATIONS.md).
+    /// Record headers, decoded from JSONB storage (DR-8). They are stored as an
+    /// ordered array of pairs, so their order survives; duplicate keys do not, because
+    /// the kafka-protocol record type holds headers in a map (PROTOCOL_DEVIATIONS.md).
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Producer id stamped on the row: set for records written by a
+    /// transactional producer, `None` otherwise. Fetch groups consecutive records of
+    /// one producer id/epoch into one RecordBatch and marks it transactional.
+    pub producer_id: Option<i64>,
+    /// Producer epoch stamped with `producer_id`.
+    pub producer_epoch: Option<i16>,
 }
 
-/// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
-/// ordered array of `[key, hex(value)]` pairs; rows written before that hold a
-/// `{key: hex(value)}` object, which is still accepted.
-///
-/// Pure function so the decoding logic is unit-testable even though its only
-/// caller lives in the coverage-ignored SPI layer (QA-1 pattern, like
-/// `validate_sequence`). Malformed JSON or hex yields an empty/partial result
-/// rather than an error: headers are metadata, and failing a whole fetch over
-/// an undecodable header would be worse than dropping it.
-pub fn decode_headers_json(json: Option<&str>) -> Vec<(String, Vec<u8>)> {
-    let Some(json) = json else {
-        return Vec::new();
-    };
-    let pairs: Vec<(String, String)> = if let Ok(pairs) =
-        serde_json::from_str::<Vec<(String, String)>>(json)
-    {
-        pairs
-    } else if let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json)
-    {
-        map.into_iter().collect()
-    } else {
-        return Vec::new();
-    };
-    pairs
-        .into_iter()
-        .filter_map(|(k, hex)| hex_decode(&hex).map(|v| (k, v)))
-        .collect()
-}
-
-/// Decode a lowercase/uppercase hex string into bytes; `None` on malformed input.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        // `get` instead of slicing: a non-ASCII char would put `i` off a char
-        // boundary and slicing would panic. Invalid input yields None instead.
-        .map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-        .collect()
+/// The producer that owns a transactional id, as InitProducerId judges a presented
+/// producer id and epoch against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionalProducer {
+    /// Current producer id.
+    pub producer_id: i64,
+    /// Current epoch.
+    pub epoch: i16,
+    /// The epoch before the last bump the current producer asked for itself (an
+    /// InitProducerId presenting its id and epoch); a retry of that request presents it.
+    /// None after any other change of epoch (a new producer fencing the old, a timeout
+    /// abort), as Kafka's lastProducerEpoch.
+    pub previous_epoch: Option<i16>,
 }
 
 /// Committed offset information (internal representation)
@@ -99,7 +98,7 @@ pub struct CommittedOffset {
     pub metadata: Option<String>,
 }
 
-/// Transaction state (Phase 10)
+/// Transaction state (the `kafka.transactions.state` column).
 ///
 /// Represents the lifecycle state of a Kafka transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +144,7 @@ impl TransactionState {
     }
 }
 
-/// Consumer isolation level (Phase 10)
+/// Consumer isolation level.
 ///
 /// Controls visibility of transactional messages during fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -167,18 +166,75 @@ impl IsolationLevel {
     }
 }
 
-/// Abstract storage interface for Kafka data operations
-///
-/// This trait defines the contract between the Kafka protocol handlers
-/// and the underlying storage implementation. Implementors handle the
-/// actual data persistence (SQL, file system, etc.) while handlers
-/// focus on protocol logic.
-///
-/// All methods are assumed to run within a transaction context managed
-/// by the caller (typically the background worker).
-pub trait KafkaStore {
-    // ===== Topic Operations =====
+/// Offset bounds of one partition, as reported in a Fetch response
+/// (see [`LogStore::get_partition_bounds`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartitionBounds {
+    /// Log-end offset; never regresses (BUG-4).
+    pub high_watermark: i64,
+    /// Lowest pending transactional offset (ReadCommitted), or the high watermark.
+    pub last_stable_offset: i64,
+    /// Earliest retained offset: GREATEST(first surviving row, durable log start).
+    pub earliest_offset: i64,
+    /// Durable log start (`kafka.partition_offsets.log_start_offset`).
+    pub log_start_offset: i64,
+}
 
+impl PartitionBounds {
+    /// Build the bounds from the raw per-partition values one SQL statement reads:
+    /// the offset counter row (`next_offset`, `log_start_offset`; `None` when the
+    /// partition has no counter row), MIN/MAX `partition_offset` over the stored rows,
+    /// and the lowest pending transactional offset. Mirrors the single-value queries
+    /// in `PostgresStore` so the combined statement cannot drift from them.
+    pub fn from_raw(
+        next_offset: Option<i64>,
+        log_start_offset: Option<i64>,
+        min_offset: Option<i64>,
+        max_offset: Option<i64>,
+        min_pending_offset: Option<i64>,
+        isolation_level: IsolationLevel,
+    ) -> Self {
+        let log_start = log_start_offset.unwrap_or(0);
+        let high_watermark = next_offset
+            .unwrap_or(0)
+            .max(max_offset.map_or(0, |m| m.saturating_add(1)));
+        let last_stable_offset = match isolation_level {
+            IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
+            IsolationLevel::ReadUncommitted => high_watermark,
+        };
+        PartitionBounds {
+            high_watermark,
+            last_stable_offset,
+            earliest_offset: min_offset.unwrap_or(0).max(log_start),
+            log_start_offset: log_start,
+        }
+    }
+}
+
+/// Order `rows` (`(name, id, partition_count)` from one batched lookup) as the
+/// requested `names`, dropping names with no row. A name requested twice appears
+/// twice.
+pub fn order_topic_metadata(names: &[String], rows: Vec<(String, i32, i32)>) -> Vec<TopicMetadata> {
+    let by_name: std::collections::HashMap<String, (i32, i32)> = rows
+        .into_iter()
+        .map(|(name, id, partitions)| (name, (id, partitions)))
+        .collect();
+    names
+        .iter()
+        .filter_map(|name| {
+            by_name
+                .get(name)
+                .map(|&(id, partition_count)| TopicMetadata {
+                    name: name.clone(),
+                    id,
+                    partition_count,
+                })
+        })
+        .collect()
+}
+
+/// Topic catalog: lookup, auto-create, admin (create/delete/partition count) and per-topic config.
+pub trait TopicStore {
     /// Get or create a topic by name
     ///
     /// If the topic exists, returns its ID and partition count.
@@ -192,6 +248,16 @@ pub trait KafkaStore {
     /// Tuple of (topic_id, partition_count) on success, error otherwise
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
 
+    /// Create each of `names` that does not exist with `partition_count` partitions, in one
+    /// statement however many names: the topics of `names` afterwards, created here, before
+    /// or concurrently by another session, in no particular order. (A name another session
+    /// commits while the insert waits on it takes a second statement to read.)
+    fn get_or_create_topics(
+        &self,
+        names: &[String],
+        partition_count: i32,
+    ) -> Result<Vec<TopicMetadata>>;
+
     /// Get metadata for topics
     ///
     /// # Arguments
@@ -200,130 +266,6 @@ pub trait KafkaStore {
     /// # Returns
     /// Vector of topic metadata
     fn get_topic_metadata(&self, names: Option<&[String]>) -> Result<Vec<TopicMetadata>>;
-
-    // ===== Message Operations =====
-
-    /// Insert records into a topic partition
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `records` - Slice of records to insert
-    ///
-    /// # Returns
-    /// Base partition offset assigned to the first record
-    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
-
-    /// Fetch messages from a topic partition
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
-    ///
-    /// # Returns
-    /// Vector of fetched messages
-    fn fetch_records(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-    ) -> Result<Vec<FetchedMessage>>;
-
-    /// Get high watermark for a topic partition
-    ///
-    /// The high watermark is the offset of the next message to be written.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// High watermark offset (0 if partition is empty)
-    fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Get earliest offset for a topic partition
-    ///
-    /// The earliest offset is the offset of the first available message.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Earliest offset (0 if partition is empty)
-    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Get the durable log start offset for a topic partition
-    /// (`kafka.partition_offsets.log_start_offset`).
-    ///
-    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
-    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
-    /// rows without retiring those offsets, so only DeleteRecords and the retention
-    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
-    /// partition has no counter row.
-    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
-    /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
-    /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
-    /// visible record qualifies. Records that carried no timestamp (stored as -1) are excluded.
-    fn get_offset_for_timestamp(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        timestamp_ms: i64,
-    ) -> Result<Option<(i64, i64)>>;
-
-    // ===== Consumer Offset Operations =====
-
-    /// Commit consumer offsets for a group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `offset` - Offset to commit
-    /// * `metadata` - Optional metadata
-    ///
-    /// # Returns
-    /// Ok on success
-    fn commit_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-        offset: i64,
-        metadata: Option<&str>,
-    ) -> Result<()>;
-
-    /// Fetch committed offset for a consumer group partition
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Committed offset info, or None if not committed
-    fn fetch_offset(
-        &self,
-        group_id: &str,
-        topic_id: i32,
-        partition_id: i32,
-    ) -> Result<Option<CommittedOffset>>;
-
-    /// Fetch all committed offsets for a consumer group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    ///
-    /// # Returns
-    /// Map of (topic_name, partition_id) -> CommittedOffset
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
-
-    // ===== Admin Topic Operations (Phase 6) =====
 
     /// Check if a topic exists
     ///
@@ -381,7 +323,239 @@ pub trait KafkaStore {
     /// Ok on success
     fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
 
-    // ===== Admin Consumer Group Operations (Phase 6) =====
+    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
+    ///
+    /// # Returns
+    /// `None` when the topic inherits the global
+    /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
+    /// (`ms < 0` = infinite retention for this topic).
+    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+
+    /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
+    ///
+    /// # Arguments
+    /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
+    ///   clear the override and fall back to the global GUC
+    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
+
+    /// Every existing topic whose name equals one of `names` once '.' and '_' are treated as
+    /// equal (Kafka's metric-name collision rule), the names themselves included, sorted;
+    /// one statement however many names.
+    fn colliding_topics(&self, names: &[String]) -> Result<Vec<String>>;
+}
+
+/// The message log: append, read (with isolation), offset bounds and truncation.
+pub trait LogStore {
+    /// Insert records into a topic partition
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `records` - Slice of records to insert
+    ///
+    /// # Returns
+    /// Base partition offset assigned to the first record
+    fn insert_records(&self, topic_id: i32, partition_id: i32, records: &[Record]) -> Result<i64>;
+
+    /// Fetch messages from a topic partition
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `fetch_offset` - Offset to start fetching from
+    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    ///
+    /// # Returns
+    /// Vector of fetched messages
+    fn fetch_records(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+    ) -> Result<Vec<FetchedMessage>>;
+
+    /// Fetch records with isolation level filtering
+    ///
+    /// Like fetch_records but respects isolation level:
+    /// - ReadUncommitted: returns all records (existing behavior)
+    /// - ReadCommitted: filters out records where txn_state='pending' or 'aborted'
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `fetch_offset` - Offset to start fetching from
+    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    /// * `isolation_level` - Consumer isolation level
+    ///
+    /// # Returns
+    /// Vector of fetched messages respecting isolation level
+    fn fetch_records_with_isolation(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        fetch_offset: i64,
+        max_bytes: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<Vec<FetchedMessage>>;
+
+    /// Get high watermark for a topic partition
+    ///
+    /// The high watermark is the offset of the next message to be written.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// High watermark offset (0 if partition is empty)
+    fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get earliest offset for a topic partition
+    ///
+    /// The earliest offset is the offset of the first available message.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Earliest offset (0 if partition is empty)
+    fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get the durable log start offset for a topic partition
+    /// (`kafka.partition_offsets.log_start_offset`).
+    ///
+    /// Unlike [`get_earliest_offset`](Self::get_earliest_offset), this ignores which
+    /// rows happen to survive: aborted-message cleanup can delete a partition's leading
+    /// rows without retiring those offsets, so only DeleteRecords and the retention
+    /// sweep (which advance this column) make an offset out of range. Returns 0 when the
+    /// partition has no counter row.
+    fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// Get last stable offset for a partition
+    ///
+    /// Returns the lowest offset of any pending transaction, or the high
+    /// watermark if no transactions are pending. Used by read_committed
+    /// consumers to know how far they can safely read.
+    ///
+    /// # Arguments
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    ///
+    /// # Returns
+    /// Last stable offset
+    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
+
+    /// All offset bounds a Fetch response reports for one partition, in one storage
+    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
+    /// to the high watermark for ReadUncommitted), earliest offset and durable log
+    /// start. Each field matches the corresponding single-value method
+    /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
+    /// `get_log_start_offset`).
+    ///
+    /// The default composes those methods (four statements). `PostgresStore`
+    /// overrides it with a single statement, and `ShadowStore` forwards it; the
+    /// mockall `MockKafkaStore` deliberately keeps this default so expectations set
+    /// on the single-value methods keep driving handler tests.
+    fn get_partition_bounds(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        isolation_level: IsolationLevel,
+    ) -> Result<PartitionBounds> {
+        let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
+        let last_stable_offset = match isolation_level {
+            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
+            IsolationLevel::ReadUncommitted => high_watermark,
+        };
+        let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
+        let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
+        Ok(PartitionBounds {
+            high_watermark,
+            last_stable_offset,
+            earliest_offset,
+            log_start_offset,
+        })
+    }
+
+    /// Find the earliest offset whose record timestamp is at or after `timestamp_ms` (CONF-7,
+    /// Kafka's ListOffsets-by-timestamp). Returns `(offset, record_timestamp_ms)`, or `None` when no
+    /// record qualifies. Records that carried no timestamp (stored as -1) and aborted records are
+    /// excluded; pending transactional records are included (the caller bounds the result by the
+    /// high watermark or the last stable offset, as Kafka does).
+    ///
+    /// `timestamp_ms == MAX_TIMESTAMP` (-3, KIP-734) instead returns the record with the
+    /// largest timestamp (the lowest offset among equal ones).
+    fn get_offset_for_timestamp(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        timestamp_ms: i64,
+    ) -> Result<Option<(i64, i64)>>;
+
+    /// Delete records below `before_offset` in a partition (DeleteRecords, API 21).
+    ///
+    /// Rows with `partition_offset < before_offset` are removed (pending
+    /// transactional rows included — the caller has explicitly asked for
+    /// truncation, matching Kafka semantics where DeleteRecords advances the
+    /// log start offset unconditionally).
+    ///
+    /// # Arguments
+    /// * `before_offset` - Exclusive upper bound; caller must already have
+    ///   clamped/validated it against the high watermark
+    ///
+    /// # Returns
+    /// The partition's new log start offset (earliest remaining offset, or the
+    /// high watermark when the partition is now empty)
+    fn delete_records_before(
+        &self,
+        topic_id: i32,
+        partition_id: i32,
+        before_offset: i64,
+    ) -> Result<i64>;
+}
+
+/// Committed consumer-group offsets.
+pub trait OffsetStore {
+    /// Commit consumer offsets for a group
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    /// * `topic_id` - Topic ID
+    /// * `partition_id` - Partition ID
+    /// * `offset` - Offset to commit
+    /// * `metadata` - Optional metadata
+    ///
+    /// # Returns
+    /// Ok on success
+    fn commit_offset(
+        &self,
+        group_id: &str,
+        topic_id: i32,
+        partition_id: i32,
+        offset: i64,
+        metadata: Option<&str>,
+    ) -> Result<()>;
+
+    /// Fetch all committed offsets for a consumer group
+    ///
+    /// # Arguments
+    /// * `group_id` - Consumer group ID
+    ///
+    /// # Returns
+    /// Map of (topic_name, partition_id) -> CommittedOffset
+    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+
+    /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`
+    /// pairs), as `(topic_id, partition_id, offset)` in no particular order; a partition
+    /// without one is left out. One statement, reading only the requested partitions, so
+    /// OffsetFetch of a few partitions costs the same however many offsets the group has.
+    fn fetch_offsets(
+        &self,
+        group_id: &str,
+        partitions: &[(i32, i32)],
+    ) -> Result<Vec<(i32, i32, CommittedOffset)>>;
 
     /// Delete all committed offsets for a consumer group
     ///
@@ -392,8 +566,26 @@ pub trait KafkaStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    // ===== Idempotent Producer Operations (Phase 9) =====
+    /// The ids of every group that has at least one committed offset (sorted). These groups
+    /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
+    /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
+    fn list_offset_groups(&self) -> Result<Vec<String>>;
 
+    /// Which of `group_ids` have at least one committed offset, in one statement.
+    fn groups_with_offsets(&self, group_ids: &[String]) -> Result<HashSet<String>>;
+    /// The `(topic name, partition)` pairs of `group_id` that have a transactional
+    /// offset commit (TxnOffsetCommit) whose transaction has not ended yet: among
+    /// `partitions` (`(topic_id, partition_id)`) when given, of the whole group otherwise.
+    /// OffsetFetch with `require_stable` (KIP-447) answers UNSTABLE_OFFSET_COMMIT for them.
+    fn pending_txn_offset_partitions(
+        &self,
+        group_id: &str,
+        partitions: Option<&[(i32, i32)]>,
+    ) -> Result<Vec<(String, i32)>>;
+}
+
+/// Idempotent producer state: producer ids, epochs and sequence numbers.
+pub trait ProducerStore {
     /// Allocate a new producer ID with epoch 0
     ///
     /// Creates a new entry in the producer_ids table and returns the allocated
@@ -411,35 +603,16 @@ pub trait KafkaStore {
         transactional_id: Option<&str>,
     ) -> Result<(i64, i16)>;
 
-    /// Get the current epoch for a producer ID
+    /// Validate an idempotent producer's batch against the producer state of one
+    /// partition (Kafka's model, see [`validate_sequence`]).
     ///
-    /// # Arguments
-    /// * `producer_id` - The producer ID to look up
-    ///
-    /// # Returns
-    /// The current epoch if producer exists, None otherwise
-    fn get_producer_epoch(&self, producer_id: i64) -> Result<Option<i16>>;
-
-    /// Increment the producer epoch (for reconnection/fencing)
-    ///
-    /// Atomically increments the epoch for the given producer ID.
-    /// Used when a producer reconnects and needs a new epoch.
-    ///
-    /// # Arguments
-    /// * `producer_id` - The producer ID to update
-    ///
-    /// # Returns
-    /// `(producer_id, epoch)`: normally the same id with the bumped epoch; a fresh id at
-    /// epoch 0 once the epoch is exhausted. Clears the producer's sequence state, since
-    /// a new epoch restarts sequence numbers. Errors if the producer is unknown or is
-    /// transactional.
-    fn increment_producer_epoch(&self, producer_id: i64) -> Result<(i64, i16)>;
-
-    /// Check and update sequence number for idempotent producer
-    ///
-    /// Validates that the sequence number is exactly `last_sequence + 1` for
-    /// the given (producer_id, topic_id, partition_id) tuple. If valid, updates
-    /// the last_sequence to `base_sequence + record_count - 1`.
+    /// The batch is appended when it starts right after the partition's last sequence
+    /// (at any sequence on a partition where the producer has no entry, at 0 on one
+    /// whose entry an epoch change reset), and is a duplicate when its exact sequence
+    /// range is one of the producer's last [`PRODUCER_BATCH_CACHE`] batches on the
+    /// partition; then the original base offset is returned. Nothing is written for a
+    /// duplicate or an error; a batch at a new (client-bumped) epoch moves the
+    /// producer's stored epoch and resets its sequence state first.
     ///
     /// # Arguments
     /// * `producer_id` - The producer ID
@@ -450,10 +623,11 @@ pub trait KafkaStore {
     /// * `record_count` - Number of records in the batch
     ///
     /// # Returns
-    /// * `Ok(true)` if sequence is valid and should be inserted (new message)
-    /// * `Ok(false)` if sequence is a duplicate (skip insert, return success to client)
-    /// * `Err(OutOfOrderSequence)` if there's a gap in the sequence
-    /// * `Err(ProducerFenced)` if the epoch is stale
+    /// * `Ok(SequenceCheck::Append)`: insert the batch, then [`record_producer_batch`](Self::record_producer_batch)
+    /// * `Ok(SequenceCheck::Duplicate { base_offset })`: a retry; skip the insert and
+    ///   answer success with the original base offset
+    /// * `Err(OutOfOrderSequence)`: anything else out of sequence
+    /// * `Err(Protocol { code: INVALID_PRODUCER_EPOCH })`: a stale epoch
     fn check_and_update_sequence(
         &self,
         producer_id: i64,
@@ -462,14 +636,59 @@ pub trait KafkaStore {
         partition_id: i32,
         base_sequence: i32,
         record_count: i32,
+    ) -> Result<SequenceCheck>;
+
+    /// Persist an appended idempotent batch AFTER its records were inserted (RV-8):
+    /// advance the partition's last sequence and remember the batch (sequence range and
+    /// base offset) among the producer's last [`PRODUCER_BATCH_CACHE`] batches there, so
+    /// a retry of it is answered with its original offset.
+    fn record_producer_batch(&self, batch: ProducerBatch) -> Result<()>;
+
+    /// Register partitions in a transaction (AddPartitionsToTxn). A transactional
+    /// Produce is accepted only for registered partitions. The registry is
+    /// cleared when the next transaction of the transactional id begins and on
+    /// InitProducerId.
+    fn add_txn_partitions(&self, transactional_id: &str, partitions: &[(i32, i32)]) -> Result<()>;
+
+    /// Whether `(topic_id, partition_id)` was registered for the current transaction of
+    /// `transactional_id` with [`add_txn_partitions`](Self::add_txn_partitions).
+    fn txn_has_partition(
+        &self,
+        transactional_id: &str,
+        topic_id: i32,
+        partition_id: i32,
     ) -> Result<bool>;
+
+    /// Register a consumer group in the open transaction of `transactional_id`
+    /// (AddOffsetsToTxn). A TxnOffsetCommit is accepted only for a registered group. The
+    /// registry is cleared with the partitions'
+    /// ([`add_txn_partitions`](Self::add_txn_partitions)).
+    fn add_txn_group(&self, transactional_id: &str, group_id: &str) -> Result<()>;
+
+    /// Whether `group_id` was registered for the current transaction of
+    /// `transactional_id` with [`add_txn_group`](Self::add_txn_group).
+    fn txn_has_group(&self, transactional_id: &str, group_id: &str) -> Result<bool>;
+
+    /// The epoch of `producer_id`'s Ongoing transaction when that transaction has written
+    /// records to `(topic_id, partition_id)` (they are pending there); None otherwise. A
+    /// non-transactional batch of the producer there is INVALID_TXN_STATE, as in Kafka.
+    fn open_txn_epoch_on_partition(
+        &self,
+        producer_id: i64,
+        topic_id: i32,
+        partition_id: i32,
+    ) -> Result<Option<i16>>;
 
     /// Persist a producer's advanced `last_sequence` AFTER a successful insert (RV-8).
     ///
-    /// The sequence advance is split out from `check_and_update_sequence` (which now
-    /// only validates) so it happens only once the records are durably inserted.
-    /// Otherwise a failed insert would leave the sequence advanced and a retry of
-    /// the same batch would be misclassified as a duplicate and silently dropped.
+    /// `check_and_update_sequence` only validates, so the advance happens only once
+    /// the records are durably inserted: a failed insert must not leave the sequence
+    /// advanced, or a retry of the same batch would be taken for a duplicate and
+    /// dropped.
+    ///
+    /// Sets only the last sequence; the produce path uses
+    /// [`record_producer_batch`](Self::record_producer_batch), which also remembers
+    /// the batch for duplicate detection.
     fn record_producer_sequence(
         &self,
         producer_id: i64,
@@ -478,8 +697,19 @@ pub trait KafkaStore {
         last_sequence: i32,
     ) -> Result<()>;
 
-    // ===== Transaction Operations (Phase 10) =====
+    /// The producer that owns `transactional_id`, if it has one.
+    fn transactional_producer(
+        &self,
+        transactional_id: &str,
+    ) -> Result<Option<TransactionalProducer>>;
 
+    /// Record `previous_epoch` as the epoch before the producer's current one, after a
+    /// bump the producer asked for (see [`TransactionalProducer::previous_epoch`]).
+    fn remember_previous_epoch(&self, producer_id: i64, previous_epoch: i16) -> Result<()>;
+}
+
+/// Transactions: transactional producers, state, transactional writes and offsets, commit/abort.
+pub trait TransactionStore {
     /// Look up or create producer by transactional_id
     ///
     /// If transactional_id exists: bump epoch (fences old producer), return existing producer_id.
@@ -640,45 +870,10 @@ pub trait KafkaStore {
     /// # Returns
     /// Current transaction state, or None if transactional_id not found
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
+}
 
-    /// Fetch records with isolation level filtering
-    ///
-    /// Like fetch_records but respects isolation level:
-    /// - ReadUncommitted: returns all records (existing behavior)
-    /// - ReadCommitted: filters out records where txn_state='pending' or 'aborted'
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
-    /// * `isolation_level` - Consumer isolation level
-    ///
-    /// # Returns
-    /// Vector of fetched messages respecting isolation level
-    fn fetch_records_with_isolation(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        fetch_offset: i64,
-        max_bytes: i32,
-        isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>>;
-
-    /// Get last stable offset for a partition
-    ///
-    /// Returns the lowest offset of any pending transaction, or the high
-    /// watermark if no transactions are pending. Used by read_committed
-    /// consumers to know how far they can safely read.
-    ///
-    /// # Arguments
-    /// * `topic_id` - Topic ID
-    /// * `partition_id` - Partition ID
-    ///
-    /// # Returns
-    /// Last stable offset
-    fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
-
+/// Background maintenance the worker runs between requests.
+pub trait MaintenanceStore {
     /// Abort timed-out transactions
     ///
     /// Finds transactions in 'Ongoing' state that have exceeded their timeout
@@ -702,116 +897,46 @@ pub trait KafkaStore {
     /// # Returns
     /// Number of messages deleted
     fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64>;
-
-    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
-    ///
-    /// # Returns
-    /// `None` when the topic inherits the global
-    /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
-    /// (`ms < 0` = infinite retention for this topic).
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
-
-    /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
-    ///
-    /// # Arguments
-    /// * `retention_ms` - `Some(ms)` to set (negative = infinite), `None` to
-    ///   clear the override and fall back to the global GUC
-    fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
-
-    /// Delete records below `before_offset` in a partition (DeleteRecords, API 21).
-    ///
-    /// Rows with `partition_offset < before_offset` are removed (pending
-    /// transactional rows included — the caller has explicitly asked for
-    /// truncation, matching Kafka semantics where DeleteRecords advances the
-    /// log start offset unconditionally).
-    ///
-    /// # Arguments
-    /// * `before_offset` - Exclusive upper bound; caller must already have
-    ///   clamped/validated it against the high watermark
-    ///
-    /// # Returns
-    /// The partition's new log start offset (earliest remaining offset, or the
-    /// high watermark when the partition is now empty)
-    fn delete_records_before(
-        &self,
-        topic_id: i32,
-        partition_id: i32,
-        before_offset: i64,
-    ) -> Result<i64>;
 }
 
-/// Outcome of validating a producer batch's sequence range against the last
-/// persisted sequence for a (producer, topic, partition).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceValidation {
-    /// The entire batch is at or behind the last persisted sequence: a replay
-    /// of already-persisted records. Skip the insert, report success.
-    Duplicate,
-    /// The batch starts exactly at the expected sequence. Persist it and
-    /// advance the stored sequence to `new_last_sequence`.
-    Proceed { new_last_sequence: i32 },
-    /// The batch leaves a gap ahead of the expected sequence, or partially
-    /// overlaps already-persisted records (base behind expected but extending
-    /// past the last persisted sequence). Persisting it would drop or
-    /// duplicate records, so the producer must be told to back off.
-    OutOfOrder { expected_sequence: i32 },
+/// Every storage role: what handlers see through `HandlerContext::store`. Implemented for
+/// every type that implements all roles.
+pub trait KafkaStore:
+    TopicStore + LogStore + OffsetStore + ProducerStore + TransactionStore + MaintenanceStore
+{
 }
 
-/// Validate a producer batch's sequence range.
-///
-/// A batch is only a duplicate when *every* record in it is at or behind
-/// `last_sequence`. A batch whose base is behind the expected sequence but
-/// which extends past `last_sequence` is NOT a duplicate: silently skipping
-/// it would lose the unseen tail records, so it is rejected as out of order
-/// (matching Kafka, which only honors exact replays of cached batches).
-///
-/// All arithmetic is done in i64 so sequence ranges near `i32::MAX` cannot
-/// overflow. Sequence wraparound (mod 2^31) is not yet supported; a batch
-/// that would advance past `i32::MAX` is rejected as out of order rather
-/// than wrapping silently.
-pub fn validate_sequence(
-    last_sequence: i32,
-    base_sequence: i32,
-    record_count: i32,
-) -> SequenceValidation {
-    // RV-12: a negative base_sequence (or record_count) is malformed wire input. It
-    // must not fall through to the Duplicate branch below — for e.g. a fresh
-    // partition (last_sequence = -1) with base_sequence = -1, `batch_last` (-1) is
-    // <= last_sequence, so it would be classified Duplicate, skipped, and acked
-    // success = silent data loss. Reject it as out of order so the client resyncs.
-    if base_sequence < 0 || record_count < 0 {
-        return SequenceValidation::OutOfOrder {
-            expected_sequence: last_sequence.wrapping_add(1),
-        };
-    }
-
-    let expected = last_sequence as i64 + 1;
-    let base = base_sequence as i64;
-    let batch_last = base + (record_count.max(1) as i64) - 1;
-
-    if base == expected {
-        match i32::try_from(batch_last) {
-            Ok(new_last_sequence) => SequenceValidation::Proceed { new_last_sequence },
-            // Would overflow i32 (client wrapped mod 2^31, which we don't
-            // support yet): refuse rather than wrap silently.
-            Err(_) => SequenceValidation::OutOfOrder {
-                expected_sequence: last_sequence.wrapping_add(1),
-            },
-        }
-    } else if batch_last <= last_sequence as i64 {
-        SequenceValidation::Duplicate
-    } else {
-        SequenceValidation::OutOfOrder {
-            expected_sequence: last_sequence.wrapping_add(1),
-        }
-    }
+impl<T> KafkaStore for T where
+    T: TopicStore
+        + LogStore
+        + OffsetStore
+        + ProducerStore
+        + TransactionStore
+        + MaintenanceStore
+        + ?Sized
+{
 }
 
-// Submodules
+/// Every storage role trait, for code that calls store methods on a concrete store type
+/// (`use crate::kafka::storage::roles::*`); through `&dyn KafkaStore` they are in scope
+/// already.
+pub mod roles {
+    pub use super::{
+        LogStore, MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionStore,
+    };
+}
+
+/// ListOffsets' MAX_TIMESTAMP (-3, KIP-734): the record with the largest timestamp.
+pub const MAX_TIMESTAMP: i64 = -3;
+
 pub mod postgres;
+pub mod privileges;
+pub mod retention;
 
 #[cfg(test)]
 mod tests;
 
-// Re-export main types
+#[cfg(test)]
+mod schema_tests;
+
 pub use postgres::PostgresStore;

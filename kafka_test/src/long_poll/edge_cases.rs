@@ -9,6 +9,7 @@
 
 use crate::common::{create_producer, get_bootstrap_servers, TestResult};
 use crate::fixtures::TestTopicBuilder;
+use crate::members::{close_all, Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -64,6 +65,7 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -76,39 +78,39 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     let topic_name = topic.name.clone();
 
     let consumer_handle = tokio::spawn(async move {
-        let start = Instant::now();
-        loop {
-            if start.elapsed() > Duration::from_secs(8) {
-                break;
-            }
+        let elapsed = async {
+            let start = Instant::now();
+            loop {
+                if start.elapsed() > Duration::from_secs(8) {
+                    break;
+                }
 
-            match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
-                Ok(Ok(msg)) => {
-                    let value = msg
-                        .payload()
-                        .map(|v| String::from_utf8_lossy(v).to_string());
-                    if value
-                        .as_deref()
-                        .map(|v| v.starts_with("batch-"))
-                        .unwrap_or(false)
-                    {
-                        received_clone.fetch_add(1, Ordering::SeqCst);
-                        let elapsed = start.elapsed();
-                        println!("  Consumer received message in {:?}", elapsed);
-                        if received_clone.load(Ordering::SeqCst) >= 3 {
-                            return elapsed;
+                match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
+                    Ok(Ok(msg)) => {
+                        let value = msg
+                            .payload()
+                            .map(|v| String::from_utf8_lossy(v).to_string());
+                        if value.as_deref().is_some_and(|v| v.starts_with("batch-")) {
+                            received_clone.fetch_add(1, Ordering::SeqCst);
+                            let elapsed = start.elapsed();
+                            println!("  Consumer received message in {elapsed:?}");
+                            if received_clone.load(Ordering::SeqCst) >= 3 {
+                                return elapsed;
+                            }
                         }
                     }
-                }
-                Ok(Err(e)) => {
-                    if !e.to_string().contains("BrokerTransportFailure") {
-                        println!("  Consumer error: {}", e);
+                    Ok(Err(e)) => {
+                        if !e.to_string().contains("BrokerTransportFailure") {
+                            println!("  Consumer error: {e}");
+                        }
                     }
+                    Err(_) => {}
                 }
-                Err(_) => continue,
             }
+            start.elapsed()
         }
-        start.elapsed()
+        .await;
+        (elapsed, consumer)
     });
 
     // Wait briefly then produce batch of messages
@@ -122,7 +124,7 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
             .send(
                 FutureRecord::to(&topic_name)
                     .payload(&payload)
-                    .key(&format!("key-{}", i)),
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -131,18 +133,18 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     println!("  Produced 5 messages (~500+ bytes total)");
 
     // Wait for consumer
-    let duration = consumer_handle.await?;
+    let (duration, consumer) = consumer_handle.await?;
+    consumer.close(CLOSE_TIMEOUT).await?;
     let count = received.load(Ordering::SeqCst);
 
     println!("\nStep 4: Verifying behavior...");
-    println!("  Messages received: {}", count);
-    println!("  Time to receive: {:?}", duration);
+    println!("  Messages received: {count}");
+    println!("  Time to receive: {duration:?}");
 
     // Consumer should have received messages after batch accumulated
     assert!(
         count >= 3,
-        "Should receive at least 3 messages, got {}",
-        count
+        "Should receive at least 3 messages, got {count}"
     );
 
     ctx.cleanup().await?;
@@ -195,6 +197,7 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -241,16 +244,14 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
 
     let total_duration = start.elapsed();
     println!("\nStep 4: Verifying behavior...");
-    println!(
-        "  Total time for {} polls: {:?}",
-        poll_count, total_duration
-    );
+    println!("  Total time for {poll_count} polls: {total_duration:?}");
 
     // Should complete all polls reasonably quickly
     assert!(
         total_duration < Duration::from_secs(10),
         "All polls should complete within 10 seconds"
     );
+    consumer.close(CLOSE_TIMEOUT).await?;
     println!("  ✅ Polls completed successfully");
 
     ctx.cleanup().await?;
@@ -306,6 +307,7 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
             .set("enable.auto.commit", "false")
             .create()?;
 
+        let consumer = Member::new(consumer);
         consumer.subscribe(&[&topic.name])?;
         println!("  Consumer subscribed, starting poll...");
 
@@ -314,7 +316,8 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
         let _ = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await;
         println!("  Consumer polling for {:?}...", poll_start.elapsed());
 
-        // Consumer drops here
+        // Closes while its Fetch is parked on the broker.
+        consumer.close(CLOSE_TIMEOUT).await?;
     }
     println!("  First consumer dropped (disconnected)\n");
 
@@ -337,6 +340,7 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
         .set("enable.auto.commit", "false")
         .create()?;
 
+    let consumer2 = Member::new(consumer2);
     consumer2.subscribe(&[&topic.name])?;
     println!("  New consumer subscribed");
 
@@ -345,22 +349,22 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
     let start = Instant::now();
     let mut received = false;
     while start.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(500), consumer2.recv()).await {
-            Ok(Ok(msg)) => {
-                let value = msg
-                    .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string());
-                if value.as_deref() == Some("test-message") {
-                    received = true;
-                    println!("  ✅ New consumer received message");
-                    break;
-                }
+        if let Ok(Ok(msg)) =
+            tokio::time::timeout(Duration::from_millis(500), consumer2.recv()).await
+        {
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
+            if value.as_deref() == Some("test-message") {
+                received = true;
+                println!("  ✅ New consumer received message");
+                break;
             }
-            _ => continue,
         }
     }
 
     assert!(received, "New consumer should receive the message");
+    consumer2.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("\n✅ Long poll consumer disconnect test PASSED\n");
@@ -414,6 +418,7 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
             .set("enable.auto.commit", "false")
             .create()?;
 
+        let consumer = Member::new(consumer);
         consumer.subscribe(&[&topic.name])?;
         consumers.push(consumer);
         println!("  Consumer {} created and subscribed", i + 1);
@@ -431,10 +436,12 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
     for (i, consumer) in consumers.into_iter().enumerate() {
         let count = received_counts[i].clone();
         let handle = tokio::spawn(async move {
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(5) {
-                match tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await {
-                    Ok(Ok(msg)) => {
+            let got = async {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(5) {
+                    if let Ok(Ok(msg)) =
+                        tokio::time::timeout(Duration::from_millis(100), consumer.recv()).await
+                    {
                         let value = msg
                             .payload()
                             .map(|v| String::from_utf8_lossy(v).to_string());
@@ -448,10 +455,11 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
                             return true;
                         }
                     }
-                    _ => continue,
                 }
+                false
             }
-            false
+            .await;
+            (got, consumer)
         });
         handles.push(handle);
     }
@@ -474,20 +482,23 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
 
     // Wait for consumers
     let mut success_count = 0;
+    let mut closing = Vec::new();
     for handle in handles {
-        if handle.await? {
+        let (got, consumer) = handle.await?;
+        if got {
             success_count += 1;
         }
+        closing.push(consumer.closing());
     }
+    close_all(closing, CLOSE_TIMEOUT).await?;
 
     println!("\nStep 5: Verifying results...");
-    println!("  Consumers that received message: {}/3", success_count);
+    println!("  Consumers that received message: {success_count}/3");
 
     // At least 2 of 3 consumers should receive (accounting for timing)
     assert!(
         success_count >= 2,
-        "At least 2 of 3 consumers should receive the broadcast, got {}",
-        success_count
+        "At least 2 of 3 consumers should receive the broadcast, got {success_count}"
     );
 
     ctx.cleanup().await?;
@@ -521,8 +532,8 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic.name)
-                    .payload(&format!("message-{}", i))
-                    .key(&format!("key-{}", i)),
+                    .payload(&format!("message-{i}"))
+                    .key(&format!("key-{i}")),
                 Duration::from_secs(5),
             )
             .await
@@ -544,6 +555,7 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
         .set("auto.commit.interval.ms", "2000")
         .create()?;
 
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic.name])?;
     println!("  Consumer subscribed");
 
@@ -552,22 +564,20 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     let mut consumed = 0;
     let start = Instant::now();
     while consumed < 3 && start.elapsed() < Duration::from_secs(5) {
-        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-            Ok(Ok(msg)) => {
-                let value = msg
-                    .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string());
-                if let Some(v) = value {
-                    if v.starts_with("message-") {
-                        consumed += 1;
-                        println!("  Consumed: {}", v);
-                    }
+        if let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await
+        {
+            let value = msg
+                .payload()
+                .map(|v| String::from_utf8_lossy(v).to_string());
+            if let Some(v) = value {
+                if v.starts_with("message-") {
+                    consumed += 1;
+                    println!("  Consumed: {v}");
                 }
             }
-            _ => continue,
         }
     }
-    println!("  Consumed {} messages", consumed);
+    println!("  Consumed {consumed} messages");
 
     // Wait for auto-commit interval
     println!("\nStep 4: Waiting for auto-commit interval (3s)...");
@@ -575,7 +585,7 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     println!("  Wait complete");
 
     // Drop consumer to ensure commits are flushed
-    drop(consumer);
+    consumer.close(CLOSE_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Check committed offset
@@ -601,7 +611,7 @@ pub async fn test_long_poll_auto_commit_interval() -> TestResult {
     match offset_result {
         Some(row) => {
             let offset: i64 = row.get(0);
-            println!("  Committed offset: {}", offset);
+            println!("  Committed offset: {offset}");
             assert!(offset >= 1, "Should have auto-committed after consuming");
         }
         None => {

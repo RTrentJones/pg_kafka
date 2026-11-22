@@ -21,7 +21,7 @@ pub async fn test_offset_no_reuse_after_cleanup() -> TestResult {
     // Produce three messages to a fresh topic -> consecutive offsets ending at `last`.
     let mut last_offset: Option<(i32, i64)> = None;
     for i in 0..3 {
-        let payload = format!("m{}", i);
+        let payload = format!("m{i}");
         let (p, off) = producer
             .send(
                 FutureRecord::to(&topic).payload(&payload).key("k"),
@@ -32,7 +32,7 @@ pub async fn test_offset_no_reuse_after_cleanup() -> TestResult {
         last_offset = Some((p, off));
     }
     let (partition, last) = last_offset.expect("produced at least one message");
-    println!("Produced 3 messages, last offset = {}", last);
+    println!("Produced 3 messages, last offset = {last}");
 
     // Simulate cleanup_aborted_messages deleting the highest row, which lowers
     // MAX(partition_offset). Only the persisted monotonic counter prevents reuse.
@@ -91,7 +91,7 @@ pub async fn test_high_watermark_no_regress_after_cleanup() -> TestResult {
     let mut partition = 0i32;
     let mut last = -1i64;
     for i in 0..5 {
-        let payload = format!("m{}", i);
+        let payload = format!("m{i}");
         let (p, off) = producer
             .send(
                 FutureRecord::to(&topic).payload(&payload).key("k"),
@@ -103,10 +103,7 @@ pub async fn test_high_watermark_no_regress_after_cleanup() -> TestResult {
         last = off;
     }
     let expected_hwm = last + 1;
-    println!(
-        "Produced 5 messages, last offset = {}, HWM = {}",
-        last, expected_hwm
-    );
+    println!("Produced 5 messages, last offset = {last}, HWM = {expected_hwm}");
 
     let consumer = create_base_consumer("hwm-probe")?;
     let timeout = Duration::from_secs(5);
@@ -131,15 +128,11 @@ pub async fn test_high_watermark_no_regress_after_cleanup() -> TestResult {
     // The high watermark must NOT regress: MAX(partition_offset)+1 would now be last - 1, but the
     // monotonic counter keeps it at expected_hwm.
     let (_low, high_after) = consumer.fetch_watermarks(&topic, partition, timeout)?;
-    println!(
-        "HWM after cleanup = {} (expected {})",
-        high_after, expected_hwm
-    );
+    println!("HWM after cleanup = {high_after} (expected {expected_hwm})");
 
     if high_after != expected_hwm {
         return Err(format!(
-            "BUG-4 regression: high watermark regressed after cleanup — expected {}, got {}",
-            expected_hwm, high_after
+            "BUG-4 regression: high watermark regressed after cleanup — expected {expected_hwm}, got {high_after}"
         )
         .into());
     }

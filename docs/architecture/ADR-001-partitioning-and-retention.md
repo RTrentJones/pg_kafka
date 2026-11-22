@@ -1,30 +1,288 @@
 # ADR-001: Partitioning and Retention Strategy
 
-**Status:** Proposed (Future Phase). Partitioning is not implemented; retention shipped by a different mechanism (see the status note below).
+**Status:** Accepted and implemented in 0.1.0. The sections from "Summary" on are the
+original 2026-01 proposal, kept for the record; where they differ, "As built" below wins.
 **Date:** 2026-01-02
-**Last Reviewed:** 2026-10-29
+**Last Reviewed:** 2026-11-18
 **Context:** Based on PostgreSQL queue/pubsub benchmark findings
 
-> **Implementation status (2026-10-29):** The decision below is unchanged and still a proposal.
-> What the code does today:
->
-> - **No table partitioning.** `kafka.messages` is a single, unpartitioned table (`sql/bootstrap.sql`).
->   None of `kafka.ensure_next_partition()`, `kafka.drop_old_partitions()`, `sql/migrate_to_partitioned.sql`,
->   or the `pg_kafka.retention_days` GUC exist.
-> - **Retention exists, implemented as a bounded `DELETE` sweep** (DR-1/DR-2, DEEP-REVIEW-2026-07), which is
->   closer to the `DELETE`-based approach this ADR rejected in Alternative 2 than to partition dropping. The
->   background worker runs the sweep every 60 seconds, deleting at most 10,000 expired rows per statement.
->   It is controlled by `pg_kafka.message_retention_hours` (default 0 = keep forever, SIGHUP-reloadable) and
->   can be run on demand with `SELECT * FROM pg_kafka_run_retention_sweep();`. Pending transactional messages
->   are never deleted. The same sweep reclaims aborted transactional rows, stale producer ids, terminal
->   transactions, and delivered shadow-outbox rows.
-> - **Per-topic retention exists** (Open Question 2 / Alternative 4, answered without per-topic partition
->   sets). `retention.ms` set through IncrementalAlterConfigs is stored in `kafka.topics.retention_ms`
->   (NULL = inherit the GUC, `>= 0` = enforce this window, negative = infinite) and enforced by the same sweep.
->   DeleteRecords truncates a partition on demand, and `kafka.partition_offsets.log_start_offset` keeps the
->   earliest offset from moving backwards.
-> - Space reclaimed by the sweep is returned through `VACUUM`. `sql/tune_autovacuum.sql` tunes autovacuum
->   for the high-churn counter tables.
+## As built (0.1.0)
+
+`kafka.messages` is `PARTITION BY RANGE (created_at)`. Retention drops a whole leaf
+("time partition", the analogue of a Kafka log segment) instead of deleting it row by
+row, wherever every row in the leaf is expired under its own topic's rule.
+
+### Layout
+
+- **Leaves**: width `pg_kafka.message_partition_minutes`
+  (default 1440 = one day, 5 minutes to 30 days, SIGHUP), aligned to UTC multiples of the
+  width, named `kafka.messages_pYYYYMMDD_HHMMSS` after their (UTC) lower bound.
+- **`kafka.messages_default`**, the DEFAULT leaf, catches any row whose leaf does not exist
+  (worker late, or a row written out of band with an old/future `created_at`). A Produce
+  therefore never fails because maintenance was late. It is normally empty.
+- **Maintenance** (`kafka.ensure_message_partitions(width, ahead)`; the worker calls it at
+  start and every 60 s sweep interval, operators via `SELECT pg_kafka_run_partition_maintenance()`)
+  creates the leaf for now and the next two widths, and gives every row in the DEFAULT leaf a
+  proper leaf (create the table standalone, move the rows with one `DELETE ... RETURNING` /
+  `INSERT`, attach it: Postgres refuses `CREATE ... PARTITION OF` while the default holds rows
+  for the range). Only gaps are filled, so changing the width never produces overlapping leaves;
+  existing leaves keep their bounds.
+- **Catalog listing:** `kafka.message_partitions()` returns every leaf with its bounds
+  (parsed from `pg_get_expr(relpartbound)` with DateStyle pinned so they round-trip).
+- **Monitoring:** `kafka.metrics` sums `reltuples` / `pg_table_size` over the leaves (the
+  partitioned parent stores nothing) and reports `messages.time_partitions`.
+
+### Uniqueness
+
+Postgres only accepts a unique constraint on a partitioned table if it includes the partition
+key, so the parent has no primary key and no `UNIQUE (global_offset)`. What actually makes
+offsets unique has always been the allocator: `partition_offset` comes from
+`kafka.partition_offsets.next_offset`, read and advanced under the per-partition advisory lock
+and the counter row's lock in the same transaction, and never decremented;
+`global_offset` comes from one sequence. As a backstop every leaf carries
+`UNIQUE (topic_id, partition_id, partition_offset)` and `UNIQUE (global_offset)` btrees
+(created by `kafka.create_message_partition` for every leaf, by bootstrap for the DEFAULT leaf,
+and inherited from the old primary key / unique constraint by the upgraded leaf). A duplicate
+inside one leaf is still rejected; a duplicate across leaves would need the counter to go
+backwards, which nothing does.
+
+Fetch, ListOffsets and the HWM/LSO probes do not name `created_at`, so they cannot prune: the
+planner runs a MergeAppend (or one LIMIT 1 probe per leaf for MIN/MAX) over every leaf's unique
+btree. The cost is one btree descent per leaf, which stays cheap because the leaf count is
+bounded (retention window / width + 3 + DEFAULT, e.g. 11 leaves for 7-day retention with daily
+leaves). Very small widths with long retention multiply the leaf count and should be avoided.
+
+Planning is the larger cost: planning a statement over a partitioned table expands every leaf,
+so with 11 leaves a one-shot `MAX(partition_offset)` probe cost 0.75 ms against 0.10 ms on the
+unpartitioned table (pgbench, simple protocol), almost all of it planning. The hot read
+statements in `storage/postgres/log.rs` (produce's base-offset probe, Fetch, the partition-bounds,
+HWM and earliest-offset probes) therefore run through prepared plans kept for the life of the
+backend (`select_cached`, `SPI_keepplan`; the plan cache re-plans them when a leaf is created
+or dropped). With cached plans, at 11 leaves: Fetch of 100 rows 0.20 ms vs 0.135 ms, MAX probe
+0.19 ms vs 0.05 ms. The plans execute with `read_only = false` so each takes a fresh READ
+COMMITTED snapshot like the one-shot statements: executed read-only, a cached plan reused a
+snapshot older than the group-commit batch's latest requests and Fetch reported a stale
+high watermark (caught by `test_fetch_bounds_from_single_statement`).
+
+### Kafka-visible behaviour
+
+- **Unchanged:** offsets, HWM, log start, Fetch, ListOffsets (earliest/latest/timestamp),
+  DeleteRecords, transactions, shadow outbox/replay. No UPDATE the extension issues changes
+  `created_at` (EndTxn only sets `txn_state`), so no row ever moves between leaves.
+- **Retention granularity (the one deliberate change):** a topic whose window is at least one
+  width is expired a leaf at a time, like Kafka segment retention (a segment goes once its
+  newest record is past `retention.ms`): its rows are removed once the leaf's upper bound is past
+  the window, so a row lives at most `window + width`. A topic whose window is shorter than one
+  width keeps exact row-by-row expiry (as before 0.1.0), so a short `retention.ms` is not
+  stretched to a day. Rows still in the DEFAULT leaf are always expired row by row.
+
+### The sweep (`PostgresStore::run_retention_sweep`)
+
+1. For every past leaf (upper bound <= now) it asks `kafka.message_partition_contents(leaf)` for
+   the (topic, partition) pairs present (a loose index scan, one descent per pair) and whether a
+   pending transactional row is there, then `retention::classify_leaf` decides:
+   **Drop** when every topic present is wholly expired (`upper + window <= now`) and nothing is
+   pending; **Trim** when some topics are wholly expired but the leaf must stay (a longer or
+   infinite window, or a pending row): those topics' rows in that leaf get the existing bounded
+   row delete; **Keep** otherwise. Empty past leaves are dropped.
+2. Row-level expiry for short windows (and for the DEFAULT leaf), per (topic, leaf), with the
+   same 10,000-row batches and 1.5 s pass budget as before. Each statement is confined to one
+   leaf (the leaf's bounds make the planner prune to it, and `tableoid` keeps `ctid`
+   unambiguous; the DEFAULT leaf is addressed directly).
+3. Drops last (at most 64 per pass), through `kafka.drop_message_partition(leaf, expired_topics)`,
+   which re-checks under `ACCESS EXCLUSIVE` on `kafka.messages` that the leaf holds only listed
+   topics and no pending row, so a concurrent writer cannot lose a row.
+4. `log_start_offset` of every touched (topic, partition) advances to the oldest surviving offset
+   or the HWM, only forward (GREATEST), exactly as for row deletes. Offsets are assigned in
+   `created_at` order, so a dropped leaf is an offset prefix of each partition it held; the only
+   transient exception is a topic whose older rows sit in a non-droppable leaf awaiting the Trim
+   delete of the same pass, and those rows are expired too.
+
+A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
+timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.
+
+### Concurrency with the worker and with manual maintenance
+
+Maintenance can run in the worker and, at the same time, in any superuser session
+(`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`; EXECUTE on both is
+revoked from PUBLIC, and a role granted it also needs the privileges their SQL needs). Who may
+call them matters: a call holds `ACCESS SHARE` on the extension object while it waits for the
+maintenance advisory lock (below), and any role can hold that advisory lock. A role that could
+call them would, holding `pg_advisory_lock(8099547369649367905)` in one session and calling the
+sweep with `lock_timeout = 0` in another, keep `DROP EXTENSION` waiting for as long as it liked,
+and every worker transaction (whose extension lock queues behind the DROP) with it. The rules:
+
+* **Everything that locks member tables takes the extension lock first.** `DROP EXTENSION
+  pg_kafka` takes `ACCESS EXCLUSIVE` on the extension object and then locks its members
+  one by one (the schema `kafka`, then `kafka.topics`, ..., `kafka.messages`), and partition
+  DDL locks the extension too (`CREATE TABLE` in schema `kafka` locks the schema, `ALTER
+  EXTENSION ... ADD/DROP TABLE` the extension). A pass that held a member table when DROP
+  started (maintenance takes `ACCESS SHARE` on `kafka.messages` first, a sweep deletes rows)
+  and then needed one DROP already held formed a lock cycle, and Postgres aborted DROP or
+  the pass with `deadlock detected`. So every worker transaction and both SQL functions
+  (`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`) start with
+  `ACCESS SHARE` on the extension object (`worker::txn::lock_extension`), before any table
+  lock: a pass either waits for a DROP in progress (bounded by the session's `lock_timeout`;
+  if the extension is gone afterwards, the function fails) or makes DROP wait until it
+  commits; the pass's own `ALTER EXTENSION ... ADD/DROP TABLE` (`SHARE UPDATE EXCLUSIVE`)
+  then never waits for DROP. The SQL functions do not take the schema lock: they serialize
+  with the worker's maintenance through the maintenance lock, and a move takes it EXCLUSIVE
+  as below. `kafka.ensure_message_partitions` and `kafka.drop_message_partition` called
+  directly (only superusers and `pgkafka_worker` may) cannot take the extension lock from
+  SQL, so they keep the deadlock with a concurrent DROP EXTENSION: operators call the
+  `pg_kafka_run_*` functions instead.
+* **Moving rows out of the DEFAULT leaf never overlaps a worker transaction.** The move
+  (`DELETE` from `kafka.messages_default` + `INSERT` into the new leaf, in
+  `create_message_partition`) would otherwise race the worker's UPDATEs of `kafka.messages`
+  (EndTxn's `txn_state` change, the timeout/fencing aborts, DeleteRecords): an UPDATE that
+  meets a row the move deleted skips it once the move commits and never sees its copy,
+  leaving a committed transaction `pending` forever. So every worker transaction
+  starts by taking the pg_kafka schema advisory lock (key 8099547369649367906) in SHARE
+  mode (`worker::txn::lock_schema`), and a pass that has rows to move takes it EXCLUSIVE.
+  `ensure_message_partitions` queues for it once, bounded by its `lock_timeout`, when
+  `kafka.messages_default` holds rows, before its first leaf locks any table: a pass that
+  creates several leaves holds `kafka.messages` `ACCESS EXCLUSIVE` from the first to commit,
+  and queueing for the schema lock after that would wait for a worker transaction that
+  waits for `kafka.messages`, a lock cycle. `create_message_partition` then only tries the
+  lock (`pg_try_advisory_xact_lock`, which succeeds at once for the pass that holds it): a
+  leaf whose move finds it taken (the wait timed out, or the pass found DEFAULT empty and
+  did not queue) is not created, and the next pass retries; the pass's other leaves are.
+  Rows can still reach DEFAULT while `create_message_partition` waits for its table locks
+  (`CREATE ... PARTITION OF` would then fail with `check_violation`), so a leaf that had
+  none to move checks again once it holds `kafka.messages`, when none can arrive, and
+  moves the rows on the same terms. That check reads the transaction's snapshot: a manual
+  pass under `REPEATABLE READ` or `SERIALIZABLE` does not see rows committed during the
+  wait, so a `check_violation` from the leaf's DDL skips the leaf (a WARNING, as for a lock
+  timeout) and a later pass moves the rows. Trying the schema lock while holding the tables
+  waits for nothing, so it cannot close a cycle. The upgrade scripts take the same lock
+  first. No other path waits for the schema lock after a table lock.
+* **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
+  (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
+  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,
+  which needs `ACCESS EXCLUSIVE` there. Two sweeps interleaving those steps form a lock cycle
+  (one waits for `ACCESS EXCLUSIVE` behind the other's `ROW EXCLUSIVE`, the other waits for
+  the first's deleted rows or for the maintenance lock) and Postgres aborts one with
+  `deadlock detected`. So every sweep takes the partition-maintenance advisory lock
+  (8099547369649367905) before its first statement and holds it to commit, as
+  `ensure_message_partitions` and `drop_message_partition` do: sweeps and maintenance run one
+  at a time. `pg_kafka_run_retention_sweep()` queues for the lock (bounded by the session's
+  `lock_timeout`; it holds nothing else yet). The worker never waits for it, because its
+  transaction holds the schema lock in SHARE mode, which a manual pass holding the
+  maintenance lock may be waiting for (moving rows out of DEFAULT): its sweep is skipped with
+  a WARNING while another session holds the lock, and the SQL functions only poll for it
+  (`kafka.try_maintenance_lock()`, `pg_try_advisory_xact_lock` until their `lock_timeout`),
+  never queue. Produce and fetch never take this lock, so they are not serialized with
+  maintenance beyond the table locks below.
+* **Partition DDL takes its table locks without deadlocking with worker transactions.**
+  Creating or dropping a leaf locks `kafka.messages` (`ACCESS EXCLUSIVE`) and, to clone or
+  drop the leaf's `topic_id` foreign key, `kafka.topics` (`SHARE ROW EXCLUSIVE`). A worker
+  transaction locks these two tables in either order (a group-commit batch can fetch from
+  one topic and then auto-create another, whose produce upserts `kafka.topics`), so no fixed
+  order avoids a cycle with it. `kafka.lock_message_tables()` takes both (topics, then
+  messages) in attempts of at most 50 ms each, well below `deadlock_timeout`, in a
+  subtransaction whose failure releases both, and retries with a random pause until the
+  caller's `lock_timeout` (2 s in the partition functions) has passed. A worker transaction
+  therefore waits at most one attempt, and one that holds a lock the DDL needs simply makes
+  it retry.
+* **Every lock wait in maintenance is bounded and handled.** A session that ran maintenance
+  and stayed open makes the next pass skip with a WARNING instead of stalling it (and, for
+  the worker, the whole broker). `drop_message_partition` takes its table locks inside a
+  `lock_not_available` handler, so a timeout skips that leaf instead of rolling back the
+  caller's whole sweep. Any ERROR in the worker's maintenance (a lock timeout, a deadlock
+  with a client's own transaction) rolls back that task's subtransaction only; the worker
+  logs a WARNING, keeps serving, and the next interval retries.
+* **A leaf dropped concurrently is "not dropped", not an error.** When two sweeps pick
+  the same leaf, the second waits for the first's locks; afterwards
+  `drop_message_partition` (and `message_partition_contents`) find the leaf gone and
+  return `dropped = false` (NULL contents) instead of erroring on the vanished OID.
+* **Maintenance locks the parent before any leaf.** Every worker statement on
+  `kafka.messages` locks the parent first and then its leaves in bound order, and
+  `ensure_message_partitions` takes `ACCESS SHARE` on `kafka.messages` before it reads
+  `kafka.messages_default`: a leaf locked without the parent would close a cycle with a
+  session that holds the parent and waits for that leaf.
+* **Your own DDL on `kafka.messages`: lock the parent first.** `CREATE TRIGGER`,
+  `ALTER TABLE` and the like lock the parent before the leaves, but `DROP TRIGGER` on a
+  partitioned table takes only `ACCESS SHARE` on the parent, then `ACCESS EXCLUSIVE` on
+  each leaf (DEFAULT first, then newest first), so it can deadlock with any worker read
+  that spans leaves (Fetch, the outbox claim), and Postgres may abort the worker's request
+  rather than the DDL. Run such DDL as `BEGIN; LOCK TABLE kafka.messages IN ACCESS
+  EXCLUSIVE MODE; ...; COMMIT;`, which waits for the worker instead (as
+  `kafka_test/src/shadow/rollback.rs` does).
+* The worker's own lock waits are bounded by `pg_kafka.worker_lock_timeout_ms` (default
+  5 s), which applies to these locks too.
+
+### Least privilege
+
+The worker runs as `pgkafka_worker`, which has no DDL rights. All partition DDL runs inside
+SECURITY DEFINER functions owned by the extension owner, each with `SET search_path = pg_catalog,
+pg_temp`, schema-qualified names and `lock_timeout = 2s` around the DDL (a lock that cannot be had
+in time is a WARNING and a retry next pass, never a stalled worker). EXECUTE is revoked from PUBLIC
+and granted to `pgkafka_worker` only for `ensure_message_partitions`, `message_partition_contents`
+and `drop_message_partition`; `create_message_partition` and the lock helpers
+`try_maintenance_lock` and `lock_message_tables` are internal. Each function refuses any
+relation that is not a leaf of `kafka.messages` (and `drop` refuses the DEFAULT leaf), so the
+grant is no wider than the worker's existing INSERT/DELETE on `kafka.messages`: it can create
+leaves of that table and drop leaves whose rows it may delete anyway. The worker reads and writes
+leaves only through `kafka.messages`, plus `SELECT, DELETE` on `kafka.messages_default` for the
+row delete there. `storage/privileges.rs` lists the function grants (`WORKER_FUNCTION_GRANTS`) and
+the startup role check verifies them with `has_function_privilege`.
+
+### Upgrade from 0.0.0
+
+`ALTER EXTENSION pg_kafka UPDATE` renames the populated table to `kafka.messages_legacy`
+(renaming its primary key / unique index / constraints to the per-leaf names), creates the
+partitioned parent (same `global_offset` sequence, now owned by the parent) with the DEFAULT leaf,
+and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied. It
+reads the old table three times (MAX(created_at) for the bound, the attach's bound check, the BRIN
+build) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
+The views that read the table are recreated on the parent. A new binary
+running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
+skips partition maintenance; its retention sweep expires rows row by row on the
+unpartitioned table. `scripts/check-upgrade.sh` compares
+the upgraded and fresh schemas with leaves normalized (each leaf's index set and grants must be
+identical; leaf names and counts are data-dependent), then checks that maintenance works on both,
+that the legacy leaf drops whole without losing the sequence, and that `pg_dump` emits no kafka
+table.
+
+### pg_dump / restore
+
+Every leaf is made a member of the extension (`ALTER EXTENSION pg_kafka ADD TABLE`, and `DROP`
+before dropping it), like the tables `CREATE EXTENSION` made. pg_dump therefore treats leaves
+exactly as it always treated `kafka.messages`: it dumps `CREATE EXTENSION pg_kafka` and no kafka
+table or data (pg_kafka never marked its tables with `pg_extension_config_dump`). A restore gets a
+fresh, empty schema with the DEFAULT leaf, and the worker creates the time leaves. If leaves were
+not members, pg_dump would emit them, their `ATTACH` and their rows, and the restore would fail on
+the foreign key to the (not dumped) `kafka.topics`. Back up pg_kafka data physically (base
+backup + WAL), as before. `pg_upgrade` (binary-upgrade dump of extension members) was not tested.
+
+### PostgreSQL versions
+
+Only features present since PG11-12 are used (declarative RANGE partitioning with DEFAULT,
+partitioned BRIN/partial indexes, FKs from partitioned tables, `pg_partition_tree`,
+`ATTACH PARTITION`, run-time partition pruning); no catalog column or syntax newer than PG14.
+Measured on PG15; CI runs the E2E suite (time partitions included) on PG14-18.
+
+### Measured (PG15 sandbox, 1,000,000 expired + 100,000 retained rows, one topic, retention 1 day)
+
+| | before (row DELETE sweep) | after (partition drop) |
+|---|---|---|
+| sweep passes until caught up | 3 | 1 (+1 no-op) |
+| wall time of the sweep calls | 2.94 s | 0.35 s |
+| rows deleted / leaves dropped | 1,000,000 / - | 0 / 3 |
+| WAL written by the sweep | 240.5 MB | 0.16 MB |
+| dead tuples left | 1,002,360 | 0 |
+| following VACUUM | 0.37 s, 59 MB WAL | 0.04 s, 8 kB WAL |
+| `kafka.messages` size afterwards | 248 MB (space kept) | 17 MB |
+
+`performance` E2E category (rdkafka clients, msgs/s; three runs each, noisy shared 4-core box):
+
+| | produce | consume | produce P50 |
+|---|---|---|---|
+| before (unpartitioned) | 120-140 | 433-435 | 6.7-8.0 ms |
+| after, 4 leaves | 142-145 | 417-434 | 6.8-6.9 ms |
+| after, 11 leaves | 138-142 | 416-420 | 7.0-7.1 ms |
+| after, 11 leaves, before plan caching | 123-127 | 416-418 | 7.5-7.7 ms |
+
 
 ## Summary
 
@@ -377,8 +635,7 @@ Based on this retention limitation:
 ---
 
 **Next Steps:**
-- [ ] Implement partition management functions (Phase 3.1)
-- [ ] Test migration script with 10M+ rows
-- [ ] Document data loss behavior in user-facing docs (the `DELETE`-sweep retention is documented in
-      [PERFORMANCE.md](../PERFORMANCE.md#retention--lifecycle-gucs-shipped); partition dropping is not implemented)
-- [ ] Add monitoring for partition operations
+- [x] Implement partition management functions (0.1.0, see "As built")
+- [ ] Test the 0.0.0 upgrade with 10M+ rows (checked with small data in `scripts/check-upgrade.sh`)
+- [x] Document data loss behavior in user-facing docs ([PERFORMANCE.md](../PERFORMANCE.md#retention--lifecycle-gucs-shipped))
+- [x] Add monitoring for partition operations (`kafka.metrics` `messages.time_partitions`, worker log lines)

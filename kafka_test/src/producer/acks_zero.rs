@@ -8,6 +8,7 @@
 //! 2. Can keep using the same connection afterwards (metadata + acks=1)
 //! 3. The messages are actually persisted (best-effort write happened)
 
+use crate::common::to_i64;
 use crate::common::{get_bootstrap_servers, TestResult};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
@@ -36,14 +37,11 @@ pub async fn test_producer_acks_zero() -> TestResult {
     let topic = ctx.unique_topic("acks-zero").await;
 
     // 2. ACTION: produce with acks=0
-    println!(
-        "Step 1: Producing {} messages with acks=0...",
-        MESSAGE_COUNT
-    );
+    println!("Step 1: Producing {MESSAGE_COUNT} messages with acks=0...");
     let producer = create_acks_zero_producer()?;
     for i in 0..MESSAGE_COUNT {
-        let key = format!("key-{}", i);
-        let value = format!("acks-zero-message-{}", i);
+        let key = format!("key-{i}");
+        let value = format!("acks-zero-message-{i}");
         // With acks=0 the client reports delivery as soon as the request is
         // written; any protocol desync (e.g., an unexpected response frame)
         // surfaces as a transport error on subsequent sends
@@ -54,12 +52,12 @@ pub async fn test_producer_acks_zero() -> TestResult {
             )
             .await
             .map_err(|(err, _msg)| {
-                println!("❌ acks=0 delivery failed for message {}: {}", i, err);
+                println!("❌ acks=0 delivery failed for message {i}: {err}");
                 err
             })?;
     }
     producer.flush(Duration::from_secs(5))?;
-    println!("✅ {} messages sent fire-and-forget\n", MESSAGE_COUNT);
+    println!("✅ {MESSAGE_COUNT} messages sent fire-and-forget\n");
 
     // 3. VERIFY: the connection still works for request/response traffic.
     // If the broker had sent unsolicited response frames for the acks=0
@@ -75,15 +73,12 @@ pub async fn test_producer_acks_zero() -> TestResult {
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!(
-        "✅ acks=1 produce confirmed (partition {}, offset {})\n",
-        partition, offset
-    );
+    println!("✅ acks=1 produce confirmed (partition {partition}, offset {offset})\n");
 
     // 4. VERIFY: best-effort writes actually landed in the database.
     // acks=0 writes are async relative to the client, so poll briefly.
     println!("=== Database Verification ===\n");
-    let expected = (MESSAGE_COUNT + 1) as i64;
+    let expected = to_i64(MESSAGE_COUNT + 1);
     let mut count: i64 = 0;
     for _ in 0..50 {
         let row = ctx
@@ -102,10 +97,9 @@ pub async fn test_producer_acks_zero() -> TestResult {
     }
     assert_eq!(
         count, expected,
-        "Expected {} messages ({} acks=0 + 1 acks=1), found {}",
-        expected, MESSAGE_COUNT, count
+        "Expected {expected} messages ({MESSAGE_COUNT} acks=0 + 1 acks=1), found {count}"
     );
-    println!("✅ All {} messages persisted\n", count);
+    println!("✅ All {count} messages persisted\n");
 
     // 5. CLEANUP
     ctx.cleanup().await?;

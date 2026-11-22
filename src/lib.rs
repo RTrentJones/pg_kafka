@@ -1,119 +1,88 @@
+//! pg_kafka: a PostgreSQL extension that serves the Kafka wire protocol from a background
+//! worker, with Postgres tables as the log.
+//!
+//! This crate root holds the module tree, the logging macros the DB thread uses, the
+//! `_PG_init` hook that registers the GUCs and the worker, the SQL-callable functions
+//! defined here, and the inclusion of the bootstrap schema.
+
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 use pgrx::prelude::*;
 
-// Module declarations for our extension components
-mod config; // Configuration (GUC parameters)
-pub mod kafka; // Kafka protocol implementation (listener, protocol, messages)
-pub mod worker; // Background worker implementation
+mod config;
+pub mod kafka;
+mod worker;
 
-// Test utilities (only compiled in test builds)
 #[cfg(test)]
 pub mod testing;
 
-// Note: Previously had RELOAD_SHADOW_CONFIG_REQUESTED atomic flag here.
-// Removed because PostgreSQL uses separate processes (not threads), so static
-// variables aren't shared between the SQL function process and worker process.
-// Use shadow_config_reload_interval_ms GUC instead for testing.
-
-// ===== Conditional Logging Macros =====
-// These provide test-safe alternatives to pgrx logging functions
-
-/// Production logging - uses pgrx::log!()
-#[cfg(not(test))]
+/// Log at LOG level through `pgrx::log!`. In unit tests (no Postgres to log to) the
+/// arguments are only formatted, so they stay type-checked and used.
 #[macro_export]
 macro_rules! pg_log {
-    ($($arg:tt)*) => { pgrx::log!($($arg)*) };
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        pgrx::log!($($arg)*);
+        #[cfg(test)]
+        let _ = ::std::format!($($arg)*);
+    }};
 }
 
-/// Test logging - consumes args to avoid unused variable warnings
-#[cfg(test)]
-#[macro_export]
-macro_rules! pg_log {
-    ($($arg:tt)*) => {
-        // Consume args to avoid unused variable warnings in test mode
-        // Uncomment for test debugging:
-        // eprintln!("[LOG] {}", format!($($arg)*));
-        let _ = format!($($arg)*);
-    };
-}
-
-/// Production warning - uses pgrx::warning!()
-#[cfg(not(test))]
+/// Log a WARNING through `pgrx::warning!` (only formatted in unit tests, see
+/// [`pg_log!`]).
 #[macro_export]
 macro_rules! pg_warning {
-    ($($arg:tt)*) => { pgrx::warning!($($arg)*) };
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        pgrx::warning!($($arg)*);
+        #[cfg(test)]
+        let _ = ::std::format!($($arg)*);
+    }};
 }
 
-/// Test warning - consumes args to avoid unused variable warnings
-#[cfg(test)]
-#[macro_export]
-macro_rules! pg_warning {
-    ($($arg:tt)*) => {
-        // Consume args to avoid unused variable warnings in test mode
-        // Uncomment for test debugging:
-        // eprintln!("[WARNING] {}", format!($($arg)*));
-        let _ = format!($($arg)*);
-    };
-}
-
-/// Production debug logging - uses pgrx::debug1!()
-#[cfg(not(test))]
+/// Log at DEBUG1 through `pgrx::debug1!` (only formatted in unit tests, see
+/// [`pg_log!`]).
 #[macro_export]
 macro_rules! pg_debug {
-    ($($arg:tt)*) => { pgrx::debug1!($($arg)*) };
-}
-
-/// Test debug logging - consumes args to avoid unused variable warnings
-#[cfg(test)]
-#[macro_export]
-macro_rules! pg_debug {
-    ($($arg:tt)*) => {
-        // Consume args to avoid unused variable warnings in test mode
-        // Uncomment for test debugging:
-        // eprintln!("[DEBUG] {}", format!($($arg)*));
-        let _ = format!($($arg)*);
-    };
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        pgrx::debug1!($($arg)*);
+        #[cfg(test)]
+        let _ = ::std::format!($($arg)*);
+    }};
 }
 
 ::pgrx::pg_module_magic!();
 
-/// Extension initialization hook - called exactly once when Postgres loads the extension.
+/// Extension initialization hook, called once when Postgres loads the library through
+/// `shared_preload_libraries`.
 ///
-/// This function is called by PostgreSQL when the extension is loaded via the
-/// `shared_preload_libraries` configuration parameter in postgresql.conf.
-///
-/// IMPORTANT: Background workers MUST be registered in _PG_init(). They cannot
-/// be registered later (e.g., in CREATE EXTENSION) because Postgres needs to
-/// know about them before the postmaster has finished starting up.
-///
-/// For more details, see:
-/// - https://www.postgresql.org/docs/current/bgworker.html
-/// - https://docs.rs/pgrx/latest/pgrx/bgworkers/index.html
+/// Background workers must be registered here: the postmaster needs to know them
+/// before it has finished starting, so `CREATE EXTENSION` is too late. See
+/// <https://www.postgresql.org/docs/current/bgworker.html>.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
     use pgrx::bgworkers::BgWorkerStartTime;
 
     pgrx::log!("pg_kafka: _PG_init() called - extension loading");
-
-    // Initialize GUC configuration parameters
     config::init();
     pgrx::log!("pg_kafka: GUC configuration initialized");
 
-    // Register the pg_kafka background worker with PostgreSQL.
-    //
-    // BackgroundWorkerBuilder configures how Postgres should manage our worker:
-    // - name: Identifier shown in pg_stat_activity
-    // - function: The Rust function to run (entry point)
-    // - library: Must match the shared library name (pg_kafka.so)
-    // - start_time: When to start (PostmasterStart = at server startup)
-    //
-    // enable_spi_access() allows the worker to connect to the database and
-    // execute SQL queries (we'll use this in Phase 2).
+    // - start_time RecoveryFinished: the worker needs a database connection (SPI),
+    //   which Postgres allows only once recovery has finished (pgrx's
+    //   enable_spi_access() forces this start time anyway). So the listener does not
+    //   run on a hot standby: it starts on a primary, or on a standby once promoted.
+    // - restart_time: if the worker exits for any reason other than a clean unregister
+    //   (exit code 0) (a FATAL error, a failed bind, a caught commit failure, or
+    //   `pg_terminate_backend()` on its pid), the postmaster starts a fresh one after
+    //   WORKER_RESTART_INTERVAL, so the Kafka port does not stay dead until Postgres
+    //   restarts. The worker exits with code 1 on SIGTERM for this reason; during a
+    //   server shutdown the postmaster does not restart workers.
     pgrx::log!("pg_kafka: Registering background worker 'pg_kafka_listener'");
     BackgroundWorkerBuilder::new("pg_kafka_listener")
         .set_function("pg_kafka_listener_main")
         .set_library("pg_kafka")
-        .set_start_time(BgWorkerStartTime::PostmasterStart)
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(worker::WORKER_RESTART_INTERVAL))
         .enable_spi_access()
         .load();
 
@@ -121,88 +90,126 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     pgrx::log!("pg_kafka: _PG_init() completed");
 }
 
+/// Smoke test: `SELECT hello_pg_kafka()` answers when the library is loaded.
 #[pg_extern]
 fn hello_pg_kafka() -> &'static str {
     "Hello, pg_kafka"
 }
 
-/// DR-1/DR-2 (DEEP-REVIEW-2026-07): run one storage-lifecycle retention sweep on
-/// demand and report what it deleted. The background worker runs the identical
-/// sweep periodically; this function exists for operators (reclaim space now,
-/// observe what a sweep would reap) and for the E2E suite, which can't wait out
-/// the worker's sweep interval.
+/// DR-1/DR-2: run one storage-lifecycle retention sweep on demand and report what it
+/// deleted. The background worker runs the identical sweep periodically; this function
+/// exists for operators (reclaim space now, observe what a sweep would reap) and for the
+/// E2E suite, which cannot wait out the worker's sweep interval.
 ///
-/// * `message_retention_hours` — NULL (default) uses `pg_kafka.message_retention_hours`;
+/// * `message_retention_hours`: NULL (default) uses `pg_kafka.message_retention_hours`;
 ///   0 disables the expired-message delete for this pass.
-/// * `aborted_grace_seconds` — minimum age of `txn_state='aborted'` rows to reclaim
-///   (default matches the worker's ABORTED_MESSAGE_GRACE).
+/// * `aborted_grace_seconds`: minimum age of `txn_state='aborted'` rows to reclaim
+///   (the default matches the worker's `ABORTED_MESSAGE_GRACE`; negative means 0).
+///
+/// Sweeps and partition maintenance are serialized: a call first waits for the
+/// partition-maintenance lock (bounded by the session's `lock_timeout`), so a
+/// concurrent pass (another session's, or the worker's) finishes first. Call it in a
+/// transaction of its own: a transaction that already locked kafka.messages could
+/// deadlock with the pass it waits for.
+///
+/// Superusers only: EXECUTE is revoked from PUBLIC (`sql/bootstrap.sql`), since a caller
+/// that waits here holds the extension lock, and any role can hold the maintenance lock.
 #[pg_extern(volatile)]
 fn pg_kafka_run_retention_sweep(
     message_retention_hours: default!(Option<i32>, "NULL"),
     aborted_grace_seconds: default!(i64, 60),
 ) -> TableIterator<'static, (name!(category, String), name!(deleted, i64))> {
     use crate::kafka::storage::postgres::PostgresStore;
+    use crate::kafka::storage::retention::MaintenanceLockWait;
 
     let retention_hours =
         message_retention_hours.unwrap_or_else(|| config::MESSAGE_RETENTION_HOURS.get());
-    let grace = std::time::Duration::from_secs(aborted_grace_seconds.max(0) as u64);
+    let grace = std::time::Duration::from_secs(u64::try_from(aborted_grace_seconds).unwrap_or(0));
 
-    let store = PostgresStore::new();
-    let stats = store
-        .run_retention_sweep(retention_hours, grace)
-        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e));
+    lock_extension_for_maintenance("pg_kafka_run_retention_sweep");
+    let stats = PostgresStore::new()
+        .run_retention_sweep(
+            retention_hours,
+            grace,
+            config::MESSAGE_PARTITION_MINUTES.get(),
+            MaintenanceLockWait::Wait,
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_retention_sweep failed: {}", e))
+        .unwrap_or_default();
 
-    TableIterator::new(vec![
+    let rows = [
+        ("aborted_messages", stats.aborted_messages),
+        ("expired_messages", stats.expired_messages),
+        ("dropped_partitions", stats.dropped_partitions),
+        ("stale_producers", stats.stale_producers),
+        ("terminal_transactions", stats.terminal_transactions),
+        ("shadow_delivered_rows", stats.shadow_delivered_rows),
+    ];
+    TableIterator::new(rows.map(|(category, deleted)| {
         (
-            "aborted_messages".to_string(),
-            stats.aborted_messages as i64,
-        ),
-        (
-            "expired_messages".to_string(),
-            stats.expired_messages as i64,
-        ),
-        ("stale_producers".to_string(), stats.stale_producers as i64),
-        (
-            "terminal_transactions".to_string(),
-            stats.terminal_transactions as i64,
-        ),
-        (
-            "shadow_delivered_rows".to_string(),
-            stats.shadow_delivered_rows as i64,
-        ),
-    ])
+            category.to_string(),
+            i64::try_from(deleted).unwrap_or(i64::MAX),
+        )
+    }))
 }
 
-// Note: Removed reload_shadow_config() SQL function.
-// It didn't work because PostgreSQL uses separate processes, not threads.
-// Static variables aren't shared between backend and worker processes.
-// Use shadow_config_reload_interval_ms GUC for fast reloads during testing.
+/// ADR-001: run one time-partition maintenance pass on demand: create the leaves of
+/// kafka.messages for now and the next two widths, and move any row the DEFAULT leaf
+/// caught into its proper leaf. The worker runs the same pass at start and every
+/// retention interval. Returns the number of leaves created.
+///
+/// * `partition_minutes`: NULL (default) uses `pg_kafka.message_partition_minutes`.
+///
+/// Like the sweep, call it in a transaction of its own: it takes the extension lock
+/// first ([`lock_extension_for_maintenance`]), which only helps while it holds no member
+/// table yet. Superusers only, like the sweep (EXECUTE is revoked from PUBLIC).
+#[pg_extern(volatile)]
+fn pg_kafka_run_partition_maintenance(partition_minutes: default!(Option<i32>, "NULL")) -> i64 {
+    use crate::kafka::storage::postgres::PostgresStore;
 
-// Include bootstrap SQL to create kafka schema and tables
-pgrx::extension_sql_file!("../sql/bootstrap.sql");
+    let minutes = partition_minutes.unwrap_or_else(|| config::MESSAGE_PARTITION_MINUTES.get());
+    lock_extension_for_maintenance("pg_kafka_run_partition_maintenance");
+    PostgresStore::new()
+        .ensure_time_partitions(minutes)
+        .unwrap_or_else(|e| pgrx::error!("pg_kafka_run_partition_maintenance failed: {}", e))
+}
 
-// #[cfg(any(test, feature = "pg_test")]]
-// #[pg_schema]
-// mod tests {
-//     use pgrx::prelude::*;
+/// The first lock of the SQL maintenance functions, before any member table: the share
+/// lock on the extension object every worker transaction also starts with
+/// (`worker::txn::lock_extension`). DROP EXTENSION locks the extension and then its
+/// members, and the partition DDL runs ALTER EXTENSION ... ADD/DROP TABLE, which locks
+/// the extension too; a pass that already held kafka.messages when DROP took the
+/// extension would wait for DROP (for kafka.topics, or the extension itself) while DROP
+/// waited for kafka.messages: "deadlock detected" in one of them. Taken first, the
+/// pass waits for a DROP in progress (bounded by the session's `lock_timeout`) or makes
+/// DROP wait for it. A pass whose extension was dropped meanwhile fails.
+fn lock_extension_for_maintenance(function: &str) {
+    if worker::txn::lock_extension().is_none() {
+        pgrx::error!("{function}: the pg_kafka extension was dropped");
+    }
+}
 
-//     #[pg_test]
-//     fn test_hello_pg_kafka() {
-//         assert_eq!("Hello, pg_kafka", crate::hello_pg_kafka());
-//     }
-// }
+// The kafka schema, tables, roles and functions CREATE EXTENSION installs. It requires
+// the SQL maintenance functions, so pgrx creates them first: the file ends by revoking
+// EXECUTE on them from PUBLIC.
+pgrx::extension_sql_file!(
+    "../sql/bootstrap.sql",
+    requires = [
+        pg_kafka_run_retention_sweep,
+        pg_kafka_run_partition_maintenance
+    ]
+);
 
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
+/// Required by `cargo pgrx test` at the crate root (the extension's tests run as E2E
+/// tests instead, see docs/PGRX_TESTING_GUIDE.md).
 #[cfg(test)]
 pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
+    /// One-off initialization when the pg_test framework starts (none needed).
+    pub fn setup(_options: Vec<&str>) {}
 
+    /// postgresql.conf settings the pg_test framework needs (none).
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
         vec![]
     }
 }

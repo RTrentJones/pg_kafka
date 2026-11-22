@@ -1,76 +1,27 @@
-# Git Hooks for pg_kafka
+# Git hooks
 
-This directory contains git hooks that enforce code quality standards for the pg_kafka project.
+| Hook | Runs | Takes |
+|------|------|-------|
+| `pre-commit` | `cargo fmt --check` in the root crate and `kafka_test/` | seconds |
+| `pre-push` | `cargo clippy --all-targets --features pg14 -- -D warnings` and the `kafka_test/` equivalent | minutes |
 
-## Available Hooks
+Clippy runs on push rather than on every commit: a slow pre-commit hook trains contributors to
+reach for `--no-verify`, which skips everything.
 
-### pre-commit (fast)
+## Install
 
-Runs before every commit to ensure:
-- Code is properly formatted in both crates (`cargo fmt --check`, root + kafka_test)
-
-### pre-push (slower)
-
-Runs once per push (DR-25: keeping the minutes-long lint off the per-commit
-path so nobody is tempted into `--no-verify`):
-- No clippy warnings in either crate
-  (`cargo clippy --all-targets --features pg14 -- -D warnings` and the
-  kafka_test equivalent — the same gates CI enforces)
-
-## Installation
-
-### Quick Install
-
-Run the install script from the repository root:
+Git does not install hooks on clone. Run, from anywhere in the clone (and again after the hooks
+change):
 
 ```bash
 ./hooks/install.sh
 ```
 
-### Manual Install
+It copies both hooks into the clone's hooks directory (`git rev-parse --git-path hooks`).
+The hooks are plain scripts rather than `cargo-husky`, which would add a dev-dependency and a
+build script.
 
-Copy hooks to your `.git/hooks/` directory:
+## Bypassing
 
-```bash
-cp hooks/pre-commit .git/hooks/pre-commit
-cp hooks/pre-push .git/hooks/pre-push
-chmod +x .git/hooks/pre-commit .git/hooks/pre-push
-```
-
-## For New Contributors
-
-**Important:** Git hooks are not automatically installed when cloning a repository (for security reasons). Each developer must manually install them.
-
-Add this step to your onboarding:
-
-1. Clone the repository
-2. Run `./hooks/install.sh` to install hooks
-3. Hooks will now run automatically before commits (pre-commit) and pushes (pre-push)
-
-## Bypassing Hooks (Not Recommended)
-
-In rare cases where you need to bypass hooks (e.g., work-in-progress commits):
-
-```bash
-git commit --no-verify   # skips pre-commit
-git push --no-verify     # skips pre-push
-```
-
-**Warning:** Do not push commits that haven't passed the hooks checks. CI's `Lint & Format` job runs the same `cargo fmt --check` and `cargo clippy --all-targets ... -D warnings` gates for both crates and will reject them.
-
-## Updating Hooks
-
-If hooks are updated in the repository:
-
-1. Pull the latest changes
-2. Re-run `./hooks/install.sh` to update your local hooks
-
-## Why Not cargo-husky?
-
-We considered using `cargo-husky` for automatic hook installation, but:
-- It adds an extra dev-dependency
-- It requires build script execution which adds complexity
-- Manual installation is simple and explicit
-- Gives developers control over when hooks are installed
-
-The trade-off is that new contributors must remember to run `./hooks/install.sh`.
+`git commit --no-verify` / `git push --no-verify` skip them. CI's `Lint & Format` job runs the
+same checks for both crates, so a bypass only defers the failure.

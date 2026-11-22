@@ -1,8 +1,6 @@
 //! E2E tests for the storage-lifecycle retention sweep (DR-1/DR-2, DEEP-REVIEW-2026-07).
 //!
-//! Fail-before/pass-after: before the fix, `pg_kafka_run_retention_sweep()` did not
-//! exist (and `cleanup_aborted_messages` had no production caller), so these tests
-//! fail on the pre-fix extension. The SQL function runs the exact sweep the worker
+//! The SQL function `pg_kafka_run_retention_sweep()` runs the exact sweep the worker
 //! runs every RETENTION_SWEEP_INTERVAL, so exercising it exercises the production
 //! path without waiting out the interval.
 //!
@@ -68,10 +66,7 @@ pub async fn test_retention_sweep_reclaims_aborted_messages() -> TestResult {
         .find(|r| r.get::<_, String>(0) == "aborted_messages")
         .map(|r| r.get(1))
         .ok_or("sweep result missing aborted_messages row")?;
-    println!(
-        "  Sweep reported {} aborted message(s) deleted",
-        aborted_deleted
-    );
+    println!("  Sweep reported {aborted_deleted} aborted message(s) deleted");
     assert!(
         aborted_deleted >= 1,
         "Sweep should report at least our 1 aborted row deleted"
@@ -121,7 +116,7 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic)
-                    .payload(&format!("msg-{}", i))
+                    .payload(&format!("msg-{i}"))
                     .key("k"),
                 Duration::from_secs(5),
             )
@@ -186,12 +181,11 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
         )
         .await?;
     let survivors: Vec<(i64, Option<String>)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-    println!("  Survivors: {:?}", survivors);
+    println!("  Survivors: {survivors:?}");
     assert_eq!(
         survivors.len(),
         2,
-        "Expected 2 survivors (fresh committed + aged pending), got {:?}",
-        survivors
+        "Expected 2 survivors (fresh committed + aged pending), got {survivors:?}"
     );
     assert!(
         survivors

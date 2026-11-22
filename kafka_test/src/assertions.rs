@@ -55,7 +55,7 @@ pub async fn assert_topic_exists(
         Some(row) => Ok(row.get(0)),
         None => Err(Box::new(AssertionError::new(
             "Topic does not exist",
-            format!("Topic '{}' to exist", topic_name),
+            format!("Topic '{topic_name}' to exist"),
             "Topic not found",
         ))),
     }
@@ -78,7 +78,7 @@ pub async fn assert_partition_count(
 
     if actual != expected {
         return Err(Box::new(AssertionError::new(
-            format!("Partition count mismatch for topic '{}'", topic_name),
+            format!("Partition count mismatch for topic '{topic_name}'"),
             expected.to_string(),
             actual.to_string(),
         )));
@@ -106,7 +106,7 @@ pub async fn assert_message_count(
 
     if actual != expected {
         return Err(Box::new(AssertionError::new(
-            format!("Message count mismatch for topic '{}'", topic_name),
+            format!("Message count mismatch for topic '{topic_name}'"),
             expected.to_string(),
             actual.to_string(),
         )));
@@ -134,8 +134,8 @@ pub async fn assert_message_count_at_least(
 
     if actual < minimum {
         return Err(Box::new(AssertionError::new(
-            format!("Not enough messages for topic '{}'", topic_name),
-            format!("at least {}", minimum),
+            format!("Not enough messages for topic '{topic_name}'"),
+            format!("at least {minimum}"),
             actual.to_string(),
         )));
     }
@@ -164,8 +164,7 @@ pub async fn assert_message_content(
     let row = row.ok_or_else(|| {
         AssertionError::new(
             format!(
-                "Message not found at topic={}, partition={}, offset={}",
-                topic_name, partition, offset
+                "Message not found at topic={topic_name}, partition={partition}, offset={offset}"
             ),
             "Message to exist",
             "Message not found",
@@ -220,8 +219,7 @@ pub async fn assert_offset_committed(
     let row = row.ok_or_else(|| {
         AssertionError::new(
             format!(
-                "No committed offset for group={}, topic={}, partition={}",
-                group_id, topic_name, partition
+                "No committed offset for group={group_id}, topic={topic_name}, partition={partition}"
             ),
             "Committed offset to exist",
             "No offset found",
@@ -233,8 +231,7 @@ pub async fn assert_offset_committed(
     if actual != expected_offset {
         return Err(Box::new(AssertionError::new(
             format!(
-                "Committed offset mismatch for group={}, topic={}, partition={}",
-                group_id, topic_name, partition
+                "Committed offset mismatch for group={group_id}, topic={topic_name}, partition={partition}"
             ),
             expected_offset.to_string(),
             actual.to_string(),
@@ -262,14 +259,11 @@ pub async fn assert_offsets_sequential(
 
     for (i, row) in rows.iter().enumerate() {
         let offset: i64 = row.get(0);
-        if offset != i as i64 {
+        if offset != crate::common::to_i64(i) {
             return Err(Box::new(AssertionError::new(
-                format!(
-                    "Gap in offsets for topic={}, partition={}",
-                    topic_name, partition
-                ),
-                format!("offset {} at position {}", i, i),
-                format!("offset {} at position {}", offset, i),
+                format!("Gap in offsets for topic={topic_name}, partition={partition}"),
+                format!("offset {i} at position {i}"),
+                format!("offset {offset} at position {i}"),
             )));
         }
     }
@@ -297,10 +291,7 @@ pub async fn assert_high_watermark(
 
     if actual != expected {
         return Err(Box::new(AssertionError::new(
-            format!(
-                "High watermark mismatch for topic={}, partition={}",
-                topic_name, partition
-            ),
+            format!("High watermark mismatch for topic={topic_name}, partition={partition}"),
             expected.to_string(),
             actual.to_string(),
         )));
@@ -329,10 +320,7 @@ pub async fn assert_earliest_offset(
 
     if actual != expected {
         return Err(Box::new(AssertionError::new(
-            format!(
-                "Earliest offset mismatch for topic={}, partition={}",
-                topic_name, partition
-            ),
+            format!("Earliest offset mismatch for topic={topic_name}, partition={partition}"),
             expected.to_string(),
             actual.to_string(),
         )));
@@ -360,8 +348,7 @@ pub async fn assert_no_committed_offset(
     if row.is_some() {
         return Err(Box::new(AssertionError::new(
             format!(
-                "Unexpected committed offset exists for group={}, topic={}, partition={}",
-                group_id, topic_name, partition
+                "Unexpected committed offset exists for group={group_id}, topic={topic_name}, partition={partition}"
             ),
             "No committed offset",
             "Committed offset exists",

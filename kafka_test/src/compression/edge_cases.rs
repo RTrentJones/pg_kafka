@@ -6,12 +6,15 @@
 //! - Empty batches with compression
 //! - Compression ratio verification
 
+use crate::common::to_i32;
 use crate::common::{get_bootstrap_servers, TestResult};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 /// Create a Kafka producer with specified compression type
@@ -82,6 +85,7 @@ pub async fn test_large_value_compression() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_value: Option<String> = None;
@@ -94,8 +98,8 @@ pub async fn test_large_value_compression() -> TestResult {
                     println!("   Received message: {} bytes", v.len());
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -124,10 +128,11 @@ pub async fn test_large_value_compression() -> TestResult {
         )
         .await?;
     let stored_size: i32 = row.get(0);
-    println!("   Stored value size: {} bytes", stored_size);
+    println!("   Stored value size: {stored_size} bytes");
     // Note: pg_kafka stores decompressed values in the database
     println!("✅ Database verification complete\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Large Value Compression PASSED\n");
     Ok(())
@@ -202,6 +207,7 @@ pub async fn test_compression_mixed_formats() -> TestResult {
     // 3. Consume all messages
     println!("Step 3: Consuming all messages...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_messages: Vec<String> = Vec::new();
@@ -211,12 +217,12 @@ pub async fn test_compression_mixed_formats() -> TestResult {
             Ok(Ok(msg)) => {
                 if let Some(v) = msg.payload() {
                     let value = String::from_utf8_lossy(v).to_string();
-                    println!("   Received: {}", value);
+                    println!("   Received: {value}");
                     received_messages.push(value);
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -245,8 +251,9 @@ pub async fn test_compression_mixed_formats() -> TestResult {
         .await?;
     let count: i64 = row.get(0);
     assert_eq!(count, 4, "Expected 4 messages in database");
-    println!("✅ Database confirms {} messages\n", count);
+    println!("✅ Database confirms {count} messages\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Mixed Compression Formats PASSED\n");
     Ok(())
@@ -286,6 +293,7 @@ pub async fn test_compression_ratio_verification() -> TestResult {
     // 3. Consume and verify roundtrip
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received = false;
@@ -305,8 +313,8 @@ pub async fn test_compression_ratio_verification() -> TestResult {
                     println!("   Received {} bytes (decompressed)", v.len());
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -319,6 +327,7 @@ pub async fn test_compression_ratio_verification() -> TestResult {
     println!("   Compression happens on the wire protocol only");
     println!("   This is intentional for query-ability\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Compression Ratio Verification PASSED\n");
     Ok(())
@@ -339,7 +348,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
     // Use a pattern that doesn't compress well
     let mut data = String::new();
     for i in 0..10000 {
-        data.push_str(&format!("{:x}", (i * 17 + 31) % 256));
+        write!(data, "{:x}", (i * 17 + 31) % 256).expect("writing to a String cannot fail");
     }
     println!("   Data size: {} bytes", data.len());
     println!("✅ Incompressible data created\n");
@@ -360,6 +369,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_data: Option<String> = None;
@@ -372,8 +382,8 @@ pub async fn test_compression_incompressible_data() -> TestResult {
                     println!("   Received {} bytes", v.len());
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -382,6 +392,7 @@ pub async fn test_compression_incompressible_data() -> TestResult {
     assert_eq!(received, data, "Content should match original");
     println!("✅ Incompressible data roundtrip verified\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Compression with Incompressible Data PASSED\n");
     Ok(())
@@ -424,6 +435,7 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
     // 3. Consume and verify
     println!("Step 3: Consuming message...");
     let consumer = create_consumer(&group)?;
+    let consumer = Member::new(consumer);
     consumer.subscribe(&[&topic])?;
 
     let mut received_msg: Option<String> = None;
@@ -436,8 +448,8 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
                     println!("   Received: '{}'", received_msg.as_ref().unwrap());
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -459,11 +471,12 @@ pub async fn test_compression_small_message_overhead() -> TestResult {
     let stored_len: i32 = row.get(0);
     assert_eq!(
         stored_len,
-        small_message.len() as i32,
+        to_i32(small_message.len()),
         "Stored size should match"
     );
-    println!("✅ Database stores original size: {} bytes\n", stored_len);
+    println!("✅ Database stores original size: {stored_len} bytes\n");
 
+    consumer.close(CLOSE_TIMEOUT).await?;
     ctx.cleanup().await?;
     println!("✅ Test: Small Message Compression Overhead PASSED\n");
     Ok(())

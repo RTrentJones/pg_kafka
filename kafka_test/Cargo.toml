@@ -2,13 +2,18 @@
 name = "kafka_test"
 version = "0.1.0"
 edition = "2021"
+# src/bin/soak.rs is a second binary (scripts/soak.sh); `cargo run` stays the suite.
+default-run = "kafka_test"
 # Test harness only, no Shadow Mode code — plain MIT like the project root
 # (required so `cargo deny check licenses` can evaluate this crate; DR-16).
 license = "MIT"
 
 [dependencies]
 # Kafka client for E2E testing
-rdkafka = { version = "0.36", features = ["cmake-build", "zstd"] }
+# "ssl" (system OpenSSL, libssl-dev) gives librdkafka TLS and its built-in SASL
+# PLAIN / SCRAM-SHA-256 / SCRAM-SHA-512 for the auth E2E tests; no libsasl2 is needed
+# (that is only for GSSAPI).
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "zstd"] }
 
 # Async utilities for parallel execution
 futures = "0.3"
@@ -30,6 +35,9 @@ crc32c = "0.6"
 
 # Database client for verification
 tokio-postgres = "0.7.15"
+# Client-side SCRAM verifier (libpq format) for the auth E2E tests; already a
+# dependency of tokio-postgres.
+postgres-protocol = "0.6"
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
@@ -42,10 +50,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Timing utilities
-chrono = { version = "0.4", features = ["serde"] }
 
 # Same kafka-protocol fork as the root crate (see ../Cargo.toml): the fork also moves zstd to 0.14,
 # which clears the zstd-safe 7.x / zstd-sys 2.0 advisories that crates.io kafka-protocol 0.17
 # (zstd ^0.13) cannot. Keep this rev in lockstep with the root [patch.crates-io].
 [patch.crates-io]
 kafka-protocol = { git = "https://github.com/RTrentJones/kafka-protocol-rs", rev = "642043e3a6681e51e2b6d37e5c8b69c2db633ea6" }
+
+[lints.rust]
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+todo = "warn"

@@ -10,6 +10,7 @@ use crate::common::{
     create_stream_consumer, create_transactional_producer, get_bootstrap_servers, TestResult,
 };
 use crate::fixtures::{generate_messages, TestTopicBuilder};
+use crate::members::{Member, CLOSE_TIMEOUT};
 use crate::setup::TestContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -79,15 +80,15 @@ pub async fn test_fetch_respects_min_one_message() -> TestResult {
                 }
                 received = true;
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
     // QA-3: max_bytes is advisory — Kafka must still return at least one complete message even when
     // the message is larger than the fetch budget, otherwise a consumer with a small max_bytes would
     // stall forever. That guarantee is the whole point of this test, so assert it.
-    println!("   Received message: {}", received);
+    println!("   Received message: {received}");
 
     ctx.cleanup().await?;
     if !received {
@@ -170,11 +171,11 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
                 if let Some(payload) = msg.payload() {
                     let value = String::from_utf8_lossy(payload).to_string();
                     committed_msgs.push(value.clone());
-                    println!("   read_committed saw: {}", value);
+                    println!("   read_committed saw: {value}");
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
     println!(
@@ -206,11 +207,11 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
                 if let Some(payload) = msg.payload() {
                     let value = String::from_utf8_lossy(payload).to_string();
                     uncommitted_msgs.push(value.clone());
-                    println!("   read_uncommitted saw: {}", value);
+                    println!("   read_uncommitted saw: {value}");
                 }
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
     println!(
@@ -258,7 +259,7 @@ pub async fn test_fetch_after_offset_reset() -> TestResult {
 
     // 2. Create consumer with auto.offset.reset=earliest
     println!("Step 2: Creating consumer with auto.offset.reset=earliest...");
-    let consumer = create_stream_consumer(&group)?;
+    let consumer = Member::new(create_stream_consumer(&group)?);
     consumer.subscribe(&[&topic.name])?;
     println!("✅ Consumer subscribed\n");
 
@@ -272,8 +273,8 @@ pub async fn test_fetch_after_offset_reset() -> TestResult {
                 println!("   Received message at offset {}", msg.offset());
                 received.push(msg.offset());
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
@@ -288,6 +289,7 @@ pub async fn test_fetch_after_offset_reset() -> TestResult {
         assert_eq!(received[0], 0, "Should start from offset 0 with earliest");
         println!("✅ Consumer correctly started from offset 0\n");
     }
+    consumer.close(CLOSE_TIMEOUT).await?;
 
     ctx.cleanup().await?;
     println!("✅ Test: Fetch After Offset Reset PASSED\n");
@@ -350,8 +352,8 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
                 );
                 received_before_delete = true;
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
     println!("✅ Consumer received initial message\n");
@@ -387,22 +389,18 @@ pub async fn test_fetch_with_deleted_topic() -> TestResult {
                 println!("   Unexpected: received message at offset {}", msg.offset());
             }
             Ok(Err(e)) => {
-                println!("   Expected error after delete: {}", e);
+                println!("   Expected error after delete: {e}");
                 got_error_or_timeout = true;
                 break;
             }
             Err(_) => {
                 // Timeout is also acceptable
-                continue;
             }
         }
     }
 
     // Both a clean error and a quiet timeout are acceptable post-delete outcomes.
-    println!(
-        "   Fetch after deletion handled gracefully (saw error: {})",
-        got_error_or_timeout
-    );
+    println!("   Fetch after deletion handled gracefully (saw error: {got_error_or_timeout})");
 
     ctx.cleanup().await?;
     println!("✅ Test: Fetch with Deleted Topic PASSED\n");
@@ -441,8 +439,8 @@ pub async fn test_fetch_from_new_partition() -> TestResult {
         producer
             .send(
                 FutureRecord::to(&topic_name)
-                    .payload(&format!("msg-{}", i))
-                    .key(&format!("key-{}", i))
+                    .payload(&format!("msg-{i}"))
+                    .key(&format!("key-{i}"))
                     .partition(0),
                 Duration::from_secs(5),
             )
@@ -470,15 +468,12 @@ pub async fn test_fetch_from_new_partition() -> TestResult {
                 );
                 received_from_partition1 += 1;
             }
-            Ok(Err(e)) => println!("   Error: {}", e),
-            Err(_) => continue,
+            Ok(Err(e)) => println!("   Error: {e}"),
+            Err(_) => {}
         }
     }
 
-    println!(
-        "   Messages received from partition 1: {}",
-        received_from_partition1
-    );
+    println!("   Messages received from partition 1: {received_from_partition1}");
     println!("✅ Partition 1 correctly starts empty\n");
 
     // 4. Produce to partition 1 and verify offset starts at 0

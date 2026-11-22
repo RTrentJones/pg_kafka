@@ -6,11 +6,18 @@
 //! - Consume from specific offsets
 
 mod basic;
+mod batching;
 mod from_offset;
 mod headers;
 mod multiple;
 
-pub use basic::test_consumer_basic;
-pub use from_offset::test_consumer_from_offset;
-pub use headers::test_consumer_receives_headers;
-pub use multiple::test_consumer_multiple_messages;
+/// The `consumer` tests, in run order.
+pub fn tests() -> Vec<crate::registry::TestDef> {
+    crate::test_defs!["consumer";
+        basic::test_consumer_basic,
+        headers::test_consumer_receives_headers,
+        multiple::test_consumer_multiple_messages,
+        from_offset::test_consumer_from_offset,
+        batching::test_fetch_groups_records_into_batches,
+    ]
+}
