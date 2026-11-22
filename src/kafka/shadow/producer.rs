@@ -57,8 +57,12 @@ const PRODUCER_MESSAGE_TIMEOUT_MS: &str = "0";
 /// producer. A record is handed to a producer only with at least a quarter of
 /// it left (`forwarder_task::send_margin`, 30 s); one still in the backlog with
 /// less left is answered there, so the forwarder's own queueing cannot time out
-/// a healthy producer. One outbox attempt therefore resolves (delivered or
-/// failed) within about this long of its dispatch, which the DB thread's
+/// a healthy producer: as a failed attempt only if nothing older is still
+/// outstanding on a live producer, otherwise not attempted (a queue full of
+/// another partition's stuck records is not the record's failure, and that
+/// producer times out by the older record's deadline, freeing the queue). One
+/// outbox attempt therefore resolves (delivered, failed or not attempted)
+/// within about this long of its dispatch, which the DB thread's
 /// in-flight eviction (`INFLIGHT_EVICT_AFTER`, 150 s) relies on.
 /// `pg_kafka.test_shadow_delivery_timeout_ms` shortens it for tests.
 pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);

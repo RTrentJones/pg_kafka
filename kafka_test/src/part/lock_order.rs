@@ -21,7 +21,9 @@ use tokio_postgres::Client;
 ///
 /// Asserts: the pass, holding the DEFAULT leaf, also holds kafka.messages; the LOCK
 /// TABLE waits for kafka.messages itself, not for a leaf; and both then succeed, the
-/// pass recreating the leaf.
+/// pass recreating the leaf. An attempt the worker's own maintenance overlaps (it
+/// recreated the leaf first, or held the maintenance lock so the pass gave up) proves
+/// nothing and is run again, up to [`ATTEMPTS`] times.
 pub async fn test_partition_maintenance_locks_parent_before_leaves() -> TestResult {
     into_test_result(parent_before_leaves().await)
 }
@@ -71,6 +73,63 @@ pub(super) async fn backend_pid(db: &Client) -> SendResult<i32> {
         .get(0))
 }
 
+/// Attempts at the race before the test gives up: the worker's own partition
+/// maintenance (every 60 s) can overlap one and leave it inconclusive.
+const ATTEMPTS: usize = 5;
+
+async fn parent_before_leaves() -> SendResult<()> {
+    println!("=== Test: partition maintenance locks kafka.messages before its leaves ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+
+    // The worker's own pass can overlap an attempt: it may recreate the dropped leaf
+    // before the test's pass (which then has nothing to create, `created == Ok(0)`),
+    // or hold the maintenance lock, itself stopped in `lock_message_tables` behind the
+    // blocker, so the test's pass gives up at `try_maintenance_lock` and never holds
+    // the DEFAULT leaf. Neither says anything about the lock order: run the whole race
+    // again. Every assertion applies, unchanged, to the first conclusive attempt.
+    let mut inconclusive = String::new();
+    for attempt in 1..=ATTEMPTS {
+        println!("--- attempt {attempt} of {ATTEMPTS} ---");
+        let (leaf, outcome) = attempt_race(&db).await?;
+        let RaceOutcome {
+            has_default,
+            parent_held,
+            ddl_waited_for,
+            ddl,
+            created,
+        } = outcome;
+        if !has_default || created == Ok(0) {
+            inconclusive = if has_default {
+                format!("the pass found {leaf} already recreated (by the worker's own pass)")
+            } else {
+                "the pass never held kafka.messages_default".to_string()
+            };
+            println!(
+                "  inconclusive: {inconclusive}; the worker's maintenance overlapped, retrying"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        assert!(
+            parent_held,
+            "the pass held kafka.messages_default without kafka.messages"
+        );
+        assert_eq!(
+            ddl_waited_for.as_deref(),
+            Some("kafka.messages"),
+            "LOCK TABLE kafka.messages must wait for the parent, not hold it and wait for a leaf"
+        );
+        ddl.map_err(|e| format!("LOCK TABLE kafka.messages failed: {e}"))?;
+        assert_eq!(created, Ok(1), "the pass must recreate {leaf}");
+        println!(
+            "✅ the pass locked kafka.messages first; the DDL waited for it, and both succeeded"
+        );
+        return Ok(());
+    }
+    Err(format!("no conclusive attempt in {ATTEMPTS}; the last: {inconclusive}").into())
+}
+
 /// Step 0 of the tests that race a maintenance pass: give the pass a leaf to create by
 /// dropping the worker's furthest leaf ahead. A pass first (right after a bucket
 /// boundary the worker may not have made the new furthest leaf yet); the drop returns
@@ -101,44 +160,33 @@ pub(super) async fn drop_furthest_leaf(db: &Client) -> SendResult<String> {
     Err("could not drop the furthest leaf ahead".into())
 }
 
-async fn parent_before_leaves() -> SendResult<()> {
-    println!("=== Test: partition maintenance locks kafka.messages before its leaves ===\n");
-    let db = session().await?;
-    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+/// One attempt: drop the furthest leaf ahead, run [`race`], and restore the layout.
+/// Returns the dropped leaf and what the race observed.
+async fn attempt_race(db: &Client) -> SendResult<(String, RaceOutcome)> {
+    let leaf = drop_furthest_leaf(db).await?;
 
-    let leaf = drop_furthest_leaf(&db).await?;
-
-    let result = race(&db).await;
+    let result = race(db).await;
 
     // Whatever happened, leave the worker's layout as it was.
     db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
         .await
         .map_err(boxed)?;
-    let (parent_held, ddl_waited_for, ddl, created) = result?;
-
-    assert!(
-        parent_held,
-        "the pass held kafka.messages_default without kafka.messages"
-    );
-    assert_eq!(
-        ddl_waited_for.as_deref(),
-        Some("kafka.messages"),
-        "LOCK TABLE kafka.messages must wait for the parent, not hold it and wait for a leaf"
-    );
-    ddl.map_err(|e| format!("LOCK TABLE kafka.messages failed: {e}"))?;
-    assert_eq!(created, Ok(1), "the pass must recreate {leaf}");
-    println!("✅ the pass locked kafka.messages first; the DDL waited for it, and both succeeded");
-    Ok(())
+    Ok((leaf, result?))
 }
 
-/// What [`race`] observed: whether the pass held kafka.messages while holding the
-/// DEFAULT leaf, the relation the LOCK TABLE waited for, its outcome, and the pass's.
-type RaceOutcome = (
-    bool,
-    Option<String>,
-    Result<(), String>,
-    Result<i64, String>,
-);
+/// What [`race`] observed.
+struct RaceOutcome {
+    /// Whether the pass was seen holding the DEFAULT leaf.
+    has_default: bool,
+    /// Whether the pass held kafka.messages then.
+    parent_held: bool,
+    /// The relation the LOCK TABLE waited for.
+    ddl_waited_for: Option<String>,
+    /// The LOCK TABLE's outcome.
+    ddl: Result<(), String>,
+    /// The pass's outcome: the leaves it created.
+    created: Result<i64, String>,
+}
 
 async fn race(db: &Client) -> SendResult<RaceOutcome> {
     let blocker = session().await?;
@@ -216,8 +264,11 @@ async fn race(db: &Client) -> SendResult<RaceOutcome> {
     let created = pass.await.map_err(boxed)?;
     let ddl_result = lock.await.map_err(boxed)?;
     println!("Step 5: the pass returned {created:?}, the LOCK TABLE {ddl_result:?}");
-    if !has_default {
-        return Err("the pass never held kafka.messages_default".into());
-    }
-    Ok((parent_held, ddl_waited_for, ddl_result, created))
+    Ok(RaceOutcome {
+        has_default,
+        parent_held,
+        ddl_waited_for,
+        ddl: ddl_result,
+        created,
+    })
 }

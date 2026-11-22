@@ -76,10 +76,20 @@
 //! (the fence would hold them back anyway), and so is a head that has not had a
 //! fair window yet (received less than half a timeout ago, for example a
 //! healthy partition whose records were flowing). A record that runs out of
-//! time in the backlog counts the same way: it fails if it is the first record
-//! its partition waits on, and is collateral behind an earlier failure or
-//! behind an earlier record of its partition still on a producer. In a
-//! persistent outage every stuck partition's head is held for close to a whole
+//! time in the backlog is collateral (`NotAttempted`, and its partition is
+//! fenced so its later records keep their order) behind an earlier failure of
+//! its partition, behind an earlier record of its partition still on a
+//! producer, or behind a record of any partition received no later than it and
+//! still outstanding on a live generation. In the last case the queue was full
+//! of older records (for example those of one partition whose external topic
+//! is unavailable), and their generation times out, freeing the queue, by the
+//! older record's deadline, which is before this one's: the record is claimed
+//! again at once, its new deadline is past that timeout, and it goes out on the
+//! replacement producer: a partition is not charged an attempt for waiting
+//! behind another partition's stuck records. Only a record that found no room with
+//! nothing older on a live generation (the queue held by a retired generation's
+//! records) fails there, if it is the first record its partition waits on. In
+//! a persistent outage every stuck partition's head is held for close to a whole
 //! timeout at each retirement (the outbox backoff, at most 30 s, is under half
 //! of it), so it fails once per cycle and is dead-lettered after
 //! `shadow_max_retries` cycles; the records behind it are not penalized, and
@@ -257,9 +267,14 @@ impl ForwarderCore {
     /// soon after and purge every other record on it. The backlog is in the
     /// order the records were received, so these are a prefix of it.
     ///
-    /// Only the record a partition waits on counts a failed attempt: a record
-    /// behind an earlier failure of its partition (the fence), or behind an
-    /// earlier record of its partition still outstanding on a producer, is
+    /// Only the record a partition waits on counts a failed attempt, and only
+    /// when nothing else explains why it found no room: a record behind an
+    /// earlier failure of its partition (the fence), behind an earlier record
+    /// of its partition still outstanding on a producer, or behind a record of
+    /// any partition received no later than it and still outstanding on a live
+    /// generation (the queue is full of older records, possibly of a partition
+    /// whose external topic is unavailable: that generation times out and
+    /// frees the queue by that record's deadline, before this one's) is
     /// collateral. Either way it fences its partition, so the records behind it
     /// wait for its retry.
     pub(crate) fn expire_backlog(
@@ -269,8 +284,11 @@ impl ForwarderCore {
         timeout: Duration,
     ) {
         let expire_at = timeout.saturating_sub(send_margin(timeout));
-        // Lowest outstanding offset per partition, built at the first expiry.
+        // Lowest outstanding offset per partition, and when the oldest record
+        // outstanding on a live generation was received: found at the first
+        // expiry.
         let mut lowest: Option<HashMap<(i32, i32), i64>> = None;
+        let mut oldest_live: Option<Option<Instant>> = None;
         while let Some(queued) = backlog.pop_front() {
             if now.saturating_duration_since(queued.received_at) < expire_at {
                 backlog.push_front(queued);
@@ -289,6 +307,8 @@ impl ForwarderCore {
                 }
                 lowest
             });
+            let oldest_live = *oldest_live
+                .get_or_insert_with(|| self.oldest_live().map(|(received_at, _)| received_at));
             self.fence(key);
             if lowest
                 .get(&key.partition())
@@ -297,6 +317,13 @@ impl ForwarderCore {
                 self.not_attempted(
                     key,
                     "queued behind an earlier record of the partition that is not delivered yet",
+                );
+                continue;
+            }
+            if oldest_live.is_some_and(|oldest| oldest <= queued.received_at) {
+                self.not_attempted(
+                    key,
+                    "librdkafka's queue was full of earlier records not delivered yet",
                 );
                 continue;
             }
@@ -330,17 +357,23 @@ impl ForwarderCore {
         }
     }
 
+    /// The oldest record outstanding on a generation not retired yet: when it
+    /// was received and its generation.
+    fn oldest_live(&self) -> Option<(Instant, u64)> {
+        self.by_age.iter().find_map(|(received_at, key)| {
+            self.outstanding
+                .get(key)
+                .filter(|o| !self.collateral_generations.contains(&o.generation))
+                .map(|o| (*received_at, o.generation))
+        })
+    }
+
     /// The generation whose oldest outstanding record has waited `timeout` by
     /// `now`, if any. Generations already retired are skipped: their records
     /// were purged and resolve on their own.
     pub(crate) fn expired_generation(&self, now: Instant, timeout: Duration) -> Option<u64> {
-        let (received_at, key) = self.by_age.iter().find(|(_, key)| {
-            self.outstanding
-                .get(key)
-                .is_some_and(|o| !self.collateral_generations.contains(&o.generation))
-        })?;
-        let generation = self.outstanding.get(key)?.generation;
-        (now.saturating_duration_since(*received_at) >= timeout).then_some(generation)
+        let (received_at, generation) = self.oldest_live()?;
+        (now.saturating_duration_since(received_at) >= timeout).then_some(generation)
     }
 
     /// `generation` ran out of delivery time at `now`: fence its partitions,
@@ -1298,7 +1331,10 @@ mod tests {
             queued(1, 3, t0 + secs(10)),
         ]);
         // Partition 3's offset 1 is still on a producer: partition 3 waits on it.
+        // Its generation is retired (purged, its report still to come), so it
+        // is not a live record the others wait behind.
         core.sent(RowKey::new(1, 3, 1), 1, t0);
+        core.retire_generation(1);
         // Less than the margin (30 s) left: 90 s after arrival.
         assert_eq!(send_margin(TIMEOUT), secs(30));
         let expire_at = secs(90);
@@ -1536,6 +1572,120 @@ mod tests {
         // The record sent with more than the margin left times out at its
         // arrival + the timeout (were it never delivered).
         assert_eq!(tick(&mut core, &mut backlog, early + TIMEOUT), vec![1]);
+    }
+
+    /// One partition's external topic is unavailable and its records fill
+    /// librdkafka's queue; healthy partitions' records received after that
+    /// wait in the backlog. They reach the margin (90 s) before the stuck
+    /// generation's timeout (its head's arrival + 120 s): they never had room
+    /// through no fault of their partitions, so they are answered NotAttempted
+    /// (fenced, so their partitions keep their order), not Failed, and go out
+    /// once the timeout purges the stuck generation and frees the queue.
+    #[test]
+    fn a_record_held_back_by_another_partitions_stuck_records_is_not_a_failure() {
+        const QUEUE: usize = 4;
+        let mut core = ForwarderCore::default();
+        let t0 = Instant::now();
+        // Partition 0's records fill the queue of generation 1.
+        for o in (0_i64..).take(QUEUE) {
+            core.sent(RowKey::new(1, 0, o), 1, t0);
+        }
+        // Healthy partitions 1 and 2 (their earlier records were delivered).
+        let arrived = t0 + secs(4);
+        let mut backlog = VecDeque::from([
+            queued(1, 40, arrived),
+            queued(1, 41, arrived),
+            queued(2, 40, arrived),
+        ]);
+        let mut live = 1u64;
+        let send = |core: &mut ForwarderCore, q: Queued, live: u64| {
+            if core.admit(&q.record) == Admit::Fenced {
+                core.not_attempted(q.record.row, "fenced");
+                return None;
+            }
+            let on_queue = core
+                .outstanding
+                .values()
+                .filter(|o| o.generation == live)
+                .count();
+            if on_queue >= QUEUE {
+                return Some(q);
+            }
+            core.sent(q.record.row, live, q.received_at);
+            None
+        };
+        // 90 s after their arrival, 26 s before generation 1 times out.
+        let now = arrived + secs(90);
+        assert_eq!(core.expired_generation(now, TIMEOUT), None);
+        core.pump_backlog(&mut backlog, now, TIMEOUT, |c, q| send(c, q, live));
+        assert!(backlog.is_empty());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 3, "{got:?}");
+        for (key, outcome) in &got {
+            assert!(
+                matches!(outcome, ForwardOutcome::NotAttempted(_)),
+                "{key:?} was charged a failed attempt: {got:?}"
+            );
+        }
+        // Fenced: a later record of partition 1 may not overtake 40.
+        assert_eq!(core.admit(&rec(1, 42, false)), Admit::Fenced);
+        // The DB thread dispatches them again at once (no backoff); 40 of each
+        // partition is its head. They wait for room again.
+        let again = now + HOLD_TICK;
+        backlog.extend([
+            Queued {
+                record: rec(1, 40, true),
+                received_at: again,
+            },
+            Queued {
+                record: rec(1, 41, false),
+                received_at: again,
+            },
+            Queued {
+                record: rec(2, 40, true),
+                received_at: again,
+            },
+        ]);
+        core.pump_backlog(&mut backlog, again, TIMEOUT, |c, q| send(c, q, live));
+        assert_eq!(backlog.len(), 3, "the queue is still full");
+        // Generation 1 times out at its head's arrival + the timeout: only
+        // partition 0's head counts, and the purge frees the queue.
+        let deadline = t0 + TIMEOUT;
+        assert_eq!(core.expired_generation(deadline, TIMEOUT), Some(1));
+        core.time_out_generation(1, deadline, TIMEOUT);
+        for o in (0_i64..).take(QUEUE) {
+            core.on_result(RowKey::new(1, 0, o), 1, Err("purged".into()), false);
+        }
+        live = 2;
+        core.pump_backlog(&mut backlog, deadline, TIMEOUT, |c, q| send(c, q, live));
+        assert!(
+            backlog.is_empty(),
+            "the healthy records go out on generation 2"
+        );
+        for (p, o) in [(1, 40), (1, 41), (2, 40)] {
+            core.on_result(RowKey::new(1, p, o), 2, Ok(o), false);
+        }
+        let got = outcomes(&mut core);
+        let failed: Vec<RowKey> = got
+            .iter()
+            .filter(|(_, o)| matches!(o, ForwardOutcome::Failed(_)))
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(failed, vec![RowKey::new(1, 0, 0)], "{got:?}");
+        let delivered: Vec<RowKey> = got
+            .iter()
+            .filter(|(_, o)| matches!(o, ForwardOutcome::Delivered(_)))
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![
+                RowKey::new(1, 1, 40),
+                RowKey::new(1, 1, 41),
+                RowKey::new(1, 2, 40)
+            ]
+        );
+        assert_eq!(core.admit(&rec(1, 42, false)), Admit::Send);
     }
 
     #[test]
