@@ -75,7 +75,7 @@ pub(super) async fn backend_pid(db: &Client) -> SendResult<i32> {
 
 /// Attempts at the race before the test gives up: the worker's own partition
 /// maintenance (every 60 s) can overlap one and leave it inconclusive.
-const ATTEMPTS: usize = 5;
+pub(super) const ATTEMPTS: usize = 5;
 
 async fn parent_before_leaves() -> SendResult<()> {
     println!("=== Test: partition maintenance locks kafka.messages before its leaves ===\n");

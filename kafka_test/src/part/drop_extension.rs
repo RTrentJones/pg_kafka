@@ -1,7 +1,7 @@
 //! The SQL maintenance functions against a concurrent DROP EXTENSION: they lock the
 //! extension object before any member table, as every worker transaction does.
 
-use super::lock_order::{backend_pid, drop_furthest_leaf, wait_until};
+use super::lock_order::{backend_pid, drop_furthest_leaf, wait_until, ATTEMPTS};
 use crate::common::TestResult;
 use crate::worker::{boxed, into_test_result, session, wait_for_serving_listener, SendResult};
 use std::time::Duration;
@@ -38,7 +38,10 @@ async fn waits_for(db: &Client, pid: i32) -> SendResult<Option<String>> {
 /// ROLLBACK` runs in another session, and kafka.topics is released.
 ///
 /// Asserts: DROP waits for the extension object (the pass holds it), not for a member
-/// table; then the pass recreates the leaf and DROP succeeds (and is rolled back).
+/// table; then the pass recreates the leaf and DROP succeeds (and is rolled back). An
+/// attempt the worker's own maintenance overlaps (it recreated the leaf first, or held
+/// the maintenance lock so the pass gave up before waiting for kafka.topics) proves
+/// nothing and is run again, up to [`ATTEMPTS`] times.
 pub async fn test_partition_maintenance_vs_drop_extension() -> TestResult {
     into_test_result(maintenance_vs_drop().await)
 }
@@ -47,30 +50,68 @@ async fn maintenance_vs_drop() -> SendResult<()> {
     println!("=== Test: partition maintenance against a concurrent DROP EXTENSION ===\n");
     let db = session().await?;
     wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
-    let leaf = drop_furthest_leaf(&db).await?;
 
-    let result = maintenance_race(&db).await;
+    // The worker's own pass (every 60 s) can overlap an attempt: it may recreate the
+    // dropped leaf before the test's pass (which then has nothing to create,
+    // `created == Ok(0)`), or hold the maintenance lock, itself stopped behind the
+    // blocker, so the test's pass gives up at `try_maintenance_lock` and never waits
+    // for kafka.topics. Neither says anything about the lock order: run the whole race
+    // again. Every assertion applies, unchanged, to the first conclusive attempt.
+    let mut inconclusive = String::new();
+    for attempt in 1..=ATTEMPTS {
+        println!("--- attempt {attempt} of {ATTEMPTS} ---");
+        let leaf = drop_furthest_leaf(&db).await?;
 
-    // Whatever happened, leave the worker's layout as it was.
-    db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
-        .await
-        .map_err(boxed)?;
-    let (drop_waited_for, drop_result, created) = result?;
+        let result = maintenance_race(&db).await;
 
-    assert_eq!(
-        drop_waited_for.as_deref(),
-        Some("pg_extension"),
-        "DROP EXTENSION must wait for the pass's extension lock, not hold a member table \
-         the pass needs and wait for another"
-    );
-    drop_result.map_err(|e| format!("DROP EXTENSION failed: {e}"))?;
-    assert_eq!(created, Ok(1), "the pass must recreate {leaf}");
-    println!("✅ DROP EXTENSION waited for the pass, and both succeeded");
-    Ok(())
+        // Whatever happened, leave the worker's layout as it was.
+        db.query("SELECT pg_kafka_run_partition_maintenance()", &[])
+            .await
+            .map_err(boxed)?;
+        let MaintenanceRace {
+            stopped,
+            drop_waited_for,
+            drop_result,
+            created,
+        } = result?;
+        if !stopped || created == Ok(0) {
+            inconclusive = if stopped {
+                format!("the pass found {leaf} already recreated (by the worker's own pass)")
+            } else {
+                "the pass never waited for kafka.topics".to_string()
+            };
+            println!(
+                "  inconclusive: {inconclusive}; the worker's maintenance overlapped, retrying"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        assert_eq!(
+            drop_waited_for.as_deref(),
+            Some("pg_extension"),
+            "DROP EXTENSION must wait for the pass's extension lock, not hold a member table \
+             the pass needs and wait for another"
+        );
+        drop_result.map_err(|e| format!("DROP EXTENSION failed: {e}"))?;
+        assert_eq!(created, Ok(1), "the pass must recreate {leaf}");
+        println!("✅ DROP EXTENSION waited for the pass, and both succeeded");
+        return Ok(());
+    }
+    Err(format!("no conclusive attempt in {ATTEMPTS}; the last: {inconclusive}").into())
 }
 
-/// DROP's lock wait, DROP's outcome, the pass's outcome.
-type MaintenanceRace = (Option<String>, Result<(), String>, Result<i64, String>);
+/// What [`maintenance_race`] observed.
+struct MaintenanceRace {
+    /// Whether the pass was seen waiting for kafka.topics.
+    stopped: bool,
+    /// The lock DROP EXTENSION waited for.
+    drop_waited_for: Option<String>,
+    /// DROP EXTENSION's outcome.
+    drop_result: Result<(), String>,
+    /// The pass's outcome: the leaves it created.
+    created: Result<i64, String>,
+}
 
 async fn maintenance_race(db: &Client) -> SendResult<MaintenanceRace> {
     let blocker = session().await?;
@@ -127,10 +168,12 @@ async fn maintenance_race(db: &Client) -> SendResult<MaintenanceRace> {
     let created = pass.await.map_err(boxed)?;
     let drop_result = drop.await.map_err(boxed)?;
     println!("Step 5: the pass returned {created:?}, DROP EXTENSION {drop_result:?}");
-    if !stopped {
-        return Err("the pass never waited for kafka.topics".into());
-    }
-    Ok((drop_waited_for, drop_result, created))
+    Ok(MaintenanceRace {
+        stopped,
+        drop_waited_for,
+        drop_result,
+        created,
+    })
 }
 
 /// `pg_kafka_run_retention_sweep()` must take the extension lock before any member
@@ -188,3 +231,4 @@ async fn sweep_vs_drop() -> SendResult<()> {
     println!("✅ the sweep waited for the extension first, then ran");
     Ok(())
 }
+
