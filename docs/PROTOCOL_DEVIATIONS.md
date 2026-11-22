@@ -754,7 +754,8 @@ Shadow forwarding to an external Kafka cluster uses a durable outbox
   not re-claimed at lease expiry — the DB thread tracks dispatched
   forwards and the outbox claim skips them until the ack resolves or the
   entry ages out (`INFLIGHT_EVICT_AFTER`, 150 s, sized above the
-  forwarder's 120 s delivery timeout). Duplicates therefore occur only on genuine ack
+  forwarder's 120 s delivery timeout, which runs from when the forwarder
+  receives the record, time in its backlog included). Duplicates therefore occur only on genuine ack
   *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
   finalization remain exactly-once in all modes.
 

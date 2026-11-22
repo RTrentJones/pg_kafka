@@ -108,7 +108,11 @@ of each; see duplicates below). That rests on:
    is infinite and the forwarder keeps its own **delivery timeout** (120 s) per producer
    generation: once the oldest outstanding record has waited that long, every partition with a
    record on the producer is fenced and all of its queued and in-flight records are purged at
-   once, so every partition restarts at its first undelivered record on a new producer. A purged
+   once, so every partition restarts at its first undelivered record on a new producer. A record's
+   timeout runs from when the forwarder receives it, so the time it waits in the forwarder's
+   backlog for room in librdkafka's queue (64 MiB) counts, and a record whose timeout runs out
+   while it still waits there is answered there: every dispatched record is answered within the
+   timeout of its dispatch, before its in-flight entry can be evicted (150 s). A purged
    in-flight request may still be written by the broker, but only as an in-order prefix of that
    producer's records (the broker checks the sequence numbers), so the first copy of every record
    stays in order.
@@ -128,9 +132,10 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
 retry budget. Of the records purged by the delivery timeout, the lowest outstanding record of each
-local partition that has been outstanding for at least half the timeout is `Failed` (the record
-the partition waits on); the records behind it, and a head sent less than half a timeout ago (a
-partition that was flowing), are `NotAttempted`. In a persistent outage each stuck partition's head
+local partition that has been held for at least half the timeout is `Failed` (the record the
+partition waits on); the records behind it, and a head received less than half a timeout ago (a
+partition that was flowing), are `NotAttempted`. A record that runs out of time in the backlog is
+`Failed` if it is the record its partition waits on and `NotAttempted` behind an earlier failure. In a persistent outage each stuck partition's head
 therefore fails once per timeout and is dead-lettered after `shadow_max_retries` timeouts, and the
 next record becomes the head; a partial outage (one external partition stuck) also re-sends the
 other partitions' in-flight records once per timeout, which can duplicate them.
