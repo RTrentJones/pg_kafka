@@ -1340,3 +1340,13 @@ SELECT decode(
     'hex');
 GRANT SELECT ON kafka.sasl_server_secret TO pgkafka_worker;
 COMMENT ON TABLE kafka.sasl_server_secret IS 'Secret keying the fake SCRAM salts of unknown SASL users; never shown to clients.';
+
+-- The SQL entry points of the Rust library (pg_kafka_run_retention_sweep,
+-- pg_kafka_run_partition_maintenance) are created by pgrx; src/lib.rs makes this file
+-- require them, so they exist here. They are for superusers only (ADR-001, "Concurrency
+-- with the worker and with manual maintenance"): both take the extension lock first and
+-- then wait for the maintenance advisory lock, which any role can hold, so a role that
+-- may call them could keep DROP EXTENSION, and every worker transaction queued behind it,
+-- waiting for as long as it likes.
+REVOKE EXECUTE ON FUNCTION pg_kafka_run_retention_sweep(INT, BIGINT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_kafka_run_partition_maintenance(INT) FROM PUBLIC;

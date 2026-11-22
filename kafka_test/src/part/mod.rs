@@ -23,6 +23,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lock_order::test_partition_maintenance_locks_parent_before_leaves: sequential,
         drop_extension::test_partition_maintenance_vs_drop_extension: sequential,
         drop_extension::test_retention_sweep_waits_for_drop_extension_first: sequential,
+        drop_extension::test_maintenance_functions_refuse_public: sequential,
         sweep_concurrency::test_concurrent_sweeps_and_maintenance_do_not_deadlock: sequential,
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
     ]

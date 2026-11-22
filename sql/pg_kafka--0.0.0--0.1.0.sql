@@ -788,6 +788,12 @@ VOLATILE
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'pg_kafka_run_partition_maintenance_wrapper';
 
+-- The SQL entry points of the Rust library are for superusers only (as in
+-- bootstrap.sql): both take the extension lock first and then wait for the maintenance
+-- advisory lock, which any role can hold.
+REVOKE EXECUTE ON FUNCTION pg_kafka_run_retention_sweep(INT, BIGINT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_kafka_run_partition_maintenance(INT) FROM PUBLIC;
+
 -- 3. Least-privilege roles (same definitions as bootstrap.sql).
 DO $$
 BEGIN

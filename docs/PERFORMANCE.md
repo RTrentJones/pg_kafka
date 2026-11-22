@@ -379,6 +379,7 @@ pg_kafka.message_retention_hours = 168   -- e.g. 7 days
 -- at most window + width, like Kafka segment retention); shorter windows row by row.
 pg_kafka.message_partition_minutes = 1440
 
+-- Both functions below are for superusers (EXECUTE is revoked from PUBLIC; ADR-001).
 -- On-demand partition maintenance: create the leaves for now and the next two
 -- widths and move rows the DEFAULT leaf caught. Returns the number created.
 SELECT pg_kafka_run_partition_maintenance();

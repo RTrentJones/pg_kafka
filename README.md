@@ -41,7 +41,7 @@ kcat -C -b localhost:9092 -t my-topic -p 0 -o beginning
 - **Offset Management** - OffsetCommit/OffsetFetch for consumer progress tracking
 - **Admin APIs** - CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups
 - **Config & Log Management** - DescribeConfigs, IncrementalAlterConfigs (`retention.ms` only), DeleteRecords
-- **Retention** - Periodic time-based sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable via `SELECT * FROM pg_kafka_run_retention_sweep()`; `kafka.messages` is time-partitioned (`pg_kafka.message_partition_minutes`, default one day), so expired data goes by dropping whole partitions instead of row deletes (ADR-001)
+- **Retention** - Periodic time-based sweep (`pg_kafka.message_retention_hours`, per-topic `retention.ms`), also runnable via `SELECT * FROM pg_kafka_run_retention_sweep()` (superusers only, like `pg_kafka_run_partition_maintenance()`: EXECUTE is revoked from PUBLIC); `kafka.messages` is time-partitioned (`pg_kafka.message_partition_minutes`, default one day), so expired data goes by dropping whole partitions instead of row deletes (ADR-001)
 - **Compression** - gzip, snappy, lz4, zstd (inbound/outbound)
 - **Multi-Partition Topics** - Key-based routing with murmur2 hash
 - **Topic Auto-Creation** - Topics created on first produce

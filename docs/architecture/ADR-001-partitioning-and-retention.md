@@ -103,8 +103,14 @@ timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dro
 
 ### Concurrency with the worker and with manual maintenance
 
-Maintenance can run in the worker and, at the same time, in any session
-(`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`). The rules:
+Maintenance can run in the worker and, at the same time, in any superuser session
+(`pg_kafka_run_partition_maintenance()`, `pg_kafka_run_retention_sweep()`; EXECUTE on both is
+revoked from PUBLIC, and a role granted it also needs the privileges their SQL needs). Who may
+call them matters: a call holds `ACCESS SHARE` on the extension object while it waits for the
+maintenance advisory lock (below), and any role can hold that advisory lock. A role that could
+call them would, holding `pg_advisory_lock(8099547369649367905)` in one session and calling the
+sweep with `lock_timeout = 0` in another, keep `DROP EXTENSION` waiting for as long as it liked,
+and every worker transaction (whose extension lock queues behind the DROP) with it. The rules:
 
 * **Everything that locks member tables takes the extension lock first.** `DROP EXTENSION
   pg_kafka` takes `ACCESS EXCLUSIVE` on the extension object and then locks its members

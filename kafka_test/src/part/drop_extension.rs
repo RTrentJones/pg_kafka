@@ -232,3 +232,151 @@ async fn sweep_vs_drop() -> SendResult<()> {
     Ok(())
 }
 
+/// The SQL maintenance functions are for superusers: EXECUTE is revoked from PUBLIC.
+/// Both take the extension lock first and then wait for the maintenance advisory lock,
+/// which needs no privilege at all: a role that could call the sweep would, holding
+/// `pg_advisory_lock(MAINTENANCE_LOCK_KEY)` in one session and calling it with
+/// `lock_timeout = 0` in another, hold the extension lock for as long as it liked, so
+/// DROP EXTENSION would wait forever and every worker transaction queue behind DROP.
+///
+/// Asserts: PUBLIC has no EXECUTE on either function; a role with no grant, holding the
+/// advisory lock, is refused both at once ("permission denied for function"), not left
+/// waiting while holding the extension lock; a superuser still runs both.
+pub async fn test_maintenance_functions_refuse_public() -> TestResult {
+    into_test_result(maintenance_functions_refuse_public().await)
+}
+
+/// The partition-maintenance advisory lock (`retention::MAINTENANCE_LOCK_KEY`).
+const MAINTENANCE_LOCK_KEY: i64 = 8_099_547_369_649_367_905;
+
+const MAINTENANCE_FUNCTIONS: [(&str, &str); 2] = [
+    (
+        "pg_kafka_run_retention_sweep(int, bigint)",
+        "SELECT * FROM pg_kafka_run_retention_sweep()",
+    ),
+    (
+        "pg_kafka_run_partition_maintenance(int)",
+        "SELECT pg_kafka_run_partition_maintenance()",
+    ),
+];
+
+async fn maintenance_functions_refuse_public() -> SendResult<()> {
+    println!("=== Test: PUBLIC cannot execute the SQL maintenance functions ===\n");
+    let db = session().await?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+
+    for (signature, _) in MAINTENANCE_FUNCTIONS {
+        let public: bool = db
+            .query_one(
+                &format!("SELECT has_function_privilege('public', '{signature}', 'EXECUTE')"),
+                &[],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        println!("Step 1: PUBLIC may execute {signature}: {public}");
+        if public {
+            return Err(format!("PUBLIC may execute {signature}").into());
+        }
+    }
+
+    let role = format!("kt_unprivileged_{}", uuid::Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} NOLOGIN"))
+        .await
+        .map_err(boxed)?;
+    let result = calls_as(&db, &role).await;
+    if let Err(e) = db.batch_execute(&format!("DROP ROLE {role}")).await {
+        eprintln!("⚠️  cleanup: failed to drop role {role}: {e}");
+    }
+    result?;
+
+    println!("Step 3: a superuser still runs both...");
+    for (_, call) in MAINTENANCE_FUNCTIONS {
+        db.query(call, &[]).await.map_err(boxed)?;
+    }
+    println!("✅ PUBLIC is refused both functions; a superuser runs them");
+    Ok(())
+}
+
+/// Call both functions as `role` while another session of `role` holds the maintenance
+/// advisory lock; each must be refused at once.
+async fn calls_as(db: &Client, role: &str) -> SendResult<()> {
+    let holder = session().await?;
+    holder
+        .batch_execute(&format!(
+            "SET ROLE {role}; SELECT pg_advisory_lock({MAINTENANCE_LOCK_KEY})"
+        ))
+        .await
+        .map_err(boxed)?;
+    println!("Step 2: {role} holds the maintenance advisory lock in one session");
+    let result = async {
+        for (signature, call) in MAINTENANCE_FUNCTIONS {
+            let caller = session().await?;
+            caller
+                .batch_execute(&format!(
+                    "SET ROLE {role}; SET lock_timeout = 0; SET statement_timeout = '20s'"
+                ))
+                .await
+                .map_err(boxed)?;
+            let pid = backend_pid(&caller).await?;
+            let call = call.to_string();
+            let mut task = tokio::spawn(async move {
+                caller
+                    .query(&call, &[])
+                    .await
+                    .map(|rows| rows.len())
+                    .map_err(|e| {
+                        e.as_db_error()
+                            .map_or(e.to_string(), |d| d.message().to_string())
+                    })
+            });
+            let outcome = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+            let outcome = if let Ok(joined) = outcome {
+                joined.map_err(boxed)?
+            } else {
+                // Still running: say what it holds, then cancel it.
+                let holds_extension: bool = db
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND granted
+                                         AND locktype = 'object'
+                                         AND classid = 'pg_extension'::regclass)",
+                        &[&pid],
+                    )
+                    .await
+                    .map_err(boxed)?
+                    .get(0);
+                db.query("SELECT pg_cancel_backend($1)", &[&pid])
+                    .await
+                    .map_err(boxed)?;
+                let _ = task.await;
+                return Err(format!(
+                    "{signature} called by {role} was still running after 3 s (holding the \
+                     extension lock: {holds_extension}): PUBLIC may execute it"
+                )
+                .into());
+            };
+            println!("  {signature} as {role}: {outcome:?}");
+            match outcome {
+                Err(msg) if msg.contains("permission denied for function") => {}
+                other => {
+                    return Err(format!(
+                        "{signature} called by {role} must be refused with \"permission \
+                         denied for function\", got {other:?}"
+                    )
+                    .into())
+                }
+            }
+        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
+    if let Err(e) = holder
+        .batch_execute(&format!(
+            "SELECT pg_advisory_unlock({MAINTENANCE_LOCK_KEY}); RESET ROLE"
+        ))
+        .await
+    {
+        eprintln!("⚠️  cleanup: failed to release the maintenance advisory lock: {e}");
+    }
+    result
+}

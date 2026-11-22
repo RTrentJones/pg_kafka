@@ -323,6 +323,46 @@ mod tests {
         );
     }
 
+    /// The SQL maintenance functions take the extension lock and then wait for an
+    /// advisory lock any role can hold: PUBLIC must not execute them, in a fresh install
+    /// and after the upgrade alike. bootstrap.sql can revoke only because src/lib.rs
+    /// makes it require them (pgrx creates its functions after the file otherwise).
+    #[test]
+    fn maintenance_functions_are_revoked_from_public() {
+        const LIB_RS: &str = include_str!("../../lib.rs");
+        for revoke in [
+            "REVOKE EXECUTE ON FUNCTION pg_kafka_run_retention_sweep(INT, BIGINT) FROM PUBLIC;",
+            "REVOKE EXECUTE ON FUNCTION pg_kafka_run_partition_maintenance(INT) FROM PUBLIC;",
+        ] {
+            assert!(
+                BOOTSTRAP_SQL.contains(revoke),
+                "bootstrap.sql lacks {revoke}"
+            );
+            assert!(
+                UPGRADE_0_1_0_SQL.contains(revoke),
+                "the 0.0.0 -> 0.1.0 upgrade lacks {revoke}"
+            );
+        }
+        let bootstrap = LIB_RS
+            .split("extension_sql_file!(")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .expect("src/lib.rs includes bootstrap.sql with extension_sql_file!");
+        let requires = bootstrap
+            .split_once("requires")
+            .map(|(_, r)| r)
+            .expect("bootstrap.sql's extension_sql_file! has requires");
+        for function in [
+            "pg_kafka_run_retention_sweep",
+            "pg_kafka_run_partition_maintenance",
+        ] {
+            assert!(
+                requires.contains(function),
+                "bootstrap.sql must require {function}"
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_grants_nothing_to_public() {
         for line in BOOTSTRAP_SQL.lines() {

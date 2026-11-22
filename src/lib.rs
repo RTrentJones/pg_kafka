@@ -111,6 +111,9 @@ fn hello_pg_kafka() -> &'static str {
 /// concurrent pass (another session's, or the worker's) finishes first. Call it in a
 /// transaction of its own: a transaction that already locked kafka.messages could
 /// deadlock with the pass it waits for.
+///
+/// Superusers only: EXECUTE is revoked from PUBLIC (`sql/bootstrap.sql`), since a caller
+/// that waits here holds the extension lock, and any role can hold the maintenance lock.
 #[pg_extern(volatile)]
 fn pg_kafka_run_retention_sweep(
     message_retention_hours: default!(Option<i32>, "NULL"),
@@ -159,7 +162,7 @@ fn pg_kafka_run_retention_sweep(
 ///
 /// Like the sweep, call it in a transaction of its own: it takes the extension lock
 /// first ([`lock_extension_for_maintenance`]), which only helps while it holds no member
-/// table yet.
+/// table yet. Superusers only, like the sweep (EXECUTE is revoked from PUBLIC).
 #[pg_extern(volatile)]
 fn pg_kafka_run_partition_maintenance(partition_minutes: default!(Option<i32>, "NULL")) -> i64 {
     use crate::kafka::storage::postgres::PostgresStore;
@@ -186,8 +189,16 @@ fn lock_extension_for_maintenance(function: &str) {
     }
 }
 
-// The kafka schema, tables, roles and functions CREATE EXTENSION installs.
-pgrx::extension_sql_file!("../sql/bootstrap.sql");
+// The kafka schema, tables, roles and functions CREATE EXTENSION installs. It requires
+// the SQL maintenance functions, so pgrx creates them first: the file ends by revoking
+// EXECUTE on them from PUBLIC.
+pgrx::extension_sql_file!(
+    "../sql/bootstrap.sql",
+    requires = [
+        pg_kafka_run_retention_sweep,
+        pg_kafka_run_partition_maintenance
+    ]
+);
 
 /// Required by `cargo pgrx test` at the crate root (the extension's tests run as E2E
 /// tests instead, see docs/PGRX_TESTING_GUIDE.md).

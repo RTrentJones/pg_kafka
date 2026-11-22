@@ -95,7 +95,9 @@ EXTENSION pg_kafka` has run, without a restart.
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
   the retention sweep;
-- adds `pg_kafka_run_partition_maintenance()`;
+- adds `pg_kafka_run_partition_maintenance()`, and revokes EXECUTE on it and on
+  `pg_kafka_run_retention_sweep()` from PUBLIC (superusers only, as in a fresh install;
+  ADR-001, "Concurrency with the worker and with manual maintenance");
 - creates the NOLOGIN roles `pgkafka_reader` and `pgkafka_worker` if they do not exist,
   revokes every privilege 0.0.0 granted to PUBLIC on the kafka schema (including
   EXECUTE on `kafka.replay_shadow_messages`), grants read-only access to
