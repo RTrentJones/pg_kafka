@@ -301,19 +301,26 @@ pub async fn test_shadow_full_producer_queue_does_not_block_sync_timeouts() -> T
         let held_for = start.elapsed();
         println!("  sync produce answered after {held_for:?}");
         sent.map_err(|(e, _)| format!("sync produce failed after {held_for:?}: {e}"))?;
-        assert!(
-            held_for < Duration::from_secs(8),
-            "the sync response must be released at shadow_sync_timeout_ms (3 s), \
-             was held {held_for:?}"
-        );
+        // Errors, not panics: the cleanup below must still restore the GUCs.
+        if held_for >= Duration::from_secs(8) {
+            return Err(format!(
+                "the sync response must be released at shadow_sync_timeout_ms (3 s), \
+                 was held {held_for:?}"
+            )
+            .into());
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await
     .map_err(|e| e.to_string());
 
     // Delete the topics (and their outbox rows) before the real cluster is back.
-    ctx.cleanup().await?;
-    alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_sync_timeout_ms").await?;
+    if let Err(e) = ctx.cleanup().await {
+        eprintln!("⚠️  cleanup: failed to delete the topics: {e}");
+    }
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.shadow_sync_timeout_ms").await {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.shadow_sync_timeout_ms: {e}");
+    }
     restore_bootstrap_servers(&db).await?;
     result?;
     println!("✅ Test PASSED\n");
@@ -345,7 +352,13 @@ const BACKLOG_DELIVERY_TIMEOUT_MS: u64 = 100_000;
 ///
 /// The small topic's head is answered from the backlog too, but NotAttempted:
 /// it found no room only because the large topic's older records filled the
-/// queue, so it counts no failed attempt there. It is claimed again, goes out
+/// queue, so it counts no failed attempt there. For that the "small" records
+/// carry as many bytes as the large ones: the queue holds a whole number of
+/// large records, and the bytes left over (under one large record) would take
+/// a record of a few bytes as soon as the large records ahead of it in the
+/// backlog are answered there. Such a record goes out on the first
+/// generation, a few seconds before that generation times out, and fails with
+/// it (a real attempt), not from the backlog. It is claimed again, goes out
 /// on the replacement producer once the first generation times out, and fails
 /// one delivery timeout after that second dispatch.
 pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires(
@@ -407,19 +420,58 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
                 .map_err(|(e, _)| format!("big record {i}: {e}"))?;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-        println!("Step 2: {SMALL} records of another topic wait behind them...");
+        println!("Step 2: {SMALL} records of another topic, as large, wait behind them...");
         for i in 0..SMALL {
             producer
                 .send(
                     FutureRecord::<(), _>::to(&small_topic)
-                        .payload("small")
+                        .payload(&payload[..])
                         .partition(0),
                     Duration::from_secs(30),
                 )
                 .await
                 .map_err(|(e, _)| format!("small record {i}: {e}"))?;
         }
+        // The topics are async: the produce ack comes before the claim, which
+        // the next outbox tick (every 250 ms) makes. Wait for it, so the first
+        // claim is not taken for the re-claim after a NotAttempted answer, and
+        // time the head's first attempt from it.
+        let claim_wait = Instant::now();
+        let small_head_claimed: Option<String> = loop {
+            let row = ctx
+                .db()
+                .query_one(
+                    "SELECT forwarded_at::text, attempt_open, retry_count \
+                     FROM kafka.shadow_tracking WHERE topic_id = $1 AND local_offset = 0",
+                    &[&small_id],
+                )
+                .await?;
+            let (claimed_at, open, retries): (Option<String>, bool, i32) =
+                (row.get(0), row.get(1), row.get(2));
+            if retries != 0 {
+                return Err(format!(
+                    "the small topic's head counted {retries} failed attempt(s) before its \
+                     first claim was seen"
+                )
+                .into());
+            }
+            if claimed_at.is_some() && open {
+                break claimed_at;
+            }
+            if claim_wait.elapsed() > Duration::from_secs(10) {
+                return Err(format!(
+                    "the small topic's head was not claimed within 10 s of its produce \
+                     (forwarded_at {claimed_at:?}, attempt open {open})"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         let dispatched = Instant::now();
+        println!(
+            "  the small topic's head was claimed {:?} after its produce was acked",
+            claim_wait.elapsed()
+        );
         // The large topic's last record and head: (retry_count, attempt_open,
         // when it was last claimed).
         let big_state = |offset: i64| {
@@ -449,16 +501,6 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
             .into());
         }
         let mut tail_answered_after = None;
-
-        let small_head_claimed: Option<String> = ctx
-            .db()
-            .query_one(
-                "SELECT forwarded_at::text FROM kafka.shadow_tracking \
-                 WHERE topic_id = $1 AND local_offset = 0",
-                &[&small_id],
-            )
-            .await?
-            .get(0);
 
         // The in-flight entries expire 150 s after each dispatch: watch a
         // little past that, and until the small topic's head failed its
@@ -565,17 +607,26 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
         // Each attempt is answered within one delivery timeout of its dispatch:
         // the first from the backlog, the second by the replacement
         // producer's timeout, timed from that dispatch.
+        // Errors, not panics: the cleanup below must still restore the GUCs.
         let timeout = Duration::from_millis(BACKLOG_DELIVERY_TIMEOUT_MS);
-        assert!(
-            head_reclaimed_after < timeout,
-            "the head's first attempt was answered {head_reclaimed_after:?} after its \
-             dispatch, more than the delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
-        );
+        if head_reclaimed_after >= timeout {
+            return Err(format!(
+                "the head's first attempt was answered {head_reclaimed_after:?} after its \
+                 dispatch, more than the delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
+            )
+            .into());
+        }
         let second = head_failed_after.saturating_sub(head_reclaimed_after);
-        assert!(
-            second < timeout + Duration::from_secs(10),
-            "the head failed {second:?} after its second dispatch, more than the \
-             delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
+        if second >= timeout + Duration::from_secs(10) {
+            return Err(format!(
+                "the head failed {second:?} after its second dispatch, more than the \
+                 delivery timeout ({BACKLOG_DELIVERY_TIMEOUT_MS} ms)"
+            )
+            .into());
+        }
+        println!(
+            "  first attempt answered after {head_reclaimed_after:?}, second failed {second:?} \
+             after its dispatch"
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
@@ -583,12 +634,17 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
     .map_err(|e| e.to_string());
 
     // Delete the topics (and their outbox rows) before the real cluster is back.
-    ctx.cleanup().await?;
-    alter_system(
+    if let Err(e) = ctx.cleanup().await {
+        eprintln!("⚠️  cleanup: failed to delete the topics: {e}");
+    }
+    if let Err(e) = alter_system(
         &db,
         "ALTER SYSTEM RESET pg_kafka.test_shadow_delivery_timeout_ms",
     )
-    .await?;
+    .await
+    {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.test_shadow_delivery_timeout_ms: {e}");
+    }
     restore_bootstrap_servers(&db).await?;
     result?;
     println!("✅ Test PASSED\n");
@@ -733,7 +789,10 @@ pub async fn test_shadow_ack_application_error_loses_no_ack() -> TestResult {
                 .await?;
             (row.get(0), row.get(1))
         };
-        assert!(!delivered, "the trigger refuses the delivered mark");
+        // Errors, not panics: the cleanup below must still drop the trigger.
+        if delivered {
+            return Err("the trigger did not refuse the delivered mark".into());
+        }
         println!("  while refused: retry_count={retries}");
 
         println!("Step 2: drop the trigger; the kept ack is applied...");
@@ -755,12 +814,17 @@ pub async fn test_shadow_ack_application_error_loses_no_ack() -> TestResult {
             )
             .await?
             .get(0);
-        assert_eq!(
-            retry_count, 0,
-            "the ack was lost: its attempt was counted as failed and re-sent"
-        );
+        if retry_count != 0 {
+            return Err(format!(
+                "the ack was lost: its attempt was counted as failed and re-sent \
+                 (retry_count {retry_count})"
+            )
+            .into());
+        }
         let external = count_external_messages(&topic, Duration::from_secs(5)).await?;
-        assert_eq!(external, 1, "forwarded {external} times");
+        if external != 1 {
+            return Err(format!("forwarded {external} times").into());
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await
@@ -844,10 +908,13 @@ pub async fn test_shadow_failed_tick_commit_loses_no_ack() -> TestResult {
             )
             .await?;
         let (delivered, retries): (i64, i32) = (row.get(0), row.get(1));
-        assert_eq!(
-            delivered, 0,
-            "the trigger refuses the delivered mark at commit"
-        );
+        // Errors, not panics: the cleanup below must still drop the trigger.
+        if delivered != 0 {
+            return Err(format!(
+                "the trigger did not refuse the delivered mark at commit ({delivered} delivered)"
+            )
+            .into());
+        }
         println!("  while refused: max retry_count={retries}");
 
         println!("Step 2: drop the trigger; the kept acks are applied...");
@@ -869,15 +936,17 @@ pub async fn test_shadow_failed_tick_commit_loses_no_ack() -> TestResult {
             )
             .await?
             .get(0);
-        assert_eq!(
-            max_retries, 0,
-            "an ack was lost: its attempt was counted as failed and re-sent"
-        );
+        if max_retries != 0 {
+            return Err(format!(
+                "an ack was lost: its attempt was counted as failed and re-sent \
+                 (max retry_count {max_retries})"
+            )
+            .into());
+        }
         let external = count_external_messages(&topic, Duration::from_secs(5)).await?;
-        assert_eq!(
-            external, RECORDS,
-            "forwarded {external} records for {RECORDS}"
-        );
+        if external != RECORDS {
+            return Err(format!("forwarded {external} records for {RECORDS}").into());
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     }
     .await
