@@ -2033,3 +2033,42 @@ fn test_a_new_leader_is_not_counted_beyond_the_departed_one() {
         c.held_bytes()
     );
 }
+
+#[test]
+fn test_a_stale_generation_sync_forgets_no_empty_group() {
+    // A leader SyncGroup with assignments that need room, at a generation that is not the
+    // group's: it is answered ILLEGAL_GENERATION and must change nothing, not even forget
+    // the Empty groups the room would have come from.
+    let c = GroupCoordinator::new();
+    let e = "e".repeat(60_000);
+    join_and_leave(&c, &e).unwrap();
+    let a = joined(&join(&c, "g", None));
+    let sb = join(&c, "g", None);
+    let a = joined(&join(&c, "g", Some(&a.member_id)));
+    joined(&sb);
+    assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+    c.set_memory_limit(c.held_bytes() + 50_000);
+    let stale = c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id - 1,
+        vec![(a.member_id.clone(), vec![1; 80_000])],
+    );
+    assert_eq!(
+        stale.unwrap_err().to_kafka_error_code(),
+        crate::kafka::constants::ERROR_ILLEGAL_GENERATION
+    );
+    assert!(
+        c.get_group_state(&e).is_some(),
+        "the Empty group was forgotten"
+    );
+    // At its generation the same SyncGroup makes room by forgetting it.
+    c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![1; 80_000])],
+    )
+    .unwrap();
+    assert!(c.get_group_state(&e).is_none());
+}

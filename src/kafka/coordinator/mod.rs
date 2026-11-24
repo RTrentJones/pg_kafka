@@ -697,11 +697,14 @@ impl GroupCoordinator {
             generation_id,
             assignments,
         } = request;
+        // The member and its generation are checked before anything else: a SyncGroup
+        // answered UNKNOWN_MEMBER_ID or ILLEGAL_GENERATION changes nothing, not even the
+        // Empty groups the memory budget would forget for its assignments.
+        let group = current_member_group(groups, group_id, member_id, generation_id)?;
         // What every other group holds, for the memory budget of a leader's assignments
         // (only a leader's SyncGroup in the sync phase stores any).
-        let stores_assignments = groups.get(group_id).is_some_and(|g| {
-            g.state == GroupState::CompletingRebalance && g.leader.as_deref() == Some(member_id)
-        });
+        let stores_assignments = group.state == GroupState::CompletingRebalance
+            && group.leader.as_deref() == Some(member_id);
         // Room for the assignments is made first (forgetting least recently active Empty
         // groups), so the check below sees what is left.
         if stores_assignments {
@@ -722,6 +725,7 @@ impl GroupCoordinator {
         } else {
             0
         };
+        // Still there: make_room keeps the group it makes room for.
         let group = current_member_group(groups, group_id, member_id, generation_id)?;
         let is_leader = group.leader.as_deref() == Some(member_id);
         if matches!(
