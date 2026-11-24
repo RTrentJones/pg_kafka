@@ -311,6 +311,39 @@ impl ConsumerGroup {
                 .sum::<usize>()
     }
 
+    /// What the group's own copies of its protocol type, leader id and protocol name hold
+    /// now, and what they will hold once `member_id` has joined with `params` and the join
+    /// phase completed: a member that fills an empty group sets the protocol type, the first
+    /// member of a leaderless group becomes the leader, and a group without a protocol name
+    /// gets one of the member's (priced at the longest). Counted as
+    /// [`Self::count_held_bytes`] counts them.
+    pub(super) fn join_fields_held_bytes(
+        &self,
+        member_id: &str,
+        params: &JoinGroupParams,
+    ) -> (usize, usize) {
+        let text = |s: Option<&str>| s.map_or(0, |s| s.len() + ALLOCATION_OVERHEAD);
+        let now = text(self.protocol_type.as_deref())
+            + text(self.leader.as_deref())
+            + text(self.protocol_name.as_deref());
+        let fills = self.members.keys().all(|id| id == member_id);
+        let protocol_type = if fills {
+            Some(params.protocol_type.as_str())
+        } else {
+            self.protocol_type.as_deref()
+        };
+        let leader = self.leader.as_deref().unwrap_or(member_id);
+        let protocol_name = self.protocol_name.as_deref().or_else(|| {
+            params
+                .protocols
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .max_by_key(|name| name.len())
+        });
+        let after = text(protocol_type) + text(Some(leader)) + text(protocol_name);
+        (now, after)
+    }
+
     /// Bring [`Self::held_bytes`] up to date after the group changed.
     pub(super) fn recount(&mut self) {
         self.held_bytes = self.count_held_bytes();

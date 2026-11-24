@@ -1861,3 +1861,25 @@ fn test_empty_groups_stay_when_forgetting_them_would_not_make_room() {
     assert!(c.get_group_state(&"e".repeat(30_000)).is_none());
     assert_eq!(c.get_group_state(&target).map(|g| g.members.len()), Some(1));
 }
+
+#[test]
+fn test_new_group_is_priced_with_what_the_join_stores() {
+    // A group-creating JoinGroup stores the group's own copies of the protocol type, the
+    // leader's id and the protocol name besides the member: the admission must price them.
+    let mut p = params("g", None, &[]);
+    p.protocol_type = "t".repeat(30_000);
+    p.protocols = vec![("p".repeat(30_000), Vec::new())];
+    let unbounded = GroupCoordinator::new();
+    joined(&join_with(&unbounded, &p));
+    let held = unbounded.held_bytes();
+    assert_eq!(held, counted_afresh(&unbounded));
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(held - 1);
+    assert_eq!(
+        join_error_code(&join_with(&c, &p)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    c.set_memory_limit(held);
+    joined(&join_with(&c, &p));
+    assert_eq!(c.held_bytes(), held);
+}
