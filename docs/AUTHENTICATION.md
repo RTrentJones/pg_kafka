@@ -68,7 +68,7 @@ operator migrate clients one at a time (and lets the E2E suite keep using PLAINT
 | `pg_kafka.sasl_enabled_mechanisms` | `PLAIN,SCRAM-SHA-256,SCRAM-SHA-512` | Mechanisms offered on SASL listeners |
 | `pg_kafka.max_connections` | `1024` | Concurrent connections **per listener** (each listener has its own cap) |
 | `pg_kafka.max_connections_per_ip` | `256` | Concurrent connections from one IP address, across all listeners (Kafka's `max.connections.per.ip`) |
-| `pg_kafka.connections_max_idle_ms` | `600000` | Close a connection idle this long (nothing read, nothing written, nothing outstanding; Kafka's `connections.max.idle.ms`) |
+| `pg_kafka.connections_max_idle_ms` | `600000` | Close a connection idle this long (nothing read or written, and nothing outstanding or a response waiting for the client to read it; Kafka's `connections.max.idle.ms`) |
 | `pg_kafka.request_read_timeout_ms` | `60000` | A request frame must arrive completely within this long of its first byte |
 
 All of them are read once, **when the background worker starts**. They are `SIGHUP`

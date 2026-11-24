@@ -25,6 +25,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use super::dispatch::send_with_backpressure;
+use super::response_budget::ReplyCharge;
 use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
 use crate::kafka::constants::API_KEY_FETCH;
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
@@ -88,10 +89,14 @@ impl LongPoll {
     }
 
     /// Answer the client: register for wake-ups, fetch until done, unregister.
+    /// Each attempt reserves the request's `max_bytes` of the connection's response budget
+    /// first (`reply`), so the responses many long polls fetch at once wait for room instead
+    /// of all being held together.
     pub(super) async fn run(
         self,
         registry: &PendingFetchRegistry,
         poll_interval: Duration,
+        reply: &ReplyCharge,
     ) -> Result<(), LongPollError> {
         // The client is gone (its connection's writer, which owns the response slot,
         // has been torn down): do nothing rather than queue work for the DB thread.
@@ -117,7 +122,7 @@ impl LongPoll {
         }
 
         let result = self
-            .fetch_until_done(&notify, deadline, poll_interval)
+            .fetch_until_done(read_committed, &notify, deadline, poll_interval, reply)
             .await;
 
         // Always drop the registrations, whatever the outcome.
@@ -131,9 +136,11 @@ impl LongPoll {
     /// The fetch / wait loop; [`run`](Self::run) owns the registration around it.
     async fn fetch_until_done(
         &self,
+        read_committed: bool,
         notify: &Notify,
         deadline: Instant,
         poll_interval: Duration,
+        reply: &ReplyCharge,
     ) -> Result<(), LongPollError> {
         loop {
             // Stop instead of re-fetching for a client that has disconnected.
@@ -141,6 +148,13 @@ impl LongPoll {
                 debug!("Long poll: client disconnected, abandoning fetch");
                 return Ok(());
             }
+            let charge = tokio::select! {
+                charge = reply.reserve(self.fetch.max_bytes) => charge,
+                () = self.response_tx.closed() => {
+                    debug!("Long poll: client disconnected while waiting for response room");
+                    return Ok(());
+                }
+            };
             let response = self.fetch_once().await?;
 
             let total_bytes = calculate_response_bytes(&response);
@@ -150,10 +164,15 @@ impl LongPoll {
             // straight away, as Kafka does, so the consumer can react instead of waiting
             // out max_wait_ms for data that will not arrive. A non-positive min_bytes is
             // met by any response.
-            let enough =
-                min_bytes <= 0 || usize::try_from(min_bytes).is_ok_and(|min| total_bytes >= min);
+            // A response that stopped short of a partition's readable end is as full as the
+            // request's limits let it be: Kafka counts the bytes available (more than fit), so
+            // it answers too, and a min_bytes the cap lowered to max_bytes is never waited out.
+            let enough = min_bytes <= 0
+                || usize::try_from(min_bytes).is_ok_and(|min| total_bytes >= min)
+                || stopped_short(&response, read_committed);
             if enough || response_has_partition_error(&response) {
                 debug!("Long poll: min_bytes threshold met, returning response");
+                reply.hold(charge);
                 let _ = self.response_tx.send(response);
                 return Ok(());
             }
@@ -161,9 +180,11 @@ impl LongPoll {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 debug!("Long poll: timeout reached, returning response");
+                reply.hold(charge);
                 let _ = self.response_tx.send(response);
                 return Ok(());
             }
+            drop((response, charge));
 
             // Not enough data and not timed out: wait for a wake-up. The deadline wait is
             // exact (the final re-fetch happens at max_wait_ms); the safety-net interval
@@ -229,6 +250,48 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
     }
 }
 
+/// Whether a partition of a Fetch response returned records but stopped before its readable
+/// end (the high watermark, or the last stable offset for `read_committed`): the request's
+/// `max_bytes` or the partition's `partition_max_bytes` cut it short.
+fn stopped_short(response: &KafkaResponse, read_committed: bool) -> bool {
+    let ResponseBody::Fetch(response) = &response.body else {
+        return false;
+    };
+    response
+        .responses
+        .iter()
+        .flat_map(|t| t.partitions.iter())
+        .any(|p| {
+            let readable_end = if read_committed {
+                p.last_stable_offset
+            } else {
+                p.high_watermark
+            };
+            p.records
+                .as_ref()
+                .and_then(next_offset_after)
+                .is_some_and(|next| next < readable_end)
+        })
+}
+
+/// The offset after the last batch of encoded RecordBatch v2 `records` (base offset plus
+/// last offset delta plus one), or `None` when they hold no whole batch.
+fn next_offset_after(records: &Bytes) -> Option<i64> {
+    // base offset (8), batch length (4), leader epoch (4), magic (1), CRC (4), attributes (2),
+    // then the last offset delta (4).
+    const LAST_OFFSET_DELTA_AT: usize = 23;
+    let mut at = 0usize;
+    let mut next = None;
+    while let Some(header) = records.get(at..at + LAST_OFFSET_DELTA_AT + 4) {
+        let base = i64::from_be_bytes(header[..8].try_into().ok()?);
+        let length = usize::try_from(i32::from_be_bytes(header[8..12].try_into().ok()?)).ok()?;
+        let delta = i32::from_be_bytes(header[LAST_OFFSET_DELTA_AT..].try_into().ok()?);
+        next = Some(base + i64::from(delta) + 1);
+        at += 12 + length;
+    }
+    next
+}
+
 /// Whether any partition in a Fetch response carries a non-zero error code.
 fn response_has_partition_error(response: &KafkaResponse) -> bool {
     match &response.body {
@@ -247,6 +310,14 @@ mod tests {
     use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// A reply charge on a roomy budget of its own.
+    fn test_reply() -> ReplyCharge {
+        ReplyCharge::new(
+            super::super::response_budget::ResponseBudget::new(1 << 20),
+            0,
+        )
+    }
 
     /// A Fetch v4 long poll (correlation id 1, `max_bytes` 1024) of `topics`.
     fn long_poll(
@@ -277,6 +348,41 @@ mod tests {
     }
 
     #[test]
+    fn test_a_response_cut_short_by_its_limits_is_enough() {
+        use kafka_protocol::messages::fetch_response::{
+            FetchResponse, FetchableTopicResponse, PartitionData,
+        };
+        // The 61-byte header of a batch of offsets 5..=7 (base offset 5, last offset
+        // delta 2), records left out.
+        let mut header = Vec::new();
+        header.extend_from_slice(&5i64.to_be_bytes());
+        header.extend_from_slice(&49i32.to_be_bytes());
+        header.extend_from_slice(&[0; 11]);
+        header.extend_from_slice(&2i32.to_be_bytes());
+        header.resize(61, 0);
+        let records = Bytes::from(header);
+        assert_eq!(next_offset_after(&records), Some(8));
+        let response = |high_watermark, last_stable_offset| {
+            let mut partition = PartitionData::default();
+            partition.high_watermark = high_watermark;
+            partition.last_stable_offset = last_stable_offset;
+            partition.records = Some(records.clone());
+            let mut topic = FetchableTopicResponse::default();
+            topic.partitions = vec![partition];
+            let mut fetch = FetchResponse::default();
+            fetch.responses = vec![topic];
+            KafkaResponse::new(1, 4, ResponseBody::Fetch(fetch))
+        };
+        assert!(stopped_short(&response(20, 20), false), "more to read");
+        assert!(!stopped_short(&response(8, 8), false), "read to the end");
+        assert!(
+            !stopped_short(&response(20, 8), true),
+            "read_committed stops at the last stable offset"
+        );
+        assert!(next_offset_after(&Bytes::new()).is_none());
+    }
+
+    #[test]
     fn test_long_poll_stops_when_client_is_gone() {
         // A long poll whose client has disconnected (response slot closed) must return
         // straight away instead of re-fetching on the DB thread until max_wait_ms.
@@ -297,8 +403,11 @@ mod tests {
             .unwrap();
         let started = Instant::now();
         rt.block_on(
-            long_poll(i32::MAX, i32::MAX, 0, vec![topic], request_tx, final_tx)
-                .run(&PendingFetchRegistry::new(), Duration::from_millis(100)),
+            long_poll(i32::MAX, i32::MAX, 0, vec![topic], request_tx, final_tx).run(
+                &PendingFetchRegistry::new(),
+                Duration::from_millis(100),
+                &test_reply(),
+            ),
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -389,7 +498,7 @@ mod tests {
             request_tx,
             final_tx,
         )
-        .run(&registry, Duration::from_millis(10_000))
+        .run(&registry, Duration::from_millis(10_000), &test_reply())
         .await
         .unwrap();
 
@@ -416,7 +525,11 @@ mod tests {
             request_tx,
             final_tx,
         )
-        .run(&PendingFetchRegistry::new(), Duration::from_millis(200))
+        .run(
+            &PendingFetchRegistry::new(),
+            Duration::from_millis(200),
+            &test_reply(),
+        )
         .await
         .unwrap();
 
@@ -458,7 +571,7 @@ mod tests {
             request_tx,
             final_tx,
         )
-        .run(&registry, Duration::from_millis(10_000))
+        .run(&registry, Duration::from_millis(10_000), &test_reply())
         .await
         .unwrap();
 
@@ -501,7 +614,7 @@ mod tests {
             request_tx,
             final_tx,
         )
-        .run(&registry, Duration::from_millis(10_000))
+        .run(&registry, Duration::from_millis(10_000), &test_reply())
         .await
         .unwrap();
 

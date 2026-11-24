@@ -52,7 +52,7 @@ fn distinct(prefix: &str, n: usize) -> impl Iterator<Item = String> + '_ {
 
 /// A connection from `src` that reads nothing: its receive buffer is as small as the
 /// kernel allows, so a few responses fill it and the broker's writer stalls.
-async fn non_reading(src: Ipv4Addr) -> std::io::Result<TcpStream> {
+pub(super) async fn non_reading(src: Ipv4Addr) -> std::io::Result<TcpStream> {
     let socket = TcpSocket::new_v4()?;
     socket.set_recv_buffer_size(4096)?;
     socket.bind(SocketAddr::from((src, 0)))?;
@@ -165,6 +165,29 @@ pub(super) fn broker_side_state(client: SocketAddr) -> DynResult<Option<u8>> {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() > 3 && cols[1] == local && cols[2] == remote {
             return Ok(Some(u8::from_str_radix(cols[3], 16)?));
+        }
+    }
+    Ok(None)
+}
+
+/// The bytes waiting in the broker's receive queue (`/proc/net/tcp` `rx_queue`) of the
+/// connection whose client end is `client`: what the client sent and the broker has not read.
+pub(super) fn broker_side_unread(client: SocketAddr) -> DynResult<Option<u64>> {
+    let SocketAddr::V4(client) = client else {
+        return Err("an IPv4 client address".into());
+    };
+    let hex = |a: Ipv4Addr, p: u16| format!("{:08X}:{p:04X}", u32::from_le_bytes(a.octets()));
+    let local = hex(Ipv4Addr::LOCALHOST, port());
+    let remote = hex(*client.ip(), client.port());
+    let table = std::fs::read_to_string("/proc/net/tcp")?;
+    for line in table.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() > 4 && cols[1] == local && cols[2] == remote {
+            let rx = cols[4]
+                .split(':')
+                .nth(1)
+                .ok_or("a tx_queue:rx_queue column")?;
+            return Ok(Some(u64::from_str_radix(rx, 16)?));
         }
     }
     Ok(None)

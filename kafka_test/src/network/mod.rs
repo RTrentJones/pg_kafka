@@ -19,6 +19,7 @@
 pub mod decode_memory;
 pub mod decode_work;
 pub mod fanout;
+pub mod fetch_limits;
 pub mod hostile_clients;
 pub mod large_decodes;
 pub mod produce_decoding;
@@ -170,6 +171,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         // setup first, teardown last).
         hostile_clients::test_partial_frames_cannot_exhaust_the_frame_budget: sequential,
         hostile_clients::test_response_larger_than_the_request_limit_is_delivered: sequential,
+        fetch_limits::test_fetch_responses_are_capped_by_fetch_max_bytes: sequential,
         hostile_clients::test_pipelined_requests_are_not_delayed_by_nagle: sequential,
         hostile_clients::test_acks0_produce_error_closes_connection: sequential,
         hostile_clients::test_invalid_acks_rejected_and_nothing_written: sequential,
@@ -222,6 +224,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         limits::test_per_listener_connection_limit: sequential,
         limits::test_idle_and_frame_read_timeouts_close_connections: sequential,
         limits::test_a_stalled_writer_closes_after_the_idle_timeout: sequential,
+        limits::test_a_non_reading_client_behind_a_long_poll_closes_after_the_idle_timeout: sequential,
         limits::test_pre_auth_deadline_runs_from_accept: sequential,
         limits::test_sasl_credential_lookups_are_rate_limited: sequential,
         limits::test_network_limits_teardown: sequential,

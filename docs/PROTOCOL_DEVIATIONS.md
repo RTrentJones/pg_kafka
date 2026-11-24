@@ -519,6 +519,16 @@ pg_kafka.compression_type = 'gzip'
   the response budget is spent; the first partition with data always returns at least
   one message, later partitions return only what still fits (sizes are estimated as
   key + value + 64 bytes per record, the same accounting `partition_max_bytes` uses)
+- ✅ Broker-side response cap (`pg_kafka.fetch_max_bytes`, default 55 MiB, Kafka's broker
+  `fetch.max.bytes`): a request's `max_bytes` is lowered to it and its `min_bytes` to the
+  result, as Kafka 3.7's `KafkaApis.handleFetchRequest` does, so a `max_bytes` of `i32::MAX`
+  returns at most the cap; each partition reads up to its `partition_max_bytes` within what is
+  left, and the first record of the first partition with data is returned whole even when it
+  is larger (KIP-74; Kafka returns the first record batch). A long poll answers once its
+  response holds `min_bytes` or a partition stopped short of its readable end (the limits cut
+  it: Kafka counts the bytes available, which are more). `max_wait_ms` is not capped, as in
+  Kafka; a connection waiting on one is closed by the idle timeout once responses behind it
+  wait unread (Network Security Posture)
 - ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
   when a Produce to one of its partitions (or, for `read_committed`, any transaction
   end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
@@ -529,7 +539,7 @@ pg_kafka.compression_type = 'gzip'
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
 - At most 64 long-poll fetches may wait concurrently per connection; a fetch over that cap is answered immediately (possibly empty) instead of waiting for `max_wait_ms`
-- At most 128 requests per connection may be in flight (read but not yet answered on the socket); beyond that the broker stops reading from the connection until responses are consumed (TCP backpressure), much as Kafka mutes a connection while it has an outstanding request
+- At most 128 requests per connection may be in flight (read but not yet answered on the socket); beyond that the broker stops reading from the connection until responses are consumed (TCP backpressure), much as Kafka mutes a connection while it has an outstanding request. Kafka reads a connection's next request only once the previous response is sent, so it holds one response per connection; pg_kafka bounds what the in-flight requests' responses hold together by a per-connection budget of `pg_kafka.fetch_max_bytes`: a Fetch reserves its `max_bytes` before it reads records (a long poll before each attempt), a response counts at its encoded size once it arrives and is given back once written, and while the connection's unwritten responses hold more than the budget it reads no further request. The oldest request whose response is not written never waits, so a connection holds at most the budget plus that response (and a first record larger than its request's `max_bytes`)
 
 **Client Impact:**
 - Works with standard Kafka clients
@@ -858,10 +868,12 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
   where Kafka's default is unlimited); over a cap the socket is closed at accept. A
   connection closes after `pg_kafka.connections_max_idle_ms` (600000, as Kafka) without a byte
-  read or written, once nothing it sent is still being answered or its responses wait for it to
-  read them (a client that stops reading: as Kafka's idle expiry closes a muted connection whose
-  response does not go out); a request still being answered (a long-poll Fetch, a JoinGroup
-  waiting for its group) keeps it open. A request frame must arrive within
+  read or written, once nothing it sent is still being answered or responses wait for it to
+  read them: one being written, or answered ones waiting behind an earlier request such as a
+  long poll (a client that stops reading: as Kafka's idle expiry closes a muted connection whose
+  response does not go out). A request still being answered with nothing answered behind it
+  (a long-poll Fetch, a JoinGroup waiting for its group) keeps it open; Kafka's idle expiry
+  closes such a connection too. A request frame must arrive within
   `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
   incomplete incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over
   1 MiB (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame
@@ -878,13 +890,14 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   request if its frame is under 100 MB, pg_kafka does not. 64 MiB is what a Metadata request of
   some 300,000 topic names of 50 bytes decodes to, or a Fetch of some 500,000 partitions, far
   beyond what clients send. Decoded requests then hold at most 256 MiB together until the
-  DB thread has run them (not until their responses are written: a connection whose client
-  stops reading holds at most its 128 in-flight responses, until the idle timeout), 32 MiB of it
+  DB thread has run them (not until their responses are written: the responses a connection
+  whose client stops reading holds are bounded by its response budget, `pg_kafka.fetch_max_bytes`
+  (§7), until the idle timeout), 32 MiB of it
   kept for requests of at most 64 KiB (Heartbeats, ApiVersions, commits), so a few large
   requests cannot lock control traffic out; a decoded request that finds no room is freed and
   decodes again once there is, waiting up to 10 s (its connection reads nothing meanwhile),
-  after which the connection closes. Responses are not size-capped (they are bounded by the
-  request's `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  after which the connection closes. A Fetch response holds at most the request's `max_bytes`,
+  lowered to `pg_kafka.fetch_max_bytes` (§7). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
   Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the

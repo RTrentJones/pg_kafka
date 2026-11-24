@@ -13,7 +13,7 @@ worker starts: reload, then `pg_terminate_backend()` the `pg_kafka_listener` wor
 `SET` it in a session, but only the server-wide value (reload) reaches the worker. A string shown
 as "(unset)" has no boot value; the code then applies the default its description names.
 
-<!--gen:guc-count-->50<!--/gen--> settings:
+<!--gen:guc-count-->51<!--/gen--> settings:
 
 <!--gen:guc-table-->
 | Name | Type | Default | Range | Changes take effect | Description |
@@ -26,6 +26,7 @@ as "(unset)" has no boot value; the code then applies the default its descriptio
 | `pg_kafka.database` | string | (unset) |  | restart | Database to connect to for SPI operations. The database where CREATE EXTENSION pg_kafka was run. Default: postgres. Requires restart. |
 | `pg_kafka.default_partitions` | integer | `1` | 1-10000 | restart | Default number of partitions for auto-created topics. When a topic is auto-created via produce, this sets the partition count. Default: 1. |
 | `pg_kafka.enable_long_polling` | bool | `on` |  | restart | Enable long polling for FetchRequest. When enabled, FetchRequest will wait up to max_wait_ms for data. Default: true. |
+| `pg_kafka.fetch_max_bytes` | integer | `57671680` | 1024-2147483647 | reload | Most bytes a Fetch response returns, whatever the request asks (Kafka's fetch.max.bytes). Each Fetch request's max_bytes is lowered to this, and its min_bytes to the result, as Kafka's broker fetch.max.bytes does. Records are still returned if the first record of the first partition with data is larger, so a consumer always makes progress; later partitions return only what fits. The per-partition limit is the request's partition_max_bytes, within what is left of this. It also bounds what one connection's unwritten Fetch responses may reserve together. Default: 57671680 (55 MiB). Reloadable via SIGHUP; applies to requests read after the reload. |
 | `pg_kafka.fetch_poll_interval_ms` | integer | `1000` | 10-60000 | restart | Polling interval for long polling fallback (milliseconds). A waiting FetchRequest re-runs when new data is signalled (Produce, EndTxn) or max_wait_ms expires; this interval is only the safety-net re-check for a missed signal. Default: 1000ms. |
 | `pg_kafka.group_max_size` | integer | `1000` | 1-100000 | reload | Maximum number of members in one consumer group. A new member joining a full group gets GROUP_MAX_SIZE_REACHED (Kafka group.max.size). Default 1000. Reloadable. |
 | `pg_kafka.host` | string | (unset) |  | restart | Host/interface to bind to. The network interface to listen on. Default 127.0.0.1 (local clients only). This listener speaks pg_kafka.security_protocol (default PLAINTEXT, unauthenticated), so a non-loopback PLAINTEXT bind (e.g. 0.0.0.0 = all interfaces) must be protected by network controls (firewall/security groups); see docs/AUTHENTICATION.md. Requires restart. |
