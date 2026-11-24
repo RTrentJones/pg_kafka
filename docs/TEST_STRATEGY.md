@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->1029<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->1034<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->430<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1469<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->431<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1475<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -70,7 +70,7 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `producer` | 8 |
 | `consumer` | 5 |
 | `offset_management` | 15 |
-| `consumer_group` | 24 |
+| `consumer_group` | 25 |
 | `partition` | 9 |
 | `error_paths` | 70 |
 | `edge_cases` | 13 |
@@ -88,7 +88,7 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `auth` | 16 |
 | `network` | 57 |
 | `worker` | 6 |
-| **Total** | **430** |
+| **Total** | **431** |
 <!--/gen-->
 
 ### Running E2E Tests
@@ -212,8 +212,8 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 | `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
 | `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
 
-The functional suite (365 tests, including the auth, network and worker categories' listener
-restarts) took 9.6 minutes on PG16 in a 4-core sandbox shared with two other builds; the 25-minute
+The functional suite (every category but performance and shadow, including the auth, network
+and worker categories' listener restarts; 365 tests at the time) took 9.6 minutes on PG16 in a 4-core sandbox shared with two other builds; the 25-minute
 step timeout leaves about a 2.5x margin over that loaded run, and the job timeout (100 min)
 covers a cold build, the suite and, on pg14, the shadow and performance categories.
 
