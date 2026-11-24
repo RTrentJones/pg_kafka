@@ -37,6 +37,48 @@ async fn alter_system(db: &Client, sql: &str) -> TestResult {
     Ok(())
 }
 
+/// Runs `ALTER SYSTEM` statements that undo a test's settings when it drops, also when an
+/// assert panics or the runner aborts the test at its timeout. They run on a thread of their
+/// own with its own runtime and connection, and the drop waits for them, so they are in force
+/// (reloaded) before the next test starts whatever state the test's runtime is in.
+struct SystemReset(Vec<String>);
+
+impl Drop for SystemReset {
+    fn drop(&mut self) {
+        let statements = std::mem::take(&mut self.0);
+        let reset = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let db = create_db_client().await.map_err(|e| e.to_string())?;
+                let mut failed = Vec::new();
+                for sql in &statements {
+                    if let Err(e) = db.batch_execute(sql).await {
+                        failed.push(format!("{sql}: {e}"));
+                    }
+                }
+                db.batch_execute("SELECT pg_reload_conf()")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // As in alter_system: the worker and the forwarder pick the reload up.
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                if failed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(failed.join("; "))
+                }
+            })
+        });
+        match reset.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("⚠️  cleanup: {e}"),
+            Err(_) => eprintln!("⚠️  cleanup: the reset panicked"),
+        }
+    }
+}
+
 async fn topic_id(db: &Client, topic: &str) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(db
         .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
@@ -166,6 +208,10 @@ pub async fn test_external_only_fallback() -> TestResult {
     let admin = external_admin()?;
     let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
     let db = create_db_client().await?;
+    let reset = SystemReset(vec![
+        "ALTER SYSTEM RESET pg_kafka.shadow_max_retries".to_string(),
+        "ALTER SYSTEM RESET pg_kafka.shadow_retry_backoff_ms".to_string(),
+    ]);
 
     let result = async {
         let new_topic = NewTopic::new(&external, 1, TopicReplication::Fixed(1))
@@ -263,14 +309,7 @@ pub async fn test_external_only_fallback() -> TestResult {
     .await
     .map_err(|e| e.to_string());
 
-    for reset in [
-        "ALTER SYSTEM RESET pg_kafka.shadow_max_retries",
-        "ALTER SYSTEM RESET pg_kafka.shadow_retry_backoff_ms",
-    ] {
-        if let Err(e) = alter_system(&db, reset).await {
-            eprintln!("⚠️  cleanup: {reset} failed: {e}");
-        }
-    }
+    drop(reset);
     ctx.cleanup().await?;
     let _ = admin.delete_topics(&[&external], &opts).await;
     result?;
@@ -309,6 +348,15 @@ pub async fn test_shadow_unbuildable_settings_dead_letter_after_a_working_produc
     .await?;
     let topic_id = topic_id(ctx.db(), &topic).await?;
     let db = create_db_client().await?;
+    let reset = SystemReset(vec![
+        "ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT'".to_string(),
+        format!(
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+            get_internal_bootstrap_servers()
+        ),
+        "ALTER SYSTEM RESET pg_kafka.shadow_max_retries".to_string(),
+        "ALTER SYSTEM RESET pg_kafka.shadow_retry_backoff_ms".to_string(),
+    ]);
 
     let result = async {
         println!("Step 1: a valid producer for an unreachable broker; {RECORDS} records");
@@ -441,19 +489,7 @@ pub async fn test_shadow_unbuildable_settings_dead_letter_after_a_working_produc
     .await
     .map_err(|e| e.to_string());
 
-    for reset in [
-        "ALTER SYSTEM SET pg_kafka.shadow_security_protocol = 'PLAINTEXT'".to_string(),
-        format!(
-            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
-            get_internal_bootstrap_servers()
-        ),
-        "ALTER SYSTEM RESET pg_kafka.shadow_max_retries".to_string(),
-        "ALTER SYSTEM RESET pg_kafka.shadow_retry_backoff_ms".to_string(),
-    ] {
-        if let Err(e) = alter_system(&db, &reset).await {
-            eprintln!("⚠️  cleanup: {reset} failed: {e}");
-        }
-    }
+    drop(reset);
     ctx.cleanup().await?;
     result?;
     println!("✅ Test PASSED\n");
