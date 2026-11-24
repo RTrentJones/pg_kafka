@@ -1046,10 +1046,9 @@ impl GroupCoordinator {
             }
 
             // Reclaim expired empty groups here (every sweep), not just on the next
-            // join_group's pass, so coordinator memory stays bounded. An Empty group is kept until
-            // EMPTY_GROUP_TTL_SECS has passed (the same rule join_group applies): dropping it
-            // immediately would restart a rejoining group at generation 1, defeating the
-            // monotonic generation that fences zombie consumers (see remove_member).
+            // join_group's pass, so an idle Empty group does not outlive EMPTY_GROUP_TTL_SECS.
+            // Forgetting one earlier is safe too (make_room and pg_kafka.max_consumer_groups do,
+            // at any age): see remove_member for why a recreated group needs no old generation.
             groups.retain(|_, g| !g.is_expired_empty());
         }
 

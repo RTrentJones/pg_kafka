@@ -238,8 +238,8 @@ pub struct ConsumerGroup {
     pub group_id: String,
 
     /// Generation ID: incremented each time a join phase completes. Used to fence
-    /// stale members. Never reset, not even when the group empties (see
-    /// `remove_member`).
+    /// stale members. Kept when the group empties; a forgotten group starts over at 0
+    /// (see `remove_member`).
     pub generation_id: i32,
 
     /// Chosen partition assignment strategy, selected when a join phase completes
@@ -719,11 +719,14 @@ impl ConsumerGroup {
             self.leader = self.members.keys().min().cloned();
         }
 
-        // If no members are left, return to Empty.
-        // NOTE: generation_id is intentionally NOT reset. The generation is the
-        // zombie-fencing token: if it restarted at 0, a stale client from a previous
-        // incarnation of the group could pass the generation checks. Kafka keeps it
-        // monotonic for the lifetime of the group; so do we.
+        // If no members are left, return to Empty. The generation is kept while the group
+        // is held, as in Kafka. A group forgotten while Empty (its TTL, make_room, the
+        // pg_kafka.max_consumer_groups cap) starts over at generation 0 when it is recreated,
+        // as a group Kafka 3.7 removed does; a member of the old group cannot pass the fencing
+        // of the new one, since every fencing path (SyncGroup, Heartbeat, OffsetCommit,
+        // TxnOffsetCommit) refuses a generation-bearing request from a member id the group
+        // does not hold, and member ids carry a random UUID, so no old member id is a member
+        // of the new group.
         if self.members.is_empty() {
             self.state = GroupState::Empty;
             self.protocol_name = None;
