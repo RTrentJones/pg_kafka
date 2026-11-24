@@ -127,8 +127,11 @@ pub async fn test_shadow_max_retries_refuses_zero() -> TestResult {
 }
 
 /// A topic with a large outbox backlog (here a replay) shares each claim with
-/// the other partitions: another topic's new record is forwarded while most of
-/// the backlog is still waiting, not after it.
+/// the other partitions: another topic's record, queued with the backlog, is
+/// forwarded while most of the backlog is still waiting, not after it. Both are
+/// queued by the two replays of one statement, so the backlog has no head start: a
+/// record produced only after the replay would let the forwarder drain rounds of
+/// the backlog before the other topic had anything to send.
 pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     const BACKLOG: usize = 30_000;
     println!("=== Test: a backlog does not starve other topics ===\n");
@@ -137,14 +140,16 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     let backlog_topic = ctx.unique_topic("shadow-backlog").await;
     let other_topic = ctx.unique_topic("shadow-not-starved").await;
     verify_external_kafka_ready().await?;
-    enable_shadow_mode(
-        ctx.db(),
-        &backlog_topic,
-        &config(ShadowMode::LocalOnly, SyncMode::Async),
-    )
-    .await?;
+    for topic in [&backlog_topic, &other_topic] {
+        enable_shadow_mode(
+            ctx.db(),
+            topic,
+            &config(ShadowMode::LocalOnly, SyncMode::Async),
+        )
+        .await?;
+    }
 
-    println!("Step 1: {BACKLOG} records stored locally, not forwarded...");
+    println!("Step 1: {BACKLOG} records and one other record stored locally, not forwarded...");
     let producer = bulk_producer()?;
     let payload = [b'b'; 100];
     let mut sends = Vec::with_capacity(BACKLOG);
@@ -159,6 +164,17 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     for send in sends {
         send.await?.map_err(|(e, _)| e)?;
     }
+    let single = create_producer()?;
+    single
+        .send(
+            FutureRecord::to(&other_topic)
+                .key("k")
+                .payload("not starved")
+                .partition(0),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
 
     enable_shadow_mode(
         ctx.db(),
@@ -176,27 +192,20 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     let other_id = topic_id(ctx.db(), &other_topic).await?;
     assert!(backlog_id < other_id);
 
-    println!("Step 2: replay the backlog, then produce one record to the other topic...");
-    let queued: i64 = ctx
-        .db()
-        .query_one(
-            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
-            &[&backlog_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(queued, i64::try_from(BACKLOG)?);
-    let single = create_producer()?;
-    single
-        .send(
-            FutureRecord::to(&other_topic)
-                .key("k")
-                .payload("not starved")
-                .partition(0),
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|(e, _)| e)?;
+    println!("Step 2: replay the backlog and the other record in one statement...");
+    let (queued_backlog, queued_other): (i64, i64) = {
+        let row = ctx
+            .db()
+            .query_one(
+                "SELECT kafka.replay_shadow_messages($1, 0, NULL), \
+                        kafka.replay_shadow_messages($2, 0, NULL)",
+                &[&backlog_id, &other_id],
+            )
+            .await?;
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(queued_backlog, i64::try_from(BACKLOG)?);
+    assert_eq!(queued_other, 1);
 
     let start = Instant::now();
     let backlog_left = loop {
