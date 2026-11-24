@@ -1307,22 +1307,34 @@ fn make_room(
     if held.saturating_add(extra) <= max_memory {
         return true;
     }
-    let mut victims: Vec<(Instant, String, usize)> = groups
+    let forgettable = |g: &&ConsumerGroup| g.state == GroupState::Empty && g.group_id != keep;
+    // Whether forgetting helps is decided before anything is collected: a refusal costs no
+    // copy of the (up to 32 KB) group ids.
+    let reclaimable: usize = groups
         .values()
-        .filter(|g| g.state == GroupState::Empty && g.group_id != keep)
-        .map(|g| (g.last_activity, g.group_id.clone(), g.held_bytes))
-        .collect();
-    let reclaimable: usize = victims.iter().map(|(_, _, bytes)| bytes).sum();
+        .filter(forgettable)
+        .map(|g| g.held_bytes)
+        .sum();
     if held.saturating_sub(reclaimable).saturating_add(extra) > max_memory {
         return false;
     }
-    victims.sort_unstable();
-    for (_, group_id, bytes) in victims {
+    let mut candidates: Vec<(Instant, &str, usize)> = groups
+        .values()
+        .filter(forgettable)
+        .map(|g| (g.last_activity, g.group_id.as_str(), g.held_bytes))
+        .collect();
+    candidates.sort_unstable();
+    // Only the ids of the groups actually forgotten are copied.
+    let mut victims = Vec::new();
+    for (_, group_id, bytes) in candidates {
         if held.saturating_add(extra) <= max_memory {
             break;
         }
-        groups.remove(&group_id);
+        victims.push(group_id.to_string());
         held = held.saturating_sub(bytes);
+    }
+    for group_id in victims {
+        groups.remove(&group_id);
     }
     true
 }
