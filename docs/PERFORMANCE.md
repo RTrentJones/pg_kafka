@@ -417,6 +417,12 @@ in one 521 MB leaf, 500,000 recent delivered outbox rows, retention off):
 | worst Metadata round trip, 20 ms probe | 217-308 ms each minute | 24 ms |
 | sweep with 20 past daily leaves of 2,000 partitions each, too | 539 ms | 32-52 ms |
 
+The delivered-row index costs the outbox one btree entry per ack and nothing per claim: its
+key columns never change and its predicate column (`external_offset`) already keys the pending
+indexes, so a claim stays a HOT update. Bulk UPDATEs of 200,000 rows as the outbox issues them
+(PG16, three runs): claims 273-332 ms before, 296-339 ms after, with the same HOT count; acks
+710-779 ms before, 853-989 ms after (about 0.5-1 us per acked row).
+
 Per-topic overrides use Kafka's own config key. `retention.ms` set through
 IncrementalAlterConfigs (API 44) is stored in `kafka.topics.retention_ms` and
 enforced by the same sweep: a value `>= 0` applies even when the global GUC is
