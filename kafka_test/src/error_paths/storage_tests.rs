@@ -190,12 +190,12 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
         "committed records 2..4 must be returned"
     );
 
-    println!("Step 3: read_uncommitted fetch reports LSO = HWM...");
+    println!("Step 3: read_uncommitted fetch reports the same LSO, as Kafka does...");
     let response = roundtrip(&mut stream, 5, 9102, &fetch_request(&topic.name, 0, 2, 0)).await?;
     let p = &response.responses[0].partitions[0];
     assert_eq!(p.error_code, 0);
     assert_eq!(p.high_watermark, 6);
-    assert_eq!(p.last_stable_offset, 6);
+    assert_eq!(p.last_stable_offset, 5);
 
     println!("Step 4: fetch below the log start is out of range...");
     let response = roundtrip(&mut stream, 5, 9103, &fetch_request(&topic.name, 0, 1, 0)).await?;
