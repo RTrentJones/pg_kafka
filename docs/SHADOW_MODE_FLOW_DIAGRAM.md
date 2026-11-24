@@ -57,7 +57,7 @@ GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads t
 | `pg_kafka.shadow_ssl_ca_location` | '' | CA file for SSL. |
 | `pg_kafka.shadow_batch_size` | 1000 | Records per outbox claim, and librdkafka `batch.num.messages`. |
 | `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms` (0-5000). |
-| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms` (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
+| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, capped at 10 s so that librdkafka's own retries stay well inside the 120 s delivery timeout (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it; `topic.metadata.refresh.fast.interval.ms`, which would follow it, is pinned to librdkafka's default 100 ms), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
 | `pg_kafka.shadow_max_retries` | 10 | Failed delivery attempts after which a row is a dead letter. |
 | `pg_kafka.shadow_sync_timeout_ms` | 5000 | How long a sync-mode produce response is held for the external ack (0 = not held). |
 | `pg_kafka.shadow_metrics_enabled` | true | Write `kafka.shadow_metrics`. |

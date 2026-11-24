@@ -75,6 +75,18 @@ const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 /// librdkafka's default `retry.backoff.max.ms`, kept unless `retry.backoff.ms`
 /// is larger (see [`build_producer_settings`]).
 const LIBRDKAFKA_RETRY_BACKOFF_MAX_MS: i32 = 1000;
+/// The most librdkafka's own retry backoff (`retry.backoff.ms` and
+/// `retry.backoff.max.ms`) is set to, whatever `shadow_retry_backoff_ms` is:
+/// librdkafka retries inside one delivery attempt, so two retriable errors in a
+/// row (each up to a request timeout plus a backoff, 2 x 40 s) stay well inside
+/// [`DELIVERY_TIMEOUT`]. With the GUC's 60 s maximum applied as is, they took
+/// longer and the attempt timed out with its whole producer generation.
+const LIBRDKAFKA_RETRY_BACKOFF_CAP_MS: i32 = 10_000;
+/// `topic.metadata.refresh.fast.interval.ms`, librdkafka's documented default:
+/// the first interval of the leader query after a partition loses its leader
+/// (doubling up to `retry.backoff.max.ms`). Set explicitly because, unset, it
+/// follows `retry.backoff.ms`.
+const LIBRDKAFKA_LEADER_QUERY_INTERVAL_MS: &str = "100";
 
 /// Assemble the ordered librdkafka settings for the shadow forwarding producer.
 ///
@@ -87,12 +99,15 @@ const LIBRDKAFKA_RETRY_BACKOFF_MAX_MS: i32 = 1000;
 /// - `shadow_batch_size` (messages) → `batch.num.messages` (librdkafka's
 ///   per-batch message cap; `batch.size` would be bytes);
 /// - `shadow_linger_ms` → `linger.ms`;
-/// - `shadow_retry_backoff_ms` → `retry.backoff.ms` (librdkafka's own retries
-///   inside one delivery attempt; the outbox uses the same base for its re-attempt
-///   backoff, see `ShadowStore`), and `retry.backoff.max.ms` to the larger of it
-///   and librdkafka's default 1000 ms: librdkafka caps the backoff at
-///   `retry.backoff.max.ms`, so a larger `retry.backoff.ms` alone would be
-///   ignored (with only a configuration warning);
+/// - `shadow_retry_backoff_ms` → `retry.backoff.ms`, capped at 10 s
+///   ([`LIBRDKAFKA_RETRY_BACKOFF_CAP_MS`]: librdkafka's own retries inside one
+///   delivery attempt; the outbox uses the uncapped value as the base of its
+///   re-attempt backoff, see `ShadowStore`), and `retry.backoff.max.ms` to the
+///   larger of that and librdkafka's default 1000 ms: librdkafka caps the
+///   backoff at `retry.backoff.max.ms`, so a larger `retry.backoff.ms` alone
+///   would be ignored (with only a configuration warning). The leader query's
+///   first interval (`topic.metadata.refresh.fast.interval.ms`) is pinned to
+///   librdkafka's default instead of following the backoff;
 /// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
 ///   librdkafka retries (its default `retries`, which is what idempotence
@@ -132,13 +147,17 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     // Producer performance settings (see the GUC mapping above).
     settings.push(("batch.num.messages", config.batch_size.to_string()));
     settings.push(("linger.ms", config.linger_ms.to_string()));
-    settings.push(("retry.backoff.ms", config.retry_backoff_ms.to_string()));
+    let retry_backoff = config.retry_backoff_ms.min(LIBRDKAFKA_RETRY_BACKOFF_CAP_MS);
+    settings.push(("retry.backoff.ms", retry_backoff.to_string()));
     settings.push((
         "retry.backoff.max.ms",
-        config
-            .retry_backoff_ms
+        retry_backoff
             .max(LIBRDKAFKA_RETRY_BACKOFF_MAX_MS)
             .to_string(),
+    ));
+    settings.push((
+        "topic.metadata.refresh.fast.interval.ms",
+        LIBRDKAFKA_LEADER_QUERY_INTERVAL_MS.to_string(),
     ));
 
     // Compression (use none for maximum compatibility)
@@ -518,19 +537,61 @@ mod tests {
     }
 
     /// A backoff above librdkafka's default cap raises the cap with it, or
-    /// librdkafka would apply the cap instead.
+    /// librdkafka would apply the cap instead; up to its own cap.
     #[test]
     fn test_build_producer_settings_applies_a_long_retry_backoff() {
         let config = ShadowConfig {
             enabled: true,
             bootstrap_servers: "a:9092".to_string(),
             security_protocol: "PLAINTEXT".to_string(),
-            retry_backoff_ms: crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS,
+            retry_backoff_ms: 3_000,
             ..Default::default()
         };
         let s = build_producer_settings(&config);
-        let max = crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS.to_string();
-        assert!(has(&s, "retry.backoff.ms", &max));
-        assert!(has(&s, "retry.backoff.max.ms", &max));
+        assert!(has(&s, "retry.backoff.ms", "3000"));
+        assert!(has(&s, "retry.backoff.max.ms", "3000"));
+    }
+
+    /// librdkafka's own retries stay well inside one delivery attempt
+    /// ([`DELIVERY_TIMEOUT`]) whatever `shadow_retry_backoff_ms` is: its retry
+    /// backoff cap (which also caps the leader query after a lost leader) is
+    /// bounded, and the leader query does not start at the backoff. With the
+    /// GUC's 60 s maximum applied as is, two retriable errors in a row (each a
+    /// request timeout and a backoff) took longer than the timeout.
+    #[test]
+    fn test_build_producer_settings_bound_librdkafka_retries() {
+        let ms = |s: &[(&str, String)], key: &str| -> u64 {
+            s.iter()
+                .find(|(k, _)| *k == key)
+                .map_or_else(|| panic!("{key} not set"), |(_, v)| v.parse().unwrap())
+        };
+        for backoff in [
+            crate::kafka::constants::MIN_SHADOW_RETRY_BACKOFF_MS,
+            crate::kafka::constants::DEFAULT_SHADOW_RETRY_BACKOFF_MS,
+            30_000,
+            crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS,
+        ] {
+            let config = ShadowConfig {
+                enabled: true,
+                bootstrap_servers: "a:9092".to_string(),
+                security_protocol: "PLAINTEXT".to_string(),
+                retry_backoff_ms: backoff,
+                ..Default::default()
+            };
+            let s = build_producer_settings(&config);
+            let (base, max) = (ms(&s, "retry.backoff.ms"), ms(&s, "retry.backoff.max.ms"));
+            let leader_query = ms(&s, "topic.metadata.refresh.fast.interval.ms");
+            let request = ms(&s, "request.timeout.ms");
+            assert!(base <= max && leader_query <= max, "backoff {backoff}");
+            assert!(
+                max <= 10_000,
+                "backoff {backoff}: retry.backoff.max.ms {max}"
+            );
+            let two_retries = 2 * (request + max);
+            assert!(
+                u128::from(two_retries) < DELIVERY_TIMEOUT.as_millis(),
+                "backoff {backoff}: two retries take {two_retries} ms"
+            );
+        }
     }
 }
