@@ -807,8 +807,14 @@ librdkafka producer and answers every record with an ack.
   again while the worker tracks it (no lease: a slow ack never causes a re-send). Consumers of the
   external topic that need exactly-once semantics must deduplicate, for example on an
   application id.
-- **Order.** The first copy of every record of a local partition reaches the external topic in
-  local-offset order (duplicates may follow it).
+- **Order.** The forwarder sends the records of a local partition in local-offset order, never
+  one ahead of an earlier one's retry, but the external partition is chosen by key
+  (`murmur2_random`, the Java client's partitioner; random for a null key), so the order the
+  external topic keeps is per external partition: the first copies of the records of one local
+  partition that land in the same external partition (for keyed records, those of one key) are in
+  local-offset order there (duplicates may follow them). Records with different keys, or null
+  keys, may land in different external partitions with no order between them. A dead-lettered
+  record that is replayed later lands after the records that followed it.
 - **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
   forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised. Only
   the record a partition waits on is charged an attempt when nothing is sent for reasons outside

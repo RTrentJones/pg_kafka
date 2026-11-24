@@ -104,8 +104,15 @@ producer sent none, which is what local consumers see). `partition` is left to t
 
 ### Ordering
 
-The records of one local partition reach the external topic in local-offset order (the first copy
-of each; see duplicates below). That rests on:
+The forwarder sends the records of one local partition in local-offset order, and none of them
+goes out ahead of an earlier one's retry. What the external topic keeps of that order is per
+external partition: the partitioner (`murmur2_random`) places each record by its key, so the
+records of one local partition that land in the same external partition (for keyed records, the
+records of one key) are in local-offset order there (the first copy of each; see duplicates
+below), while records with different keys, and records with a null key (placed at random), may
+land in different external partitions with no order between them. A record that is dead-lettered
+lets its partition move on: if it is replayed later, it lands after the records that followed it.
+The sending order rests on:
 
 1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with a row due (its lowest due offsets; partitions holding only dead letters or rows in flight or backing off take no share), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A claim that leaves rows due is followed by the next one at once (5 ms at the earliest). A row is
    never claimed behind an earlier row of its partition that is backing off after a failure.
