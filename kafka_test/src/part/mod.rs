@@ -35,5 +35,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_budget::test_sweep_aborted_cleanup_reaches_every_leaf: sequential,
         sweep_budget::test_sweep_expiry_reaches_the_current_leaf_on_a_spent_budget: sequential,
         sweep_budget::test_sweep_expiry_keeps_its_share_behind_an_aborted_backlog: sequential,
+        sweep_budget::test_sweep_prunes_producers_within_its_budget: sequential,
     ]
 }

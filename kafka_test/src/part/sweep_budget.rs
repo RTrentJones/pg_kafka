@@ -606,3 +606,101 @@ async fn expiry_share() -> SendResult<()> {
     println!("✅ row expiry ran behind the aborted backlog");
     Ok(())
 }
+
+/// Idle producer ids with a terminal transaction each, seeded for the prune test.
+const EXPIRING_PRODUCERS: i64 = 100_000;
+/// What one sweep with that backlog may take: the 1.5 s budget, one statement per step
+/// and slack.
+const PRUNE_PASS_LIMIT: Duration = Duration::from_secs(5);
+
+/// The terminal-transaction and stale-producer prunes are bounded steps: index-driven
+/// (every deleted producer id checks the transactions that reference it through an
+/// index on transactions.producer_id), in batches within the pass budget, carrying
+/// their progress to the next pass. Without the index each deleted id read the whole
+/// kafka.transactions table for its foreign key, so the prune of N ids cost N full
+/// scans in one statement (40,000 ids: 18.6 s on the DB thread).
+///
+/// Asserts: with 100,000 producer ids idle for 8 days, each with a CompleteCommit
+/// transaction as old, one sweep returns within 5 s (statement_timeout 30 s), and
+/// repeated sweeps remove every seeded id and transaction.
+pub async fn test_sweep_prunes_producers_within_its_budget() -> TestResult {
+    into_test_result(producer_prune().await)
+}
+
+async fn producer_prune() -> SendResult<()> {
+    println!("=== Test: the producer prune stays within the pass budget ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let prefix = unique("prune");
+    db.execute(
+        "WITH p AS (
+             INSERT INTO kafka.producer_ids (producer_id, transactional_id, created_at,
+                                             last_active_at)
+             SELECT base.id - g, $1 || '-' || g, now() - INTERVAL '8 days',
+                    now() - INTERVAL '8 days'
+             FROM generate_series(1, $2::bigint) AS g,
+                  -- Explicit negative ids, never issued by the sequence: drawing 100,000
+                  -- values from it would move the ids later tests are handed far past the
+                  -- creation-time range the idempotent tests check them against.
+                  (SELECT -(floor(random() * 1000000)::bigint + 1) * 1000000 AS id) AS base
+             RETURNING producer_id, transactional_id)
+         INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch, state,
+                                         last_updated_at)
+         SELECT transactional_id, producer_id, 0, 'CompleteCommit', now() - INTERVAL '8 days'
+         FROM p",
+        &[&prefix, &EXPIRING_PRODUCERS],
+    )
+    .await
+    .map_err(boxed)?;
+    println!(
+        "Step 0: {EXPIRING_PRODUCERS} producer ids idle 8 days, each with a terminal transaction"
+    );
+    let left = || {
+        let db = &db;
+        let prefix = &prefix;
+        async move {
+            db.query_one(
+            "SELECT (SELECT count(*) FROM kafka.producer_ids WHERE transactional_id LIKE $1 || '-%'),
+                    (SELECT count(*) FROM kafka.transactions WHERE transactional_id LIKE $1 || '-%')",
+            &[prefix],
+        )
+        .await
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+        .map_err(boxed)
+        }
+    };
+
+    let t = Instant::now();
+    db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+        .await
+        .map_err(boxed)?;
+    let took = t.elapsed();
+    println!(
+        "Step 1: first sweep took {took:?}, left {:?}",
+        left().await?
+    );
+    if took >= PRUNE_PASS_LIMIT {
+        return Err(format!("a sweep with the prune backlog took {took:?}").into());
+    }
+    for pass in 2..=60 {
+        if left().await? == (0, 0) {
+            println!(
+                "Step 2: every seeded id and transaction gone after {} sweep(s)",
+                pass - 1
+            );
+            println!("✅ the prune stayed bounded and drained");
+            return Ok(());
+        }
+        let t = Instant::now();
+        db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        let took = t.elapsed();
+        if took >= PRUNE_PASS_LIMIT {
+            return Err(format!("sweep {pass} took {took:?}").into());
+        }
+    }
+    Err(format!("seeded rows left after 60 sweeps: {:?}", left().await?).into())
+}

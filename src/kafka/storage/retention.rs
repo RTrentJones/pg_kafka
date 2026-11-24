@@ -15,7 +15,7 @@ pub const RETENTION_DELETE_BATCH: i64 = 10_000;
 /// Wall-clock budget for one sweep pass. The sweep runs on the single worker DB
 /// thread, so a pass must stay bounded: every step whose cost grows with the data
 /// (the aborted-row cleanup, the leaf contents probes, the expired-message deletes,
-/// the leaf drops, the shadow-outbox reaping)
+/// the leaf drops, the producer and transaction prunes, the shadow-outbox reaping)
 /// checks it between statements, each statement itself bounded
 /// ([`RETENTION_DELETE_BATCH`] rows, one leaf), and runs at least one statement per
 /// pass ([`step_may_continue`]). The two steps that run before the expiry, the
@@ -252,6 +252,23 @@ pub static ABORTED_ROTATION: KeyCursor<i64> = KeyCursor::new();
 /// Rotation of the row-level expiry over its work items, keyed by (topic id,
 /// [`leaf_key`]).
 pub static EXPIRY_ROTATION: KeyCursor<(i32, i64)> = KeyCursor::new();
+
+/// Where the stale-producer prune resumes: the (last_active_at in epoch microseconds,
+/// producer id) of the last candidate it examined. Candidates it keeps (a producer
+/// still referenced by a transaction, or active through its sequences) stay below the
+/// idle cutoff, so without a cursor every pass would examine them again first.
+pub static PRODUCER_PRUNE_CURSOR: KeyCursor<(i64, i64)> = KeyCursor::new();
+
+/// The prune cursor after a statement that examined `examined` candidates (at most
+/// `batch`), the last one `last`: a short batch reached the end of the candidates, so
+/// the next statement starts from the oldest again (`None`).
+pub fn next_prune_cursor<K>(examined: u64, batch: i64, last: Option<K>) -> Option<K> {
+    if u64::try_from(batch).is_ok_and(|b| examined >= b) {
+        last
+    } else {
+        None
+    }
+}
 
 /// Whether a past leaf needs the full contents probe: only a leaf where some topic
 /// can be wholly expired (`upper + shortest finite window <= now`) can be dropped
@@ -523,6 +540,15 @@ mod tests {
         assert_eq!(leaf_key(&leaf(1, None, None, true)), i64::MAX);
         assert_eq!(leaf_key(&leaf(2, None, Some(100), false)), 100);
         assert_eq!(leaf_key(&leaf(3, Some(100), Some(200), false)), 200);
+    }
+
+    #[test]
+    fn prune_cursor_wraps_on_a_short_batch() {
+        assert_eq!(next_prune_cursor(10, 10, Some((5, 7))), Some((5, 7)));
+        assert_eq!(next_prune_cursor(9, 10, Some((5, 7))), None);
+        assert_eq!(next_prune_cursor::<(i64, i64)>(0, 10, None), None);
+        assert_eq!(next_prune_cursor(10, 0, Some(1)), Some(1));
+        assert_eq!(next_prune_cursor(10, -1, Some(1)), None);
     }
 
     #[test]

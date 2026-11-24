@@ -708,6 +708,12 @@ CREATE TABLE kafka.producer_ids (
 CREATE INDEX idx_producer_ids_txn_id
 ON kafka.producer_ids(transactional_id) WHERE transactional_id IS NOT NULL;
 
+-- Producer ids by idleness: the retention sweep prunes the ones idle past the
+-- expiration window through it, resuming at (last_active_at, producer_id) from pass to
+-- pass, so a pass with none idle costs one descent.
+CREATE INDEX idx_producer_ids_last_active
+ON kafka.producer_ids(last_active_at, producer_id);
+
 -- Producer sequences table: Tracks sequence numbers for idempotent deduplication
 CREATE TABLE kafka.producer_sequences (
     producer_id BIGINT NOT NULL,
@@ -804,6 +810,19 @@ WHERE state = 'Ongoing';
 CREATE INDEX idx_transactions_ongoing_producer
 ON kafka.transactions(producer_id)
 WHERE state = 'Ongoing';
+
+-- Every transaction row by producer id, for the foreign key on producer_ids: the
+-- retention sweep deletes idle producer ids, and each delete checks that no transaction
+-- row references the id. Without an index on the referencing column that check reads
+-- the whole table once per deleted id.
+CREATE INDEX idx_transactions_producer
+ON kafka.transactions(producer_id);
+
+-- Terminal transactions oldest first: the retention sweep deletes the ones idle past
+-- the transactional-id expiration through it, reading only those.
+CREATE INDEX idx_transactions_terminal
+ON kafka.transactions(last_updated_at)
+WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
 
 -- Pending transactional offsets table: Stores offset commits within an active transaction
 -- These offsets are moved to consumer_offsets on commit, deleted on abort

@@ -216,7 +216,8 @@ impl PostgresStore {
     /// with the stored data when there is little to do. Every step is index-driven
     /// (the aborted rows through the partial index idx_messages_txn_aborted, the
     /// delivered and orphaned outbox rows through idx_shadow_tracking_delivered and the
-    /// primary key), runs bounded
+    /// primary key, the producer and transaction prunes through indexes on
+    /// last_active_at, last_updated_at and transactions.producer_id), runs bounded
     /// statements ([`RETENTION_DELETE_BATCH`] rows, one leaf), and stops between
     /// statements once the pass has spent [`retention::RETENTION_PASS_BUDGET`] (after at
     /// least one statement per step, so no step starves; the steps before row expiry
@@ -313,8 +314,8 @@ impl PostgresStore {
             stats.dropped_partitions = drop_leaves(client, plan.drops, &mut affected, pass_start)?;
             advance_log_start(client, affected)?;
 
-            stats.terminal_transactions = delete_terminal_transactions(client)?;
-            stats.stale_producers = delete_stale_producers(client)?;
+            stats.terminal_transactions = delete_terminal_transactions(client, pass_start)?;
+            stats.stale_producers = delete_stale_producers(client, pass_start)?;
             // After advance_log_start, so the outbox rows of the messages this pass
             // removed go in the same pass.
             stats.shadow_orphaned_rows = delete_orphaned_shadow_rows(client, pass_start)?;
@@ -1067,26 +1068,70 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
 /// producer that resumes a terminal transactional id within the window keeps its row;
 /// one that resumes after the prune re-creates it with InitProducerId, matching Kafka's
 /// transactional.id expiration.
-fn delete_terminal_transactions(client: &mut SpiClient<'_>) -> Result<u64> {
-    let table = client.update(
-        "DELETE FROM kafka.transactions
-         WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
-           AND last_updated_at < NOW() - ($1 || ' seconds')::interval
-         RETURNING 1",
-        None,
-        &[whole_seconds(TERMINAL_TXN_RETENTION).into()],
-    )?;
-    Ok(row_count(table.len()))
+///
+/// Index-driven and bounded: the partial index idx_transactions_terminal
+/// (last_updated_at) WHERE the state is terminal holds exactly the rows this deletes,
+/// oldest first, so a pass with none due costs one descent; batches of
+/// [`RETENTION_DELETE_BATCH`] rows within the pass budget (the transactional ids are
+/// client-chosen, so their number is too).
+fn delete_terminal_transactions(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
+    let mut deleted = 0u64;
+    let mut statements = 0usize;
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
+        let table = client.update(
+            "DELETE FROM kafka.transactions
+             WHERE ctid = ANY (ARRAY(
+                 SELECT t.ctid FROM kafka.transactions t
+                 WHERE t.state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
+                   AND t.last_updated_at < NOW() - ($1 || ' seconds')::interval
+                 LIMIT $2))
+             RETURNING 1",
+            None,
+            &[
+                whole_seconds(TERMINAL_TXN_RETENTION).into(),
+                RETENTION_DELETE_BATCH.into(),
+            ],
+        )?;
+        statements += 1;
+        let n = row_count(table.len());
+        deleted += n;
+        if !retention::should_run_another_batch(
+            n,
+            RETENTION_DELETE_BATCH,
+            Duration::ZERO,
+            pass_budget(),
+        ) {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
-/// Producers idle past [`PRODUCER_ID_RETENTION`] and not referenced by any remaining
-/// transaction row. Their sequences go with them (no foreign key between the two
-/// tables, so one statement keeps it atomic).
-fn delete_stale_producers(client: &mut SpiClient<'_>) -> Result<u64> {
-    let table = client.update(
-        "WITH doomed AS (
-             DELETE FROM kafka.producer_ids p
+/// The stale-producer prune's statement: examine the next [`RETENTION_DELETE_BATCH`]
+/// producer ids idle past the window in (last_active_at, producer_id) order through
+/// idx_producer_ids_last_active, after the cursor (`$3`, `$4`: last_active_at in epoch
+/// microseconds and the id) when there is one, and delete those not referenced by a
+/// transaction row and without recent sequence activity, with their sequences. Returns
+/// the rows deleted, the candidates examined and the key of the last one.
+fn producer_prune_sql(with_cursor: bool) -> String {
+    let after = if with_cursor {
+        "AND (p.last_active_at, p.producer_id)
+             > (TIMESTAMP 'epoch' + $3::bigint * INTERVAL '1 microsecond', $4::bigint)"
+    } else {
+        ""
+    };
+    format!(
+        "WITH candidates AS (
+             SELECT p.producer_id, p.last_active_at FROM kafka.producer_ids p
              WHERE p.last_active_at < NOW() - ($1 || ' seconds')::interval
+               {after}
+             ORDER BY p.last_active_at, p.producer_id
+             LIMIT $2
+         ),
+         doomed AS (
+             DELETE FROM kafka.producer_ids p
+             USING candidates c
+             WHERE p.producer_id = c.producer_id
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
@@ -1105,12 +1150,76 @@ fn delete_stale_producers(client: &mut SpiClient<'_>) -> Result<u64> {
              USING doomed d
              WHERE s.producer_id = d.producer_id
          )
-         SELECT COUNT(*)::BIGINT AS n FROM doomed",
-        None,
-        &[whole_seconds(PRODUCER_ID_RETENTION).into()],
-    )?;
-    let deleted = table.first().get_by_name::<i64, _>("n")?.unwrap_or(0);
-    Ok(u64::try_from(deleted).unwrap_or(0))
+         SELECT (SELECT count(*) FROM doomed)::bigint AS deleted,
+                (SELECT count(*) FROM candidates)::bigint AS examined,
+                last.at_us, last.producer_id
+         FROM (SELECT 1) AS one
+         LEFT JOIN LATERAL (
+             SELECT (EXTRACT(EPOCH FROM c.last_active_at) * 1000000)::bigint AS at_us,
+                    c.producer_id
+             FROM candidates c
+             ORDER BY c.last_active_at DESC, c.producer_id DESC
+             LIMIT 1) AS last ON true"
+    )
+}
+
+/// Producers idle past [`PRODUCER_ID_RETENTION`] and not referenced by any remaining
+/// transaction row. Their sequences go with them (no foreign key between the two
+/// tables, so one statement keeps it atomic).
+///
+/// Index-driven and bounded: producer ids are client-driven (every InitProducerId
+/// without a transactional id makes one), so each statement examines at most
+/// [`RETENTION_DELETE_BATCH`] candidates through idx_producer_ids_last_active (a pass
+/// with none idle costs one descent), the foreign key of kafka.transactions on each
+/// deleted id is checked through idx_transactions_producer, and the step runs within
+/// the pass budget. Candidates it keeps (still referenced, or active through their
+/// sequences) stay idle by last_active_at, so the step resumes after the last one it
+/// examined ([`retention::PRODUCER_PRUNE_CURSOR`]) and starts from the oldest again
+/// once it reaches the end.
+fn delete_stale_producers(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
+    let mut deleted = 0u64;
+    let mut statements = 0usize;
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
+        let cursor = retention::PRODUCER_PRUNE_CURSOR.get();
+        let window = whole_seconds(PRODUCER_ID_RETENTION);
+        let table = match cursor {
+            None => client.update(
+                &producer_prune_sql(false),
+                None,
+                &[window.into(), RETENTION_DELETE_BATCH.into()],
+            )?,
+            Some((at_us, producer_id)) => client.update(
+                &producer_prune_sql(true),
+                None,
+                &[
+                    window.into(),
+                    RETENTION_DELETE_BATCH.into(),
+                    at_us.into(),
+                    producer_id.into(),
+                ],
+            )?,
+        };
+        statements += 1;
+        let row = table.first();
+        let n: i64 = row.get_by_name("deleted")?.unwrap_or(0);
+        let examined: i64 = row.get_by_name("examined")?.unwrap_or(0);
+        let last = match (
+            row.get_by_name::<i64, _>("at_us")?,
+            row.get_by_name::<i64, _>("producer_id")?,
+        ) {
+            (Some(at_us), Some(producer_id)) => Some((at_us, producer_id)),
+            _ => None,
+        };
+        deleted += u64::try_from(n).unwrap_or(0);
+        let examined = u64::try_from(examined).unwrap_or(0);
+        let next = retention::next_prune_cursor(examined, RETENTION_DELETE_BATCH, last);
+        retention::PRODUCER_PRUNE_CURSOR.set(next);
+        // A short batch reached the end of the candidates.
+        if next.is_none() {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Shadow-outbox rows forwarded (external_offset set) more than

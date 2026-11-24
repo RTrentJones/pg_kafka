@@ -130,10 +130,14 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
    `created_at` order, so a dropped leaf is an offset prefix of each partition it held; the only
    transient exception is a topic whose older rows sit in a non-droppable leaf awaiting the Trim
    delete of the same pass, and those rows are expired too.
-5. Then the auxiliary tables: terminal transactions and stale producers, shadow-outbox rows
-   below their partition's log start (their message is gone: one primary-key range per
-   partition, so the rows of the messages this pass removed go in the same pass, and
-   DeleteRecords' at the next), and outbox rows delivered more than a day ago (walked per
+5. Then the auxiliary tables: terminal transactions (through a partial index on
+   `last_updated_at` of the terminal rows) and stale producers (through an index on
+   `(last_active_at, producer_id)`, resuming after the last candidate the previous pass
+   examined, since the ones it keeps stay idle by that column; each deleted id's foreign-key
+   check reads `kafka.transactions` through an index on `producer_id`), in 10,000-row batches
+   within the pass budget; shadow-outbox rows below their partition's log start (their message
+   is gone: one primary-key range per partition, so the rows of the messages this pass removed
+   go in the same pass, and DeleteRecords' at the next), and outbox rows delivered more than a day ago (walked per
    partition in offset order through `idx_shadow_tracking_delivered`, one index step per due
    row; a partition with none due costs one descent).
 
@@ -145,12 +149,14 @@ starves behind another's backlog. The two steps before row expiry (the aborted-r
 and the contents probes) stop at a third of the budget each, so a client-driven backlog there
 leaves row expiry at least a third of every pass, not only its one statement. Each step
 resumes where the last pass left it, by the identity of its items (a leaf's upper bound, a
-(topic, leaf) pair), not their position, so leaves dropped or created between passes do not
-shift it. A pass costs at most the budget plus
+(topic, leaf) pair, a producer's `(last_active_at, producer_id)`), not their position, so
+leaves dropped or created between passes do not shift it. A pass costs at most the budget plus
 one statement per step, one of them a leaf drop that can wait 2 s for its lock (the drops stop
-after the first that times out), and with nothing to do it reads a few index pages. (Before, the aborted-row DELETE read
-every block of every leaf, outside the budget: a 20 ms Metadata probe saw a 200-300 ms stall
-every minute with 3,000,000 stored rows; PERFORMANCE.md "The sweep's cost" has the numbers.)
+after the first that times out), and with nothing to do it reads a few index pages. (Before,
+the aborted-row DELETE read every block of every leaf, outside the budget: a 20 ms Metadata
+probe saw a 200-300 ms stall every minute with 3,000,000 stored rows; and every stale
+producer id deleted read all of `kafka.transactions` for its foreign key, 18.6 s for 40,000
+ids. PERFORMANCE.md "The sweep's cost" has the numbers.)
 
 A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
 timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.
