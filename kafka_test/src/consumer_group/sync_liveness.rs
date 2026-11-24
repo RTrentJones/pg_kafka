@@ -230,10 +230,14 @@ pub async fn test_member_that_never_syncs_is_removed() -> TestResult {
         b_answers.len() >= 2,
         "not before the rebalance timeout: {b_answers:?}"
     );
+    // A's heartbeat of the last round went out before B's, so it may have been answered
+    // before B was removed; the next one must be told to rejoin.
+    let a_after = heartbeat(&mut a, &group, generation, &leader).await?;
+    println!("  A after B's removal: {a_after}");
     assert_eq!(
-        a_answers.last(),
-        Some(&error_codes::REBALANCE_IN_PROGRESS),
-        "the leader is told to rejoin"
+        a_after,
+        error_codes::REBALANCE_IN_PROGRESS,
+        "the leader is told to rejoin once B is removed"
     );
     assert_eq!(leave(&mut a, &group, &leader).await?, error_codes::NONE);
     ctx.cleanup().await?;
