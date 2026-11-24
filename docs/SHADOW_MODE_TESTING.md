@@ -183,7 +183,7 @@ set `pg_kafka.shadow_bootstrap_servers = '127.0.0.1:9093'` (plus the other GUCs 
 suite with `INTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093 EXTERNAL_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9093`.
 The order test creates and alters an external topic through the admin API, so the broker must allow
 it (the default does).
-The delivery-timeout order test pauses and resumes the broker with the shell commands in
+The delivery-timeout order test and `test_dual_write_external_down` pause and resume the broker with the shell commands in
 `EXTERNAL_KAFKA_PAUSE_CMD` / `EXTERNAL_KAFKA_RESUME_CMD` (default `docker pause external_kafka` /
 `docker unpause external_kafka`); without Docker, stop the broker's process instead, for example
 `pkill -STOP -f '[k]afka.Kafka'` / `pkill -CONT -f '[k]afka.Kafka'` (the bracket keeps the pattern
@@ -209,7 +209,7 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_async_forwarding_no_duplicates_on_slow_ack` | With `pg_kafka.test_forward_ack_delay_ms` holding acks for 6.5 s, each record reaches external Kafka exactly once and no attempt is re-claimed (`retry_count` stays 0) |
 | `test_external_only_mode` | ExternalOnly (external-primary): delivered externally, stored locally, but a pg_kafka consumer reads nothing |
 | `test_local_only_mode` | `mode = 'local_only'`: stored locally, not forwarded |
-| `test_reload_clears_deleted_topic_config` | Deleting a `kafka.shadow_config` row stops forwarding after reload |
+| `test_reload_clears_deleted_topic_config` | Deleting a `kafka.shadow_config` row stops forwarding the topic's new records after reload |
 | `test_outbox_row_written_and_finalized` | A forwarded record gets a `kafka.shadow_tracking` row whose `external_offset` is set |
 | `test_zero_percent_forwarding` / `test_hundred_percent_forwarding` / `test_fifty_percent_forwarding` | Percentage-based routing at 0%, 100%, 50% |
 | `test_deterministic_routing` | The same key always gets the same forward decision |
@@ -219,8 +219,9 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_aborted_transaction_not_forwarded` | Aborted transaction records are not forwarded |
 | `test_committed_transaction_uses_durable_outbox` | Committed transaction records go through `kafka.shadow_tracking` |
 | `test_committed_txn_leaves_no_orphan_outbox_rows` | A committed transaction leaves no outbox rows without a backing message |
-| `test_dual_write_external_down` | DualWrite (async): the local write succeeds regardless of forwarding. It runs against the normal broker config and does not take the broker down |
-| `test_external_only_fallback` | ExternalOnly produce succeeds. It accepts either local count, and with the current code the record is always stored locally |
+| `test_dual_write_external_down` | DualWrite (async) with the external broker paused (`EXTERNAL_KAFKA_PAUSE_CMD`): the produce is acked at once and stored locally, its outbox row stays undelivered, and the record is forwarded once the broker resumes |
+| `test_external_only_fallback` | ExternalOnly with a record the external topic refuses (`max.message.bytes`): every attempt fails, the row is dead-lettered at `shadow_max_retries` with its error, and a pg_kafka consumer then reads the record locally |
+| `test_shadow_unbuildable_settings_dead_letter_after_a_working_producer` | A producer setting no producer can be built from (`shadow_security_protocol = 'BOGUS'`), set while a working producer holds 5000 records: every record counts failed attempts and is dead-lettered with the configuration error |
 | `test_external_primary_dead_letter_serves_local` | Once a forward is dead-lettered (`retry_count >= pg_kafka.shadow_max_retries`), an external-primary topic serves the record locally |
 | `test_replay_historical_messages` | `kafka.replay_shadow_messages()` re-queues stored messages and they are forwarded |
 | `test_replay_skips_aborted_records` | Replay never re-queues aborted transactional records |

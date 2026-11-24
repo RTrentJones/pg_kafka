@@ -490,6 +490,26 @@ impl ForwarderCore {
         }
     }
 
+    /// No producer could be built for `key` (invalid or unbuildable settings,
+    /// also after the previous producer was retired by a settings change or went
+    /// fatal): a real delivery failure of this record, retried and eventually
+    /// dead-lettered like any other. It is not attributed to a producer
+    /// generation: the record never reached one, and the latest generation may
+    /// be retired already, which would make the failure collateral
+    /// (`NotAttempted`, never counted) and leave the record to be claimed again
+    /// and again without ever reaching the retry cap.
+    ///
+    /// Every record answered this way counts, whether or not its partition is
+    /// fenced: nothing is sent while no producer can be built, so the claim's
+    /// partition order is not at stake, and each record had its attempt. The
+    /// partition is fenced at the record, so once a producer can be built again
+    /// nothing later of the partition goes out ahead of the record's retry.
+    pub(crate) fn producer_unavailable(&mut self, key: RowKey, error: String) {
+        self.fence(key);
+        self.acks
+            .push_back(ForwardAck::new(key, ForwardOutcome::Failed(error)));
+    }
+
     /// Register a held response. Released at once if it waits for nothing.
     pub(crate) fn add_hold(&mut self, hold: SyncHold, now: Instant) {
         if hold.keys.is_empty() {
@@ -926,9 +946,7 @@ fn forward_one(
     let (producer, generation) = match slot.current(core, &config) {
         Ok(p) => p,
         Err(e) => {
-            // No producer can be built: a real delivery failure (it is retried
-            // and eventually dead-lettered, like any other).
-            core.on_result(key, slot.generation, Err(e), false);
+            core.producer_unavailable(key, e);
             return None;
         }
     };
@@ -942,8 +960,9 @@ fn forward_one(
         Ok(future) => {
             core.sent(key, generation, queued.received_at);
             // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
-            // production): delay the ack past the outbox retry lease. Only
-            // this delivery's own future waits; the pipeline keeps going.
+            // production): delay the ack, to check that a slow ack is not
+            // re-sent. Only this delivery's own future waits; the pipeline
+            // keeps going.
             let ack_delay =
                 Duration::from_millis(u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0));
             deliveries.push(Box::pin(async move {
@@ -1068,6 +1087,108 @@ mod tests {
             core.retire_generation(g);
         }
         assert!(core.collateral_generations.len() <= 64);
+    }
+
+    /// Shadow settings for `forward_one`, with an unreachable bootstrap server
+    /// (building a producer does not connect).
+    fn unreachable_config(security_protocol: &str) -> crate::config::Config {
+        let mut config = crate::config::Config::load();
+        config.shadow_mode_enabled = true;
+        config.shadow_bootstrap_servers = "127.0.0.1:1".into();
+        config.shadow_security_protocol = security_protocol.into();
+        config
+    }
+
+    /// Send `records` of partition 0 through `forward_one` with `config`.
+    fn forward_records(
+        config: crate::config::Config,
+        core: &mut ForwarderCore,
+        slot: &mut ProducerSlot,
+        records: &[(i64, bool)],
+    ) -> Vec<(RowKey, ForwardOutcome)> {
+        let context = crate::kafka::RuntimeContext::new(config);
+        let mut deliveries = Deliveries::new();
+        for &(offset, restart) in records {
+            let queued = Queued {
+                record: rec(0, offset, restart),
+                received_at: Instant::now(),
+            };
+            assert!(forward_one(queued, &context, core, slot, &mut deliveries).is_none());
+        }
+        assert!(deliveries.is_empty(), "nothing may be sent");
+        outcomes(core)
+    }
+
+    fn assert_unbuildable_failures(got: &[(RowKey, ForwardOutcome)], offsets: &[i64]) {
+        let keys: Vec<RowKey> = got.iter().map(|(k, _)| *k).collect();
+        let expected: Vec<RowKey> = offsets.iter().map(|&o| RowKey::new(1, 0, o)).collect();
+        assert_eq!(keys, expected);
+        for (key, outcome) in got {
+            assert!(
+                matches!(outcome, ForwardOutcome::Failed(e) if e.contains("invalid shadow configuration")),
+                "{key:?}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Settings no producer can be built from are a delivery failure of every
+    /// record the forwarder cannot send, also right after a settings change has
+    /// retired the previous producer: the failure is not that retired
+    /// generation's (whose failures are collateral and never counted), or the
+    /// records would be claimed again and again and never dead-lettered.
+    #[test]
+    fn an_unbuildable_producer_fails_records_after_a_settings_change() {
+        let mut core = ForwarderCore::default();
+        let mut slot = ProducerSlot::default();
+        slot.current(&mut core, &unreachable_config("PLAINTEXT"))
+            .expect("a producer for valid settings");
+        assert_eq!(slot.generation, 1);
+
+        // The change retires generation 1; no replacement can be built.
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true), (1, false), (2, false)],
+        );
+        assert_unbuildable_failures(&got, &[0, 1, 2]);
+        // Every later attempt fails the same way.
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true)],
+        );
+        assert_unbuildable_failures(&got, &[0]);
+
+        // Valid settings again: the partition is fenced at its first failed
+        // record, so nothing later goes out ahead of its retry.
+        let got = forward_records(
+            unreachable_config("PLAINTEXT"),
+            &mut core,
+            &mut slot,
+            &[(1, false)],
+        );
+        assert!(
+            matches!(got[0].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert_eq!(slot.generation, 2);
+    }
+
+    /// The same settings at a fresh start (no producer ever built) fail the
+    /// same way.
+    #[test]
+    fn an_unbuildable_producer_fails_records_at_a_fresh_start() {
+        let mut core = ForwarderCore::default();
+        let mut slot = ProducerSlot::default();
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true), (1, false)],
+        );
+        assert_unbuildable_failures(&got, &[0, 1]);
     }
 
     /// A replaced producer's outstanding records fail later; until they do, a
