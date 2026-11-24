@@ -6,7 +6,7 @@
 //! - CreatePartitions (API 37)
 //! - DeleteGroups (API 42)
 
-mod configs;
+pub(crate) mod configs;
 mod create_validation;
 
 use crate::common::create_admin_client;

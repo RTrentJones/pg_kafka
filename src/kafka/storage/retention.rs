@@ -12,10 +12,13 @@ use std::time::Duration;
 /// thread briefly; the sweep runs as many batches as fit in [`RETENTION_PASS_BUDGET`].
 pub const RETENTION_DELETE_BATCH: i64 = 10_000;
 
-/// Wall-clock budget for the expired-message deletes of one sweep pass. The sweep
-/// runs on the single worker DB thread, so a pass must stay bounded; within the
-/// budget it keeps deleting batches until every topic is caught up. A backlog
-/// larger than one pass can clear drains over the following passes.
+/// Wall-clock budget for one sweep pass. The sweep runs on the single worker DB
+/// thread, so a pass must stay bounded: every step whose cost grows with the data
+/// (the aborted-row cleanup, the leaf contents probes, the expired-message deletes,
+/// the shadow-outbox reaping) checks it between statements, each statement itself
+/// bounded ([`RETENTION_DELETE_BATCH`] rows, one leaf), and runs at least one
+/// statement per pass ([`step_may_continue`]) so no step starves behind another's
+/// backlog. A backlog larger than one pass can clear drains over the following passes.
 pub const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Upper clamp for a retention window in milliseconds (1e13 ms, about 317 years).
@@ -60,6 +63,14 @@ pub fn should_run_another_batch(
 ) -> bool {
     u64::try_from(batch_size).is_ok_and(|size| size > 0 && last_batch_deleted >= size)
         && elapsed < budget
+}
+
+/// Whether a bounded sweep step may run another statement: always its first one in
+/// a pass (so a step never starves behind another step's backlog), then only while the
+/// pass is within its budget. A pass therefore costs at most the budget plus one
+/// statement per step.
+pub fn step_may_continue(statements_run: usize, elapsed: Duration, budget: Duration) -> bool {
+    statements_run == 0 || elapsed < budget
 }
 
 /// Rotation cursor for the topic order, so a pass that runs out of budget on one
@@ -131,6 +142,33 @@ pub const MIN_PARTITION_MINUTES: i32 = 5;
 pub const MAX_PARTITION_MINUTES: i32 = 43_200;
 /// Leaves the worker keeps ready beyond the current one.
 pub const PARTITIONS_AHEAD: i32 = 2;
+/// Upper bound on `kafka.message_partition_contents` probes per sweep pass (each costs
+/// one btree descent per (topic, partition) present in the leaf). Leaves kept past
+/// their window by a longer one stay candidates every pass, so the probes rotate
+/// over them ([`next_probe_start`]) instead of always starting from the oldest.
+pub const MAX_CONTENTS_PROBES_PER_PASS: usize = 64;
+
+/// Rotation cursor for the contents probes (see [`MAX_CONTENTS_PROBES_PER_PASS`]).
+static PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// The index to start this pass's contents probes from, advancing the cursor by the
+/// probes a pass makes, so consecutive capped passes cover every candidate.
+pub fn next_probe_start(candidates: usize) -> usize {
+    if candidates <= MAX_CONTENTS_PROBES_PER_PASS {
+        return 0;
+    }
+    PROBE_CURSOR.fetch_add(MAX_CONTENTS_PROBES_PER_PASS, Ordering::Relaxed) % candidates
+}
+
+/// Whether a past leaf needs the full contents probe: only a leaf where some topic
+/// can be wholly expired (`upper + shortest finite window <= now`) can be dropped
+/// with rows in it or trimmed. Every other past leaf can only be dropped if it is
+/// empty, which a cheap emptiness check answers. `None`: no topic has a finite
+/// window (`pg_kafka.message_retention_hours = 0` and no per-topic `retention.ms`).
+pub fn needs_contents_probe(upper_ms: i64, now_ms: i64, shortest_window_ms: Option<i64>) -> bool {
+    wholly_expired(upper_ms, now_ms, shortest_window_ms)
+}
+
 /// Upper bound on whole-leaf drops per sweep pass (each takes a short ACCESS
 /// EXCLUSIVE lock on kafka.messages; a long backlog drains over a few passes).
 pub const MAX_PARTITION_DROPS_PER_PASS: usize = 64;
@@ -291,6 +329,32 @@ mod tests {
         // Budget spent: stop even though more rows may remain.
         assert!(!should_run_another_batch(10_000, 10_000, budget, budget));
         assert!(!should_run_another_batch(10_000, 0, Duration::ZERO, budget));
+    }
+
+    #[test]
+    fn steps_run_once_then_only_within_budget() {
+        let budget = Duration::from_millis(1500);
+        assert!(step_may_continue(0, budget * 2, budget));
+        assert!(step_may_continue(3, Duration::from_millis(10), budget));
+        assert!(!step_may_continue(1, budget, budget));
+    }
+
+    #[test]
+    fn contents_probe_only_where_a_topic_can_be_expired() {
+        // No finite window anywhere: no leaf needs the probe (only the emptiness check).
+        assert!(!needs_contents_probe(1_000, i64::MAX, None));
+        assert!(needs_contents_probe(1_000, 2_000, Some(1_000)));
+        assert!(!needs_contents_probe(1_000, 1_999, Some(1_000)));
+    }
+
+    #[test]
+    fn probe_rotation_covers_every_candidate() {
+        assert_eq!(next_probe_start(0), 0);
+        assert_eq!(next_probe_start(MAX_CONTENTS_PROBES_PER_PASS), 0);
+        let n = MAX_CONTENTS_PROBES_PER_PASS * 2 + 5;
+        for _ in 0..10 {
+            assert!(next_probe_start(n) < n);
+        }
     }
 
     #[test]

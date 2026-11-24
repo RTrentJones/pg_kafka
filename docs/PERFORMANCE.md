@@ -371,7 +371,9 @@ CREATE TABLE kafka.consumer_offsets (
 ```sql
 -- Time-based retention for kafka.messages, enforced by the worker's periodic
 -- retention sweep (60s cadence, at most 10,000 rows per DELETE). 0 (default)
--- keeps forever. Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
+-- keeps forever (a topic's retention.ms still applies). The sweep runs either way:
+-- it also cleans up aborted rows and the shadow outbox (see "The sweep's cost"
+-- below). Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
 pg_kafka.message_retention_hours = 168   -- e.g. 7 days
 
 -- Width of one time partition of kafka.messages (minutes, default 1440 = one day,
@@ -385,12 +387,41 @@ pg_kafka.message_partition_minutes = 1440
 SELECT pg_kafka_run_partition_maintenance();
 
 -- On-demand sweep + report (also reclaims aborted transactional rows and prunes
--- stale producers, terminal transactions, and delivered shadow-outbox rows).
+-- stale producers, terminal transactions, delivered shadow-outbox rows and
+-- outbox rows whose message retention or DeleteRecords removed).
 -- Arguments: message_retention_hours (NULL = use the GUC), aborted_grace_seconds
 -- (default 60). Returns one (category, deleted) row per category, including
 -- dropped_partitions (whole leaves dropped).
 SELECT * FROM pg_kafka_run_retention_sweep();
 ```
+
+### The sweep's cost
+
+The sweep runs on the worker's single DB thread every 60 s, so while it runs no request is
+served (Produce, Fetch, Heartbeats). Its cost therefore follows the work it does, not the
+data stored: the aborted-row cleanup goes through the partial index
+`idx_messages_txn_aborted` leaf by leaf, delivered outbox rows are walked per partition through
+`idx_shadow_tracking_delivered` (only rows a day old are visited), orphaned outbox rows through
+the primary key below each partition's log start, and a past leaf gets the full contents
+probe (one descent per (topic, partition)) only where some topic's window can have expired it
+(at most 64 per pass); other past leaves get one emptiness check. Every step runs bounded
+statements (10,000 rows, one leaf) and stops once the pass has used 1.5 s, after at least one
+statement, so a backlog drains over several passes. Measured on PG16 (3,000,000 committed rows
+in one 521 MB leaf, 500,000 recent delivered outbox rows, retention off):
+
+| | before | after |
+|---|---|---|
+| aborted-row cleanup (EXPLAIN ANALYZE) | Seq Scan, 66,667 blocks, 231 ms | partial index, 1 block, 0.15 ms |
+| delivered-outbox reaping | Seq Scan, 4,673 blocks, 58 ms | index walk, 11 blocks, 0.2 ms |
+| whole sweep (`pg_kafka_run_retention_sweep(0, 60)`) | 262 ms | 2.1 ms |
+| worst Metadata round trip, 20 ms probe | 217-308 ms each minute | 24 ms |
+| sweep with 20 past daily leaves of 2,000 partitions each, too | 539 ms | 32-52 ms |
+
+The delivered-row index costs the outbox one btree entry per ack and nothing per claim: its
+key columns never change and its predicate column (`external_offset`) already keys the pending
+indexes, so a claim stays a HOT update. Bulk UPDATEs of 200,000 rows as the outbox issues them
+(PG16, three runs): claims 273-332 ms before, 296-339 ms after, with the same HOT count; acks
+710-779 ms before, 853-989 ms after (about 0.5-1 us per acked row).
 
 Per-topic overrides use Kafka's own config key. `retention.ms` set through
 IncrementalAlterConfigs (API 44) is stored in `kafka.topics.retention_ms` and
