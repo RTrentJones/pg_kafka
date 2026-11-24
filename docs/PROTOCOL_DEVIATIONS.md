@@ -454,8 +454,12 @@ pg_kafka.compression_type = 'gzip'
   never sync; an allocation failure aborts the worker and sends Postgres into crash
   recovery. A JoinGroup whose member state does not fit, or a leader SyncGroup whose
   assignments do not, gets COORDINATOR_NOT_AVAILABLE (15), retriable, as for a full
-  `max_consumer_groups`: the memory frees as members leave or time out, and the budget is the
-  broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
+  `max_consumer_groups`: the memory frees as members leave or time out, and before refusing,
+  the least recently active Empty groups (no members; their committed offsets stay, so they
+  remain listed as Empty groups) are forgotten until the state fits, as at the group-count cap,
+  unless forgetting all of them would not make room. (Kafka removes an Empty group without
+  offsets at its ~10-minute offsets cleanup; an Empty group here otherwise stays in memory for
+  24 hours.) The budget is the broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
   the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
   nothing and the group stays in its sync phase. A rejoin that holds no more than before is
   always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.

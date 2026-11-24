@@ -41,6 +41,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sync_liveness::test_slow_leader_sync_keeps_silent_follower: sequential, // Has sleep delays
         group_cap::test_lowered_group_cap_still_admits_new_groups: sequential, // changes a GUC
         member_memory::test_member_state_beyond_the_memory_budget_is_refused: sequential, // changes a GUC
+        member_memory::test_empty_groups_do_not_exhaust_the_memory_budget: sequential, // changes a GUC
         sync_liveness::test_member_that_never_syncs_is_removed: sequential, // Has sleep delays
         state_reporting::test_describe_groups_reports_metadata_only_when_stable,
         state_reporting::test_list_groups_state_filter_is_case_sensitive,

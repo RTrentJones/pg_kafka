@@ -103,3 +103,43 @@ async fn run(ctx: &TestContext) -> DynResult<()> {
     }
     Ok(())
 }
+
+/// The review's reproduction, scaled to a small budget: every JoinGroup and LeaveGroup under a
+/// long group id leaves an Empty group (no members) that holds the id for 24 hours. With
+/// `pg_kafka.max_group_memory` = 2MB about 30 of them, with 30 000-byte ids, filled the budget
+/// and every JoinGroup that created a group got COORDINATOR_NOT_AVAILABLE from then on, though
+/// nothing else held the memory. The least recently active Empty groups are forgotten to make
+/// room (as at `pg_kafka.max_consumer_groups`), so all of them, and a new group after them,
+/// are admitted.
+pub async fn test_empty_groups_do_not_exhaust_the_memory_budget() -> TestResult {
+    println!("=== Test: Empty groups do not exhaust pg_kafka.max_group_memory ===\n");
+    let ctx = TestContext::new().await?;
+    set_budget(ctx.db(), Some("2MB")).await?;
+    let outcome = run_empty_groups(&ctx).await.map_err(|e| e.to_string());
+    set_budget(ctx.db(), None).await?;
+    outcome?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+async fn run_empty_groups(ctx: &TestContext) -> DynResult<()> {
+    const GROUPS: usize = 100;
+    let base = ctx.unique_group("mem-empty").await;
+    let mut c = conn().await?;
+    println!("Step 1: {GROUPS} JoinGroup + LeaveGroup pairs under 30 000-byte group ids...");
+    for i in 0..GROUPS {
+        let group = format!("{base}-{i}-{}", "x".repeat(30_000));
+        let (code, _, member, _) =
+            join_now(&mut c, &join_req(&group, "", "consumer", &["range"])).await?;
+        assert_eq!(code, error_codes::NONE, "JoinGroup {i} creating its group");
+        assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
+    }
+    println!("Step 2: a new group is still admitted...");
+    let group = ctx.unique_group("mem-after").await;
+    let (code, _, member, _) =
+        join_now(&mut c, &join_req(&group, "", "consumer", &["range"])).await?;
+    assert_eq!(code, error_codes::NONE);
+    assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
+    Ok(())
+}
