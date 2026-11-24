@@ -136,9 +136,11 @@ The sending order rests on:
    stays in order.
 3. **The fence.** Once a record of a partition fails, every later record of that partition the
    forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
-   a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
-   the lowest pending row, which is how a partition moves on after its failed record is
-   dead-lettered). When a producer is replaced (settings change) or goes fatal, every partition
+   the failed record's retry, or a record above it that the claim marks as the partition head
+   (`restart`, the lowest pending row, which is how a partition moves on after its failed record
+   is delivered or dead-lettered). A record below the failed offset (one a replay made due) is
+   sent but leaves the fence in place, so the later records of its claim cannot overtake the
+   failed record's retry. When a producer is replaced (settings change) or goes fatal, every partition
    with a record still outstanding on it is fenced at once, at its lowest outstanding offset:
    those records fail later, and nothing of their partitions may go out on the replacement ahead
    of their retry. A replaced producer's queued and in-flight records are purged, the fatal one's

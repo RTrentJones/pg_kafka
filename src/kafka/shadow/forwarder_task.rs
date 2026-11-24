@@ -220,12 +220,22 @@ pub(crate) struct ForwarderCore {
 }
 
 impl ForwarderCore {
-    /// Ordering fence check for a record about to be sent.
+    /// Ordering fence check for a record about to be sent. A record below the
+    /// fence goes out ahead of the failed record, as it should, but leaves the
+    /// fence in place. The fence is lifted by the failed record's retry, or by
+    /// a partition head (`restart`) above it: the claim's head is the lowest
+    /// pending row, so a head above the fence means the failed record is no
+    /// longer pending (delivered or dead-lettered). A head below it does not:
+    /// a replay can make a lower row due while the failed record still waits
+    /// for its retry, and lifting the fence then would let the later records
+    /// of the same claim overtake that retry.
     pub(crate) fn admit(&mut self, record: &ForwardRecord) -> Admit {
         let part = record.row.partition();
+        let offset = record.row.local_offset;
         match self.fences.get(&part) {
             None => Admit::Send,
-            Some(&fence) if record.restart || record.row.local_offset <= fence => {
+            Some(&fence) if offset < fence => Admit::Send,
+            Some(&fence) if offset == fence || record.restart => {
                 self.fences.remove(&part);
                 Admit::Send
             }
@@ -1085,6 +1095,21 @@ mod tests {
         assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
         // 5 was dead-lettered: the DB marks 6 as the partition's head.
         assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
+    }
+
+    #[test]
+    fn a_lower_head_does_not_lift_the_fence_of_a_later_failure() {
+        let mut core = ForwarderCore::default();
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("boom".into()), false);
+        // Before the DB thread applies 5's failure, a replay makes 3 due: the
+        // next claim dispatches 3 (now the partition's head) and 6. 3 may go
+        // out, but 6 must not overtake the retry of 5.
+        assert_eq!(core.admit(&rec(0, 3, true)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
+        // 5's retry lifts the fence.
+        assert_eq!(core.admit(&rec(0, 5, true)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 6, false)), Admit::Send);
     }
 
     #[test]
