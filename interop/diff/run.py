@@ -72,6 +72,14 @@ KNOWN = {
         "deviation", "PROTOCOL_DEVIATIONS.md §7: aborted records are filtered server-side, so "
         "the fetch ends at the last visible record and the control batch covering the aborted "
         "tail comes with the next fetch (and §4: no markers)"),
+    ("offsets_parity", "committed_leader_epoch"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §6: the committed leader epoch is not stored; "
+        "OffsetFetch answers -1"),
+    ("groups_parity", "join.first_join"): ("deviation", "PROTOCOL_DEVIATIONS.md §5: no "
+                                           "MEMBER_ID_REQUIRED (KIP-394)"),
+    ("groups_parity", "describe_stable.client_host"): (
+        "deviation", "PROTOCOL_DEVIATIONS.md §5: DescribeGroups reports client_host "
+        "\"localhost\""),
     ("transactions", "batch_layout"): (
         "deviation", "PROTOCOL_DEVIATIONS.md §7: records are regrouped at read time into one "
         "batch per run of a producer's consecutive offsets (and §4: no control batches)"),
@@ -155,8 +163,8 @@ def has_code(obj, code):
     return False
 
 
-ERRORS.update({-1: "UNKNOWN_SERVER_ERROR", 51: "CONCURRENT_TRANSACTIONS",
-               59: "UNKNOWN_PRODUCER_ID"})
+ERRORS.update({-1: "UNKNOWN_SERVER_ERROR", 12: "OFFSET_METADATA_TOO_LARGE",
+               51: "CONCURRENT_TRANSACTIONS", 59: "UNKNOWN_PRODUCER_ID"})
 
 
 def errname(code):
@@ -620,6 +628,150 @@ def sc_admin(t, obs):
                                                           "timeoutMs": 10000}))))
 
 
+def offset_fetch(t, group, topic, version=7, partitions=(0, 1)):
+    return normalise(t, body(t.req(9, version, {"groupId": group, "topics": [
+        {"name": topic, "partitionIndexes": list(partitions)}]})))
+
+
+def offset_commit(t, group, topic, entries, version=8):
+    return normalise(t, body(t.req(8, version, {
+        "groupId": group, "generationIdOrMemberEpoch": -1, "memberId": "",
+        "topics": [{"name": topic, "partitions": [
+            dict({"partitionIndex": p, "committedOffset": o, "committedMetadata": m}, **kw)
+            for p, o, m, kw in entries]}]})))
+
+
+def sc_offsets_parity(t, obs):
+    """OffsetFetch of a missing topic, commit metadata, its length limit, the leader epoch."""
+    group, topic = f"diff-op-{RUN}", f"diff-op-{RUN}"
+    for version in range(1, 8):
+        obs(f"fetch_never_created_v{version}", offset_fetch(t, group, f"{topic}-never", version))
+    create_topics(t, [topic_spec(topic, 2)])
+    obs("commit_metadata", offset_commit(t, group, topic, [
+        (0, 3, "x" * 4096, {}), (1, 4, "x" * 4097, {})]))
+    obs("fetch_after_metadata", offset_fetch(t, group, topic))
+    obs("commit_null_metadata", offset_commit(t, group, topic, [(1, 6, None, {})]))
+    fetched = offset_fetch(t, group, topic)
+    obs("fetch_null_metadata", fetched)
+    offset_commit(t, group, topic, [(0, 8, "m", {"committedLeaderEpoch": 7})])
+    parts = offset_fetch(t, group, topic)["topics"][0]["partitions"]
+    obs("committed_leader_epoch", [p["committedLeaderEpoch"] for p in parts])
+    for p in parts:
+        p.pop("committedLeaderEpoch", None)
+    obs("fetch_with_epoch", parts)
+    t.req(20, 4, {"topicNames": [topic], "timeoutMs": 10000})
+    for _ in range(20):  # Kafka deletes the topic's offsets asynchronously
+        fetched = offset_fetch(t, group, topic)
+        if all(p["committedOffset"] == -1 for p in fetched["topics"][0]["partitions"]):
+            break
+        time.sleep(0.5)
+    obs("fetch_deleted_topic", fetched)
+
+
+def sc_txn_parity(t, obs):
+    """EndTxn of an Empty transaction, transactional commit metadata, the LSO a
+    read_uncommitted Fetch reports."""
+    topic, txn, group = f"diff-tp-{RUN}", f"diff-tp-{RUN}", f"diff-tpg-{RUN}"
+    create_topics(t, [topic_spec(topic, 2)])
+    produce(t, topic, ["a", "b"])
+    b, pid, ep = init_pid(t, txn)
+    end = {"transactionalId": txn, "producerId": pid, "producerEpoch": ep}
+    for version in range(0, 4):
+        for committed in (True, False):
+            obs(f"end_txn_empty_v{version}_{'commit' if committed else 'abort'}",
+                normalise(t, body(t.req(26, version, dict(end, committed=committed)))))
+    obs("add_partitions", normalise(t, body(t.req(24, 3, {
+        "v3AndBelowTransactionalId": txn, "v3AndBelowProducerId": pid,
+        "v3AndBelowProducerEpoch": ep, "v3AndBelowTopics": [{"name": topic, "partitions": [0]}]}))))
+    obs("produce_txn", produce_part(produce(t, topic, ["c", "d"], txn=txn, producerId=pid,
+                                            producerEpoch=ep, baseSequence=0,
+                                            transactional=True)))
+    for iso in (0, 1):
+        _, p = fetch(t, topic, 0, iso)
+        obs(f"fetch_isolation_{iso}_bounds", None if p is None else {
+            k: p[k] for k in ("errorCode", "highWatermark", "lastStableOffset")})
+    obs("add_offsets", normalise(t, body(t.req(25, 3, dict(end, groupId=group)))))
+    toc = body(t.req(28, 3, {"transactionalId": txn, "groupId": group, "producerId": pid,
+                             "producerEpoch": ep, "topics": [{"name": topic, "partitions": [
+                                 {"partitionIndex": 0, "committedOffset": 1,
+                                  "committedMetadata": "x" * 4096},
+                                 {"partitionIndex": 1, "committedOffset": 1,
+                                  "committedMetadata": "x" * 4097}]}]}))
+    obs("txn_offset_commit_metadata", normalise(t, toc))
+    obs("commit", normalise(t, body(t.req(26, 3, dict(end, committed=True)))))
+
+
+def sc_groups_parity(t, obs):
+    """DescribeGroups outside Stable, ListGroups' states filter, FindCoordinator key types,
+    and the removal of a member that never syncs."""
+    group = f"diff-gp-{RUN}"
+    for version, key_type in ((1, 2), (2, 5), (3, 7)):
+        obs(f"find_coordinator_key_type_{key_type}", normalise(t, body(t.req(
+            10, version, {"key": group, "keyType": key_type}, retry=False))))
+    seen = {}
+    r = joined(t, lambda k, v: (seen.__setitem__(k, v), obs(k, v)), group, "join")
+    kip394 = seen.get("join.first_join") == errname(79)
+    member, gen = r.get("memberId", ""), r.get("generationId", -1)
+
+    def described(label, client_host=False):
+        g = body(t.req(15, 5, {"groups": [group]}))["groups"][0]
+        obs(f"{label}", normalise(t, {"groupState": g["groupState"],
+                                      "protocolData": g["protocolData"],
+                                      "members": [{k: m[k] for k in ("memberMetadata",
+                                                                     "memberAssignment")}
+                                                  for m in g["members"]]}))
+        if client_host:
+            obs(f"{label}.client_host", [m["clientHost"] for m in g["members"]])
+    described("describe_completing")
+    t.req(14, 3, {"groupId": group, "generationId": gen, "memberId": member,
+                  "assignments": [{"memberId": member, "assignment": "AAE="}]})
+    described("describe_stable", client_host=True)
+    for state in ("Stable", "stable", "STABLE"):
+        groups = body(t.req(16, 4, {"statesFilter": [state]})).get("groups", [])
+        obs(f"list_groups_{state}", any(g["groupId"] == group for g in groups))
+    # A member of a new generation that never sends SyncGroup is removed after the
+    # rebalance timeout (3 s), though it heartbeats; the leader is told to rejoin.
+    jb = lambda m, conn: {"groupId": group, "sessionTimeoutMs": 6000, "rebalanceTimeoutMs": 3000,
+                          "memberId": m, "groupInstanceId": None, "protocolType": "consumer",
+                          "protocols": [{"name": "range", "metadata": ""}]}
+    # B's JoinGroup is held until A rejoins (after Kafka's MEMBER_ID_REQUIRED round trip).
+    first = body(t.req(11, 5, jb("", "b"), conn="b"))["memberId"] if kip394 else ""
+    t.send(11, 5, jb(first, "b"), conn="b")
+    time.sleep(0.5)
+    a = body(t.req(11, 5, jb(member, "a")))
+    gen = a.get("generationId", -1)
+    b = body(t.recv(11, 5, conn="b"))
+    follower = b.get("memberId", "")
+    obs("rejoin", [errname(a.get("errorCode")), errname(b.get("errorCode"))])
+    obs("leader_sync", errname(body(t.req(14, 3, {
+        "groupId": group, "generationId": gen, "memberId": member,
+        "assignments": [{"memberId": member, "assignment": ""}]})).get("errorCode")))
+
+    def hb(m, conn):
+        return errname(body(t.req(12, 3, {"groupId": group, "generationId": gen, "memberId": m},
+                                  conn=conn, retry=False)).get("errorCode"))
+    early = [hb(member, "a"), hb(follower, "b")]
+    obs("heartbeats_within_timeout", early)
+    time.sleep(4.5)
+    obs("heartbeats_after_timeout", [hb(member, "a"), hb(follower, "b")])
+    t.req(13, 3, {"groupId": group, "members": [{"memberId": member, "groupInstanceId": None}]})
+
+
+def sc_configs_parity(t, obs):
+    """IncrementalAlterConfigs SET without a value; DescribeConfigs config types."""
+    topic = f"diff-cp-{RUN}"
+    create_topics(t, [topic_spec(topic, 1)])
+    for key in ("retention.ms", "max.message.bytes"):
+        obs(f"set_null_{key}", normalise(t, body(t.req(44, 1, {"resources": [{
+            "resourceType": 2, "resourceName": topic, "configs": [
+                {"name": key, "configOperation": 0, "value": None}]}], "validateOnly": False}))))
+    r = body(t.req(32, 4, {"resources": [{"resourceType": 2, "resourceName": topic,
+                                          "configurationKeys": ["cleanup.policy",
+                                                                "retention.ms"]}]}))
+    obs("describe_types", sorted((c["name"], c["configType"])
+                                 for c in r["results"][0]["configs"]))
+
+
 SCENARIOS = [
     ("api_versions", sc_api_versions),
     ("metadata", sc_metadata),
@@ -631,6 +783,10 @@ SCENARIOS = [
     ("offsets", sc_offsets),
     ("groups", sc_groups),
     ("admin", sc_admin),
+    ("offsets_parity", sc_offsets_parity),
+    ("txn_parity", sc_txn_parity),
+    ("groups_parity", sc_groups_parity),
+    ("configs_parity", sc_configs_parity),
 ]
 COMPARE = {("api_versions", "ranges"): cmp_api_subset}
 
