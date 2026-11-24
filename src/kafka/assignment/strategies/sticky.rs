@@ -815,24 +815,43 @@ mod tests {
 
     /// A previous assignment is the leader's SyncGroup, whatever names it carries: a name
     /// that is no topic, subscribed to and over many partitions, costs nothing per
-    /// partition. Each partition copied and hashed the name, so four times the name took
-    /// four times as long.
+    /// partition. Each partition copied and hashed the name, so a 32 KB name over 100 000
+    /// partitions took some 100 000 name-sized copies and hashes more than a 1-byte name.
+    /// Both assignments also keep 100 000 partitions of a real topic, the same work for
+    /// either name; the inputs are built outside the measured runs, which time only the
+    /// assignment.
     #[test]
     fn test_previous_partitions_of_a_long_name_cost_nothing_per_partition() {
-        let growth = crate::testing::flat_growth(8 * 1024, |len| {
+        const PARTITIONS: i32 = 100_000;
+        let cost = |len: usize| {
             let name = "n".repeat(len);
-            let mut previous = HashMap::new();
-            previous.insert(
+            let previous: HashMap<String, MemberAssignment> = HashMap::from([(
                 "m".to_string(),
-                make_assignment(vec![(name.as_str(), (0..100_000).collect())]),
+                make_assignment(vec![
+                    (name.as_str(), (0..PARTITIONS).collect()),
+                    ("t", (0..PARTITIONS).collect()),
+                ]),
+            )]);
+            let input = make_input(
+                vec![("m", vec![name.as_str(), "t"])],
+                vec![("t", PARTITIONS)],
             );
-            let input = make_input(vec![("m", vec![name.as_str(), "t"])], vec![("t", 1)]);
-            let result = StickyStrategy::with_previous(previous).assign(&input);
-            assert_eq!(result["m"].partitions("t"), vec![0]);
-        });
+            // The least CPU time of three runs (noise only ever adds to it).
+            (0..3)
+                .map(|_| {
+                    let strategy = StickyStrategy::with_previous(previous.clone());
+                    let (result, spent) = crate::testing::cpu_time(|| strategy.assign(&input));
+                    assert_eq!(result["m"].partition_count(), 100_000);
+                    spent
+                })
+                .min()
+                .unwrap()
+        };
+        let short = cost(1);
+        let long = cost(32 * 1024);
         assert!(
-            growth < 2.0,
-            "4x the name length took {growth:.1}x the time"
+            long < short * 3,
+            "a 32 KB name took {long:?}, a 1-byte name {short:?}"
         );
     }
 

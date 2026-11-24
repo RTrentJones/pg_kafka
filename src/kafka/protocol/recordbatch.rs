@@ -1041,15 +1041,17 @@ mod tests {
         }
     }
 
-    /// Input that decodes to nothing is bounded by the decode's time: 1.7 MB of empty
-    /// gzip blocks (some 0.35 s of decoding, charging nothing) stops at a 20 ms limit after
-    /// at most one more chunk of input, and snappy's and zstd's framing walks do too.
+    /// Input that decodes to nothing is bounded by the decode's time: 570 kB of empty gzip
+    /// blocks (charging nothing), and snappy's and zstd's framing walks over 2 MB of input,
+    /// stop at the limit after at most one more chunk of input. The limit is a tenth of what
+    /// the whole input takes to decode on this build (debug or release), so the decode is
+    /// always refused for its time, and the bound is that limit plus what one chunk of the
+    /// input and the work before the first check (the batch's CRC and header) take.
     #[test]
     fn input_that_decodes_to_nothing_stops_at_the_decode_time() {
         use super::test_batches::gzip_empty_blocks_batch;
-        let limit = Duration::from_millis(20);
-        let gzip = gzip_empty_blocks_batch(150_000);
-        assert!(gzip.len() > 1_500_000, "{} bytes", gzip.len());
+        let gzip = gzip_empty_blocks_batch(50_000);
+        assert!(gzip.len() > 500_000, "{} bytes", gzip.len());
         let mut snappy = XERIAL_SNAPPY_HEADER.to_vec();
         for _ in 0..400_000 {
             snappy.extend_from_slice(&[0, 0, 0, 1, 0]);
@@ -1071,7 +1073,24 @@ mod tests {
                 ..Header::default()
             },
         );
+        // The least CPU time of three runs of `parse` (noise only ever adds to it); the work
+        // before the first check is short.
+        let least = |parse: &dyn Fn()| {
+            (0..3)
+                .map(|_| crate::testing::cpu_time(parse).1)
+                .min()
+                .unwrap()
+        };
         for (name, batch) in [("gzip", gzip), ("snappy", snappy), ("zstd", zstd)] {
+            // One run (a slow one only raises the limit and the bound alike).
+            let (_, whole) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget()));
+            let before_first_check = least(&|| {
+                let budget = budget().limit_time(Duration::ZERO);
+                assert!(parse_record_batch(&batch, &budget).is_err());
+            });
+            let limit = whole / 10;
+            let chunk =
+                whole * u32::try_from(INPUT_CHUNK).unwrap() / u32::try_from(batch.len()).unwrap();
             let budget = budget().limit_time(limit);
             let (err, spent) = crate::testing::cpu_time(|| parse_record_batch(&batch, &budget));
             assert!(err.is_err(), "{name}");
@@ -1081,9 +1100,11 @@ mod tests {
                 RECORD_MEMORY,
                 "{name}: only the record charged"
             );
+            // Half the limit again for noise, and the clock's reading interval (1 ms).
+            let bound = limit + limit / 2 + chunk + before_first_check + Duration::from_millis(1);
             assert!(
-                spent < limit + Duration::from_millis(80),
-                "{name}: {spent:?}"
+                spent < bound,
+                "{name}: {spent:?} spent, {whole:?} for the whole input, bound {bound:?}"
             );
         }
     }
