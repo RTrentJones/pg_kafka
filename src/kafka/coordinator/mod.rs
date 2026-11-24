@@ -450,9 +450,11 @@ impl GroupCoordinator {
 
     /// Whether the member state a JoinGroup stores fits the coordinator's memory budget
     /// (`pg_kafka.max_group_memory`): what all groups hold, less what this member and the
-    /// group's own fields (protocol type, leader, protocol name) held before, plus what they
-    /// will hold after the join (and, for a new group, the group's own record). A rejoin
-    /// that holds no more than before is always admitted. When the state does not fit, the
+    /// group's own fields (protocol type, leader, protocol name) count before, plus what they
+    /// will count after the join (and, for a new group, the group's own record; see
+    /// [`ConsumerGroup::count_held_bytes`] for why the leader and protocol name count the
+    /// most any member could put there). A rejoin that counts no more than before is always
+    /// admitted. When the state does not fit, the
     /// least recently active Empty groups are forgotten until it does (see
     /// [`make_room`]). Kafka has no such bound (its member metadata is bounded by the heap);
     /// the refusal is the retriable COORDINATOR_NOT_AVAILABLE, as for a full
@@ -467,16 +469,19 @@ impl GroupCoordinator {
     ) -> Result<()> {
         let (before, assignment, group_after) = if let Some(group) = groups.get(&params.group_id) {
             let member = group.members.get(member_id);
-            let (fields_now, fields_after) = group.join_fields_held_bytes(member_id, params);
+            let (group_now, group_after, completes) = group.join_held_bytes(member_id, params);
             (
-                member.map_or(0, GroupMember::held_bytes) + fields_now,
-                member.and_then(|m| m.assignment.as_deref()),
-                fields_after,
+                member.map_or(0, GroupMember::held_bytes) + group_now,
+                // A join that completes the phase drops the member's assignment too.
+                member
+                    .and_then(|m| m.assignment.as_deref())
+                    .filter(|_| !completes),
+                group_after,
             )
         } else {
             let group = ConsumerGroup::new(params.group_id.clone());
-            let (_, fields_after) = group.join_fields_held_bytes(member_id, params);
-            (0, None, group.held_bytes() + fields_after)
+            let (_, group_after, _) = group.join_held_bytes(member_id, params);
+            (0, None, group.held_bytes() + group_after)
         };
         let after = group::member_held_bytes(member_id, params, assignment) + group_after;
         if after <= before {

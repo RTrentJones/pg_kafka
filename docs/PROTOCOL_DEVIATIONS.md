@@ -449,7 +449,9 @@ pg_kafka.compression_type = 'gzip'
   `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST; and
   `pg_kafka.max_group_memory` (default 128MB) bounds the member state of all groups together
   (member ids, protocols and their metadata, assignments and the copies kept for the sticky
-  assignor). Kafka has no such bound (its heap is the limit), but without it the caps above
+  assignor; a group's copies of its leader's id and of its protocol name count as the longest
+  id and protocol name of its members, since a leave can make any of them the leader or
+  complete a join phase with any of their protocols, and nothing is refused then). Kafka has no such bound (its heap is the limit), but without it the caps above
   still allowed about 1e14 bytes, held up to the 30-minute session timeout by members that
   never sync; an allocation failure aborts the worker and sends Postgres into crash
   recovery. A JoinGroup whose member state does not fit, or a leader SyncGroup whose

@@ -176,3 +176,109 @@ async fn run_empty_groups(ctx: &TestContext) -> DynResult<()> {
     assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
     Ok(())
 }
+
+/// A JoinGroup whose join phase completes at once stores the protocol it selects as the
+/// group's protocol name. A lone member on "range" rejoining with one 30 000-byte protocol
+/// grows the group by that protocol in its list and by the name: about 60 000 bytes. With
+/// about 45 000 bytes of the budget left the rejoin was admitted (it was priced with the
+/// group's old name), leaving the coordinator over `pg_kafka.max_group_memory`; it gets
+/// COORDINATOR_NOT_AVAILABLE, and is admitted once the room is there.
+pub async fn test_a_rejoin_is_priced_with_the_protocol_it_selects() -> TestResult {
+    println!("=== Test: a rejoin is priced with the protocol name it selects ===\n");
+    let ctx = TestContext::new().await?;
+    let budget = set_budget(ctx.db(), "2MB").await?;
+    run_rejoin(&ctx).await?;
+    drop(budget);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// A JoinGroup of a new member (sending no Heartbeat for the test's length) with
+/// `metadata` bytes of metadata.
+fn member_with(group: &str, metadata: usize) -> kafka_protocol::messages::JoinGroupRequest {
+    let mut r = join_req(group, "", "consumer", &["range"]);
+    r.session_timeout_ms = 120_000;
+    r.rebalance_timeout_ms = 120_000;
+    r.protocols[0].metadata = Bytes::from(vec![7u8; metadata]);
+    r
+}
+
+/// The most metadata a new member of `probe` gets admitted with now, to within 256 bytes
+/// (each probe joins and leaves; at most `hi` bytes).
+async fn room(c: &mut tokio::net::TcpStream, probe: &str, hi: usize) -> DynResult<usize> {
+    let (mut lo, mut hi) = (0, hi);
+    while hi - lo > 256 {
+        let mid = lo + (hi - lo) / 2;
+        let (code, _, member, _) = join_now(c, &member_with(probe, mid)).await?;
+        if code == error_codes::NONE {
+            assert_eq!(leave(c, probe, &member).await?, error_codes::NONE);
+            lo = mid;
+        } else {
+            assert_eq!(
+                code,
+                error_codes::COORDINATOR_NOT_AVAILABLE,
+                "probe of {mid} bytes"
+            );
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+async fn run_rejoin(ctx: &TestContext) -> DynResult<()> {
+    let mut c = conn().await?;
+    let mut members = Vec::new();
+    println!("Step 1: two 700 kB members leave less than one more of the budget...");
+    for i in 0..2 {
+        let group = ctx.unique_group(&format!("rejoin-fill-{i}")).await;
+        let (code, _, member, _) = join_now(&mut c, &member_with(&group, 700 * 1024)).await?;
+        assert_eq!(code, error_codes::NONE, "fill member {i}");
+        members.push((group, member));
+    }
+    let lone = ctx.unique_group("rejoin-lone").await;
+    let (code, generation, lone_member, name) = join_now(&mut c, &member_with(&lone, 2)).await?;
+    assert_eq!((code, name.as_deref()), (error_codes::NONE, Some("range")));
+    assert_eq!(generation, 1);
+
+    println!("Step 2: fill the budget to about 45 000 bytes of room...");
+    let probe = ctx.unique_group("rejoin-probe").await;
+    let free = room(&mut c, &probe, 800 * 1024).await?;
+    println!("  {free} bytes of metadata fit");
+    let filler = ctx.unique_group("rejoin-fillr").await;
+    let fill = free
+        .checked_sub(45_000)
+        .ok_or_else(|| format!("only {free} bytes of room"))?;
+    let (code, _, filler_member, _) = join_now(&mut c, &member_with(&filler, fill)).await?;
+    assert_eq!(code, error_codes::NONE);
+    let (code, _, member, _) = join_now(&mut c, &member_with(&probe, 40_000)).await?;
+    assert_eq!(code, error_codes::NONE, "40 000 bytes of room are left");
+    assert_eq!(leave(&mut c, &probe, &member).await?, error_codes::NONE);
+
+    println!("Step 3: the lone member rejoins with one 30 000-byte protocol...");
+    let long = "P".repeat(30_000);
+    let mut rejoin = member_with(&lone, 2);
+    rejoin.member_id = s(&lone_member);
+    rejoin.protocols[0].name = s(&long);
+    let (code, ..) = join_now(&mut c, &rejoin).await?;
+    assert_eq!(
+        code,
+        error_codes::COORDINATOR_NOT_AVAILABLE,
+        "the rejoin needs about 60 000 bytes"
+    );
+
+    println!("Step 4: with the filler gone it is admitted and selects the long protocol...");
+    assert_eq!(
+        leave(&mut c, &filler, &filler_member).await?,
+        error_codes::NONE
+    );
+    let (code, generation, _, name) = join_now(&mut c, &rejoin).await?;
+    assert_eq!(code, error_codes::NONE);
+    assert_eq!((generation, name.as_deref()), (2, Some(long.as_str())));
+
+    assert_eq!(leave(&mut c, &lone, &lone_member).await?, error_codes::NONE);
+    for (group, member) in members {
+        assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
+    }
+    Ok(())
+}

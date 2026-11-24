@@ -134,6 +134,24 @@ pub(super) fn member_held_bytes(
         + assignment.map_or(0, |a| a.len() + ALLOCATION_OVERHEAD)
 }
 
+/// What a group's leader id and protocol name count ([`ConsumerGroup::count_held_bytes`])
+/// for these `(member id, protocols)` members and the group's current protocol name: the
+/// longest member id, and the longest of the current name and the members' protocol names,
+/// each with the fixed cost of an allocation (nothing when there is no member or name).
+fn copies_held_bytes<'a>(
+    members: impl Iterator<Item = (&'a str, &'a [(String, Vec<u8>)])>,
+    protocol_name: Option<&str>,
+) -> (usize, usize) {
+    let mut leader = None;
+    let mut name = protocol_name.map(str::len);
+    for (member_id, protocols) in members {
+        leader = leader.max(Some(member_id.len()));
+        name = name.max(protocols.iter().map(|(n, _)| n.len()).max());
+    }
+    let cost = |len: Option<usize>| len.map_or(0, |len| len + ALLOCATION_OVERHEAD);
+    (cost(leader), cost(name))
+}
+
 impl GroupMember {
     /// What this member holds in coordinator memory (see [`member_held_bytes`]).
     pub(super) fn held_bytes(&self) -> usize {
@@ -290,15 +308,29 @@ impl ConsumerGroup {
     }
 
     /// What the group holds in coordinator memory, counted from its current state: the
-    /// group record, its id, protocol name, protocol type and leader, every member and every
+    /// group record, its id, protocol type, leader and protocol name, every member and every
     /// previous assignment kept for the sticky assignor.
+    ///
+    /// The leader and the protocol name are copies the group takes without a JoinGroup to
+    /// refuse (a leader leaves and another member's id is copied; the last member a join
+    /// phase waits on leaves and the phase completes with a protocol of the others), so they
+    /// are counted at the most they can take: the longest id and the longest protocol name
+    /// of the members (and the current name, while a join phase may replace it). Removing a
+    /// member then never adds to the count, and a JoinGroup is priced with what any later
+    /// completion stores.
     pub(super) fn count_held_bytes(&self) -> usize {
         let text = |s: &Option<String>| s.as_ref().map_or(0, |s| s.len() + ALLOCATION_OVERHEAD);
+        let members = || {
+            self.members
+                .values()
+                .map(|m| (m.member_id.as_str(), &m.protocols[..]))
+        };
+        let (leader, protocol_name) = copies_held_bytes(members(), self.protocol_name.as_deref());
         size_of::<ConsumerGroup>()
             + 2 * (self.group_id.len() + ALLOCATION_OVERHEAD)
-            + text(&self.protocol_name)
             + text(&self.protocol_type)
-            + text(&self.leader)
+            + leader
+            + protocol_name
             + self
                 .members
                 .values()
@@ -311,37 +343,54 @@ impl ConsumerGroup {
                 .sum::<usize>()
     }
 
-    /// What the group's own copies of its protocol type, leader id and protocol name hold
-    /// now, and what they will hold once `member_id` has joined with `params` and the join
-    /// phase completed: a member that fills an empty group sets the protocol type, the first
-    /// member of a leaderless group becomes the leader, and a group without a protocol name
-    /// gets one of the member's (priced at the longest). Counted as
-    /// [`Self::count_held_bytes`] counts them.
-    pub(super) fn join_fields_held_bytes(
+    /// What a JoinGroup of `member_id` with `params` changes in the count besides the
+    /// member's own record ([`Self::count_held_bytes`]): `(now, after, completes)`, the count
+    /// of the group's protocol type, leader and protocol name (and, if the join completes
+    /// the phase, of the other members' assignments) before and after the join, and whether
+    /// it completes the join phase at once. A member that fills an empty group sets the
+    /// protocol type; the member takes part in the longest id and protocol name; and when
+    /// every other member has rejoined the join phase (or there is none), the join completes
+    /// at once: it replaces the protocol name with one of the members' and drops every
+    /// member's assignment.
+    pub(super) fn join_held_bytes(
         &self,
         member_id: &str,
         params: &JoinGroupParams,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, bool) {
         let text = |s: Option<&str>| s.map_or(0, |s| s.len() + ALLOCATION_OVERHEAD);
-        let now = text(self.protocol_type.as_deref())
-            + text(self.leader.as_deref())
-            + text(self.protocol_name.as_deref());
-        let fills = self.members.keys().all(|id| id == member_id);
+        let members = || {
+            self.members
+                .values()
+                .map(|m| (m.member_id.as_str(), &m.protocols[..]))
+        };
+        let (leader, name) = copies_held_bytes(members(), self.protocol_name.as_deref());
+        let mut now = text(self.protocol_type.as_deref()) + leader + name;
+
+        let others = self.members.values().filter(|m| m.member_id != member_id);
+        let fills = others.clone().next().is_none();
+        let completes = others.clone().all(|m| m.awaiting_join);
+        if completes {
+            now += others
+                .filter_map(|m| m.assignment.as_ref())
+                .map(|a| a.len() + ALLOCATION_OVERHEAD)
+                .sum::<usize>();
+        }
         let protocol_type = if fills {
             Some(params.protocol_type.as_str())
         } else {
             self.protocol_type.as_deref()
         };
-        let leader = self.leader.as_deref().unwrap_or(member_id);
-        let protocol_name = self.protocol_name.as_deref().or_else(|| {
-            params
-                .protocols
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .max_by_key(|name| name.len())
-        });
-        let after = text(protocol_type) + text(Some(leader)) + text(protocol_name);
-        (now, after)
+        let after_members = members()
+            .filter(|(id, _)| *id != member_id)
+            .chain(std::iter::once((member_id, &params.protocols[..])));
+        let current_name = if completes {
+            None
+        } else {
+            self.protocol_name.as_deref()
+        };
+        let (leader, name) = copies_held_bytes(after_members, current_name);
+        let after = text(protocol_type) + leader + name;
+        (now, after, completes)
     }
 
     /// Bring [`Self::held_bytes`] up to date after the group changed.

@@ -1883,3 +1883,153 @@ fn test_new_group_is_priced_with_what_the_join_stores() {
     joined(&join_with(&c, &p));
     assert_eq!(c.held_bytes(), held);
 }
+
+/// Admission of `p` (run by `setup` first on a fresh coordinator) must price exactly what
+/// the join leaves counted: it is refused one byte short of that and admitted at it.
+fn assert_join_priced_exactly(
+    setup: impl Fn(&GroupCoordinator) -> JoinGroupParams,
+    answered_at_once: bool,
+) {
+    let unbounded = GroupCoordinator::new();
+    let p = setup(&unbounded);
+    let slot = join_with(&unbounded, &p);
+    assert_eq!(!is_pending(&slot), answered_at_once);
+    let held = unbounded.held_bytes();
+    assert_eq!(held, counted_afresh(&unbounded));
+
+    let c = GroupCoordinator::new();
+    let p = setup(&c);
+    c.set_memory_limit(held - 1);
+    assert_eq!(
+        join_error_code(&join_with(&c, &p)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE,
+        "admitted beyond the {held} bytes it leaves counted"
+    );
+    c.set_memory_limit(held);
+    let slot = join_with(&c, &p);
+    assert_eq!(!is_pending(&slot), answered_at_once);
+    if answered_at_once {
+        joined(&slot);
+    }
+    assert_eq!(c.held_bytes(), held);
+}
+
+/// A Stable group of one member: joined, synced, and the rejoin params for its member id
+/// with `protocols`.
+fn lone_stable_member(c: &GroupCoordinator, protocols: &[(&str, &[u8])]) -> JoinGroupParams {
+    let a = joined(&join(c, "g", None));
+    c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![])],
+    )
+    .unwrap();
+    params("g", Some(&a.member_id), protocols)
+}
+
+#[test]
+fn test_a_join_that_completes_at_once_is_priced_with_the_protocol_it_selects() {
+    // A lone Stable member on "range" rejoins with one long protocol: the join phase
+    // completes at once and the group's protocol name becomes the long one. Pricing the
+    // group's current name admitted it 29 000 bytes over the budget.
+    let long = "P".repeat(30_000);
+    assert_join_priced_exactly(|c| lone_stable_member(c, &[(long.as_str(), b"sub")]), true);
+}
+
+#[test]
+fn test_a_new_group_is_priced_with_what_its_count_holds() {
+    // A lone member with a short and a long protocol: the group is priced and counted at the
+    // longest name it could select, so the join is admitted exactly at its count (pricing
+    // the longest but counting the selected short one refused a join that fit).
+    let long = "P".repeat(30_000);
+    assert_join_priced_exactly(
+        |_| params("g", None, &[("a", b"s"), (long.as_str(), b"s")]),
+        true,
+    );
+}
+
+#[test]
+fn test_a_held_join_is_priced_with_the_protocol_a_later_completion_selects() {
+    // Two Stable members on "range"; the follower rejoins with a long protocol it prefers.
+    // The join is held; if the leader then leaves, the phase completes with the follower
+    // alone and its long protocol, with no JoinGroup to refuse: the held join is priced so.
+    let long = "P".repeat(30_000);
+    let two_stable = |c: &GroupCoordinator| {
+        let a = joined(&join(c, "g", None));
+        let sb = join(c, "g", None);
+        let a = joined(&join(c, "g", Some(&a.member_id)));
+        let b = joined(&sb);
+        let assignments = vec![(a.member_id.clone(), vec![]), (b.member_id.clone(), vec![])];
+        c.sync_now(
+            "g".into(),
+            a.member_id.clone(),
+            a.generation_id,
+            assignments,
+        )
+        .unwrap();
+        c.sync_now("g".into(), b.member_id.clone(), b.generation_id, vec![])
+            .unwrap();
+        assert_eq!(state(c, "g"), GroupState::Stable);
+        (a, b)
+    };
+    assert_join_priced_exactly(
+        |c| {
+            let (_, b) = two_stable(c);
+            params(
+                "g",
+                Some(&b.member_id),
+                &[(long.as_str(), b"sub"), ("range", b"sub")],
+            )
+        },
+        false,
+    );
+
+    let c = GroupCoordinator::new();
+    let (a, b) = two_stable(&c);
+    let held_join = join_with(
+        &c,
+        &params(
+            "g",
+            Some(&b.member_id),
+            &[(long.as_str(), b"sub"), ("range", b"sub")],
+        ),
+    );
+    let before = c.held_bytes();
+    c.leave_group("g", &a.member_id).unwrap();
+    assert_eq!(
+        joined(&held_join).protocol_name.as_deref(),
+        Some(long.as_str())
+    );
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(
+        c.held_bytes() < before,
+        "a LeaveGroup grew the count from {before} to {}",
+        c.held_bytes()
+    );
+}
+
+#[test]
+fn test_a_new_leader_is_not_counted_beyond_the_departed_one() {
+    // The leader (short member id) leaves; the follower, whose member id carries a 30 000-byte
+    // client id, becomes the leader and the group copies its id. The count must not grow on
+    // a LeaveGroup ("the memory frees as members leave").
+    let c = GroupCoordinator::new();
+    let a = joined(&join(&c, "g", None));
+    let mut pb = params("g", None, &[("range", b"sub")]);
+    pb.client_id = "c".repeat(30_000);
+    let sb = join_with(&c, &pb);
+    let a = joined(&join(&c, "g", Some(&a.member_id)));
+    let b = joined(&sb);
+    assert_eq!(b.leader_id, a.member_id);
+    let before = c.held_bytes();
+    c.leave_group("g", &a.member_id).unwrap();
+    let group = c.get_group_state("g").unwrap();
+    assert_eq!(group.leader.as_deref(), Some(b.member_id.as_str()));
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(
+        c.held_bytes() < before,
+        "a LeaveGroup grew the count from {before} to {}",
+        c.held_bytes()
+    );
+}
