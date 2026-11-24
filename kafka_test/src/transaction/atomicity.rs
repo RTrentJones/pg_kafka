@@ -14,6 +14,7 @@ use crate::wire::records::batch;
 use crate::wire::Wire;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureRecord, Producer};
+use rdkafka::Message;
 use rdkafka::TopicPartitionList;
 use std::time::Duration;
 use uuid::Uuid;
@@ -950,16 +951,29 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;
 
-    // Poll for messages
-    let mut received = 0;
-    for _ in 0..5 {
-        match consumer.poll(Duration::from_secs(1)) {
-            Some(Ok(_msg)) => received += 1,
-            Some(Err(_)) | None => break,
+    // The first polls return nothing until the consumer has fetched, so poll until the
+    // committed message arrives, then a while longer: the pending one must never arrive.
+    let mut received: Vec<(i64, Option<Vec<u8>>)> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut quiet_until: Option<std::time::Instant> = None;
+    while std::time::Instant::now() < quiet_until.unwrap_or(deadline) {
+        match consumer.poll(Duration::from_millis(500)) {
+            Some(Ok(msg)) => {
+                received.push((msg.offset(), msg.payload().map(<[u8]>::to_vec)));
+                quiet_until
+                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(3));
+            }
+            Some(Err(e)) => return Err(format!("read_committed consumer error: {e}").into()),
+            None => {}
         }
     }
 
-    println!("  Consumer received: {received} message(s)");
+    println!("  Consumer received: {} message(s)", received.len());
+    assert_eq!(
+        received,
+        vec![(offset1, Some(b"committed message".to_vec()))],
+        "read_committed should receive the committed message only"
+    );
 
     // Clean up - abort second transaction
     println!("\nCleaning up - aborting second transaction...");
