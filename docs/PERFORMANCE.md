@@ -321,7 +321,11 @@ layout, uniqueness, least-privilege DDL and upgrade. Costs to keep in mind:
 
 - Fetch/ListOffsets/HWM lookups do not name `created_at`, so they probe every leaf's
   `(topic_id, partition_id, partition_offset)` btree: one descent per leaf. Keep the leaf count
-  modest (retention / width + 4); do not combine a tiny width with a long retention. Planning such a
+  modest (retention / width + 4); do not combine a tiny width with a long retention. Only a
+  retention window bounds it: with the defaults (`pg_kafka.message_retention_hours = 0`, no
+  `retention.ms`) a leaf with rows is never dropped and the count grows by one per width, so
+  set `pg_kafka.message_retention_hours` (or `retention.ms` on every topic) on a long-lived
+  broker. Planning such a
   statement expands every leaf, so the hot read statements run through kept prepared plans
   (`select_cached` in `storage/postgres.rs`).
 - Retention of a leaf is a `DROP TABLE`. On 1M expired rows (PG15 sandbox): 0.35 s and 0.16 MB of WAL

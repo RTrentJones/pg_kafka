@@ -48,9 +48,16 @@ backwards, which nothing does.
 
 Fetch, ListOffsets and the HWM/LSO probes do not name `created_at`, so they cannot prune: the
 planner runs a MergeAppend (or one LIMIT 1 probe per leaf for MIN/MAX) over every leaf's unique
-btree. The cost is one btree descent per leaf, which stays cheap because the leaf count is
-bounded (retention window / width + 3 + DEFAULT, e.g. 11 leaves for 7-day retention with daily
-leaves). Very small widths with long retention multiply the leaf count and should be avoided.
+btree. The cost is one btree descent per leaf, which stays cheap while the leaf count is
+bounded, and it is bounded only by a retention window: about window / width + 3 + DEFAULT,
+e.g. 11 leaves for 7-day retention with daily leaves, where the window is the longest that
+applies to any topic (a topic with `retention.ms = -1` keeps every leaf it writes to). With the
+defaults (`pg_kafka.message_retention_hours = 0` and no topic setting `retention.ms`) no row
+ever expires, so only empty past leaves are dropped: the leaf count grows by one per width
+(one a day) for as long as data arrives, and with it the per-leaf probes of every Fetch,
+ListOffsets and HWM lookup and the planning cost below. A long-lived deployment should set
+`pg_kafka.message_retention_hours` (or `retention.ms` on every topic). Very small widths with
+long retention multiply the leaf count and should be avoided.
 
 Planning is the larger cost: planning a statement over a partitioned table expands every leaf,
 so with 11 leaves a one-shot `MAX(partition_offset)` probe cost 0.75 ms against 0.10 ms on the

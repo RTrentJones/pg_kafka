@@ -227,8 +227,13 @@ gucs! {
           UTC. The worker creates the current leaf and the next two ahead of time; the \
           retention sweep drops a whole leaf once every row in it is expired under its \
           topic's retention. Topics whose retention window is shorter than one width are \
-          still expired row by row. A change applies to leaves created afterwards (existing \
-          leaves keep their bounds). Reloadable via SIGHUP.",
+          still expired row by row. Only leaves the retention empties or expires are dropped: \
+          with message_retention_hours = 0 (the default) and no topic setting retention.ms, \
+          a leaf that holds any row is kept forever, so the number of leaves grows by one \
+          per width and every Fetch, ListOffsets and high-watermark lookup probes them all; \
+          set message_retention_hours (or retention.ms on every topic) to bound it. A change \
+          applies to leaves created afterwards (existing leaves keep their bounds). \
+          Reloadable via SIGHUP.",
         context: Sighup,
         range: (crate::kafka::storage::retention::MIN_PARTITION_MINUTES, crate::kafka::storage::retention::MAX_PARTITION_MINUTES),
     }
