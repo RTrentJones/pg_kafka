@@ -678,6 +678,67 @@ fn test_parse_metadata_request_specific_topics() {
     assert_eq!(data.topics, Some(vec!["test-topic".to_string()]));
 }
 
+/// Metadata v10 makes a topic's name nullable and adds its topic id, which Kafka 3.7 serves
+/// only from v12: a null name or a non-zero topic id is refused INVALID_REQUEST on every
+/// requested topic, a null name echoed as "" and every topic id as sent (checked against
+/// Kafka 3.7). It used to drop a nameless topic, answering zero topics without an error.
+#[test]
+fn test_metadata_v10_null_name_or_topic_id_is_invalid_request() {
+    let id = uuid::Uuid::from_bytes([0x11; 16]);
+    let entry = |name: Option<&'static str>, topic_id: uuid::Uuid| {
+        let mut t = metadata_request::MetadataRequestTopic::default();
+        t.name = name.map(topic);
+        t.topic_id = topic_id;
+        t
+    };
+    for topics in [
+        vec![entry(None, id)],
+        vec![entry(None, uuid::Uuid::nil())],
+        vec![entry(Some("foo"), id)],
+        vec![entry(Some("foo"), uuid::Uuid::nil()), entry(None, id)],
+    ] {
+        let expected: Vec<(String, uuid::Uuid)> = topics
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_ref().map_or_default(|n| n.to_string()),
+                    t.topic_id,
+                )
+            })
+            .collect();
+        let mut request = MetadataRequest::default();
+        request.topics = Some(topics);
+        let (tx, mut rx) = channel();
+        let parsed = parse_request(frame(&request, 10, 31), tx).unwrap();
+        assert!(parsed.is_none(), "answered on the network thread");
+        let Ok(KafkaResponse {
+            body: ResponseBody::Metadata(response),
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("expected a Metadata response");
+        };
+        let got: Vec<(String, uuid::Uuid)> = response
+            .topics
+            .iter()
+            .map(|t| {
+                assert_eq!(t.error_code, crate::kafka::constants::ERROR_INVALID_REQUEST);
+                assert_eq!(t.partitions.len(), 0);
+                (
+                    t.name.as_ref().map_or_default(|n| n.to_string()),
+                    t.topic_id,
+                )
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+    // A name with the zero topic id is served.
+    let mut request = MetadataRequest::default();
+    request.topics = Some(vec![entry(Some("foo"), uuid::Uuid::nil())]);
+    let data = expect_body!(decode(&request, 10), Metadata);
+    assert_eq!(data.topics, Some(vec!["foo".to_string()]));
+}
+
 /// At v1+ an empty topics array means "no topics", not "all topics".
 #[test]
 fn test_parse_metadata_empty_array_v9_means_no_topics() {

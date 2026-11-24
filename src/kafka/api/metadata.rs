@@ -5,9 +5,10 @@ use kafka_protocol::messages::api_versions_response::ApiVersionsResponse;
 use kafka_protocol::messages::metadata_request::MetadataRequest;
 use kafka_protocol::messages::metadata_response::MetadataResponse;
 use kafka_protocol::messages::BrokerId;
+use uuid::Uuid;
 
 use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader};
-use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
+use crate::kafka::constants::{ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 
@@ -80,8 +81,8 @@ pub struct MetadataRequestData {
 impl ApiSchema for MetadataApi {
     type Wire = MetadataRequest;
 
-    /// The requested topic names (`None` = all topics).
-    type Echo = Option<Vec<String>>;
+    /// The requested topics, by name and topic id (`None` = all topics).
+    type Echo = Option<Vec<(String, Uuid)>>;
     const NAME: &'static str = "Metadata";
     const MIN_VERSION: i16 = 0;
 
@@ -101,12 +102,14 @@ impl ApiSchema for MetadataApi {
         if let Some(Some(topics)) = echo {
             response.topics = topics
                 .iter()
-                .map(|name| {
-                    crate::kafka::response_builders::build_topic_metadata(
+                .map(|(name, topic_id)| {
+                    let mut topic = crate::kafka::response_builders::build_topic_metadata(
                         name.clone(),
                         error_code,
                         Vec::new(),
-                    )
+                    );
+                    topic.topic_id = *topic_id;
+                    topic
                 })
                 .collect();
         }
@@ -129,12 +132,37 @@ impl KafkaApi for MetadataApi {
         wire: MetadataRequest,
         header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<Self::Echo>> {
+        // Kafka 3.7 serves topic ids from v12 only: below it a topic of a null name (v10+
+        // make it nullable) or a topic id is refused INVALID_REQUEST, every requested topic
+        // answered with it, a null name as "" (`KafkaApis.handleTopicMetadataRequest`,
+        // `MetadataRequest.getErrorResponse`).
+        if let Some(topics) = &wire.topics {
+            if topics
+                .iter()
+                .any(|t| t.name.is_none() || t.topic_id != Uuid::nil())
+            {
+                return Err(Rejection::Reply {
+                    error_code: ERROR_INVALID_REQUEST,
+                    echo: Some(Some(
+                        topics
+                            .iter()
+                            .map(|t| {
+                                (
+                                    t.name.as_ref().map_or_default(|n| n.to_string()),
+                                    t.topic_id,
+                                )
+                            })
+                            .collect(),
+                    )),
+                });
+            }
+        }
         // Empty-vs-null is version dependent. v0 has no nullable array and an empty
         // array means "all topics"; v1+ null means all topics and an empty array none.
         let topics = match wire.topics {
             Some(t) if !t.is_empty() => Some(
                 t.into_iter()
-                    .filter_map(|t| t.name.map(|n| n.to_string()))
+                    .map(|t| t.name.map_or_default(|n| n.to_string()))
                     .collect(),
             ),
             Some(_) if header.api_version == 0 => None,
@@ -148,7 +176,12 @@ impl KafkaApi for MetadataApi {
     }
 
     fn echo(request: &Self::Request) -> Self::Echo {
-        request.topics.clone()
+        request.topics.as_ref().map(|topics| {
+            topics
+                .iter()
+                .map(|name| (name.clone(), Uuid::nil()))
+                .collect()
+        })
     }
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
