@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->1025<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->1027<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->424<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1459<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->427<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1464<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -86,9 +86,9 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `protocol` | 5 |
 | `part` | 16 |
 | `auth` | 16 |
-| `network` | 54 |
+| `network` | 57 |
 | `worker` | 6 |
-| **Total** | **424** |
+| **Total** | **427** |
 <!--/gen-->
 
 ### Running E2E Tests
