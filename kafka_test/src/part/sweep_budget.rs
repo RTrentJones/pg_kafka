@@ -2,7 +2,8 @@
 //! that a pass stays within its budget when its leaf drops are blocked.
 
 use crate::common::{create_producer, TestResult};
-use crate::worker::{boxed, into_test_result, send, session, set_guc, unique, SendResult};
+use crate::setup::SystemGucGuard;
+use crate::worker::{boxed, into_test_result, send, session, unique, SendResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,9 +16,32 @@ const BLOCKED_LEAVES: i32 = 8;
 /// slack (including waiting for a worker pass in progress, bounded the same way).
 const BLOCKED_PASS_LIMIT: Duration = Duration::from_secs(6);
 
+/// The slowest produce ack the blocked-drops test accepts. Its own sweep is not the only
+/// one: the worker's (every 60 s) may run just before it and, bounded the same way, stall
+/// the DB thread for one 2 s drop wait plus its other steps, so the ceiling sits above
+/// one bounded drop wait; dropping every blocked leaf in turn would stall for about 16 s.
+const PRODUCE_ACK_CEILING: Duration = Duration::from_secs(5);
+
 /// Test-only GUC: the sweep's pass budget in ms (0 = every bounded step runs exactly
 /// one statement per pass).
 const PASS_BUDGET_GUC: &str = "pg_kafka.test_retention_pass_budget_ms";
+
+/// Set the pass budget for the life of the returned guard (reset on drop, also after a
+/// failed assert or a timeout).
+async fn pass_budget(db: &Client, ms: &str) -> SendResult<SystemGucGuard> {
+    SystemGucGuard::set(db, PASS_BUDGET_GUC, ms)
+        .await?
+        .ok_or_else(|| format!("{PASS_BUDGET_GUC} is not known to the server").into())
+}
+
+/// Sets a flag when dropped: stops a background task on every exit path of a test.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Create the one-hour leaf starting `hour` hours after 2000-01-01 (a year no other
 /// test's leaves use, so these are the oldest leaves) and return its name.
@@ -116,9 +140,7 @@ async fn probe_rotation() -> SendResult<()> {
     fill_leaf(&db, expired, base_hour + 1, 20, 20).await?;
     println!("Step 0: {kept} (expired + infinite topic), {droppable} (expired topic only)");
 
-    if !set_guc(&db, PASS_BUDGET_GUC, Some("0")).await? {
-        return Err(format!("{PASS_BUDGET_GUC} is not known to the server").into());
-    }
+    let budget = pass_budget(&db, "0").await?;
     let result: SendResult<()> = async {
         let candidates: i64 = db
             .query_one(
@@ -147,7 +169,9 @@ async fn probe_rotation() -> SendResult<()> {
             .into());
         };
         println!("Step 1: {droppable} dropped after {pass} sweep(s) ({candidates} past leaves)");
-        assert!(leaf_exists(&db, &kept).await?, "{kept} must stay");
+        if !leaf_exists(&db, &kept).await? {
+            return Err(format!("{kept} must stay").into());
+        }
         let left: i64 = db
             .query_one(
                 &format!("SELECT count(*) FROM {kept} WHERE topic_id = $1"),
@@ -156,11 +180,13 @@ async fn probe_rotation() -> SendResult<()> {
             .await
             .map_err(boxed)?
             .get(0);
-        assert_eq!(left, 20, "the infinite-retention rows must stay");
+        if left != 20 {
+            return Err(format!("the infinite-retention rows must stay: {left} of 20 left").into());
+        }
         Ok(())
     }
     .await;
-    set_guc(&db, PASS_BUDGET_GUC, None).await?;
+    drop(budget);
     // The kept leaf holds only this test's topics: drop it as if both were expired.
     db.query(
         "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int, $3::int])",
@@ -181,7 +207,7 @@ async fn probe_rotation() -> SendResult<()> {
 ///
 /// Asserts: with a reader holding ACCESS SHARE on kafka.messages and eight empty past
 /// leaves, a sweep returns within 6 s having dropped none, a producer running meanwhile
-/// sees no ack slower than 2 s; once the reader ends, the next sweep drops all eight.
+/// sees no ack slower than 5 s; once the reader ends, the next sweep drops all eight.
 pub async fn test_sweep_drops_bounded_behind_a_held_reader() -> TestResult {
     into_test_result(blocked_drops().await)
 }
@@ -215,6 +241,7 @@ async fn blocked_drops() -> SendResult<()> {
 
     let topic = unique("blocked-drops");
     let stop = Arc::new(AtomicBool::new(false));
+    let stop_producer = StopOnDrop(stop.clone());
     let producing = {
         let stop = stop.clone();
         let topic = topic.clone();
@@ -233,30 +260,26 @@ async fn blocked_drops() -> SendResult<()> {
     // Let the producer create its topic before the sweep starts.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let result: SendResult<()> = async {
-        let t = Instant::now();
-        let dropped = dropped_partitions(&db).await?;
-        let took = t.elapsed();
-        println!("Step 1: sweep behind the reader took {took:?}, dropped {dropped}");
-        assert!(
-            took < BLOCKED_PASS_LIMIT,
-            "a sweep with blocked drops took {took:?}"
-        );
-        assert_eq!(
-            dropped, 0,
-            "no leaf can be dropped while the reader holds its lock"
-        );
-        Ok(())
-    }
-    .await;
-    stop.store(true, Ordering::SeqCst);
+    let t = Instant::now();
+    let swept = dropped_partitions(&db).await;
+    let took = t.elapsed();
+    drop(stop_producer);
     let slowest = producing.await.map_err(boxed)?;
     reader.batch_execute("ROLLBACK").await.map_err(boxed)?;
-    result?;
+    let dropped = swept?;
+    println!("Step 1: sweep behind the reader took {took:?}, dropped {dropped}");
+    assert!(
+        took < BLOCKED_PASS_LIMIT,
+        "a sweep with blocked drops took {took:?}"
+    );
+    assert_eq!(
+        dropped, 0,
+        "no leaf can be dropped while the reader holds its lock"
+    );
     let slowest = slowest?;
     println!("Step 2: slowest produce ack during the sweep {slowest:?}");
     assert!(
-        slowest < Duration::from_secs(2),
+        slowest < PRODUCE_ACK_CEILING,
         "a produce ack took {slowest:?} during the sweep"
     );
 
@@ -338,9 +361,7 @@ async fn aborted_rotation() -> SendResult<()> {
     .map_err(boxed)?;
     println!("Step 0: {leaf} holds 1 committed and 20 aborted rows");
 
-    if !set_guc(&db, PASS_BUDGET_GUC, Some("0")).await? {
-        return Err(format!("{PASS_BUDGET_GUC} is not known to the server").into());
-    }
+    let budget = pass_budget(&db, "0").await?;
     let result: SendResult<()> = async {
         let leaves: i64 = db
             .query_one("SELECT count(*) FROM kafka.message_partitions()", &[])
@@ -378,11 +399,14 @@ async fn aborted_rotation() -> SendResult<()> {
             .into());
         };
         println!("Step 1: aborted rows of {leaf} deleted after {pass} sweep(s) ({leaves} leaves)");
-        assert_eq!(count("NULL").await?, 1, "the committed row must stay");
+        let committed = count("NULL").await?;
+        if committed != 1 {
+            return Err(format!("the committed row must stay: {committed} left").into());
+        }
         Ok(())
     }
     .await;
-    set_guc(&db, PASS_BUDGET_GUC, None).await?;
+    drop(budget);
     db.query(
         "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int])",
         &[&leaf, &forever],

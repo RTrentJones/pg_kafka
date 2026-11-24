@@ -181,6 +181,81 @@ impl Drop for TestContext {
     }
 }
 
+/// A server-wide GUC set with `ALTER SYSTEM` for the duration of a test, reset when the
+/// guard drops: on success, on an early `?` return, on a failed `assert!` (a panic) and
+/// when the runner aborts the test at its timeout. `ALTER SYSTEM` persists across
+/// sessions, so a test that skipped its reset would leave the setting in force for the
+/// rest of the run.
+///
+/// The reset runs on a thread of its own with its own runtime and connection, and the
+/// drop waits for it, so the setting is gone (and reloaded) before the next test starts,
+/// whatever state the test's runtime and connections are in.
+pub struct SystemGucGuard {
+    name: String,
+}
+
+impl SystemGucGuard {
+    /// `ALTER SYSTEM SET name = value` and reload; `Ok(None)` when the server refuses
+    /// the setting (an unknown GUC, a build without it).
+    pub async fn set(
+        db: &Client,
+        name: &str,
+        value: &str,
+    ) -> Result<Option<SystemGucGuard>, Box<dyn std::error::Error + Send + Sync>> {
+        let sql = format!(
+            "ALTER SYSTEM SET {} = '{}'",
+            name,
+            value.replace('\'', "''")
+        );
+        if let Err(e) = db.batch_execute(&sql).await {
+            println!("  (could not set {name}: {e})");
+            return Ok(None);
+        }
+        let guard = SystemGucGuard {
+            name: name.to_string(),
+        };
+        db.batch_execute("SELECT pg_reload_conf()").await?;
+        // The worker reloads on SIGHUP at its next loop iteration (<= 100 ms idle).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(Some(guard))
+    }
+}
+
+impl Drop for SystemGucGuard {
+    fn drop(&mut self) {
+        let name = self.name.clone();
+        let reset = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let (client, connection) = tokio_postgres::connect(&get_database_url(), NoTls)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokio::spawn(connection);
+                // Two statements: ALTER SYSTEM cannot run in the implicit transaction of
+                // a multi-statement query.
+                client
+                    .batch_execute(&format!("ALTER SYSTEM RESET {name}"))
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                client
+                    .batch_execute("SELECT pg_reload_conf()")
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                Ok(())
+            })
+        });
+        match reset.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("⚠️  could not reset {}: {e}", self.name),
+            Err(_) => eprintln!("⚠️  resetting {} panicked", self.name),
+        }
+    }
+}
+
 /// Verify that the pg_kafka server is ready to accept connections (blocks for up to 5 s).
 pub fn verify_server_ready() -> TestResult {
     use rdkafka::config::ClientConfig;
