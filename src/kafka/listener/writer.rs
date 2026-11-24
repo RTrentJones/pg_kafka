@@ -23,6 +23,7 @@ use super::is_peer_disconnect;
 use crate::kafka::api::ResponseBody;
 use crate::kafka::messages::KafkaResponse;
 use crate::kafka::protocol;
+use crate::kafka::protocol::DecodedCharge;
 
 /// The responses of one request, queued to the writer in request order.
 pub(super) struct ResponseSlot {
@@ -30,20 +31,32 @@ pub(super) struct ResponseSlot {
     /// Dropped only once the slot's response is on the socket, so the reader reads at
     /// most `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION` requests ahead of the socket.
     _in_flight: OwnedSemaphorePermit,
+    /// The decoded request's share of the decoded-request budget, held until its response
+    /// is on the socket (the request, then its response, hold the memory until then).
+    _decoded: DecodedCharge,
 }
 
 impl ResponseSlot {
-    /// A fresh response channel for one request: the sender for the request, the slot
-    /// for the writer.
-    pub(super) fn open(in_flight: OwnedSemaphorePermit) -> (UnboundedSender<KafkaResponse>, Self) {
-        let (tx, responses) = tokio::sync::mpsc::unbounded_channel();
-        (
-            tx,
-            ResponseSlot {
-                responses,
-                _in_flight: in_flight,
-            },
-        )
+    /// A fresh response channel for one request: the sender for the request, and the
+    /// receiver [`ResponseSlot::new`] makes the writer's slot of.
+    pub(super) fn channel() -> (
+        UnboundedSender<KafkaResponse>,
+        UnboundedReceiver<KafkaResponse>,
+    ) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
+    /// The writer's slot of a request's response channel.
+    pub(super) fn new(
+        responses: UnboundedReceiver<KafkaResponse>,
+        in_flight: OwnedSemaphorePermit,
+        decoded: DecodedCharge,
+    ) -> Self {
+        ResponseSlot {
+            responses,
+            _in_flight: in_flight,
+            _decoded: decoded,
+        }
     }
 }
 

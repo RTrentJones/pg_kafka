@@ -25,7 +25,7 @@
 //! Decoding (`decode_body`) and encoding run on the network thread and must not touch
 //! pgrx. [`dispatch`] runs on the DB thread.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::Sender;
 use kafka_protocol::messages::ResponseHeader;
 use kafka_protocol::protocol::{
@@ -40,6 +40,7 @@ use crate::kafka::error::KafkaError;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::notifications::InternalNotification;
+use crate::kafka::protocol::decode_meter::{self, MeteredBuf};
 
 mod admin;
 mod configs;
@@ -286,6 +287,9 @@ pub enum Decoded {
     Answered,
     /// No response can be shaped for this request: close the connection.
     Close(String),
+    /// The decode passed its memory limit (`protocol::decode_meter`); nothing was
+    /// answered.
+    OverLimit,
 }
 
 /// Decode the body of a request for API `A` whose header has been parsed.
@@ -301,7 +305,7 @@ pub enum Decoded {
 ///   INVALID_REQUEST;
 /// - [`KafkaApi::decode`] may reject a decoded body with its own code and echo.
 fn decode_api<A: KafkaApi>(
-    buf: &mut BytesMut,
+    buf: &mut MeteredBuf<Bytes>,
     header: RequestHeader,
     response_tx: UnboundedSender<KafkaResponse>,
     wrap_request: fn(A::Request) -> RequestBody,
@@ -318,6 +322,12 @@ fn decode_api<A: KafkaApi>(
     };
 
     let parsed = decode_wire::<A>(buf, &header);
+    // A decode the meter stopped (its body then looks truncated) or that holds more than
+    // its limit is answered nothing: the caller decodes it again under a larger limit, or
+    // closes the connection.
+    if buf.stopped() || decode_meter::over_limit() {
+        return Decoded::OverLimit;
+    }
 
     if !(A::MIN_VERSION..=A::MAX_VERSION).contains(&version) {
         return reject_unsupported_version::<A>(parsed.as_ref(), version, reply);
@@ -355,7 +365,7 @@ fn decode_api<A: KafkaApi>(
 /// body, so the decode runs under `catch_unwind`: a malformed body after a valid header is
 /// answered with an error response instead of tearing the connection down.
 fn decode_wire<A: KafkaApi>(
-    buf: &mut BytesMut,
+    buf: &mut MeteredBuf<Bytes>,
     header: &RequestHeader,
 ) -> Option<Result<A::Request, Rejection<A::Echo>>> {
     let version = header.api_version;
@@ -641,7 +651,7 @@ macro_rules! kafka_apis {
         /// Decode the body of a request whose header has been parsed; `None` for an API
         /// pg_kafka does not serve.
         pub(crate) fn decode_body(
-            buf: &mut BytesMut,
+            buf: &mut MeteredBuf<Bytes>,
             header: RequestHeader,
             response_tx: UnboundedSender<KafkaResponse>,
         ) -> Result<Decoded, (RequestHeader, UnboundedSender<KafkaResponse>)> {

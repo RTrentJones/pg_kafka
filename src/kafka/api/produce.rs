@@ -33,6 +33,7 @@ use crate::kafka::protocol::decode_budget::{
     INLINE_DECODE_BYTES, INLINE_DECODE_TIME, INLINE_DECODE_WORK_BYTES, LARGE_DECODES,
     MAX_DECODED_REQUEST_BYTES, SLOT_DECODE_TIME, SLOT_DECODE_WORK_BYTES,
 };
+use crate::kafka::protocol::decode_meter::unmetered;
 use crate::kafka::protocol::{
     first_batch_is_transactional, least_decoded_memory, parse_record_batch_with_metadata,
     validate_produce_records, ParsedRecordBatch,
@@ -190,7 +191,8 @@ impl KafkaApi for ProduceApi {
             });
         }
 
-        let decode = decode_all_records(&wire.topic_data, zstd_allowed);
+        // The records' memory is charged to their own budget, not to the request's meter.
+        let decode = unmetered(|| decode_all_records(&wire.topic_data, zstd_allowed));
         let transactional_id = wire.transactional_id.map(|s| s.to_string());
         let (DecodedTopics(topic_data, refused, decoded), pending) = match decode {
             Ok(Decode::Done(DecodedTopics(topic_data, refused, decoded))) => (

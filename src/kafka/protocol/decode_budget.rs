@@ -28,6 +28,13 @@
 //!   [`DECODED_BUDGET_BYTES`] ([`DECODED`]). The decoded request keeps its share
 //!   ([`DecodedCharge`]) until it is dropped after its handler ran.
 //!
+//! The rest of a request's decode (its arrays, strings, the handler's input built from them,
+//! for every API including Produce's own structure) is metered as it allocates
+//! (`super::decode_meter`): at most [`INLINE_REQUEST_DECODE_BYTES`] on an I/O thread, then
+//! [`MAX_REQUEST_DECODE_BYTES`] under a large-decode slot, past which the connection closes.
+//! What the decoded request holds is charged to [`DECODED_REQUESTS`] and kept until its
+//! response is written (`super::decode_request`).
+//!
 //! What a decode holds at any moment (the decompressed section as it grows, then the section
 //! and the records' copies of it) is at most twice what it has charged by then: the
 //! section's buffer is charged by its capacity before it grows, and shrunk to its bytes
@@ -168,6 +175,42 @@ pub struct DecodePool {
 /// The decoded records of all requests waiting for the DB thread.
 pub static DECODED: DecodePool = DecodePool::new(DECODED_BUDGET_BYTES);
 
+/// The most memory one request's decode may hold, besides a Produce request's records
+/// (`super::decode_meter`); a request whose decode would hold more closes the connection,
+/// as Kafka closes it for a frame over `socket.request.max.bytes`. 64 MiB: what a Metadata
+/// request of some 300,000 topic names of 50 bytes, a Fetch of 500,000 partitions or
+/// an OffsetCommit of 400,000 partitions decodes to, all far beyond what Kafka's clients
+/// send (a group's assignment, which a SyncGroup carries, must fit in one
+/// `__consumer_offsets` record, 1 MiB by default).
+pub const MAX_REQUEST_DECODE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most memory a request's decode may hold on an I/O thread; a larger decode is
+/// stopped and runs again under a large-decode slot ([`LargeDecodes`]), with
+/// [`MAX_REQUEST_DECODE_BYTES`]. Some 15,000 Metadata topics or 60,000 Fetch partitions.
+pub const INLINE_REQUEST_DECODE_BYTES: usize = INLINE_DECODE_BYTES;
+
+/// The most memory decoded requests (besides Produce records) may hold together, from their
+/// decode until their response is written.
+pub const DECODED_REQUESTS_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// A decoded request holding at most this much may take the last
+/// [`CONTROL_RESERVE_BYTES`] of [`DECODED_REQUESTS`]: Heartbeats, ApiVersions, OffsetCommits
+/// and the other small requests are not locked out by a few large ones.
+pub const SMALL_REQUEST_BYTES: usize = 64 * 1024;
+
+/// What larger decoded requests leave of [`DECODED_REQUESTS`] for small ones.
+pub const CONTROL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
+
+const _: () = assert!(
+    INLINE_REQUEST_DECODE_BYTES <= MAX_REQUEST_DECODE_BYTES
+        && MAX_REQUEST_DECODE_BYTES + CONTROL_RESERVE_BYTES <= DECODED_REQUESTS_BUDGET_BYTES
+        && SMALL_REQUEST_BYTES <= CONTROL_RESERVE_BYTES
+);
+
+/// The decoded requests (all but the records of Produce requests) from their decode until
+/// their response is written.
+pub static DECODED_REQUESTS: DecodePool = DecodePool::new(DECODED_REQUESTS_BUDGET_BYTES);
+
 impl DecodePool {
     /// A pool of `bytes`.
     pub const fn new(bytes: usize) -> Self {
@@ -184,6 +227,52 @@ impl DecodePool {
 
     fn take(&self, n: usize) -> bool {
         charge_frame_budget(&self.remaining, n)
+    }
+
+    /// Charge `n` bytes, leaving at least `keep` bytes free; `None`, charging nothing, when
+    /// the pool lacks them.
+    pub fn charge_leaving(&'static self, n: usize, keep: usize) -> Option<DecodedCharge> {
+        let mut remaining = self.remaining.load(Ordering::Relaxed);
+        loop {
+            if n.saturating_add(keep) > remaining {
+                return None;
+            }
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                remaining - n,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(DecodedCharge {
+                        pool: self,
+                        bytes: n,
+                    })
+                }
+                Err(actual) => remaining = actual,
+            }
+        }
+    }
+
+    /// Charge a decoded request of `n` bytes to this pool: a small one
+    /// ([`SMALL_REQUEST_BYTES`]) may take every byte left, a larger one must leave
+    /// [`CONTROL_RESERVE_BYTES`]. `None` when it does not fit now.
+    pub fn charge_request(&'static self, n: usize) -> Option<DecodedCharge> {
+        let keep = if n <= SMALL_REQUEST_BYTES {
+            0
+        } else {
+            CONTROL_RESERVE_BYTES
+        };
+        self.charge_leaving(n, keep)
+    }
+
+    /// What [`Self::charge_request`] needs free to charge `n` bytes.
+    pub fn request_room(n: usize) -> usize {
+        if n <= SMALL_REQUEST_BYTES {
+            n
+        } else {
+            n.saturating_add(CONTROL_RESERVE_BYTES)
+        }
     }
 
     fn give_back(&self, n: usize) {

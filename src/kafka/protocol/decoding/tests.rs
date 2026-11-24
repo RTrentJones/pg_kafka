@@ -151,7 +151,7 @@ fn corrupt_produce_frame(acks: i16, unsizable: bool) -> BytesMut {
         let last = batch.len() - 1;
         batch[last] ^= 1;
     }
-    p.records = Some(bytes::Bytes::from(batch));
+    p.records = Some(Bytes::from(batch));
     let mut t = TopicProduceData::default();
     t.name = topic("t");
     t.partition_data = vec![p];
@@ -178,7 +178,7 @@ fn one_record_batch(value: Vec<u8>, compression: kafka_protocol::records::Compre
         sequence: -1,
         timestamp: 0,
         key: None,
-        value: Some(bytes::Bytes::from(value)),
+        value: Some(Bytes::from(value)),
         headers: kafka_protocol::indexmap::IndexMap::default(),
     };
     let mut batch = BytesMut::new();
@@ -260,7 +260,7 @@ fn test_produce_decoding_past_the_request_limit_is_refused() {
 }
 
 /// A Produce frame of `partitions` partitions, each carrying `batch`.
-fn produce_frame_of(batch: &bytes::Bytes, partitions: i32, acks: i16) -> BytesMut {
+fn produce_frame_of(batch: &Bytes, partitions: i32, acks: i16) -> BytesMut {
     use kafka_protocol::messages::produce_request::{
         PartitionProduceData, ProduceRequest, TopicProduceData,
     };
@@ -1227,3 +1227,5 @@ fn test_parse_txn_offset_commit_request() {
         )]
     );
 }
+
+mod decode_limits;

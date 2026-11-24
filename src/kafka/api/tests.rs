@@ -24,10 +24,12 @@ pub(crate) fn sample_request(api_key: i16) -> RequestBody {
     // Encode the crate's default request at the lowest supported version and decode it
     // through the registry, so the sample covers the real decode path.
     encode_default_request(api_key, header.api_version, &mut buf);
+    let mut buf = MeteredBuf::new(buf.freeze());
     match decode_body(&mut buf, header, tx) {
         Ok(Decoded::Request(request)) => request.body,
         Ok(Decoded::Answered) => panic!("api_key {api_key} default request was rejected"),
         Ok(Decoded::Close(reason)) => panic!("api_key {api_key}: {reason}"),
+        Ok(Decoded::OverLimit) => panic!("api_key {api_key}: over the decode limit"),
         Err((_header, _tx)) => panic!("api_key {api_key} is not registered"),
     }
 }

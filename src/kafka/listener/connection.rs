@@ -10,10 +10,11 @@
 //! requests per connection are read but unanswered. A client that pipelines without
 //! reading responses fills its TCP receive window, the writer blocks, permits stop
 //! coming back and the reader stops reading: the raw request bytes a connection holds are
-//! bounded (what a Produce's compressed records decode to is bounded by
-//! `protocol::decode_budget`) and the backpressure reaches the client through TCP. A Produce
-//! that waits for room to decode stops the reader until it has decoded, so a connection
-//! waits for one such decode at a time.
+//! bounded (what a request decodes to is bounded by `protocol::decode_meter` and
+//! `protocol::decode_budget`, and held in its response slot until its response is written)
+//! and the backpressure reaches the client through TCP. A request that decodes off the I/O
+//! threads or waits for room to decode stops the reader until it has decoded, so a
+//! connection waits for one such decode at a time.
 
 use bytes::BytesMut;
 use futures::stream::{Stream, StreamExt};
@@ -39,6 +40,7 @@ use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::metrics::RequestTimer;
 use crate::kafka::protocol;
 use crate::kafka::protocol::framing::{FrameClock, FrameCodec, PRE_AUTH_MAX_FRAME};
+use crate::kafka::protocol::DecodedCharge;
 
 /// How long a client has, from the moment its TCP connection is accepted, to finish
 /// everything before it is authenticated: the TLS handshake (SSL / SASL_SSL) and, on a
@@ -254,19 +256,20 @@ where
         self.activity.touch();
         debug!("Received frame of {} bytes", frame.len());
 
-        // Queue this request's response slot to the writer BEFORE dispatching, so the
-        // writer's output order is fixed by request arrival order.
-        let (response_tx, slot) = ResponseSlot::open(permit);
-        if self.order_tx.send(slot).is_err() {
-            warn!("Writer task gone, closing connection");
-            return Err(Close::WriterGone);
-        }
+        // Each request's response slot is queued to the writer BEFORE the request is
+        // dispatched, so the writer's output order is fixed by request arrival order.
+        let (response_tx, responses) = ResponseSlot::channel();
 
         // On a SASL listener nothing but ApiVersions and the two SASL APIs is processed
         // before authentication succeeds; anything else closes the connection, as Kafka
         // does.
         let api_key = peek_api_key(&frame);
         if let Some(key) = api_key.filter(|k| is_sasl_api(*k)) {
+            self.queue_slot(ResponseSlot::new(
+                responses,
+                permit,
+                DecodedCharge::default(),
+            ))?;
             return self.serve_sasl(key, frame, response_tx).await;
         }
         let pre_auth = !self.auth.sasl.admits(-1);
@@ -279,19 +282,23 @@ where
             return Err(Close::Protocol);
         }
 
-        let parsed = match protocol::parse_request(frame, response_tx) {
-            // A Produce whose records wait for room to decode waits here, holding no thread:
-            // this connection reads nothing more meanwhile, so it waits for one decode at a
-            // time and its requests reach the DB thread in the order they were sent.
-            Ok(Some(request)) => {
-                tokio::select! {
-                    biased;
-                    _ = &mut self.writer_gone => return Err(Close::WriterGone),
-                    finished = protocol::finish_request(request) => finished,
-                }
-            }
-            other => other,
+        // A request that decodes off the I/O threads, waits for room to decode or for room
+        // to hold what it decoded waits here, holding no thread: this connection reads
+        // nothing more meanwhile, so it waits for one decode at a time and its requests
+        // reach the DB thread in the order they were sent.
+        let decoded = tokio::select! {
+            biased;
+            _ = &mut self.writer_gone => return Err(Close::WriterGone),
+            decoded = protocol::decode_request(frame, response_tx) => decoded,
         };
+        // The decoded request's share of the budget stays with its slot until its response
+        // is written.
+        let (parsed, charge) = match decoded {
+            Ok(Some((request, charge))) => (Ok(Some(request)), charge),
+            Ok(None) => (Ok(None), DecodedCharge::default()),
+            Err(e) => (Err(e), DecodedCharge::default()),
+        };
+        self.queue_slot(ResponseSlot::new(responses, permit, charge))?;
         match parsed {
             // Before SASL authentication the network thread answers ApiVersions itself,
             // as Kafka's authenticator does: an anonymous peer never reaches the one DB
@@ -321,6 +328,15 @@ where
                 Err(Close::Protocol)
             }
         }
+    }
+
+    /// Queue a request's response slot to the writer.
+    fn queue_slot(&self, slot: ResponseSlot) -> Result<(), Close> {
+        if self.order_tx.send(slot).is_err() {
+            warn!("Writer task gone, closing connection");
+            return Err(Close::WriterGone);
+        }
+        Ok(())
     }
 
     /// Wait for an in-flight slot before reading the next frame. An unauthenticated

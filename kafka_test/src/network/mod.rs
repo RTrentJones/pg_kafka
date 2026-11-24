@@ -5,7 +5,8 @@
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
 //! enumeration, decompression, record-count and header bombs, large zstd windows, partition
 //! data that is not one RecordBatch v2, batches read with Kafka's grammar and header checks,
-//! an acks=0 Produce at an unsupported version, a saturated large-decode path), each
+//! an acks=0 Produce at an unsupported version, a saturated large-decode path, requests that
+//! decode to many times their frame), each
 //! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
@@ -15,6 +16,7 @@
 //! source addresses (127.0.0.2, ...) so their per-IP accounting is separate from the
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
+pub mod decode_memory;
 pub mod decode_work;
 pub mod fanout;
 pub mod hostile_clients;
@@ -182,6 +184,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_the_decode_limit_refuses_partitions_on_their_own: sequential,
         produce_decoding::test_transactional_batches_need_a_transactional_id: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
+        decode_memory::test_requests_that_decode_to_many_times_their_frame_are_refused: sequential,
         decode_work::test_refused_partitions_do_not_hold_the_io_threads: sequential,
         decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
         decode_work::test_repeated_partition_entries_are_answered_once: sequential,

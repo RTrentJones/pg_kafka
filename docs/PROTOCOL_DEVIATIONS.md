@@ -795,14 +795,31 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
   must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
   first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
-  incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over 1 MiB
-  (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame would
-  exceed the budget is closed. Responses are not size-capped (they are bounded by the request's
+  incomplete incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over
+  1 MiB (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame
+  would exceed the budget is closed. That budget covers only the raw bytes of frames still
+  arriving: what a request decodes to is bounded separately. A frame's size bounds its decoded
+  form poorly (a Metadata v9 topic of an empty name is 2 bytes on the wire and some 90 decoded, a
+  DeleteGroups group name 1 byte and some 60; with their vectors' growth a decode of such entries
+  holds 40 to 100 times its frame), so every request's decode is metered as it allocates: a
+  decode may hold at most 2 MiB on an I/O thread, past which it runs again off the I/O threads
+  (at most two at a time) under the request limit of **64 MiB**; it holds at most about three
+  times its limit at once before it stops. A request that decodes to more than 64 MiB (besides
+  a Produce's records, bounded below) closes the connection without a response, as Kafka closes
+  the connection for a frame over `socket.request.max.bytes` (100 MB): Kafka accepts such a
+  request if its frame is under 100 MB, pg_kafka does not. 64 MiB is what a Metadata request of
+  some 300,000 topic names of 50 bytes decodes to, or a Fetch of some 500,000 partitions, far
+  beyond what clients send. Decoded requests then hold at most 256 MiB together until their
+  responses are written, 32 MiB of it kept for requests of at most 64 KiB (Heartbeats,
+  ApiVersions, commits), so a few large requests cannot lock control traffic out; a decoded
+  request that finds no room is freed and decodes again once there is, waiting up to 10 s
+  (its connection reads nothing meanwhile), after which the connection closes. Responses are not size-capped (they are bounded by the request's
   `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
-  Decoded Produce records waiting for the DB thread hold at most 512 MiB together, and decodes
-  of more than 2 MiB run off the I/O threads, at most two at a time; a request that finds no
+  Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the
+  256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
+  at most two at a time; a request that finds no
   room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
   frame counts against the frame budget while it waits, as an incomplete frame does (one the
   exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).

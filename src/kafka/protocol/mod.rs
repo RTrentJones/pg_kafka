@@ -10,9 +10,12 @@
 //! - `recordbatch`: the records of a Produce partition, one RecordBatch v2
 //!   ([`parse_record_batch_with_metadata`]);
 //! - [`decode_budget`]: how much memory decoded records may take, per request and across
-//!   all requests.
+//!   all requests, and decoded requests across the process;
+//! - [`decode_meter`]: the memory a request's decode holds, measured as it allocates, and
+//!   the decode stopped past its limit (every API, every version).
 
 pub mod decode_budget;
+pub mod decode_meter;
 mod decoding;
 mod encoding;
 pub mod framing;
@@ -21,7 +24,7 @@ mod recordbatch;
 pub(crate) use recordbatch::test_batches as recordbatch_test_batches;
 
 pub use decode_budget::{DecodeBudget, DecodedCharge};
-pub use decoding::{finish_request, parse_request};
+pub use decoding::{decode_request, finish_request, parse_request};
 pub use encoding::encode_response;
 pub use recordbatch::{
     first_batch_is_transactional, least_decoded_memory, parse_record_batch,
