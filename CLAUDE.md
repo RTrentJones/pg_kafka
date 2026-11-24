@@ -81,7 +81,8 @@ Generated doc regions (between `gen:` marker comments): the `api-*` ones are own
 
 ## Code Coverage and the QA-1 Rule
 
-Codecov gates project coverage at 80% and patch coverage at 90% (`codecov.yml`).
+Codecov gates project coverage at 78% (target 80% less its 2% threshold) and patch coverage at 85%
+(target 90% less 5%) (`codecov.yml`).
 
 Code that needs a live Postgres (SPI) or the tokio listener is invisible to unit coverage.
 `codecov.yml` lists it: `ignore:` entries (SPI/async/generated through and through) and
@@ -93,7 +94,7 @@ fails a PR that touches one without changing a Rust file under `kafka_test/src/`
 `BackgroundWorker::*`, `#[pg_extern]`) is on neither list. A genuinely test-neutral edit
 (comments, docs, renames) gets the `no-e2e-needed` label. Do **not** add a file to the ignore list
 to route untested logic around the patch gate; extract the pure logic into a testable function
-instead (see `validate_sequence` in `storage/mod.rs`, `build_producer_settings` in
+instead (see `validate_sequence` in `storage/sequence.rs`, `build_producer_settings` in
 `shadow/producer.rs`). When you split or move a listed file, update `codecov.yml` with it.
 
 **Single-DB-thread invariant:** all handlers, the `Arc<RwLock>` coordinator and the `ShadowStore`
@@ -131,7 +132,7 @@ src/
     ├── dispatch.rs     # Handler Err/panic -> error response, RequestOutcome
     ├── handlers/       # handle_* per API, taking &HandlerContext
     ├── handler_context.rs  # Store, coordinator and broker metadata passed to handlers
-    ├── coordinator.rs  # Consumer group coordinator (in-memory group state)
+    ├── coordinator/    # Consumer group coordinator (in-memory group state): mod.rs, group.rs, tests.rs
     ├── assignment/     # Range, RoundRobin, Sticky; subscription/assignment encoding
     ├── limits.rs       # Caps on client-controlled state (partitions, group size, group count)
     ├── storage/        # Storage role traits (mod.rs), delegation macros, retention planning,
@@ -231,7 +232,7 @@ Kafka error code.
 
 ### Consumer Group Coordinator
 
-Group state is in memory (`src/kafka/coordinator.rs`, `Arc<RwLock<..>>`); only committed offsets
+Group state is in memory (`src/kafka/coordinator/`, `Arc<RwLock<..>>`); only committed offsets
 persist. JoinGroup responses are held until the join phase completes (every known member rejoined,
 or the rest left or timed out), as in Kafka; the generation moves when the join completes.
 `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately, or later
@@ -353,7 +354,7 @@ ApiVersions list, the metrics names and the error path; nothing else lists the A
 
 1. Write the handler in `src/kafka/handlers/` taking `&HandlerContext` (its
    `store: &dyn KafkaStore` keeps it testable) and returning the kafka-protocol response or a
-   `KafkaError`. Add unit tests with `MockKafkaStore` (`src/kafka/handlers/tests.rs`).
+   `KafkaError`. Add unit tests with `MockKafkaStore` (`src/kafka/handlers/tests/`).
 2. In the fitting `src/kafka/api/*.rs` file, add a request data struct and `impl KafkaApi`:
    - `type Wire` = the kafka-protocol request type (its `KEY` is the api key, its `Response`
      the response body); `NAME`, `MIN_VERSION`, `MAX_VERSION` (advertised and enforced),

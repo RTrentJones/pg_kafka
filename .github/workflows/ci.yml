@@ -98,6 +98,8 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          # The `unit` flag codecov.yml configures.
+          flags: unit
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
@@ -135,8 +137,8 @@ jobs:
     name: E2E pg${{ matrix.pg }}
     runs-on: ubuntu-24.04
     needs: [lint, kafka-test-build]
-    # Cold build ~20 min + suite (~5 min measured on 4 cores, 223 functional tests including
-    # listener restarts) + shadow (~13 min locally) and performance on pg14.
+    # Cold build ~20 min + suite (9.6 min measured on 4 shared cores, 365 functional tests
+    # including listener restarts) + shadow (~13 min locally) and performance on pg14.
     timeout-minutes: 100
     strategy:
       fail-fast: false
@@ -189,7 +191,8 @@ jobs:
         run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
       - name: Functional E2E tests
-        # Measured 4.5 min on PG18 in a 4-core sandbox; the margin covers slow runners.
+        # Measured 9.6 min (365 tests) on PG16 in a 4-core sandbox shared with two other builds;
+        # the margin covers slow runners.
         timeout-minutes: 25
         working-directory: kafka_test
         run: '"$KAFKA_TEST_BIN" --exclude performance --exclude shadow --timeout-secs 300'
@@ -265,7 +268,9 @@ jobs:
   # Real Kafka clients against pg_kafka: the Apache Kafka 3.7 Java tools (interop/run-java-checks.sh)
   # and the differential harness that replays the same raw requests against pg_kafka and a real
   # Kafka broker (interop/diff/). Known failures are listed in the scripts (XFAIL in
-  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS and fails the job.
+  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS (DEV-GONE for a
+  # deviation that went away) without failing the job, so its entry can be removed. An
+  # unlisted failure or difference fails the job.
   interop:
     name: Interop (Java clients, differential vs Kafka)
     runs-on: ubuntu-24.04

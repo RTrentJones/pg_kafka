@@ -36,7 +36,8 @@ To ensure all PRs must pass tests before merging:
 ## Step 3: Set Up Code Coverage Reporting
 
 The `Test Suite` job uploads `lcov.info` with `codecov/codecov-action@v5` and `fail_ci_if_error: true`,
-so a failed upload fails CI. Coverage gating (project 80%, patch 90%) is configured in `codecov.yml`.
+so a failed upload fails CI. Coverage gating is configured in `codecov.yml`: project coverage passes
+at 78% and above (target 80%, threshold 2%), patch coverage at 85% and above (target 90%, threshold 5%).
 
 ### Option A: Codecov (as configured)
 

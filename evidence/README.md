@@ -49,8 +49,10 @@ evidence/
 
 ## How a client maps to APIs
 
-`apis.json` lists 23 APIs. pg_kafka implements 26 (`src/kafka/constants.rs`); DeleteRecords (21),
-DescribeConfigs (32) and IncrementalAlterConfigs (44) are not yet in the conformance matrix.
+`apis.json` lists 23 APIs. pg_kafka implements five more (the `kafka_apis!` registry in
+`src/kafka/api/mod.rs`): DeleteRecords (21), DescribeConfigs (32) and IncrementalAlterConfigs (44)
+are not yet in the conformance matrix, and SaslHandshake (17) and SaslAuthenticate (36) are not
+probed because the harnesses connect to a PLAINTEXT listener.
 
 Each harness drives the client through real operations and records, per API, `pass | fail | na`:
 - every probe is independently error-trapped, so one failing API never aborts the run — it just
