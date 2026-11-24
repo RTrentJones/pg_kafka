@@ -82,11 +82,16 @@ const LIBRDKAFKA_RETRY_BACKOFF_MAX_MS: i32 = 1000;
 /// [`DELIVERY_TIMEOUT`]. With the GUC's 60 s maximum applied as is, they took
 /// longer and the attempt timed out with its whole producer generation.
 const LIBRDKAFKA_RETRY_BACKOFF_CAP_MS: i32 = 10_000;
-/// `topic.metadata.refresh.fast.interval.ms`, librdkafka's documented default:
-/// the first interval of the leader query after a partition loses its leader
-/// (doubling up to `retry.backoff.max.ms`). Set explicitly because, unset, it
-/// follows `retry.backoff.ms`.
-const LIBRDKAFKA_LEADER_QUERY_INTERVAL_MS: &str = "100";
+/// `topic.metadata.refresh.fast.interval.ms`, librdkafka's documented default.
+/// When a partition loses its leader, librdkafka queries metadata at once and
+/// then re-arms the query with an exponential backoff from `retry.backoff.ms` up
+/// to `retry.backoff.max.ms` (`rd_kafka_metadata_leader_query_tmr_cb`); this
+/// setting is only the threshold of a new leader loss: it restarts the query at
+/// once when the next one is more than this far away
+/// (`rd_kafka_metadata_fast_leader_query`). Unset, it follows `retry.backoff.ms`
+/// (up to 10 s here), so a leader loss during a long backoff would wait for the
+/// scheduled query; pinned, it is noticed at once.
+const LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS: &str = "100";
 
 /// Assemble the ordered librdkafka settings for the shadow forwarding producer.
 ///
@@ -105,9 +110,12 @@ const LIBRDKAFKA_LEADER_QUERY_INTERVAL_MS: &str = "100";
 ///   re-attempt backoff, see `ShadowStore`), and `retry.backoff.max.ms` to the
 ///   larger of that and librdkafka's default 1000 ms: librdkafka caps the
 ///   backoff at `retry.backoff.max.ms`, so a larger `retry.backoff.ms` alone
-///   would be ignored (with only a configuration warning). The leader query's
-///   first interval (`topic.metadata.refresh.fast.interval.ms`) is pinned to
-///   librdkafka's default instead of following the backoff;
+///   would be ignored (with only a configuration warning). The same two
+///   settings space librdkafka's leader queries after a partition loses its
+///   leader; `topic.metadata.refresh.fast.interval.ms`, the threshold at which a
+///   new leader loss restarts that query at once, is pinned to librdkafka's
+///   default instead of following the backoff
+///   ([`LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS`]);
 /// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
 ///   librdkafka retries (its default `retries`, which is what idempotence
@@ -157,7 +165,7 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     ));
     settings.push((
         "topic.metadata.refresh.fast.interval.ms",
-        LIBRDKAFKA_LEADER_QUERY_INTERVAL_MS.to_string(),
+        LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS.to_string(),
     ));
 
     // Compression (use none for maximum compatibility)
@@ -554,10 +562,13 @@ mod tests {
 
     /// librdkafka's own retries stay well inside one delivery attempt
     /// ([`DELIVERY_TIMEOUT`]) whatever `shadow_retry_backoff_ms` is: its retry
-    /// backoff cap (which also caps the leader query after a lost leader) is
-    /// bounded, and the leader query does not start at the backoff. With the
-    /// GUC's 60 s maximum applied as is, two retriable errors in a row (each a
-    /// request timeout and a backoff) took longer than the timeout.
+    /// backoff cap (which also caps the spacing of the leader queries after a
+    /// lost leader) is bounded, and the threshold at which a new leader loss
+    /// restarts the leader query at once does not follow the backoff and stays
+    /// within `retry.backoff.max.ms` (above it librdkafka warns and uses the
+    /// maximum). With the GUC's 60 s maximum applied as is, two retriable errors
+    /// in a row (each a request timeout and a backoff) took longer than the
+    /// timeout.
     #[test]
     fn test_build_producer_settings_bound_librdkafka_retries() {
         let ms = |s: &[(&str, String)], key: &str| -> u64 {
