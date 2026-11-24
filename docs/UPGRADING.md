@@ -122,7 +122,15 @@ EXTENSION pg_kafka` has run, without a restart.
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
   differs). Converting `kafka.messages.created_at` rewrites the table, one more full
   read and write under the same lock. Layouts older than these are not supported;
-- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
+- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
+- adds indexes on the referencing columns of foreign keys whose parent rows are deleted
+  or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,
+  `idx_txn_pending_offsets_topic` and `idx_txn_partitions_topic` (`topic_id`, for the
+  cascade of DeleteTopics) and `idx_transactions_producer` (`kafka.transactions.producer_id`,
+  for the retention sweep's producer prune and the RV-13 producer-id reallocation);
+- adds `idx_producer_ids_last_active` (`last_active_at`, `producer_id`) and
+  `idx_transactions_terminal` (partial, `last_updated_at` of terminal transactions) for
+  the retention sweep's producer and transaction prunes.
 
 After the upgrade:
 

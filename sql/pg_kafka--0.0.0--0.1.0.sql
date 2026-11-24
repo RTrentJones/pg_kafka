@@ -40,6 +40,13 @@ SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
 CREATE INDEX idx_producer_ids_last_active
 ON kafka.producer_ids(last_active_at, producer_id);
 
+-- Rows by topic, for the foreign keys on kafka.topics, whose ON DELETE CASCADE
+-- (DeleteTopics) would otherwise read each table whole once per deleted topic (see
+-- bootstrap.sql). kafka.txn_partitions gets its index where it is created.
+CREATE INDEX idx_consumer_offsets_topic ON kafka.consumer_offsets(topic_id);
+CREATE INDEX idx_producer_sequences_topic ON kafka.producer_sequences(topic_id);
+CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id);
+
 -- 1. Time-partition kafka.messages (ADR-001).
 --
 -- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy
@@ -1081,6 +1088,9 @@ CREATE TABLE kafka.txn_partitions (
     partition_id INT NOT NULL CHECK (partition_id >= 0),
     PRIMARY KEY (transactional_id, topic_id, partition_id)
 );
+
+-- Rows by topic, for the foreign key on kafka.topics (see bootstrap.sql).
+CREATE INDEX idx_txn_partitions_topic ON kafka.txn_partitions(topic_id);
 
 -- Ongoing transactions by producer id: every non-transactional idempotent batch asks
 -- whether its producer has an open transaction (open_txn_epoch_on_partition), and a plain
