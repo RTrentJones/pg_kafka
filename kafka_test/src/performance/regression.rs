@@ -14,6 +14,26 @@ use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::{Duration, Instant};
 
+// The floors and ceilings of these tests. Like `throughput.rs`'s, they sit some 10-100x
+// from what a dev-class machine measures (in brackets), so environment variance passes and
+// an order-of-magnitude regression fails the suite.
+
+/// Produce throughput of 1000 concurrent sends, the producer's first metadata request
+/// included (1,000 to 50,000 msg/s, depending on how long that request takes).
+const MIN_LARGE_BATCH_PRODUCE_THROUGHPUT: f64 = 100.0;
+/// Consume throughput of those 1000 records, the group join included (900 to 6,000 msg/s).
+const MIN_LARGE_BATCH_CONSUME_THROUGHPUT: f64 = 100.0;
+/// Median latency of an awaited single-record produce (some 6 ms).
+const MAX_PRODUCE_P50: Duration = Duration::from_secs(1);
+/// 99th-percentile latency of an awaited single-record produce (8 to 40 ms).
+const MAX_PRODUCE_P99: Duration = Duration::from_secs(5);
+/// How long ten producers on their own connections may take to each send one record (the
+/// connections' setup included; some 1 s).
+const MAX_CONCURRENT_SENDS: Duration = Duration::from_secs(10);
+/// The listener process's CPU time while a consumer long-polls an empty topic for 3 s
+/// (some 0.02 s; a fetch loop that spins instead of waiting burns the whole 3 s).
+const MAX_IDLE_LONG_POLL_CPU: Duration = Duration::from_secs(1);
+
 /// Test large batch throughput (target: process 1000 messages efficiently)
 ///
 /// This test measures the system's ability to handle large batches
@@ -93,15 +113,25 @@ pub async fn test_large_batch_throughput() -> TestResult {
     println!("   Produce throughput: {produce_throughput:.2} msgs/sec");
     println!("   Consume throughput: {consume_throughput:.2} msgs/sec");
 
-    // Basic assertions (set low to avoid flaky tests)
-    assert!(
-        success_count >= batch_size * 95 / 100,
-        "Should produce at least 95% of messages"
+    assert_eq!(success_count, batch_size, "every record is acknowledged");
+    assert_eq!(
+        consumed, success_count,
+        "every acknowledged record is consumed"
     );
-    assert!(
-        consumed >= success_count * 80 / 100,
-        "Should consume at least 80% of produced messages"
-    );
+    if produce_throughput < MIN_LARGE_BATCH_PRODUCE_THROUGHPUT {
+        return Err(format!(
+            "Large batch produce regression: {produce_throughput:.2} msg/s is below the \
+             {MIN_LARGE_BATCH_PRODUCE_THROUGHPUT:.0} msg/s floor"
+        )
+        .into());
+    }
+    if consume_throughput < MIN_LARGE_BATCH_CONSUME_THROUGHPUT {
+        return Err(format!(
+            "Large batch consume regression: {consume_throughput:.2} msg/s is below the \
+             {MIN_LARGE_BATCH_CONSUME_THROUGHPUT:.0} msg/s floor"
+        )
+        .into());
+    }
 
     println!("✅ Large batch throughput test PASSED\n");
 
@@ -172,25 +202,15 @@ pub async fn test_produce_latency_percentiles() -> TestResult {
     // 3. Verify latencies are reasonable
     println!("=== Latency Assessment ===\n");
 
-    // P50 should be under 1 second (very relaxed for test environments)
-    if p50 < Duration::from_secs(1) {
-        println!("   ✓ P50 latency is acceptable");
-    } else {
-        println!("   ⚠ P50 latency is high (>1s)");
+    assert_eq!(latencies.len(), sample_size, "every record is acknowledged");
+    if p50 >= MAX_PRODUCE_P50 || p99 >= MAX_PRODUCE_P99 {
+        return Err(format!(
+            "Produce latency regression: P50 {p50:?} (ceiling {MAX_PRODUCE_P50:?}), \
+             P99 {p99:?} (ceiling {MAX_PRODUCE_P99:?})"
+        )
+        .into());
     }
-
-    // P99 should be under 5 seconds (very relaxed)
-    if p99 < Duration::from_secs(5) {
-        println!("   ✓ P99 latency is acceptable");
-    } else {
-        println!("   ⚠ P99 latency is high (>5s)");
-    }
-
-    // Basic assertion (very relaxed)
-    assert!(
-        latencies.len() >= sample_size * 90 / 100,
-        "Should measure at least 90% of messages"
-    );
+    println!("   ✓ P50 and P99 under their ceilings ({MAX_PRODUCE_P50:?}, {MAX_PRODUCE_P99:?})");
 
     println!("\n✅ Test: Produce Latency Percentiles PASSED\n");
 
@@ -253,6 +273,7 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
     println!("Step 3: Using connections concurrently...");
     let topic_name = topic.name.clone();
 
+    let sends_started = Instant::now();
     let mut handles = Vec::new();
     for (i, producer) in producers.iter().enumerate() {
         let topic = topic_name.clone();
@@ -275,7 +296,8 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
             success += 1;
         }
     }
-    println!("   ✓ {success} producers sent messages successfully\n");
+    let sends_took = sends_started.elapsed();
+    println!("   ✓ {success} producers sent messages successfully in {sends_took:?}\n");
 
     // 4. Verify all connections work
     println!("=== Connection Scaling Summary ===\n");
@@ -283,10 +305,17 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
     println!("   Total consumers: {num_consumers}");
     println!("   Successful sends: {success}");
 
-    assert!(
-        success >= num_producers * 80 / 100,
-        "At least 80% of producers should succeed"
+    assert_eq!(
+        success, num_producers,
+        "every producer's record is acknowledged"
     );
+    if sends_took >= MAX_CONCURRENT_SENDS {
+        return Err(format!(
+            "Connection scaling regression: {num_producers} concurrent sends took \
+             {sends_took:?} (ceiling {MAX_CONCURRENT_SENDS:?})"
+        )
+        .into());
+    }
 
     println!("\n✅ Test: Concurrent Connection Scaling PASSED\n");
 
@@ -296,8 +325,9 @@ pub async fn test_concurrent_connection_scaling() -> TestResult {
 
 /// Test long poll CPU usage during idle
 ///
-/// Verifies that long polling doesn't consume excessive CPU
-/// when waiting for messages.
+/// A consumer long-polls an empty topic (fetch.wait.max.ms 5 s) for 3 s: the listener's
+/// CPU time over that time stays under [`MAX_IDLE_LONG_POLL_CPU`], so the broker waits for
+/// data instead of re-fetching in a loop.
 pub async fn test_long_poll_cpu_efficiency() -> TestResult {
     println!("=== Test: Long Poll CPU Efficiency ===\n");
 
@@ -323,54 +353,77 @@ pub async fn test_long_poll_cpu_efficiency() -> TestResult {
     consumer.subscribe(&[&topic.name])?;
     println!("✅ Consumer created and subscribed\n");
 
-    // 2. Measure time during idle poll (no messages)
+    // Let the consumer join its group and start fetching first.
+    let _ = tokio::time::timeout(Duration::from_secs(3), consumer.recv()).await;
+    let listener = listener_cpu(&ctx).await?;
+
+    // 2. Long poll an empty topic, measuring the listener's CPU time meanwhile.
     println!("Step 2: Long polling for 3 seconds (empty topic)...");
     let poll_start = Instant::now();
     let poll_duration = Duration::from_secs(3);
 
     let mut poll_count = 0;
     while poll_start.elapsed() < poll_duration {
-        // Try to receive with short timeout
         match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
             // A message (unexpected in an empty topic) or a poll error.
             Ok(_) => {}
-            Err(_) => {
-                // Timeout - expected for empty topic
-                poll_count += 1;
-            }
+            Err(_) => poll_count += 1,
         }
     }
-
-    let actual_duration = poll_start.elapsed();
     println!("   Poll cycles: {poll_count}");
-    println!(
-        "   Actual duration: {:.2}s\n",
-        actual_duration.as_secs_f64()
-    );
 
-    // 3. Verify efficient polling (not spinning)
+    // 3. The broker waits for data instead of re-fetching in a loop.
     println!("=== CPU Efficiency Assessment ===\n");
-
-    // With 500ms timeout and 3s duration, we expect ~6 poll cycles
-    // If we see many more, there might be busy-waiting
-    let expected_polls = i32::try_from(poll_duration.as_millis() / 500)?;
-    let poll_efficiency = f64::from(poll_count) / f64::from(expected_polls);
-
-    println!("   Expected poll cycles: ~{expected_polls}");
-    println!("   Actual poll cycles: {poll_count}");
-    println!("   Efficiency ratio: {poll_efficiency:.2}");
-
-    if poll_efficiency <= 2.0 {
-        println!("   ✓ Polling is efficient (not busy-waiting)");
-    } else {
-        println!("   ⚠ Polling may be less efficient than expected");
+    match listener {
+        Some((pid, before)) => {
+            let after = listener_cpu_of(pid).ok_or("the listener's CPU time is unreadable")?;
+            let used = after.saturating_sub(before);
+            println!(
+                "   Listener CPU time over {:.2}s of long polling: {used:?}",
+                poll_start.elapsed().as_secs_f64()
+            );
+            if used >= MAX_IDLE_LONG_POLL_CPU {
+                return Err(format!(
+                    "Long poll CPU regression: the listener used {used:?} of CPU while a \
+                     consumer long-polled an empty topic (ceiling {MAX_IDLE_LONG_POLL_CPU:?})"
+                )
+                .into());
+            }
+        }
+        None => println!("   (the listener's /proc entry is not readable here: CPU not measured)"),
     }
-
-    // Relaxed assertion - just verify polls happened
     assert!(poll_count > 0, "Should have at least one poll cycle");
 
     println!("\n✅ Test: Long Poll CPU Efficiency PASSED\n");
 
     ctx.cleanup().await?;
     Ok(())
+}
+
+/// The listener process and its CPU time so far, or `None` when this process cannot read
+/// its `/proc` entry (the database on another host).
+async fn listener_cpu(
+    ctx: &TestContext,
+) -> Result<Option<(i32, Duration)>, Box<dyn std::error::Error>> {
+    let pid: i32 = ctx
+        .db()
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_kafka_listener'",
+            &[],
+        )
+        .await?
+        .get(0);
+    Ok(listener_cpu_of(pid).map(|cpu| (pid, cpu)))
+}
+
+/// The user and system CPU time of process `pid` (`/proc/<pid>/stat`, in clock ticks of
+/// 1/100 s, Linux's USER_HZ).
+fn listener_cpu_of(pid: i32) -> Option<Duration> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The fields after the parenthesised command name, which may contain spaces.
+    let rest = &stat[stat.rfind(')')? + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // utime and stime are fields 14 and 15 of the line, 12 and 13 after the name.
+    let ticks: u64 = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+    Some(Duration::from_millis(ticks * 10))
 }

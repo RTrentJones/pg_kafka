@@ -856,10 +856,13 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Network edge limits:** connections are capped per listener
   (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
-  where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
-  connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
-  must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
-  first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
+  where Kafka's default is unlimited); over a cap the socket is closed at accept. A
+  connection closes after `pg_kafka.connections_max_idle_ms` (600000, as Kafka) without a byte
+  read or written, once nothing it sent is still being answered or its responses wait for it to
+  read them (a client that stops reading: as Kafka's idle expiry closes a muted connection whose
+  response does not go out); a request still being answered (a long-poll Fetch, a JoinGroup
+  waiting for its group) keeps it open. A request frame must arrive within
+  `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
   incomplete incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over
   1 MiB (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame
   would exceed the budget is closed. That budget covers only the raw bytes of frames still
@@ -874,20 +877,24 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   the connection for a frame over `socket.request.max.bytes` (100 MB): Kafka accepts such a
   request if its frame is under 100 MB, pg_kafka does not. 64 MiB is what a Metadata request of
   some 300,000 topic names of 50 bytes decodes to, or a Fetch of some 500,000 partitions, far
-  beyond what clients send. Decoded requests then hold at most 256 MiB together until their
-  responses are written, 32 MiB of it kept for requests of at most 64 KiB (Heartbeats,
-  ApiVersions, commits), so a few large requests cannot lock control traffic out; a decoded
-  request that finds no room is freed and decodes again once there is, waiting up to 10 s
-  (its connection reads nothing meanwhile), after which the connection closes. Responses are not size-capped (they are bounded by the request's
-  `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  beyond what clients send. Decoded requests then hold at most 256 MiB together until the
+  DB thread has run them (not until their responses are written: a connection whose client
+  stops reading holds at most its 128 in-flight responses, until the idle timeout), 32 MiB of it
+  kept for requests of at most 64 KiB (Heartbeats, ApiVersions, commits), so a few large
+  requests cannot lock control traffic out; a decoded request that finds no room is freed and
+  decodes again once there is, waiting up to 10 s (its connection reads nothing meanwhile),
+  after which the connection closes. Responses are not size-capped (they are bounded by the
+  request's `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
   Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the
   256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
   at most two at a time; a request that finds no
   room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
-  frame counts against the frame budget while it waits, as an incomplete frame does (one the
-  exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).
+  frame counts against the frame budget while it waits (for a large-decode slot, or for room
+  in either budget), as an incomplete frame does; one the exhausted budget cannot take is
+  refused at once: a Produce is answered REQUEST_TIMED_OUT, any other request closes the
+  connection.
 
 ## Compatibility Testing
 

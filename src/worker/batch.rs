@@ -55,6 +55,7 @@ pub(super) fn reject_request(request: KafkaRequest, error_code: i16) {
         header,
         body,
         response_tx,
+        ..
     } = request;
     if !body.expects_response() {
         return;
@@ -626,6 +627,7 @@ mod tests {
                 },
                 body,
                 response_tx: tx,
+                decode_charge: crate::kafka::protocol::DecodedCharge::default(),
             },
             rx,
         )

@@ -90,8 +90,10 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
         .await?;
     topic.produce(&generate_messages(2, "m")).await?;
 
-    // Turn offset 0 into a cleaned-up aborted row: mark it aborted, then run the
-    // sweep with no grace period so cleanup_aborted_messages deletes it.
+    // Turn offset 0 into a cleaned-up aborted row: mark it aborted, then delete it as the
+    // sweep's aborted-row cleanup does (the row goes, its offset stays allocated and no log
+    // start moves). Only this topic's row: the sweep with no grace period would delete
+    // every topic's aborted rows, which transaction tests running alongside assert on.
     ctx.db()
         .execute(
             "UPDATE kafka.messages m SET txn_state = 'aborted'
@@ -100,9 +102,15 @@ pub async fn test_fetch_into_cleaned_up_aborted_rows_is_in_range() -> TestResult
             &[&topic.name],
         )
         .await?;
-    ctx.db()
-        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+    let deleted = ctx
+        .db()
+        .execute(
+            "DELETE FROM kafka.messages m USING kafka.topics t
+             WHERE m.topic_id = t.id AND t.name = $1 AND m.txn_state = 'aborted'",
+            &[&topic.name],
+        )
         .await?;
+    assert_eq!(deleted, 1);
     let surviving: i64 = ctx
         .db()
         .query_one(

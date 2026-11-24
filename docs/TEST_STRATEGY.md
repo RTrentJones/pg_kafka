@@ -212,9 +212,10 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 | `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
 | `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
 
-The functional suite took 4.5 minutes (223 tests, including the auth category's listener
-restarts) on PG18 in a 4-core sandbox; the step timeout leaves about a 5x margin and the job
-timeout (90 min) covers a cold build.
+The functional suite (365 tests, including the auth, network and worker categories' listener
+restarts) took 9.6 minutes on PG16 in a 4-core sandbox shared with two other builds; the 25-minute
+step timeout leaves about a 2.5x margin over that loaded run, and the job timeout (100 min)
+covers a cold build, the suite and, on pg14, the shadow and performance categories.
 
 ---
 
@@ -224,8 +225,8 @@ timeout (90 min) covers a cold build.
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Project Coverage | 80%+ | Testable code only |
-| Patch Coverage | 90%+ | New/modified code must be well-tested |
+| Project Coverage | 80% (gate 78%) | Testable code only; `codecov.yml` threshold 2% |
+| Patch Coverage | 90% (gate 85%) | New/modified code; threshold 5% |
 | Handler Tests | 95%+ | Aspirational; not enforced by `codecov.yml` |
 
 ### Generating Coverage Reports
@@ -249,8 +250,8 @@ cargo llvm-cov --lib --features pg14 --fail-under-lines 80
 
 Coverage is enforced in CI via **Codecov's commit status checks** (configured in `codecov.yml`): the
 `test` job uploads `lcov.info` (produced by `cargo llvm-cov --lib`), and Codecov computes the two statuses
-that gate the PR — `codecov/project` (target 80%, threshold 2%) and `codecov/patch` (target 90% on
-changed lines, threshold 5%). The
+that gate the PR — `codecov/project` (target 80%, threshold 2%: passes at 78% and above) and
+`codecov/patch` (target 90% on changed lines, threshold 5%: passes at 85% and above). The
 workflow itself does **not** run a local `--fail-under-lines` gate; the Codecov statuses are the
 enforcement.
 
@@ -276,5 +277,5 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 ---
 
 **Test Count:** see [Test Summary](#test-summary)
-**Coverage Target:** 80%+ (testable code)
+**Coverage Target:** 80% of testable code (gated at 78%)
 **All Tests Passing:** ✅

@@ -11,14 +11,17 @@
 //! reading responses fills its TCP receive window, the writer blocks, permits stop
 //! coming back and the reader stops reading: the raw request bytes a connection holds are
 //! bounded (what a request decodes to is bounded by `protocol::decode_meter` and
-//! `protocol::decode_budget`, and held in its response slot until its response is written)
-//! and the backpressure reaches the client through TCP. A request that decodes off the I/O
-//! threads or waits for room to decode stops the reader until it has decoded, so a
-//! connection waits for one such decode at a time.
+//! `protocol::decode_budget`, and given back once the DB thread has run it) and the
+//! backpressure reaches the client through TCP. Such a connection holds at most its
+//! in-flight requests' responses, and only until the idle timeout: a writer waiting for its
+//! client to read counts as idle, as Kafka's idle expiry closes a muted connection whose
+//! response does not go out. A request that decodes off the I/O threads or waits for room
+//! to decode stops the reader until it has decoded, so a connection waits for one such
+//! decode at a time.
 
 use bytes::BytesMut;
 use futures::stream::{Stream, StreamExt};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,7 +43,6 @@ use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::metrics::RequestTimer;
 use crate::kafka::protocol;
 use crate::kafka::protocol::framing::{FrameClock, FrameCodec, PRE_AUTH_MAX_FRAME};
-use crate::kafka::protocol::DecodedCharge;
 
 /// How long a client has, from the moment its TCP connection is accepted, to finish
 /// everything before it is authenticated: the TLS handshake (SSL / SASL_SSL) and, on a
@@ -59,6 +61,11 @@ const PEER_GONE_GRACE: Duration = Duration::from_millis(100);
 /// The frame-size limit once a connection may send any request.
 const AUTHENTICATED_MAX_FRAME: usize = MAX_REQUEST_SIZE;
 
+/// How often a read loop that waits (for a frame, or for an in-flight slot) re-checks
+/// whether the connection has become idle, at most: a writer may start or stop waiting for
+/// its client meanwhile.
+const IDLE_RECHECK: Duration = Duration::from_secs(1);
+
 /// Why a connection's read loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Close {
@@ -70,12 +77,17 @@ enum Close {
     Protocol,
     /// Pre-auth, per-frame read or idle deadline.
     Timeout,
+    /// The idle deadline passed while the writer waited for the client to read a response:
+    /// nothing more can be delivered, so the writer is not waited for.
+    Stalled,
 }
 
-/// When a connection last read a frame or wrote a response (the idle timeout).
+/// When a connection last read a frame or moved response bytes, and whether a response is
+/// going out (the idle timeout).
 pub(super) struct ActivityClock {
     epoch: Instant,
     last_ms: AtomicU64,
+    sending: AtomicBool,
 }
 
 impl ActivityClock {
@@ -83,6 +95,7 @@ impl ActivityClock {
         ActivityClock {
             epoch: Instant::now(),
             last_ms: AtomicU64::new(0),
+            sending: AtomicBool::new(false),
         }
     }
 
@@ -93,6 +106,69 @@ impl ActivityClock {
 
     fn last(&self) -> Instant {
         self.epoch + Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
+    }
+
+    /// A response starts going out: from now the connection waits for its client, and the
+    /// idle timeout counts from the last byte written.
+    pub(super) fn start_sending(&self) {
+        self.touch();
+        self.sending.store(true, Ordering::Relaxed);
+    }
+
+    /// The response is on the socket.
+    pub(super) fn stop_sending(&self) {
+        self.sending.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a response is going out (the writer waits for the client to read).
+    fn sending(&self) -> bool {
+        self.sending.load(Ordering::Relaxed)
+    }
+}
+
+/// A connection's socket, touching its [`ActivityClock`] whenever response bytes are
+/// written, so a large response that a slow client reads keeps its connection alive and a
+/// client that reads nothing lets it go idle (as Kafka's idle expiry counts every write).
+struct Tracked<S> {
+    inner: S,
+    activity: Arc<ActivityClock>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tracked<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let written = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(written, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.touch();
+        }
+        written
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -120,6 +196,11 @@ pub(super) async fn handle_connection<S>(
         },
     ));
     let clock = Arc::new(FrameClock::new());
+    let activity = Arc::new(ActivityClock::new());
+    let socket = Tracked {
+        inner: socket,
+        activity: Arc::clone(&activity),
+    };
     let framed = Framed::new(
         socket,
         FrameCodec::new(Arc::clone(&frame_limit), Arc::clone(&clock)),
@@ -127,7 +208,6 @@ pub(super) async fn handle_connection<S>(
     let (sink, reader) = framed.split();
 
     let (order_tx, slots) = tokio::sync::mpsc::unbounded_channel();
-    let activity = Arc::new(ActivityClock::new());
     let (writer_gone_tx, writer_gone) = oneshot::channel();
     let writer = writer::spawn(
         sink,
@@ -178,7 +258,7 @@ pub(super) async fn handle_connection<S>(
 async fn drain_writer(mut writer: tokio::task::JoinHandle<()>, close: Close, peer: &str) {
     let grace = match close {
         Close::PeerGone => PEER_GONE_GRACE,
-        Close::WriterGone => Duration::ZERO,
+        Close::WriterGone | Close::Stalled => Duration::ZERO,
         Close::Protocol | Close::Timeout => CLOSE_DRAIN_TIMEOUT,
     };
     if tokio::time::timeout(grace, &mut writer).await.is_err() {
@@ -265,11 +345,7 @@ where
         // does.
         let api_key = peek_api_key(&frame);
         if let Some(key) = api_key.filter(|k| is_sasl_api(*k)) {
-            self.queue_slot(ResponseSlot::new(
-                responses,
-                permit,
-                DecodedCharge::default(),
-            ))?;
+            self.queue_slot(ResponseSlot::new(responses, permit))?;
             return self.serve_sasl(key, frame, response_tx).await;
         }
         let pre_auth = !self.auth.sasl.admits(-1);
@@ -291,15 +367,8 @@ where
             _ = &mut self.writer_gone => return Err(Close::WriterGone),
             decoded = protocol::decode_request(frame, response_tx) => decoded,
         };
-        // The decoded request's share of the budget stays with its slot until its response
-        // is written.
-        let (parsed, charge) = match decoded {
-            Ok(Some((request, charge))) => (Ok(Some(request)), charge),
-            Ok(None) => (Ok(None), DecodedCharge::default()),
-            Err(e) => (Err(e), DecodedCharge::default()),
-        };
-        self.queue_slot(ResponseSlot::new(responses, permit, charge))?;
-        match parsed {
+        self.queue_slot(ResponseSlot::new(responses, permit))?;
+        match decoded {
             // Before SASL authentication the network thread answers ApiVersions itself,
             // as Kafka's authenticator does: an anonymous peer never reaches the one DB
             // thread, so it cannot delay authenticated clients' requests or the
@@ -339,22 +408,70 @@ where
         Ok(())
     }
 
-    /// Wait for an in-flight slot before reading the next frame. An unauthenticated
-    /// client that pipelines without reading its responses is still bound by the
-    /// pre-auth deadline here.
+    /// Wait for an in-flight slot before reading the next frame. A client that pipelines
+    /// without reading its responses is bound here by the pre-auth deadline while
+    /// unauthenticated, and by the idle timeout once its writer waits for it to read.
     async fn acquire_slot(&mut self) -> Result<OwnedSemaphorePermit, Close> {
         let pre_auth = !self.auth.sasl.admits(-1);
-        tokio::select! {
-            biased;
-            _ = &mut self.writer_gone => Err(Close::WriterGone),
-            // The semaphore is never closed, so acquiring fails only if that changes.
-            permit = Arc::clone(&self.in_flight).acquire_owned() => {
-                permit.map_err(|_| Close::Protocol)
-            }
-            () = tokio::time::sleep_until(self.pre_auth_deadline), if pre_auth => {
-                Err(pre_auth_timeout(&self.auth.peer))
+        let acquire = Arc::clone(&self.in_flight).acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            // The permits that are out are held by the requests read and not yet answered.
+            // Once the idle deadline has passed, the next turn's check closes the connection.
+            let outstanding =
+                MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION - self.in_flight.available_permits();
+            let wake = self.idle_wake(tokio::time::Instant::now(), outstanding, false)?;
+            tokio::select! {
+                biased;
+                _ = &mut self.writer_gone => return Err(Close::WriterGone),
+                // The semaphore is never closed, so acquiring fails only if that changes.
+                permit = &mut acquire => return permit.map_err(|_| Close::Protocol),
+                () = tokio::time::sleep_until(self.pre_auth_deadline), if pre_auth => {
+                    return Err(pre_auth_timeout(&self.auth.peer));
+                }
+                () = tokio::time::sleep_until(wake) => {}
             }
         }
+    }
+
+    /// When to look at the idle deadline again from `now` (at the latest the deadline
+    /// itself), or `Err` once it has passed. A connection is idle when nothing was read or
+    /// written for `connections_max_idle`, no frame is arriving, and either nothing is
+    /// outstanding or the writer is waiting for the client to read a response (a client
+    /// that stops reading). A request still being answered (a long poll, a JoinGroup
+    /// waiting for its group) does not make its connection idle. `outstanding` counts the
+    /// requests read and not yet answered; `reading_frame` is set when the caller waits for
+    /// a frame and the per-frame deadline governs a partial one.
+    fn idle_wake(
+        &self,
+        now: tokio::time::Instant,
+        outstanding: usize,
+        reading_frame: bool,
+    ) -> Result<tokio::time::Instant, Close> {
+        let limit = self.auth.security.limits.connections_max_idle;
+        let recheck = now + limit.min(IDLE_RECHECK);
+        let sending = self.activity.sending();
+        let frame_pending = reading_frame && self.clock.pending_since().is_some();
+        if frame_pending || (outstanding > 0 && !sending) {
+            return Ok(recheck);
+        }
+        let deadline = tokio::time::Instant::from_std(self.activity.last()) + limit;
+        if now >= deadline {
+            if sending {
+                debug!(
+                    "Closing connection from {}: its responses unread for {limit:?}",
+                    self.auth.peer
+                );
+                return Err(Close::Stalled);
+            }
+            debug!(
+                "Closing connection from {}: idle for {limit:?}",
+                self.auth.peer
+            );
+            return Err(Close::Timeout);
+        }
+        // The writer may start or stop waiting before the deadline.
+        Ok(deadline.min(recheck))
     }
 
     /// Requests read whose responses are not written yet (the caller holds one permit
@@ -365,8 +482,7 @@ where
 
     /// Wait for the next frame under three deadlines: the pre-auth deadline (SASL
     /// listeners, until authenticated), the per-frame read deadline (from the first
-    /// byte of a frame) and the idle timeout (nothing read, nothing written, nothing
-    /// outstanding).
+    /// byte of a frame) and the idle timeout ([`Self::idle_wake`]).
     async fn next_frame(&mut self) -> Result<BytesMut, Close> {
         let limits = self.auth.security.limits;
         loop {
@@ -391,21 +507,7 @@ where
                 }
                 wake = wake.min(deadline);
             }
-            if self.outstanding() == 0 && pending_frame.is_none() {
-                let deadline = tokio::time::Instant::from_std(self.activity.last())
-                    + limits.connections_max_idle;
-                if now >= deadline {
-                    debug!(
-                        "Closing connection from {}: idle for {:?}",
-                        self.auth.peer, limits.connections_max_idle
-                    );
-                    return Err(Close::Timeout);
-                }
-                wake = wake.min(deadline);
-            } else {
-                // Re-check once the outstanding requests may have been answered.
-                wake = wake.min(now + limits.connections_max_idle);
-            }
+            wake = wake.min(self.idle_wake(now, self.outstanding(), true)?);
             let read = tokio::select! {
                 biased;
                 _ = &mut self.writer_gone => return Err(Close::WriterGone),
@@ -568,11 +670,25 @@ mod tests {
         std::net::SocketAddr,
         crossbeam_channel::Receiver<KafkaRequest>,
     ) {
+        let (addr, rx, _task) = serve_one_task(security, capacity).await;
+        (addr, rx)
+    }
+
+    /// [`serve_one_on`], with the task serving the connection (it ends when the connection
+    /// has closed).
+    async fn serve_one_task(
+        security: ListenerSecurity,
+        capacity: usize,
+    ) -> (
+        std::net::SocketAddr,
+        crossbeam_channel::Receiver<KafkaRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
         let (main_tx, main_rx) = crossbeam_channel::bounded::<KafkaRequest>(capacity);
         let (liveness_tx, _liveness_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let (socket, _) = server.accept().await.unwrap();
             let (cred_tx, _cred_rx) = crossbeam_channel::bounded(1);
             let auth = ConnectionAuth::new(
@@ -599,7 +715,7 @@ mod tests {
             )
             .await;
         });
-        (addr, main_rx)
+        (addr, main_rx, task)
     }
 
     async fn recv_request(rx: &crossbeam_channel::Receiver<KafkaRequest>) -> KafkaRequest {
@@ -718,6 +834,89 @@ mod tests {
         assert_eq!(i32::from_be_bytes(bytes[4..8].try_into().unwrap()), 3);
         // Counted from the response (its write is activity), not from the request.
         assert!(after >= Duration::from_millis(250), "{after:?}");
+    }
+
+    /// A Fetch response of `bytes` record bytes: more than the socket buffers between the
+    /// writer and a client that reads nothing hold.
+    fn large_response(correlation_id: i32, bytes: usize) -> KafkaResponse {
+        use kafka_protocol::messages::fetch_response::{
+            FetchResponse, FetchableTopicResponse, PartitionData,
+        };
+        let mut partition = PartitionData::default();
+        partition.records = Some(bytes::Bytes::from(vec![0u8; bytes]));
+        let mut topic = FetchableTopicResponse::default();
+        topic.partitions = vec![partition];
+        let mut response = FetchResponse::default();
+        response.responses = vec![topic];
+        KafkaResponse::new(correlation_id, 4, ResponseBody::Fetch(response))
+    }
+
+    /// A client whose receive buffer is as small as the kernel allows.
+    async fn small_window_client(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.connect(addr).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_writer_waiting_for_its_client_counts_as_idle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let idle = Duration::from_millis(300);
+        let limits = NetworkLimits {
+            connections_max_idle: idle,
+            ..Default::default()
+        };
+        let security = || ListenerSecurity {
+            limits,
+            ..ListenerSecurity::plaintext("127.0.0.1:0")
+        };
+
+        // A client that reads nothing: the writer stalls on an 8 MiB response and the
+        // connection closes once nothing has been written for the idle timeout, though its
+        // request is still outstanding (its response is not on the socket).
+        let (addr, rx, task) = serve_one_task(security(), 1000).await;
+        let mut client = small_window_client(addr).await;
+        client.write_all(&api_versions_v0_frame(1)).await.unwrap();
+        let request = recv_request(&rx).await;
+        let answered = Instant::now();
+        let _ = request.response_tx.send(large_response(1, 8 << 20));
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a connection whose responses are unread must close")
+            .unwrap();
+        let after = answered.elapsed();
+        assert!(after >= Duration::from_millis(250), "{after:?}");
+
+        // A client that reads a 32 MiB response slowly, 1 MiB at a time with 50 ms pauses
+        // (more than the idle timeout in all, while the writer is still writing), gets all of
+        // it: every byte written is activity, so its connection is not closed mid-response,
+        // which would cut the response short. (The kernel wakes a writer once a part of its
+        // send buffer has drained, so progress comes in steps of that part, as in Kafka.)
+        let (addr, rx, _task) = serve_one_task(security(), 1000).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&api_versions_v0_frame(2)).await.unwrap();
+        let request = recv_request(&rx).await;
+        let _ = request.response_tx.send(large_response(2, 32 << 20));
+        drop(request);
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        let mut left = usize::try_from(u32::from_be_bytes(len)).unwrap();
+        let started = Instant::now();
+        let mut buf = vec![0u8; 1 << 20];
+        while left > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let chunk = left.min(1 << 20);
+            client
+                .read_exact(&mut buf[..chunk])
+                .await
+                .expect("the slow reader gets the whole response");
+            left -= chunk;
+        }
+        assert!(
+            started.elapsed() > idle * 3,
+            "the slow read must outlast the idle timeout"
+        );
     }
 
     /// Read one response frame: (correlation id, body after the v0 header).
