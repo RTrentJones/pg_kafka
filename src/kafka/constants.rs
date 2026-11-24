@@ -359,8 +359,9 @@ pub const DEFAULT_SHADOW_LINGER_MS: i32 = 10;
 /// Minimum shadow linger time.
 pub const MIN_SHADOW_LINGER_MS: i32 = 0;
 
-/// Maximum shadow linger time.
-pub const MAX_SHADOW_LINGER_MS: i32 = 60_000;
+/// Maximum shadow linger time: what the shadow producer applies (`ShadowConfig::validate`
+/// clamps to it), and well under the sync-mode hold timeout's default.
+pub const MAX_SHADOW_LINGER_MS: i32 = 5_000;
 
 /// Default shadow retry backoff (milliseconds).
 pub const DEFAULT_SHADOW_RETRY_BACKOFF_MS: i32 = 100;
