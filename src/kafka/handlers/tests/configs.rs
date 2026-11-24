@@ -395,3 +395,78 @@ fn test_handle_describe_configs_repeated_topic_is_read_once() {
     assert_eq!(response.results.len(), 1000);
     assert!(response.results.iter().all(|r| r.error_code == ERROR_NONE));
 }
+
+/// Kafka 3.7 refuses a SET (or APPEND / SUBTRACT) without a value as a malformed request,
+/// INVALID_REQUEST, before it looks at the key; a DELETE needs no value.
+#[test]
+fn test_handle_incremental_alter_configs_null_value_is_invalid_request() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
+    mock.expect_set_topic_retention_ms()
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let resource = |name: &str, configs: Vec<(String, i8, Option<String>)>| {
+        (RESOURCE_TYPE_TOPIC, name.to_string(), configs)
+    };
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            resource("a", vec![("retention.ms".to_string(), OP_SET, None)]),
+            resource("b", vec![("max.message.bytes".to_string(), OP_SET, None)]),
+            resource(
+                "c",
+                vec![
+                    (
+                        "max.message.bytes".to_string(),
+                        OP_SET,
+                        Some("1".to_string()),
+                    ),
+                    ("retention.ms".to_string(), OP_APPEND, None),
+                ],
+            ),
+            resource("d", vec![("retention.ms".to_string(), OP_DELETE, None)]),
+        ],
+        false,
+    )
+    .unwrap();
+    let codes: Vec<i16> = response.responses.iter().map(|r| r.error_code).collect();
+    assert_eq!(
+        codes,
+        [
+            ERROR_INVALID_REQUEST,
+            ERROR_INVALID_REQUEST,
+            ERROR_INVALID_REQUEST,
+            ERROR_NONE
+        ]
+    );
+}
+
+/// cleanup.policy is a LIST config (Kafka 3.7's ConfigType 7), retention.ms a LONG (5).
+#[test]
+fn test_handle_describe_configs_reports_kafka_config_types() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((1, 1))));
+    mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = configs::handle_describe_configs(
+        &ctx,
+        vec![(RESOURCE_TYPE_TOPIC, "t".to_string(), None)],
+        0,
+    )
+    .unwrap();
+    let types: Vec<(String, i8)> = response.results[0]
+        .configs
+        .iter()
+        .map(|c| (c.name.to_string(), c.config_type))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("retention.ms".to_string(), 5),
+            ("cleanup.policy".to_string(), 7)
+        ]
+    );
+}

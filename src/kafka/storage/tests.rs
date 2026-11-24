@@ -859,85 +859,45 @@ fn test_mock_get_last_stable_offset() {
 }
 
 mod partition_bounds {
-    use crate::kafka::storage::{order_topic_metadata, IsolationLevel, PartitionBounds};
+    use crate::kafka::storage::{order_topic_metadata, PartitionBounds};
 
     #[test]
     fn empty_partition_without_counter_row() {
-        let b =
-            PartitionBounds::from_raw(None, None, None, None, None, IsolationLevel::ReadCommitted);
+        let b = PartitionBounds::from_raw(None, None, None, None, None);
         assert_eq!(b, PartitionBounds::default());
     }
 
     #[test]
     fn hwm_takes_the_larger_of_counter_and_max_row() {
         // Counter ahead of rows (highest aborted rows cleaned up): counter wins (BUG-4).
-        let b = PartitionBounds::from_raw(
-            Some(10),
-            Some(0),
-            Some(0),
-            Some(5),
-            None,
-            IsolationLevel::ReadUncommitted,
-        );
+        let b = PartitionBounds::from_raw(Some(10), Some(0), Some(0), Some(5), None);
         assert_eq!(b.high_watermark, 10);
         assert_eq!(b.last_stable_offset, 10);
         // Rows that predate the counter: MAX + 1 wins.
-        let b = PartitionBounds::from_raw(
-            Some(2),
-            Some(0),
-            Some(0),
-            Some(7),
-            None,
-            IsolationLevel::ReadUncommitted,
-        );
+        let b = PartitionBounds::from_raw(Some(2), Some(0), Some(0), Some(7), None);
         assert_eq!(b.high_watermark, 8);
     }
 
     #[test]
-    fn lso_is_first_pending_offset_for_read_committed_only() {
-        let rc = PartitionBounds::from_raw(
-            Some(10),
-            Some(0),
-            Some(0),
-            Some(9),
-            Some(4),
-            IsolationLevel::ReadCommitted,
-        );
-        assert_eq!(rc.last_stable_offset, 4);
-        let ru = PartitionBounds::from_raw(
-            Some(10),
-            Some(0),
-            Some(0),
-            Some(9),
-            Some(4),
-            IsolationLevel::ReadUncommitted,
-        );
-        assert_eq!(ru.last_stable_offset, 10);
+    fn lso_is_first_pending_offset_for_both_isolation_levels() {
+        // Kafka reports the real last stable offset to read_uncommitted consumers too; only
+        // what a read_committed one may read depends on it.
+        let b = PartitionBounds::from_raw(Some(10), Some(0), Some(0), Some(9), Some(4));
+        assert_eq!(b.last_stable_offset, 4);
+        assert_eq!(b.high_watermark, 10);
+        let b = PartitionBounds::from_raw(Some(10), Some(0), Some(0), Some(9), None);
+        assert_eq!(b.last_stable_offset, 10);
     }
 
     #[test]
     fn earliest_respects_durable_log_start() {
         // Truncated by DeleteRecords to 6 and now empty: earliest is the log start.
-        let b = PartitionBounds::from_raw(
-            Some(6),
-            Some(6),
-            None,
-            None,
-            None,
-            IsolationLevel::ReadCommitted,
-        );
+        let b = PartitionBounds::from_raw(Some(6), Some(6), None, None, None);
         assert_eq!(b.earliest_offset, 6);
         assert_eq!(b.log_start_offset, 6);
         assert_eq!(b.high_watermark, 6);
         // Aborted leading rows cleaned up: first row above the log start.
-        let b = PartitionBounds::from_raw(
-            Some(5),
-            Some(0),
-            Some(2),
-            Some(4),
-            None,
-            IsolationLevel::ReadCommitted,
-        );
+        let b = PartitionBounds::from_raw(Some(5), Some(0), Some(2), Some(4), None);
         assert_eq!(b.earliest_offset, 2);
         assert_eq!(b.log_start_offset, 0);
     }

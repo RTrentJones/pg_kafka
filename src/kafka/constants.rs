@@ -278,6 +278,21 @@ pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 /// INVALID_REPLICATION_FACTOR: a replication factor other than 1 or -1 on this
 /// single-broker cluster.
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+/// OFFSET_METADATA_TOO_LARGE: committed offset metadata longer than
+/// [`OFFSET_METADATA_MAX_LENGTH`].
+pub const ERROR_OFFSET_METADATA_TOO_LARGE: i16 = 12;
+/// Kafka's default `offset.metadata.max.bytes`: the longest offset commit metadata stored, in
+/// UTF-16 code units (Java `String.length()`, which Kafka compares).
+pub const OFFSET_METADATA_MAX_LENGTH: usize = 4096;
+
+/// Whether commit metadata is too long to store (Kafka's `validateOffsetMetadataLength`).
+pub fn offset_metadata_too_large(metadata: Option<&str>) -> bool {
+    metadata.is_some_and(|m| {
+        m.len() > OFFSET_METADATA_MAX_LENGTH
+            && m.encode_utf16().count() > OFFSET_METADATA_MAX_LENGTH
+    })
+}
+
 /// INVALID_CONFIG: a configuration key or value that is invalid or unsupported.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// INVALID_REQUEST: a malformed request, or one that targets an unsupported entity.

@@ -160,3 +160,83 @@ pub async fn test_slow_leader_sync_keeps_silent_follower() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// As in Kafka 3.0+ (checked against a 3.7 broker): a member of a new generation that sends
+/// no SyncGroup within the rebalance timeout of the join's completion is removed, though it
+/// heartbeats and the leader's SyncGroup already made the group Stable; the leader is then
+/// told to rejoin. pg_kafka removed only a leader that did not sync, so a follower that
+/// never synced held its (unassigned) place, and blocked nothing but stayed forever.
+pub async fn test_member_that_never_syncs_is_removed() -> TestResult {
+    println!("=== Test: a member that never sends SyncGroup is removed ===\n");
+    let ctx = TestContext::new().await?;
+    let group = ctx.unique_group("never-sync").await;
+    let join = |member: &str| {
+        let mut r = member_join(&group, member);
+        r.rebalance_timeout_ms = 3_000;
+        r
+    };
+
+    println!("Step 1: A forms the group, B joins, A rejoins...");
+    let mut a = conn().await?;
+    let (e, generation, leader, _) = join_now(&mut a, &join("")).await?;
+    assert_eq!(e, error_codes::NONE);
+    let synced = roundtrip(
+        &mut a,
+        3,
+        20,
+        &sync_request(&group, generation, &leader, &[]),
+    )
+    .await?;
+    assert_eq!(synced.error_code, error_codes::NONE);
+    let mut b = conn().await?;
+    send(&mut b, 5, 10, &join("")).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (e, generation, _, _) = join_now(&mut a, &join(&leader)).await?;
+    assert_eq!(e, error_codes::NONE);
+    let b_join = tokio::time::timeout(
+        Duration::from_secs(15),
+        recv::<JoinGroupRequest>(&mut b, 5, 10),
+    )
+    .await??;
+    assert_eq!(b_join.error_code, error_codes::NONE);
+    let follower = b_join.member_id.to_string();
+
+    println!("Step 2: A syncs; B heartbeats but never syncs...");
+    let a_sync = roundtrip(
+        &mut a,
+        3,
+        21,
+        &sync_request(&group, generation, &leader, &[(leader.as_str(), b"A")]),
+    )
+    .await?;
+    assert_eq!(a_sync.error_code, error_codes::NONE);
+    let mut b_answers = Vec::new();
+    let mut a_answers = Vec::new();
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        a_answers.push(heartbeat(&mut a, &group, generation, &leader).await?);
+        b_answers.push(heartbeat(&mut b, &group, generation, &follower).await?);
+        if b_answers.last() == Some(&error_codes::UNKNOWN_MEMBER_ID) {
+            break;
+        }
+    }
+    println!("  A: {a_answers:?}\n  B: {b_answers:?}");
+    assert_eq!(
+        b_answers.last(),
+        Some(&error_codes::UNKNOWN_MEMBER_ID),
+        "B is removed once the rebalance timeout has passed"
+    );
+    assert!(
+        b_answers.len() >= 2,
+        "not before the rebalance timeout: {b_answers:?}"
+    );
+    assert_eq!(
+        a_answers.last(),
+        Some(&error_codes::REBALANCE_IN_PROGRESS),
+        "the leader is told to rejoin"
+    );
+    assert_eq!(leave(&mut a, &group, &leader).await?, error_codes::NONE);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

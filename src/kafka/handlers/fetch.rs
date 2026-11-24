@@ -861,6 +861,7 @@ mod tests {
             }])
         });
         mock.expect_get_high_watermark().returning(|_, _| Ok(3));
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(3));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
         mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock
@@ -1138,12 +1139,13 @@ mod tests {
         assert!(fetch_one(&mock, 3, IsolationLevel::ReadCommitted).is_empty());
     }
 
-    /// The default get_partition_bounds skips the LSO query for ReadUncommitted.
+    /// The default get_partition_bounds reports the last stable offset to a
+    /// read_uncommitted fetch too, as Kafka does.
     #[test]
-    fn read_uncommitted_bounds_do_not_query_lso() {
+    fn read_uncommitted_bounds_report_the_lso() {
         let mut mock = MockKafkaStore::new();
         mock.expect_get_high_watermark().returning(|_, _| Ok(4));
-        mock.expect_get_last_stable_offset().never();
+        mock.expect_get_last_stable_offset().returning(|_, _| Ok(2));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
         mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         let b = mock
@@ -1153,7 +1155,7 @@ mod tests {
             b,
             PartitionBounds {
                 high_watermark: 4,
-                last_stable_offset: 4,
+                last_stable_offset: 2,
                 earliest_offset: 0,
                 log_start_offset: 0,
             }
