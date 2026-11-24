@@ -3,9 +3,9 @@
 //! `PostgresStore::run_retention_sweep` (SPI, not unit-testable) expires messages by
 //! dropping whole time partitions or deleting rows in bounded batches. The decisions it
 //! makes (which retention window a topic has, what to do with a leaf, whether to run
-//! another batch, which topic a pass starts from) live here so they are unit tested.
+//! another batch, where a pass resumes each step) live here so they are unit tested.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 /// Rows deleted per DELETE statement. Small enough that one statement holds the DB
@@ -15,11 +15,21 @@ pub const RETENTION_DELETE_BATCH: i64 = 10_000;
 /// Wall-clock budget for one sweep pass. The sweep runs on the single worker DB
 /// thread, so a pass must stay bounded: every step whose cost grows with the data
 /// (the aborted-row cleanup, the leaf contents probes, the expired-message deletes,
-/// the shadow-outbox reaping) checks it between statements, each statement itself
-/// bounded ([`RETENTION_DELETE_BATCH`] rows, one leaf), and runs at least one
-/// statement per pass ([`step_may_continue`]) so no step starves behind another's
-/// backlog. A backlog larger than one pass can clear drains over the following passes.
+/// the leaf drops, the shadow-outbox reaping)
+/// checks it between statements, each statement itself bounded
+/// ([`RETENTION_DELETE_BATCH`] rows, one leaf), and runs at least one statement per
+/// pass ([`step_may_continue`]). The two steps that run before the expiry, the
+/// aborted-row cleanup and the contents probes, stop at a third of the budget each
+/// ([`share_may_continue`]), so a backlog there (aborted rows are client-driven) leaves
+/// row expiry at least a third of every pass, not only its one statement. A pass costs
+/// at most the budget plus one statement per step (a drop's statement includes its
+/// lock wait of up to 2 s); a backlog larger than one pass can clear drains over the
+/// following passes, each step resuming where the last pass left it.
 pub const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The steps that run before row expiry get at most `1 / STEP_SHARE_DIVISOR` of the
+/// pass budget each ([`share_may_continue`]).
+pub const STEP_SHARE_DIVISOR: u32 = 3;
 
 /// The pass budget: [`RETENTION_PASS_BUDGET`], unless the test-only
 /// `pg_kafka.test_retention_pass_budget_ms` (`test_override_ms` >= 0) replaces it.
@@ -79,6 +89,18 @@ pub fn step_may_continue(statements_run: usize, elapsed: Duration, budget: Durat
     statements_run == 0 || elapsed < budget
 }
 
+/// Whether a step with a capped share of the pass may run another statement: always its
+/// first one, then only while the step has used less than its share of the budget
+/// ([`STEP_SHARE_DIVISOR`]) and the pass is within the budget.
+pub fn share_may_continue(
+    statements_run: usize,
+    step_elapsed: Duration,
+    pass_elapsed: Duration,
+    budget: Duration,
+) -> bool {
+    statements_run == 0 || (step_elapsed < budget / STEP_SHARE_DIVISOR && pass_elapsed < budget)
+}
+
 /// Whether the whole-leaf drop step may try another leaf: a bounded step
 /// ([`step_may_continue`]) that also stops after a drop that ran out of a lock wait,
 /// since the session holding that lock blocks the next drop just as long.
@@ -89,19 +111,6 @@ pub fn drop_may_continue(
     budget: Duration,
 ) -> bool {
     !last_lock_timed_out && step_may_continue(attempts, elapsed, budget)
-}
-
-/// Rotation cursor for the topic order, so a pass that runs out of budget on one
-/// large backlog does not starve the topics after it: the next pass starts one
-/// topic further along.
-static TOPIC_CURSOR: AtomicUsize = AtomicUsize::new(0);
-
-/// The index to start this pass's topic loop from (and advance the cursor).
-pub fn next_start_index(topic_count: usize) -> usize {
-    if topic_count == 0 {
-        return 0;
-    }
-    TOPIC_CURSOR.fetch_add(1, Ordering::Relaxed) % topic_count
 }
 
 /// `items` rotated so that iteration starts at `start` and wraps around.
@@ -166,50 +175,83 @@ pub const PARTITIONS_AHEAD: i32 = 2;
 /// over them ([`PROBE_ROTATION`]) instead of always starting from the oldest.
 pub const MAX_CONTENTS_PROBES_PER_PASS: usize = 64;
 
-/// A rotation over a list that a budget-limited sweep step walks: each pass starts at
-/// the first item the previous pass did not finish, whatever the list size, so a pass
-/// cut short (by a cap, or by the pass budget another step may have spent) does not
-/// walk the same leading items again, and consecutive passes cover every item.
-pub struct Rotation(AtomicUsize);
+/// Where a budget-limited sweep step resumes: the key of the last item a pass ran a
+/// statement on. A step walks its items in key order (an item's identity: a leaf's
+/// upper bound, a (topic, leaf) pair) and starts each pass at the first item whose key
+/// is greater than the cursor, wrapping to the first ([`start_after`]). So a pass cut
+/// short (by a cap, or by the pass budget another step may have spent) does not walk
+/// the same leading items again, consecutive passes cover every item, and since the
+/// cursor is a key, not a position, items that disappear (a leaf dropped) or appear
+/// between passes do not shift it. An item the previous pass was cut short in gets its
+/// next turn after the others, not first: a backlog in one item then takes one turn
+/// per rotation (and whatever budget is left once the others are caught up) instead
+/// of every pass, so one topic's backlog cannot stall the expiry of the others.
+pub struct KeyCursor<K>(Mutex<Option<K>>);
 
-impl Rotation {
+impl<K: Ord + Copy> KeyCursor<K> {
     pub const fn new() -> Self {
-        Rotation(AtomicUsize::new(0))
+        KeyCursor(Mutex::new(None))
     }
 
-    /// The index to start this pass from in a list of `items`.
-    pub fn start(&self, items: usize) -> usize {
-        probe_start(self.0.load(Ordering::Relaxed), items)
+    /// The cursor: `None` before the first pass, or after [`KeyCursor::set`] cleared it.
+    pub fn get(&self) -> Option<K> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The pass that started at `start` finished `done` items: the next starts after them.
-    pub fn record(&self, start: usize, done: usize) {
-        self.0.store(start.wrapping_add(done), Ordering::Relaxed);
+    /// Replace the cursor.
+    pub fn set(&self, key: Option<K>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = key;
+    }
+
+    /// Where this pass starts in `sorted_keys` (ascending).
+    pub fn start(&self, sorted_keys: &[K]) -> usize {
+        start_after(sorted_keys, self.get().as_ref())
+    }
+
+    /// The pass ran its last statement on the item `last_served`, if any: the next
+    /// pass starts after it. A pass that ran none leaves the cursor where it was.
+    pub fn record(&self, last_served: Option<K>) {
+        if last_served.is_some() {
+            self.set(last_served);
+        }
     }
 }
 
-impl Default for Rotation {
+impl<K: Ord + Copy> Default for KeyCursor<K> {
     fn default() -> Self {
-        Rotation::new()
+        KeyCursor::new()
     }
+}
+
+/// The index of the first of `sorted_keys` (ascending) greater than `cursor`, or 0
+/// when there is none (wrap around) or no cursor yet.
+pub fn start_after<K: Ord>(sorted_keys: &[K], cursor: Option<&K>) -> usize {
+    cursor
+        .and_then(|c| sorted_keys.iter().position(|k| k > c))
+        .unwrap_or(0)
+}
+
+/// A leaf's key for the sweep's cursors: its upper bound, unique among the time leaves
+/// (they do not overlap); the DEFAULT leaf (and an unpartitioned table), with none, sorts
+/// last.
+pub fn leaf_key(leaf: &TimePartition) -> i64 {
+    leaf.upper_ms.unwrap_or(i64::MAX)
 }
 
 /// Rotation of the contents probes over their candidates (see
-/// [`MAX_CONTENTS_PROBES_PER_PASS`]); a pass records the probes it made.
-pub static PROBE_ROTATION: Rotation = Rotation::new();
+/// [`MAX_CONTENTS_PROBES_PER_PASS`]), keyed by [`leaf_key`]: a pass records the last
+/// leaf whose probe result it used.
+pub static PROBE_ROTATION: KeyCursor<i64> = KeyCursor::new();
 
 /// Rotation of the aborted-row cleanup over the leaves that may hold aborted rows past
-/// the grace: each leaf costs at least one probe of its partial index, so a pass whose
-/// budget runs out before the newest leaves must not start from the oldest again.
-pub static ABORTED_ROTATION: Rotation = Rotation::new();
+/// the grace, keyed by [`leaf_key`]: each leaf costs at least one probe of its partial
+/// index, so a pass whose budget runs out before the newest leaves must not start from
+/// the oldest again.
+pub static ABORTED_ROTATION: KeyCursor<i64> = KeyCursor::new();
 
-/// Where a pass over `items` starts, given a rotation cursor.
-pub fn probe_start(cursor: usize, items: usize) -> usize {
-    if items == 0 {
-        return 0;
-    }
-    cursor % items
-}
+/// Rotation of the row-level expiry over its work items, keyed by (topic id,
+/// [`leaf_key`]).
+pub static EXPIRY_ROTATION: KeyCursor<(i32, i64)> = KeyCursor::new();
 
 /// Whether a past leaf needs the full contents probe: only a leaf where some topic
 /// can be wholly expired (`upper + shortest finite window <= now`) can be dropped
@@ -419,36 +461,98 @@ mod tests {
     }
 
     #[test]
-    fn rotation_covers_every_item() {
-        assert_eq!(probe_start(7, 0), 0);
-        assert_eq!(probe_start(7, 5), 2);
-        // Passes that each finish only one item (the budget spent elsewhere), on a list
+    fn start_after_finds_the_next_key_and_wraps() {
+        let keys = [10, 20, 30];
+        assert_eq!(start_after(&keys, None), 0);
+        assert_eq!(start_after(&keys, Some(&5)), 0);
+        assert_eq!(start_after(&keys, Some(&10)), 1);
+        assert_eq!(start_after(&keys, Some(&25)), 2);
+        assert_eq!(start_after(&keys, Some(&30)), 0);
+        assert_eq!(start_after::<i32>(&[], Some(&1)), 0);
+    }
+
+    #[test]
+    fn key_cursor_covers_every_item() {
+        // Passes that each serve only one item (the budget spent elsewhere), on a list
         // shorter than the probe cap and on one longer than it: every item is reached.
-        for n in [3, MAX_CONTENTS_PROBES_PER_PASS * 2] {
-            let rotation = Rotation::new();
-            let mut seen = vec![false; n];
+        for n in [3_i64, 2 * 64] {
+            let keys: Vec<i64> = (0..n).map(|k| k * 100).collect();
+            let cursor = KeyCursor::new();
+            let mut seen = vec![false; keys.len()];
             for _ in 0..n {
-                let start = rotation.start(n);
-                assert!(start < n);
+                let start = cursor.start(&keys);
                 seen[start] = true;
-                rotation.record(start, 1);
+                cursor.record(Some(keys[start]));
             }
             assert!(seen.iter().all(|&s| s), "{n} items: {seen:?}");
         }
-        // A pass that finished nothing (cut short inside its first item) resumes there.
-        let rotation = Rotation::new();
-        rotation.record(rotation.start(4), 2);
-        let start = rotation.start(4);
-        rotation.record(start, 0);
-        assert_eq!(rotation.start(4), 2);
-        // A full pass of the cap moves the next one past every item it finished.
-        let n = MAX_CONTENTS_PROBES_PER_PASS + 5;
-        let start = rotation.start(n);
-        rotation.record(start, MAX_CONTENTS_PROBES_PER_PASS);
-        assert_eq!(
-            rotation.start(n),
-            (start + MAX_CONTENTS_PROBES_PER_PASS) % n
-        );
+        // A pass that served nothing leaves the cursor where it was.
+        let cursor = KeyCursor::new();
+        cursor.record(Some(20));
+        cursor.record(None);
+        assert_eq!(cursor.start(&[10, 20, 30]), 2);
+    }
+
+    #[test]
+    fn key_cursor_ignores_items_that_disappear_or_appear() {
+        let cursor = KeyCursor::new();
+        cursor.record(Some(30));
+        // Leaves before the cursor dropped: a positional cursor (3) would skip 40.
+        assert_eq!(cursor.start(&[30, 40, 50]), 1);
+        // The served leaf itself gone, a new one before it: still the next key.
+        assert_eq!(cursor.start(&[5, 40, 50]), 1);
+        // Everything after the cursor gone: wrap to the first.
+        assert_eq!(cursor.start(&[5, 10]), 0);
+    }
+
+    #[test]
+    fn key_cursor_rotates_pairs_by_topic_then_leaf() {
+        let keys = [(1, 100), (1, i64::MAX), (2, 100), (2, i64::MAX)];
+        let cursor = KeyCursor::new();
+        cursor.record(Some((1, i64::MAX)));
+        assert_eq!(cursor.start(&keys), 2);
+        cursor.record(Some((2, i64::MAX)));
+        assert_eq!(cursor.start(&keys), 0);
+        cursor.set(None);
+        assert_eq!(cursor.get(), None);
+        assert_eq!(cursor.start(&keys), 0);
+    }
+
+    #[test]
+    fn leaf_keys_put_the_default_leaf_last() {
+        assert_eq!(leaf_key(&leaf(1, None, None, true)), i64::MAX);
+        assert_eq!(leaf_key(&leaf(2, None, Some(100), false)), 100);
+        assert_eq!(leaf_key(&leaf(3, Some(100), Some(200), false)), 200);
+    }
+
+    #[test]
+    fn capped_steps_stop_at_their_share() {
+        let budget = Duration::from_millis(1500);
+        let share = budget / STEP_SHARE_DIVISOR;
+        // The first statement always runs.
+        assert!(share_may_continue(0, budget, budget * 2, budget));
+        assert!(share_may_continue(
+            3,
+            Duration::from_millis(499),
+            share,
+            budget
+        ));
+        assert!(!share_may_continue(3, share, share, budget));
+        // Within the share but the pass is over budget.
+        assert!(!share_may_continue(3, Duration::ZERO, budget, budget));
+        // Budget 0: one statement per step.
+        assert!(share_may_continue(
+            0,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+        assert!(!share_may_continue(
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
     }
 
     #[test]
@@ -465,14 +569,6 @@ mod tests {
         assert_eq!(rotated(&v, 1), vec![2, 3, 4, 1]);
         assert_eq!(rotated(&v, 5), vec![2, 3, 4, 1]);
         assert_eq!(rotated::<i32>(&[], 3), Vec::<i32>::new());
-    }
-
-    #[test]
-    fn start_index_stays_in_range() {
-        assert_eq!(next_start_index(0), 0);
-        for _ in 0..10 {
-            assert!(next_start_index(3) < 3);
-        }
     }
 
     fn leaf(oid: u32, lower: Option<i64>, upper: Option<i64>, is_default: bool) -> TimePartition {

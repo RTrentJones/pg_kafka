@@ -1,5 +1,6 @@
 //! Retention-sweep passes that run out of budget: what such passes still reach, and
-//! that a pass stays within its budget when its leaf drops are blocked.
+//! that a pass stays within its budget when its leaf drops are blocked or a step has a
+//! large backlog.
 
 use crate::common::{create_producer, TestResult};
 use crate::setup::SystemGucGuard;
@@ -415,5 +416,193 @@ async fn aborted_rotation() -> SendResult<()> {
     .map_err(boxed)?;
     result?;
     println!("✅ the aborted-row cleanup reached every leaf");
+    Ok(())
+}
+
+/// Rows of `topic_id` whose created_at is `age` before now, in the leaf that holds now
+/// (not the DEFAULT leaf); `first_offset` onwards.
+async fn fill_current_leaf(
+    db: &Client,
+    topic_id: i32,
+    first_offset: i64,
+    rows: i64,
+    age: &str,
+    txn_state: Option<&str>,
+) -> SendResult<()> {
+    db.execute(
+        "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                     created_at, txn_state)
+         SELECT $1, 0, $2::bigint + g, 'v'::bytea, now() - $4::text::interval, $5::text
+         FROM generate_series(0::bigint, $3::bigint - 1) AS g",
+        &[&topic_id, &first_offset, &rows, &age, &txn_state],
+    )
+    .await
+    .map_err(boxed)?;
+    let in_default: bool = db
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM kafka.messages_default WHERE topic_id = $1)",
+            &[&topic_id],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    if in_default {
+        return Err("the rows landed in the DEFAULT leaf: no leaf holds now()".into());
+    }
+    Ok(())
+}
+
+async fn topic_rows(db: &Client, topic_id: i32) -> SendResult<i64> {
+    Ok(db
+        .query_one(
+            "SELECT count(*) FROM kafka.messages WHERE topic_id = $1",
+            &[&topic_id],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Row expiry keeps a cursor over its (topic, leaf) work items, so a pass with no budget
+/// left for it still moves on. Each topic's items begin with the DEFAULT leaf, which is
+/// always in scope; when every pass started from the first item, a pass whose budget an
+/// earlier step had spent ran only that DEFAULT delete (usually of nothing), and a
+/// short-window topic's rows in the current leaf were never expired.
+///
+/// Asserts: with the pass budget at 0 and committed rows of two 1 s retention topics in
+/// the current leaf (so the first topic's items come before the second's), repeated
+/// sweeps expire both within one rotation over the work items (topics with a finite
+/// window times leaves, plus two).
+pub async fn test_sweep_expiry_reaches_the_current_leaf_on_a_spent_budget() -> TestResult {
+    into_test_result(expiry_rotation().await)
+}
+
+async fn expiry_rotation() -> SendResult<()> {
+    println!("=== Test: row expiry reaches the current leaf on a spent budget ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let first = create_topic(&db, &unique("expiry-rot-a"), 1000).await?;
+    let topic = create_topic(&db, &unique("expiry-rot-b"), 1000).await?;
+    fill_current_leaf(&db, first, 0, 20, "5 seconds", None).await?;
+    fill_current_leaf(&db, topic, 0, 20, "5 seconds", None).await?;
+    println!("Step 0: 20 rows each of two 1 s retention topics in the current leaf");
+
+    let budget = pass_budget(&db, "0").await?;
+    let result: SendResult<()> = async {
+        let items: i64 = db
+            .query_one(
+                "SELECT (SELECT count(*) FROM kafka.topics WHERE retention_ms >= 0)
+                        * (SELECT count(*) FROM kafka.message_partitions())",
+                &[],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        let passes = items + 2;
+        for pass in 1..=passes {
+            db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            if topic_rows(&db, first).await? + topic_rows(&db, topic).await? == 0 {
+                println!("Step 1: expired after {pass} sweep(s) ({items} work items)");
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "{} + {} rows still there after {passes} sweeps over {items} work items",
+            topic_rows(&db, first).await?,
+            topic_rows(&db, topic).await?
+        )
+        .into())
+    }
+    .await;
+    drop(budget);
+    db.execute(
+        "DELETE FROM kafka.topics WHERE id = ANY($1)",
+        &[&vec![first, topic]],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    println!("✅ the current leaf's expired rows were reached");
+    Ok(())
+}
+
+/// Aborted rows a pass deletes before the expiry: 80 full batches, more than the whole
+/// pass budget clears.
+const ABORTED_BACKLOG: i64 = 800_000;
+
+/// A backlog in one step cannot take the whole pass: the aborted-row cleanup (and the
+/// contents probes) get at most a third of the budget each, so row expiry, which runs
+/// after them, keeps a share. Without the cap a client that aborts enough transactions
+/// left row expiry its one mandatory statement per pass.
+///
+/// Asserts: with 800,000 aborted rows due (grace 0) and committed rows of a 1 s
+/// retention topic in the current leaf, the first sweep at the default budget expires
+/// them.
+pub async fn test_sweep_expiry_keeps_its_share_behind_an_aborted_backlog() -> TestResult {
+    into_test_result(expiry_share().await)
+}
+
+async fn expiry_share() -> SendResult<()> {
+    println!("=== Test: row expiry keeps its share of a pass behind an aborted backlog ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '120s'")
+        .await
+        .map_err(boxed)?;
+    let aborted = create_topic(&db, &unique("share-aborted"), -1).await?;
+    let short = create_topic(&db, &unique("share-short"), 1000).await?;
+    let result: SendResult<()> = async {
+        // 10 s old: past this sweep's grace (0), within the worker's (60 s).
+        fill_current_leaf(
+            &db,
+            aborted,
+            0,
+            ABORTED_BACKLOG,
+            "10 seconds",
+            Some("aborted"),
+        )
+        .await?;
+        fill_current_leaf(&db, short, 0, 20, "5 seconds", None).await?;
+        println!("Step 0: {ABORTED_BACKLOG} aborted rows due, 20 expired rows of a 1 s topic");
+        let t = Instant::now();
+        let rows = db
+            .query(
+                "SELECT category, deleted FROM pg_kafka_run_retention_sweep(0, 0)",
+                &[],
+            )
+            .await
+            .map_err(boxed)?;
+        let took = t.elapsed();
+        let stat = |name: &str| {
+            rows.iter()
+                .find(|r| r.get::<_, String>(0) == name)
+                .map_or(0, |r| r.get::<_, i64>(1))
+        };
+        let left = topic_rows(&db, short).await?;
+        println!(
+            "Step 1: one sweep in {took:?}: {} aborted, {} expired; {left} of the 20 left",
+            stat("aborted_messages"),
+            stat("expired_messages")
+        );
+        if stat("aborted_messages") >= ABORTED_BACKLOG {
+            return Err("the pass cleared the whole backlog: it does not test the cap".into());
+        }
+        if left != 0 {
+            return Err(format!("{left} expired rows left after the first sweep").into());
+        }
+        Ok(())
+    }
+    .await;
+    db.execute(
+        "DELETE FROM kafka.topics WHERE id = ANY($1)",
+        &[&vec![aborted, short]],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    println!("✅ row expiry ran behind the aborted backlog");
     Ok(())
 }

@@ -415,7 +415,9 @@ the primary key below each partition's log start, and a past leaf gets the full 
 probe (one descent per (topic, partition)) only where some topic's window can have expired it
 (at most 64 per pass); other past leaves get one emptiness check. Every step runs bounded
 statements (10,000 rows, one leaf) and stops once the pass has used 1.5 s, after at least one
-statement, so a backlog drains over several passes. Measured on PG16 (3,000,000 committed rows
+statement (the aborted-row cleanup and the contents probes, which run before row expiry, at a
+third of that each), so a backlog drains over several passes, each step resuming where the last
+pass left it. Measured on PG16 (3,000,000 committed rows
 in one 521 MB leaf, 500,000 recent delivered outbox rows, retention off):
 
 | | before | after |
