@@ -11,7 +11,8 @@
 #   4. fails unless B reports the current version, kept its data, and its kafka
 #      schema (columns, indexes, CHECK/foreign-key constraints, table/column/schema/function
 #      ACLs, function bodies, views, comments, roles, the partitioning of kafka.messages) is
-#      identical to A's;
+#      identical to A's (function arguments with their defaults, strictness and owner;
+#      relation storage parameters, persistence and owner; sequence parameters);
 #   5. checks the time partitions work on both (ADR-001): maintenance creates leaves,
 #      the converted 0.0.0 leaf drops whole, and pg_dump emits no kafka table (pg_dump
 #      must be present: PG_DUMP names it when it is not in `pg_config --bindir`).
@@ -92,6 +93,32 @@ SELECT DISTINCT 'leaf-index ' || regexp_replace(regexp_replace(indexdef,
            '\s+', ' ', 'g')
 FROM pg_indexes WHERE schemaname = 'kafka' AND tablename IN (SELECT relname FROM leaves)
 ORDER BY 1;
+-- Storage parameters, persistence (UNLOGGED/TEMP) and owner of every relation (tables,
+-- indexes, sequences, views) outside the leaves, and of the leaves normalized.
+SELECT 'relation ' || c.relname || ' kind=' || c.relkind::text
+       || ' persistence=' || c.relpersistence::text || ' owner=' || pg_get_userbyid(c.relowner)
+       || ' options=' || coalesce(array_to_string(c.reloptions, ','), '')
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'kafka' AND c.oid NOT IN (SELECT oid FROM leaves)
+  AND NOT EXISTS (SELECT 1 FROM pg_index x WHERE x.indexrelid = c.oid
+                  AND x.indrelid IN (SELECT oid FROM leaves))
+ORDER BY 1;
+SELECT DISTINCT 'leaf-relation kind=' || c.relkind::text
+       || ' persistence=' || c.relpersistence::text || ' owner=' || pg_get_userbyid(c.relowner)
+       || ' options=' || coalesce(array_to_string(c.reloptions, ','), '')
+FROM pg_class c
+WHERE c.oid IN (SELECT oid FROM leaves)
+   OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid IN (SELECT oid FROM leaves))
+ORDER BY 1;
+-- Sequence parameters (the producer-id sequence's start is time-based, checked below).
+SELECT 'sequence ' || c.relname || ' ' || format_type(s.seqtypid, NULL)
+       || ' start=' || CASE WHEN c.relname = 'producer_ids_producer_id_seq' THEN '<time>'
+                            ELSE s.seqstart::text END
+       || ' increment=' || s.seqincrement || ' min=' || s.seqmin || ' max=' || s.seqmax
+       || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'kafka' ORDER BY 1;
 SELECT 'acl ' || c.relname || ' ' || a.acl
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN LATERAL (SELECT unnest(coalesce(c.relacl, '{}'))::text AS acl) a
@@ -118,6 +145,9 @@ WHERE n.nspname = 'kafka' ORDER BY 1;
 SELECT 'function ' || p.oid::regprocedure::text || ' ' || coalesce(p.proacl::text, 'default')
        || ' secdef=' || p.prosecdef || ' ' || coalesce(array_to_string(p.proconfig, ','), '')
        || ' returns ' || pg_get_function_result(p.oid) || ' ' || p.provolatile::text
+       || ' args=(' || pg_get_function_arguments(p.oid) || ')'
+       || ' strict=' || p.proisstrict || ' parallel=' || p.proparallel::text
+       || ' owner=' || pg_get_userbyid(p.proowner)
        || ' src=' || md5(p.prosrc)
 FROM pg_proc p JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_kafka'
