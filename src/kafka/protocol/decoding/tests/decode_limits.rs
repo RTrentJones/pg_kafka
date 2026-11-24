@@ -7,7 +7,7 @@ use bytes::{BufMut, BytesMut};
 use super::super::*;
 use crate::kafka::api::{RequestBody, APIS};
 use crate::kafka::protocol::decode_budget::{
-    DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES, MAX_REQUEST_DECODE_BYTES,
+    DecodePool, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES, MAX_REQUEST_DECODE_BYTES,
 };
 use crate::testing::heap_peak;
 
@@ -309,9 +309,7 @@ fn test_decode_request_decodes_large_requests_under_a_slot_and_charges_them() {
 
 #[test]
 fn test_large_decoded_requests_leave_room_for_small_ones() {
-    use crate::kafka::protocol::decode_budget::{
-        DecodePool, CONTROL_RESERVE_BYTES, SMALL_REQUEST_BYTES,
-    };
+    use crate::kafka::protocol::decode_budget::{CONTROL_RESERVE_BYTES, SMALL_REQUEST_BYTES};
     static POOL: DecodePool = DecodePool::new(100 << 20);
     let big = 100 * 1024 * 1024 - CONTROL_RESERVE_BYTES;
     let held = POOL.charge_request(big).expect("fits leaving the reserve");
@@ -335,7 +333,6 @@ fn test_large_decoded_requests_leave_room_for_small_ones() {
 
 #[test]
 fn test_a_decoded_request_waits_for_room_and_decodes_again() {
-    use crate::kafka::protocol::decode_budget::DecodePool;
     use std::time::Duration;
     static POOL: DecodePool = DecodePool::new(1 << 20);
     static ROOMY: DecodePool = DecodePool::new(64 << 20);
@@ -345,11 +342,14 @@ fn test_a_decoded_request_waits_for_room_and_decodes_again() {
         let frame = metadata_of_names(1500, 20);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let started = std::time::Instant::now();
-        assert!(
-            decode_request_in(frame.clone(), tx, &POOL, Duration::from_millis(100))
-                .await
-                .is_err()
-        );
+        assert!(decode_request_in(
+            frame.clone(),
+            tx,
+            &budgets(&POOL),
+            Duration::from_millis(100)
+        )
+        .await
+        .is_err());
         assert!(started.elapsed() >= Duration::from_millis(100), "it waited");
         assert_eq!(POOL.remaining(), 1 << 20, "a refused request holds nothing");
 
@@ -360,7 +360,7 @@ fn test_a_decoded_request_waits_for_room_and_decodes_again() {
             drop(filler);
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let request = decode_request_in(frame, tx, &ROOMY, Duration::from_secs(10))
+        let request = decode_request_in(frame, tx, &budgets(&ROOMY), Duration::from_secs(10))
             .await
             .unwrap()
             .unwrap();
@@ -373,5 +373,89 @@ fn test_a_decoded_request_waits_for_room_and_decodes_again() {
         assert!(ROOMY.remaining() < held);
         drop(request);
         assert_eq!(ROOMY.remaining(), held);
+    });
+}
+
+/// The network thread's slots and frame budget, with `requests` for the decoded requests.
+fn budgets(requests: &'static DecodePool) -> Budgets {
+    Budgets {
+        requests,
+        ..GLOBAL_BUDGETS
+    }
+}
+
+#[test]
+fn test_a_frame_waiting_to_decode_is_charged_to_the_frame_budget() {
+    use crate::kafka::protocol::decode_budget::LargeDecodes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    // No slot ever comes free, and a pool too small for the request.
+    static NO_SLOTS: LargeDecodes = LargeDecodes::new(0);
+    static SMALL: DecodePool = DecodePool::new(1 << 20);
+    static FRAMES: AtomicUsize = AtomicUsize::new(64 << 20);
+    static TINY_FRAMES: AtomicUsize = AtomicUsize::new(1 << 20);
+    // A 1.3 MB frame (over the unmetered frame size) that decodes to more than the inline
+    // limit, so it needs a large-decode slot.
+    let frame = metadata_of_names(60_000, 20);
+    let len = frame.len();
+    assert!(len > crate::kafka::protocol::framing::UNMETERED_FRAME_BYTES);
+    runtime().block_on(async {
+        // Waiting for a slot: the frame is charged while it waits, and given back after.
+        let waiting = Budgets {
+            requests: &DECODED_REQUESTS,
+            slots: &NO_SLOTS,
+            frames: &FRAMES,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let decode = decode_request_in(frame.clone(), tx, &waiting, Duration::from_millis(300));
+        tokio::pin!(decode);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut decode)
+                .await
+                .is_err(),
+            "it waits for a slot"
+        );
+        assert_eq!(FRAMES.load(Ordering::Relaxed), (64 << 20) - len);
+        assert!(decode.await.is_err(), "no slot came free in time");
+        assert_eq!(FRAMES.load(Ordering::Relaxed), 64 << 20);
+
+        // Waiting for room in the decoded-request budget: charged while it waits.
+        let waiting = Budgets {
+            requests: &SMALL,
+            frames: &FRAMES,
+            ..GLOBAL_BUDGETS
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let decode = decode_request_in(frame.clone(), tx, &waiting, Duration::from_millis(500));
+        tokio::pin!(decode);
+        let mut charged = false;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(400) {
+            if tokio::time::timeout(Duration::from_millis(20), &mut decode)
+                .await
+                .is_ok()
+            {
+                panic!("the request cannot fit the small pool");
+            }
+            charged |= FRAMES.load(Ordering::Relaxed) == (64 << 20) - len;
+        }
+        assert!(charged, "the frame is charged while it waits for room");
+        assert!(decode.await.is_err());
+        assert_eq!(FRAMES.load(Ordering::Relaxed), 64 << 20);
+        assert_eq!(SMALL.remaining(), 1 << 20);
+
+        // A frame budget that cannot take the frame: the connection closes at once.
+        let full = Budgets {
+            slots: &NO_SLOTS,
+            frames: &TINY_FRAMES,
+            ..GLOBAL_BUDGETS
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        assert!(decode_request_in(frame, tx, &full, Duration::from_secs(10))
+            .await
+            .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1), "closed at once");
+        assert_eq!(TINY_FRAMES.load(Ordering::Relaxed), 1 << 20);
     });
 }

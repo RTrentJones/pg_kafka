@@ -153,7 +153,7 @@ pub async fn test_clients_that_stop_reading_do_not_lock_out_others() -> TestResu
 /// nothing sees no FIN even after the broker closed the connection (the FIN queues behind
 /// the unsent data), and reading would change what it tests; the broker's end shows the
 /// close.
-fn broker_side_state(client: SocketAddr) -> DynResult<Option<u8>> {
+pub(super) fn broker_side_state(client: SocketAddr) -> DynResult<Option<u8>> {
     let SocketAddr::V4(client) = client else {
         return Err("an IPv4 client address".into());
     };
@@ -171,7 +171,7 @@ fn broker_side_state(client: SocketAddr) -> DynResult<Option<u8>> {
 }
 
 /// TCP_ESTABLISHED in `/proc/net/tcp`.
-const ESTABLISHED: u8 = 1;
+pub(super) const ESTABLISHED: u8 = 1;
 
 /// A connection that sends four requests answered with some 3 MB each and reads nothing:
 /// the broker's writer stalls on the first response. With

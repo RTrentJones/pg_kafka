@@ -59,12 +59,19 @@
 //! A request that finds every slot taken, or the process-wide budget exhausted, waits for
 //! one without holding a thread ([`LargeDecodes::run`], [`DecodePool::wait_for`]), as Kafka
 //! holds a request it has no memory for (`queued.max.request.bytes`) instead of failing it.
-//! The wait is bounded ([`decode_wait`]); past it the request is answered
-//! REQUEST_TIMED_OUT, which clients retry. Slots are granted in arrival order, and a
+//! The wait is bounded: past [`decode_wait`] a Produce is answered REQUEST_TIMED_OUT, which
+//! clients retry, and past [`MAX_DECODE_WAIT`] any other request closes its connection (it
+//! has no records to refuse, and an unanswered request makes the client reconnect). Slots are granted in arrival order, and a
 //! connection waits for at most one at a time (its read loop waits with it), so one
 //! connection cannot take more than its turn. While it waits, a request's frame is charged
 //! to the frame budget as an incomplete frame is ([`HeldFrame`]), so the raw bytes waiting
-//! stay bounded as the bytes still arriving are.
+//! stay bounded as the bytes still arriving are: a request waiting for a slot or for room in
+//! [`DECODED_REQUESTS`] (`super::decode_request`), and a Produce whose records wait to
+//! decode. A frame the budget cannot take is refused at once, since waiting would hold it
+//! uncounted: a Produce's records are answered REQUEST_TIMED_OUT, any other request closes
+//! the connection, as the frame codec closes one whose arriving frame it cannot take. A
+//! decode running in a slot holds no charge for its frame (at most [`LARGE_DECODE_SLOTS`]
+//! frames).
 //!
 //! Runs on the network thread, so it logs through `tracing`, never pgrx.
 
@@ -612,7 +619,8 @@ impl HeldFrame {
         Self::charge_to(bytes, &FRAME_RESERVE_REMAINING)
     }
 
-    fn charge_to(bytes: usize, budget: &'static AtomicUsize) -> Option<Self> {
+    /// [`Self::charge`] to `budget` (tests use their own).
+    pub(super) fn charge_to(bytes: usize, budget: &'static AtomicUsize) -> Option<Self> {
         let bytes = if bytes > UNMETERED_FRAME_BYTES {
             bytes
         } else {

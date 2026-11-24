@@ -872,8 +872,10 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
   at most two at a time; a request that finds no
   room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
-  frame counts against the frame budget while it waits, as an incomplete frame does (one the
-  exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).
+  frame counts against the frame budget while it waits (for a large-decode slot, or for room
+  in either budget), as an incomplete frame does; one the exhausted budget cannot take is
+  refused at once: a Produce is answered REQUEST_TIMED_OUT, any other request closes the
+  connection.
 
 ## Compatibility Testing
 
