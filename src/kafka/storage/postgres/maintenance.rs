@@ -539,8 +539,12 @@ fn delete_target(leaf: &Leaf, partitioned: bool) -> DeleteTarget<'_> {
 /// start after the cutoff cannot hold any), in [`RETENTION_DELETE_BATCH`] batches
 /// within the pass budget. Each batch is confined to one leaf and found through that
 /// leaf's partial index idx_messages_txn_aborted, so the cost follows the aborted rows,
-/// not the leaf's size: a leaf without any costs one probe of an empty index. Aborted
-/// rows are invisible to every reader, so their removal moves no log start.
+/// not the leaf's size: a leaf without any costs one probe of an empty index. A pass
+/// whose budget runs out leaves the rest for the next ones, which start at the first
+/// leaf it did not finish ([`retention::ABORTED_ROTATION`]): starting from the oldest
+/// every time, passes on many retained leaves (or with the budget spent by earlier
+/// steps) would never reach the newest. Aborted rows are invisible to every reader, so
+/// their removal moves no log start.
 fn delete_aborted_rows(
     client: &mut SpiClient<'_>,
     leaves: &[Leaf],
@@ -553,29 +557,35 @@ fn delete_aborted_rows(
         .unwrap_or(i64::MAX)
         .min(MAX_RETENTION_WINDOW_MS);
     let filter = BatchFilter::Aborted { grace_ms };
+    let eligible: Vec<&Leaf> = leaves
+        .iter()
+        .filter(|l| retention::may_hold_expired(&l.partition, now_ms, grace_ms))
+        .collect();
+    let start = retention::ABORTED_ROTATION.start(eligible.len());
     let mut statements = 0usize;
+    let mut finished = 0usize;
     let mut deleted = 0u64;
-    for leaf in leaves {
-        if !retention::may_hold_expired(&leaf.partition, now_ms, grace_ms) {
-            continue;
-        }
+    'leaves: for leaf in retention::rotated(&eligible, start) {
         loop {
             if !retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
-                return Ok(deleted);
+                break 'leaves;
             }
             let n = delete_batch(client, filter, delete_target(leaf, partitioned), None)?;
             statements += 1;
             deleted += n;
+            // A short batch: this leaf is caught up.
             if !retention::should_run_another_batch(
                 n,
                 RETENTION_DELETE_BATCH,
                 Duration::ZERO,
-                pass_budget(),
+                Duration::MAX,
             ) {
                 break;
             }
         }
+        finished += 1;
     }
+    retention::ABORTED_ROTATION.record(start, finished);
     crate::pg_debug!("Deleted {deleted} aborted messages");
     Ok(deleted)
 }
@@ -655,7 +665,7 @@ fn plan_expiry(
             plan.drops.push((oid, Vec::new()));
         }
     }
-    let probe_start = retention::next_probe_start(probe.len());
+    let probe_start = retention::PROBE_ROTATION.start(probe.len());
     let mut probes = 0usize;
     for leaf in retention::rotated(&probe, probe_start) {
         if probes >= MAX_CONTENTS_PROBES_PER_PASS
@@ -695,7 +705,7 @@ fn plan_expiry(
             LeafAction::Keep => {}
         }
     }
-    retention::record_probes(probe_start, probes);
+    retention::PROBE_ROTATION.record(probe_start, probes);
     for &(topic_id, window_ms) in &windows.finite {
         for leaf in &partitions {
             if plan.drops.iter().any(|(oid, _)| *oid == leaf.oid) {

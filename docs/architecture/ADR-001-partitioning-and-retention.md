@@ -87,7 +87,9 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
 
 0. Aborted transactional rows past the grace (60 s) are deleted first, leaf by leaf, through
    the partial index `idx_messages_txn_aborted` (created_at) WHERE txn_state = 'aborted' (every
-   leaf has it: it is a partitioned index), in 10,000-row batches.
+   leaf has it: it is a partitioned index), in 10,000-row batches. Each leaf costs at least one
+   probe of that index, so a pass that runs out of budget part way leaves the rest to the next
+   passes, which start at the first leaf it did not finish (not at the oldest again).
 1. For every past leaf (upper bound <= now) where some topic can be wholly expired (upper bound
    + the shortest finite window <= now) it asks `kafka.message_partition_contents(leaf)` for
    the (topic, partition) pairs present (a loose index scan, one descent per pair) and whether a

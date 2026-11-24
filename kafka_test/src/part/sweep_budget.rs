@@ -295,3 +295,101 @@ async fn dropped_partitions(db: &Client) -> SendResult<i64> {
         .map(|r| r.get::<_, i64>(1))
         .ok_or_else(|| "missing dropped_partitions".into())
 }
+
+/// The aborted-row cleanup rotates over the leaves too. Each leaf it visits costs at
+/// least one probe of its partial index, so a pass whose budget runs out (many retained
+/// leaves, or earlier steps that spent it) stops part way; starting from the oldest
+/// leaf (DEFAULT first) every pass, the aborted rows of newer leaves were never
+/// deleted, and with infinite retention nothing else removes them.
+///
+/// Asserts: with the pass budget at 0 and aborted rows in a past leaf that is kept
+/// (it also holds a committed row of an infinite-retention topic), repeated sweeps
+/// delete every aborted row within two rotations over the leaves and keep the
+/// committed row.
+pub async fn test_sweep_aborted_cleanup_reaches_every_leaf() -> TestResult {
+    into_test_result(aborted_rotation().await)
+}
+
+async fn aborted_rotation() -> SendResult<()> {
+    println!("=== Test: the aborted-row cleanup rotates over every leaf on a spent budget ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let forever = create_topic(&db, &unique("abort-forever"), -1).await?;
+    let hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let leaf = hour_leaf(&db, hour).await?;
+    fill_leaf(&db, forever, hour, 0, 1).await?;
+    db.execute(
+        "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                     created_at, txn_state)
+         SELECT $1, 0, 1 + g, 'v'::bytea,
+                timestamptz '2000-01-01 00:00+00' + $2::int * INTERVAL '1 hour'
+                    + (1 + g) * INTERVAL '1 second',
+                'aborted'
+         FROM generate_series(0::bigint, 19) AS g",
+        &[&forever, &hour],
+    )
+    .await
+    .map_err(boxed)?;
+    println!("Step 0: {leaf} holds 1 committed and 20 aborted rows");
+
+    if !set_guc(&db, PASS_BUDGET_GUC, Some("0")).await? {
+        return Err(format!("{PASS_BUDGET_GUC} is not known to the server").into());
+    }
+    let result: SendResult<()> = async {
+        let leaves: i64 = db
+            .query_one("SELECT count(*) FROM kafka.message_partitions()", &[])
+            .await
+            .map_err(boxed)?
+            .get(0);
+        let passes = 2 * leaves + 2;
+        let count = |state: &'static str| {
+            let db = &db;
+            let leaf = leaf.clone();
+            async move {
+                let sql = format!(
+                    "SELECT count(*) FROM {leaf} WHERE topic_id = $1 AND txn_state IS NOT DISTINCT FROM {state}"
+                );
+                db.query_one(&sql, &[&forever])
+                    .await
+                    .map(|r| r.get::<_, i64>(0))
+                    .map_err(boxed)
+            }
+        };
+        let mut cleaned_after = None;
+        for pass in 1..=passes {
+            db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            if count("'aborted'").await? == 0 {
+                cleaned_after = Some(pass);
+                break;
+            }
+        }
+        let Some(pass) = cleaned_after else {
+            return Err(format!(
+                "aborted rows still in {leaf} after {passes} sweeps over {leaves} leaves"
+            )
+            .into());
+        };
+        println!("Step 1: aborted rows of {leaf} deleted after {pass} sweep(s) ({leaves} leaves)");
+        assert_eq!(count("NULL").await?, 1, "the committed row must stay");
+        Ok(())
+    }
+    .await;
+    set_guc(&db, PASS_BUDGET_GUC, None).await?;
+    db.query(
+        "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int])",
+        &[&leaf, &forever],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    println!("✅ the aborted-row cleanup reached every leaf");
+    Ok(())
+}

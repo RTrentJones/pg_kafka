@@ -163,33 +163,52 @@ pub const PARTITIONS_AHEAD: i32 = 2;
 /// Upper bound on `kafka.message_partition_contents` probes per sweep pass (each costs
 /// one btree descent per (topic, partition) present in the leaf). Leaves kept past
 /// their window by a longer one stay candidates every pass, so the probes rotate
-/// over them ([`next_probe_start`]) instead of always starting from the oldest.
+/// over them ([`PROBE_ROTATION`]) instead of always starting from the oldest.
 pub const MAX_CONTENTS_PROBES_PER_PASS: usize = 64;
 
-/// Rotation cursor for the contents probes: the candidate index after the last one
-/// probed (see [`next_probe_start`]).
-static PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+/// A rotation over a list that a budget-limited sweep step walks: each pass starts at
+/// the first item the previous pass did not finish, whatever the list size, so a pass
+/// cut short (by a cap, or by the pass budget another step may have spent) does not
+/// walk the same leading items again, and consecutive passes cover every item.
+pub struct Rotation(AtomicUsize);
 
-/// Where a pass with `candidates` probe candidates starts, given the rotation cursor.
-pub fn probe_start(cursor: usize, candidates: usize) -> usize {
-    if candidates == 0 {
+impl Rotation {
+    pub const fn new() -> Self {
+        Rotation(AtomicUsize::new(0))
+    }
+
+    /// The index to start this pass from in a list of `items`.
+    pub fn start(&self, items: usize) -> usize {
+        probe_start(self.0.load(Ordering::Relaxed), items)
+    }
+
+    /// The pass that started at `start` finished `done` items: the next starts after them.
+    pub fn record(&self, start: usize, done: usize) {
+        self.0.store(start.wrapping_add(done), Ordering::Relaxed);
+    }
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Rotation::new()
+    }
+}
+
+/// Rotation of the contents probes over their candidates (see
+/// [`MAX_CONTENTS_PROBES_PER_PASS`]); a pass records the probes it made.
+pub static PROBE_ROTATION: Rotation = Rotation::new();
+
+/// Rotation of the aborted-row cleanup over the leaves that may hold aborted rows past
+/// the grace: each leaf costs at least one probe of its partial index, so a pass whose
+/// budget runs out before the newest leaves must not start from the oldest again.
+pub static ABORTED_ROTATION: Rotation = Rotation::new();
+
+/// Where a pass over `items` starts, given a rotation cursor.
+pub fn probe_start(cursor: usize, items: usize) -> usize {
+    if items == 0 {
         return 0;
     }
-    cursor % candidates
-}
-
-/// The index to start this pass's contents probes from. The pass reports the probes
-/// it made with [`record_probes`], so the next pass starts at the first candidate this
-/// one did not reach, whatever the list size: a pass cut short by the cap or by the
-/// pass budget (another step may have spent it) does not probe the same leaves again,
-/// and consecutive passes cover every candidate.
-pub fn next_probe_start(candidates: usize) -> usize {
-    probe_start(PROBE_CURSOR.load(Ordering::Relaxed), candidates)
-}
-
-/// Advance the rotation cursor past the `probes` made from `start`.
-pub fn record_probes(start: usize, probes: usize) {
-    PROBE_CURSOR.store(start.wrapping_add(probes), Ordering::Relaxed);
+    cursor % items
 }
 
 /// Whether a past leaf needs the full contents probe: only a leaf where some topic
@@ -400,27 +419,34 @@ mod tests {
     }
 
     #[test]
-    fn probe_rotation_covers_every_candidate() {
+    fn rotation_covers_every_item() {
         assert_eq!(probe_start(7, 0), 0);
         assert_eq!(probe_start(7, 5), 2);
-        // Passes that each make only one probe (the budget spent elsewhere), on a list
-        // shorter than the cap and on one longer than it: every candidate is reached.
+        // Passes that each finish only one item (the budget spent elsewhere), on a list
+        // shorter than the probe cap and on one longer than it: every item is reached.
         for n in [3, MAX_CONTENTS_PROBES_PER_PASS * 2] {
+            let rotation = Rotation::new();
             let mut seen = vec![false; n];
             for _ in 0..n {
-                let start = next_probe_start(n);
+                let start = rotation.start(n);
                 assert!(start < n);
                 seen[start] = true;
-                record_probes(start, 1);
+                rotation.record(start, 1);
             }
-            assert!(seen.iter().all(|&s| s), "{n} candidates: {seen:?}");
+            assert!(seen.iter().all(|&s| s), "{n} items: {seen:?}");
         }
-        // A full pass of the cap moves the next one past every leaf it probed.
+        // A pass that finished nothing (cut short inside its first item) resumes there.
+        let rotation = Rotation::new();
+        rotation.record(rotation.start(4), 2);
+        let start = rotation.start(4);
+        rotation.record(start, 0);
+        assert_eq!(rotation.start(4), 2);
+        // A full pass of the cap moves the next one past every item it finished.
         let n = MAX_CONTENTS_PROBES_PER_PASS + 5;
-        let start = next_probe_start(n);
-        record_probes(start, MAX_CONTENTS_PROBES_PER_PASS);
+        let start = rotation.start(n);
+        rotation.record(start, MAX_CONTENTS_PROBES_PER_PASS);
         assert_eq!(
-            next_probe_start(n),
+            rotation.start(n),
             (start + MAX_CONTENTS_PROBES_PER_PASS) % n
         );
     }
