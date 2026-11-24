@@ -27,7 +27,7 @@ const PRODUCE_ACK_CEILING: Duration = Duration::from_secs(5);
 /// one statement per pass).
 const PASS_BUDGET_GUC: &str = "pg_kafka.test_retention_pass_budget_ms";
 
-/// Set the pass budget for the life of the returned guard (reset on drop, also after a
+/// Set the pass budget until the returned guard is restored (or dropped: after a
 /// failed assert or a timeout).
 async fn pass_budget(db: &Client, ms: &str) -> SendResult<SystemGucGuard> {
     SystemGucGuard::set(db, PASS_BUDGET_GUC, ms)
@@ -187,7 +187,7 @@ async fn probe_rotation() -> SendResult<()> {
         Ok(())
     }
     .await;
-    drop(budget);
+    let restored = budget.restore().await;
     // The kept leaf holds only this test's topics: drop it as if both were expired.
     db.query(
         "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int, $3::int])",
@@ -196,6 +196,7 @@ async fn probe_rotation() -> SendResult<()> {
     .await
     .map_err(boxed)?;
     result?;
+    restored?;
     println!("✅ every probe candidate was reached");
     Ok(())
 }
@@ -407,7 +408,7 @@ async fn aborted_rotation() -> SendResult<()> {
         Ok(())
     }
     .await;
-    drop(budget);
+    let restored = budget.restore().await;
     db.query(
         "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int])",
         &[&leaf, &forever],
@@ -415,6 +416,7 @@ async fn aborted_rotation() -> SendResult<()> {
     .await
     .map_err(boxed)?;
     result?;
+    restored?;
     println!("✅ the aborted-row cleanup reached every leaf");
     Ok(())
 }
@@ -518,7 +520,7 @@ async fn expiry_rotation() -> SendResult<()> {
         .into())
     }
     .await;
-    drop(budget);
+    let restored = budget.restore().await;
     db.execute(
         "DELETE FROM kafka.topics WHERE id = ANY($1)",
         &[&vec![first, topic]],
@@ -526,6 +528,7 @@ async fn expiry_rotation() -> SendResult<()> {
     .await
     .map_err(boxed)?;
     result?;
+    restored?;
     println!("✅ the current leaf's expired rows were reached");
     Ok(())
 }
@@ -703,4 +706,87 @@ async fn producer_prune() -> SendResult<()> {
         }
     }
     Err(format!("seeded rows left after 60 sweeps: {:?}", left().await?).into())
+}
+
+/// The server's pass budget setting, and its `postgresql.auto.conf` entry if any.
+/// Read on a new session, which starts with the reloaded configuration.
+async fn budget_now() -> SendResult<(String, Option<String>)> {
+    let check = session().await?;
+    let setting: String = check
+        .query_one(
+            "SELECT setting FROM pg_settings WHERE name = $1",
+            &[&PASS_BUDGET_GUC],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let entry: Option<String> = check
+        .query_opt(
+            "SELECT setting FROM pg_file_settings
+             WHERE name = $1 AND sourcefile LIKE '%postgresql.auto.conf'
+             ORDER BY seqno DESC LIMIT 1",
+            &[&PASS_BUDGET_GUC],
+        )
+        .await
+        .map_err(boxed)?
+        .map(|r| r.get(0));
+    Ok((setting, entry))
+}
+
+/// The tests above rely on `SystemGucGuard` putting `ALTER SYSTEM` settings back: a
+/// pass budget left at 0 would change every later sweep of the run.
+///
+/// Asserts: a guard restored explicitly, and one dropped by a panicking task, leave the
+/// pass budget at its default with no `postgresql.auto.conf` entry; a guard over an
+/// earlier `ALTER SYSTEM` value (7) restores that value rather than resetting it.
+pub async fn test_system_guc_guard_restores_on_every_path() -> TestResult {
+    into_test_result(guard_paths().await)
+}
+
+async fn guard_paths() -> SendResult<()> {
+    println!("=== Test: SystemGucGuard restores the setting on every path ===\n");
+    let db = session().await?;
+    let (default, entry) = budget_now().await?;
+    if entry.is_some() {
+        return Err(
+            format!("{PASS_BUDGET_GUC} already has an ALTER SYSTEM entry {entry:?}").into(),
+        );
+    }
+
+    pass_budget(&db, "0").await?.restore().await?;
+    let after = budget_now().await?;
+    println!("Step 1: after restore(): {after:?}");
+    if after != (default.clone(), None) {
+        return Err(format!("restore() left {after:?}, expected ({default:?}, None)").into());
+    }
+
+    let guard = pass_budget(&db, "0").await?;
+    let panicked = tokio::spawn(async move {
+        let _guard = guard;
+        panic!("a failed assert with the guard held");
+    })
+    .await;
+    if panicked.is_ok() {
+        return Err("the task was expected to panic".into());
+    }
+    let after = budget_now().await?;
+    println!("Step 2: after a panic with the guard held: {after:?}");
+    if after != (default.clone(), None) {
+        return Err(format!("the drop left {after:?}, expected ({default:?}, None)").into());
+    }
+
+    let outer = pass_budget(&db, "7").await?;
+    pass_budget(&db, "0").await?.restore().await?;
+    let after = budget_now().await?;
+    println!("Step 3: a guard over an earlier value 7: {after:?}");
+    outer.restore().await?;
+    if after != ("7".to_string(), Some("7".to_string())) {
+        return Err(format!("the inner guard left {after:?}, expected 7").into());
+    }
+    let after = budget_now().await?;
+    if after != (default.clone(), None) {
+        return Err(format!("the outer guard left {after:?}, expected ({default:?}, None)").into());
+    }
+    println!("✅ every path restored the setting");
+    Ok(())
 }
