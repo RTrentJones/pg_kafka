@@ -32,8 +32,9 @@
 //! for every API including Produce's own structure) is metered as it allocates
 //! (`super::decode_meter`): at most [`INLINE_REQUEST_DECODE_BYTES`] on an I/O thread, then
 //! [`MAX_REQUEST_DECODE_BYTES`] under a large-decode slot, past which the connection closes.
-//! What the decoded request holds is charged to [`DECODED_REQUESTS`] and kept until its
-//! response is written (`super::decode_request`).
+//! What the decoded request holds is charged to [`DECODED_REQUESTS`] and kept with the
+//! request (`KafkaRequest::decode_charge`, `super::decode_request`) until it is dropped once
+//! the DB thread has run it, however long its response then waits to be written.
 //!
 //! What a decode holds at any moment (the decompressed section as it grows, then the section
 //! and the records' copies of it) is at most twice what it has charged by then: the
@@ -190,7 +191,7 @@ pub const MAX_REQUEST_DECODE_BYTES: usize = 64 * 1024 * 1024;
 pub const INLINE_REQUEST_DECODE_BYTES: usize = INLINE_DECODE_BYTES;
 
 /// The most memory decoded requests (besides Produce records) may hold together, from their
-/// decode until their response is written.
+/// decode until the DB thread has run them.
 pub const DECODED_REQUESTS_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// A decoded request holding at most this much may take the last
@@ -208,7 +209,7 @@ const _: () = assert!(
 );
 
 /// The decoded requests (all but the records of Produce requests) from their decode until
-/// their response is written.
+/// the DB thread has run them.
 pub static DECODED_REQUESTS: DecodePool = DecodePool::new(DECODED_REQUESTS_BUDGET_BYTES);
 
 impl DecodePool {

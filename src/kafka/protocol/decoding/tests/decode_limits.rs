@@ -282,15 +282,12 @@ fn test_decode_request_decodes_large_requests_under_a_slot_and_charges_them() {
         let frame = metadata_of_names(40_000, 20);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let before = DECODED_REQUESTS.remaining();
-        let (request, charge) = decode_request(frame, tx).await.unwrap().unwrap();
+        let request = decode_request(frame, tx).await.unwrap().unwrap();
         assert!(matches!(request.body, RequestBody::Metadata(_)));
-        assert!(
-            charge.bytes() > INLINE_REQUEST_DECODE_BYTES,
-            "{}",
-            charge.bytes()
-        );
-        assert!(DECODED_REQUESTS.remaining() <= before - charge.bytes());
-        drop(charge);
+        let charged = request.decode_charge.bytes();
+        assert!(charged > INLINE_REQUEST_DECODE_BYTES, "{charged}");
+        assert!(DECODED_REQUESTS.remaining() <= before - charged);
+        drop(request);
 
         // Decodes to more than the request limit: the connection closes, nothing answered.
         let frame = worst_case_frames(40_000_000).swap_remove(0).1;
@@ -301,8 +298,12 @@ fn test_decode_request_decodes_large_requests_under_a_slot_and_charges_them() {
         // A small request decodes inline and holds little.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let frame = metadata_of_names(3, 10);
-        let (_, charge) = decode_request(frame, tx).await.unwrap().unwrap();
-        assert!(charge.bytes() < 4096, "{}", charge.bytes());
+        let request = decode_request(frame, tx).await.unwrap().unwrap();
+        assert!(
+            request.decode_charge.bytes() < 4096,
+            "{}",
+            request.decode_charge.bytes()
+        );
     });
 }
 
@@ -359,12 +360,18 @@ fn test_a_decoded_request_waits_for_room_and_decodes_again() {
             drop(filler);
         });
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (request, charge) = decode_request_in(frame, tx, &ROOMY, Duration::from_secs(10))
+        let request = decode_request_in(frame, tx, &ROOMY, Duration::from_secs(10))
             .await
             .unwrap()
             .unwrap();
         assert!(matches!(request.body, RequestBody::Metadata(_)));
-        assert!(charge.bytes() > 64 * 1024);
+        assert!(request.decode_charge.bytes() > 64 * 1024);
         release.await.unwrap();
+        // The request carries its charge: dropping it (as the DB thread does once its handler
+        // ran) gives the charge back, whether or not a response was ever written.
+        let held = 64 << 20;
+        assert!(ROOMY.remaining() < held);
+        drop(request);
+        assert_eq!(ROOMY.remaining(), held);
     });
 }

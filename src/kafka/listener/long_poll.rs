@@ -29,6 +29,7 @@ use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBo
 use crate::kafka::constants::API_KEY_FETCH;
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
+use crate::kafka::protocol::DecodedCharge;
 use crate::kafka::storage::IsolationLevel;
 
 /// The safety-net interval for a `pg_kafka.fetch_poll_interval_ms` value (at least 1 ms).
@@ -200,6 +201,8 @@ impl LongPoll {
                 ..self.fetch.clone()
             }),
             response_tx: attempt_tx,
+            // The long-poll task holds the original request's charge for as long as it runs.
+            decode_charge: DecodedCharge::default(),
         };
         if !send_with_backpressure(&self.request_tx, request).await {
             warn!("Worker channel closed during long poll");

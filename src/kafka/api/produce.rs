@@ -1701,6 +1701,7 @@ mod tests {
                 pending: Some(Box::new(pending)),
             }),
             response_tx,
+            decode_charge: DecodedCharge::default(),
         };
         (request, rx)
     }

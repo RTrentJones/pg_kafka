@@ -8,8 +8,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::decode_budget::{
-    DecodePool, DecodedCharge, NotRun, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES,
-    LARGE_DECODES, MAX_DECODE_WAIT, MAX_REQUEST_DECODE_BYTES,
+    DecodePool, NotRun, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES, LARGE_DECODES,
+    MAX_DECODE_WAIT, MAX_REQUEST_DECODE_BYTES,
 };
 use super::decode_meter::{metered, MeteredBuf};
 use crate::kafka::api::{self, Decoded, ResponseBody};
@@ -48,9 +48,9 @@ pub fn parse_request(
     }
 }
 
-/// Decode one request frame on the network thread, with the results of [`parse_request`]
-/// and, for a request the DB thread must run, the share of [`DECODED_REQUESTS`] the decoded
-/// request holds (to keep until its response is written).
+/// Decode one request frame on the network thread, with the results of [`parse_request`].
+/// A request the DB thread must run carries the share of [`DECODED_REQUESTS`] it holds
+/// ([`KafkaRequest::decode_charge`]), given back when the request is dropped once it ran.
 ///
 /// The decode runs on the I/O thread under [`INLINE_REQUEST_DECODE_BYTES`]; one that
 /// needs more is stopped there and runs again under a large-decode slot, off the I/O
@@ -62,7 +62,7 @@ pub fn parse_request(
 pub async fn decode_request(
     frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
-) -> Result<Option<(KafkaRequest, DecodedCharge)>> {
+) -> Result<Option<KafkaRequest>> {
     decode_request_in(frame, response_tx, &DECODED_REQUESTS, MAX_DECODE_WAIT).await
 }
 
@@ -72,7 +72,7 @@ async fn decode_request_in(
     response_tx: UnboundedSender<KafkaResponse>,
     pool: &'static DecodePool,
     wait: std::time::Duration,
-) -> Result<Option<(KafkaRequest, DecodedCharge)>> {
+) -> Result<Option<KafkaRequest>> {
     let frame = frame.freeze();
     let deadline = tokio::time::Instant::now() + wait;
     let mut inline = true;
@@ -113,7 +113,9 @@ async fn decode_request_in(
             Attempt::Parsed(other, _) => return other.map(|_| None),
         };
         if let Some(charge) = pool.charge_request(held) {
-            return Ok(finish_request(request).await?.map(|r| (r, charge)));
+            let mut request = request;
+            request.decode_charge = charge;
+            return finish_request(request).await;
         }
         // No room for what the request holds: free it, and decode it again once there is.
         drop(request);

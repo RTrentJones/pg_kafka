@@ -6,7 +6,7 @@
 //! enumeration, decompression, record-count and header bombs, large zstd windows, partition
 //! data that is not one RecordBatch v2, batches read with Kafka's grammar and header checks,
 //! an acks=0 Produce at an unsupported version, a saturated large-decode path, requests that
-//! decode to many times their frame), each
+//! decode to many times their frame, clients that stop reading their responses), each
 //! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
@@ -22,6 +22,7 @@ pub mod fanout;
 pub mod hostile_clients;
 pub mod large_decodes;
 pub mod produce_decoding;
+pub mod stalled_writers;
 
 use crate::common::DynResult;
 use crate::wire::{correlation_of, read_frame_within, request_frame};
@@ -184,6 +185,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_the_decode_limit_refuses_partitions_on_their_own: sequential,
         produce_decoding::test_transactional_batches_need_a_transactional_id: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
+        stalled_writers::test_clients_that_stop_reading_do_not_lock_out_others: sequential,
         decode_memory::test_requests_that_decode_to_many_times_their_frame_are_refused: sequential,
         decode_work::test_refused_partitions_do_not_hold_the_io_threads: sequential,
         decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
@@ -218,6 +220,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         limits::test_per_ip_connection_limit: sequential,
         limits::test_per_listener_connection_limit: sequential,
         limits::test_idle_and_frame_read_timeouts_close_connections: sequential,
+        limits::test_a_stalled_writer_closes_after_the_idle_timeout: sequential,
         limits::test_pre_auth_deadline_runs_from_accept: sequential,
         limits::test_sasl_credential_lookups_are_rate_limited: sequential,
         limits::test_network_limits_teardown: sequential,

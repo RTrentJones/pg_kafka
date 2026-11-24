@@ -23,17 +23,18 @@ use super::is_peer_disconnect;
 use crate::kafka::api::ResponseBody;
 use crate::kafka::messages::KafkaResponse;
 use crate::kafka::protocol;
-use crate::kafka::protocol::DecodedCharge;
 
 /// The responses of one request, queued to the writer in request order.
 pub(super) struct ResponseSlot {
     responses: UnboundedReceiver<KafkaResponse>,
     /// Dropped only once the slot's response is on the socket, so the reader reads at
-    /// most `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION` requests ahead of the socket.
+    /// most `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION` requests ahead of the socket. A
+    /// connection whose client stops reading therefore holds at most that many responses
+    /// (each bounded by its request, a Fetch by its `max_bytes`), never the decoded
+    /// requests they answer (`KafkaRequest::decode_charge` is given back once the request
+    /// ran), and only until `pg_kafka.connections_max_idle_ms` closes it: a writer that
+    /// makes no progress counts as idle (`ActivityClock::sending`).
     _in_flight: OwnedSemaphorePermit,
-    /// The decoded request's share of the decoded-request budget, held until its response
-    /// is on the socket (the request, then its response, hold the memory until then).
-    _decoded: DecodedCharge,
 }
 
 impl ResponseSlot {
@@ -50,12 +51,10 @@ impl ResponseSlot {
     pub(super) fn new(
         responses: UnboundedReceiver<KafkaResponse>,
         in_flight: OwnedSemaphorePermit,
-        decoded: DecodedCharge,
     ) -> Self {
         ResponseSlot {
             responses,
             _in_flight: in_flight,
-            _decoded: decoded,
         }
     }
 }
@@ -66,7 +65,8 @@ pub(super) struct WriterContext {
     pub(super) slots: UnboundedReceiver<ResponseSlot>,
     /// The listener's advertised address, written into Metadata / FindCoordinator.
     pub(super) advertised: Option<(String, i32)>,
-    /// Touched after every response written (idle timeout).
+    /// Told when a response starts and stops going out (the bytes written touch it through
+    /// the socket: idle timeout).
     pub(super) activity: Arc<ActivityClock>,
     /// Peer address (for logs).
     pub(super) peer: String,
@@ -119,7 +119,12 @@ where
                 }
             };
             debug!("Sending {} byte response to client...", bytes.len());
-            if let Err(e) = sink.send(bytes.freeze()).await {
+            // While the response goes out the connection waits for its client: if the client
+            // stops reading, nothing more is written and the idle timeout closes it.
+            activity.start_sending();
+            let sent = sink.send(bytes.freeze()).await;
+            activity.stop_sending();
+            if let Err(e) = sent {
                 if is_peer_disconnect(&e) {
                     debug!("Client went away while sending response: {e}");
                 } else {
@@ -127,7 +132,6 @@ where
                 }
                 return;
             }
-            activity.touch();
         }
         // `slot` drops here: its response (if any) is on the socket, so the reader may
         // read one more frame.
