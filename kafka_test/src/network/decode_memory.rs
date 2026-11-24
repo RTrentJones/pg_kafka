@@ -123,7 +123,12 @@ async fn refused_within_bounded_memory(
         ));
     }
 
-    let after = listener_pid(&db).await.map_err(|e| e.to_string())?;
+    let after = listener_pid(&db).await.map_err(|e| {
+        format!(
+            "{name}: the database connection failed ({e}): the postmaster restarted, as when an \
+             allocation failure aborts the listener worker"
+        )
+    })?;
     if after != Some(pid) {
         return Err(format!(
             "{name}: the listener worker was pid {pid}, now {after:?}: it died (an allocation \

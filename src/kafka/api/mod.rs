@@ -377,6 +377,8 @@ fn decode_wire<A: KafkaApi>(
         A::Wire::decode(buf, version)
     })) {
         Ok(Ok(wire)) => Some(A::decode(wire, header)),
+        // A decode the meter stopped looks truncated; the caller reports it.
+        Ok(Err(_)) | Err(_) if buf.stopped() => None,
         Ok(Err(e)) => {
             warn!("Failed to decode {} v{version} body: {e}", A::NAME);
             None
