@@ -144,6 +144,7 @@ fn pg_kafka_run_retention_sweep(
         ("stale_producers", stats.stale_producers),
         ("terminal_transactions", stats.terminal_transactions),
         ("shadow_delivered_rows", stats.shadow_delivered_rows),
+        ("shadow_orphaned_rows", stats.shadow_orphaned_rows),
     ];
     TableIterator::new(rows.map(|(category, deleted)| {
         (

@@ -132,6 +132,15 @@ CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
 
+-- Aborted transactional rows, for the retention sweep's aborted-row cleanup (every
+-- pass, whatever the retention settings): without it that DELETE read every block of
+-- every leaf (the BRIN on created_at matches nearly all of them), on the single worker
+-- DB thread. Partial, so only aborted rows are indexed: a non-transactional or
+-- committed write never touches it. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_aborted
+ON kafka.messages(created_at)
+WHERE txn_state = 'aborted';
+
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every
 -- leaf). kafka.ensure_message_partitions() moves them into a proper leaf.
@@ -923,6 +932,14 @@ WHERE external_offset IS NULL;
 CREATE INDEX idx_shadow_tracking_retrying
 ON kafka.shadow_tracking(topic_id, partition_id, dead, retry_count, local_offset)
 WHERE external_offset IS NULL AND (retry_count > 0 OR dead);
+
+-- Delivered rows, for the retention sweep's reaping of rows delivered more than a day
+-- ago (walked per partition in offset order instead of scanning the outbox). Its key
+-- columns never change and external_offset already keys the pending indexes, so the
+-- outbox's claims stay HOT; an ack adds one entry.
+CREATE INDEX idx_shadow_tracking_delivered
+ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+WHERE external_offset IS NOT NULL;
 
 CREATE INDEX idx_shadow_tracking_errors
 ON kafka.shadow_tracking(topic_id, partition_id)

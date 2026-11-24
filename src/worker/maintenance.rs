@@ -248,13 +248,14 @@ pub(super) fn run_retention_sweep() {
                 "Retention sweep: {} aborted msg(s), {} expired msg(s), \
                  {} time partition(s) dropped, \
                  {} stale producer(s), {} terminal txn(s), \
-                 {} delivered shadow row(s) reclaimed",
+                 {} delivered and {} orphaned shadow row(s) reclaimed",
                 stats.aborted_messages,
                 stats.expired_messages,
                 stats.dropped_partitions,
                 stats.stale_producers,
                 stats.terminal_transactions,
-                stats.shadow_delivered_rows
+                stats.shadow_delivered_rows,
+                stats.shadow_orphaned_rows
             ),
             Ok(Some(_)) => {}
             Err(e) => pg_warning!("Retention sweep failed: {e}"),

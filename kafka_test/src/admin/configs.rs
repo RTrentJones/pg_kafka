@@ -103,7 +103,11 @@ async fn alter_topic_config(
 
 /// Send a DeleteRecords v1 request for one partition and return
 /// (error_code, low_watermark).
-async fn delete_records(topic: &str, partition: i32, offset: i64) -> Result<(i16, i64), String> {
+pub(crate) async fn delete_records(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(i16, i64), String> {
     let request = DeleteRecordsRequest::default()
         .with_timeout_ms(10_000)
         .with_topics(vec![DeleteRecordsTopic::default()

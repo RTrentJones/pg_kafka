@@ -46,9 +46,9 @@ SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
 -- is expired under its topic's retention (row deletes until then only for topics with
 -- a window shorter than one partition width). New rows go to the new time leaves.
 --
--- Cost: ACCESS EXCLUSIVE on the old table for the whole script; three sequential
+-- Cost: ACCESS EXCLUSIVE on the old table for the whole script; four sequential
 -- reads of it (MAX(created_at) for the leaf bound, the attach's bound check, and the
--- BRIN build). The rows themselves are not copied.
+-- BRIN and idx_messages_txn_aborted builds). The rows themselves are not copied.
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
 ALTER INDEX kafka.messages_pkey RENAME TO messages_legacy_offset_key;
 ALTER INDEX kafka.messages_global_offset_key RENAME TO messages_legacy_global_offset_key;
@@ -142,6 +142,15 @@ ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
+
+-- Aborted transactional rows, for the retention sweep's aborted-row cleanup (every
+-- pass, whatever the retention settings): without it that DELETE read every block of
+-- every leaf (the BRIN on created_at matches nearly all of them), on the single worker
+-- DB thread. Partial, so only aborted rows are indexed: a non-transactional or
+-- committed write never touches it. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_aborted
+ON kafka.messages(created_at)
+WHERE txn_state = 'aborted';
 
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every
@@ -1145,6 +1154,14 @@ WHERE external_offset IS NULL;
 CREATE INDEX idx_shadow_tracking_retrying
 ON kafka.shadow_tracking(topic_id, partition_id, dead, retry_count, local_offset)
 WHERE external_offset IS NULL AND (retry_count > 0 OR dead);
+
+-- Delivered rows, for the retention sweep's reaping of rows delivered more than a day
+-- ago (walked per partition in offset order instead of scanning the outbox). Its key
+-- columns never change and external_offset already keys the pending indexes, so the
+-- outbox's claims stay HOT; an ack adds one entry.
+CREATE INDEX idx_shadow_tracking_delivered
+ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+WHERE external_offset IS NOT NULL;
 COMMENT ON COLUMN kafka.shadow_tracking.retry_count IS 'Failed delivery attempts. At pg_kafka.shadow_max_retries the row is a dead letter (pending, never retried) until replayed or the cap is raised.';
 COMMENT ON COLUMN kafka.shadow_tracking.attempt_open IS 'True while a forward of the row is in flight (claimed, not yet acked).';
 COMMENT ON COLUMN kafka.shadow_tracking.dead IS 'retry_count >= pg_kafka.shadow_max_retries on pending rows, kept by the worker (failure acks, lost attempts, replay, and a full sync at worker start and when the cap changes); indexed so claims skip dead letters.';

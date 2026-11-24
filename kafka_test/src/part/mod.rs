@@ -5,6 +5,7 @@ mod drop_extension;
 mod lock_order;
 mod lock_races;
 mod sweep_concurrency;
+mod sweep_cost;
 pub mod time_partitions;
 
 /// The `part` tests, in run order.
@@ -26,5 +27,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         drop_extension::test_maintenance_functions_refuse_public: sequential,
         sweep_concurrency::test_concurrent_sweeps_and_maintenance_do_not_deadlock: sequential,
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
+        sweep_cost::test_sweep_reads_only_what_it_deletes: sequential,
+        sweep_cost::test_sweep_reaps_outbox_rows_of_removed_messages: sequential,
     ]
 }
