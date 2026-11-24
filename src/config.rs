@@ -208,8 +208,11 @@ gucs! {
     /// terminal transactions, delivered shadow-outbox rows) always runs.
     pub(crate) int MESSAGE_RETENTION_HOURS = 0 => c"pg_kafka.message_retention_hours" {
         short: c"Delete messages older than this many hours (0 = keep forever)",
-        long: c"Time-based retention for kafka.messages, enforced by the worker's periodic \
-          retention sweep. 0 (default) disables the sweep. Pending transactional \
+        long: c"Default time-based retention for kafka.messages, enforced by the worker's \
+          retention sweep (every 60 s). 0 (default) keeps messages forever unless the topic \
+          sets retention.ms, which overrides this setting either way. The sweep runs \
+          whatever this is: it also deletes aborted transactional rows and prunes stale \
+          producers, terminal transactions and the shadow outbox. Pending transactional \
           messages are never deleted regardless of age. Reloadable via SIGHUP.",
         context: Sighup,
         range: (0, 87_600),
