@@ -3,7 +3,9 @@
 //! the slots and their queue full must not get a legitimate request's connection closed:
 //! it waits its turn and is answered.
 
+use super::decode_work::empty_blocks_batch;
 use super::produce_decoding::{raw_batch, record, varint};
+use super::stalled_writers::{broker_side_state, metadata_of, ESTABLISHED};
 use super::{client_config, connect_from, port, rdkafka_roundtrip, stored_rows};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
@@ -223,6 +225,109 @@ pub async fn test_saturated_large_decodes_wait_instead_of_closing() -> TestResul
     assert_eq!(closed, 0, "the broker answers the hostile requests too");
     println!("✅ every legitimate request stored, no connection closed");
 
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The frame budget, `FRAME_RESERVE_BUDGET_BYTES` in `src/kafka/protocol/framing.rs`.
+const FRAME_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Connections that each send a large Metadata frame while hostile Produce requests keep
+/// the large-decode slots busy.
+const WAITING_CONNECTIONS: u8 = 8;
+
+/// Hostile connections that keep the large-decode slots and their queue busy.
+const SLOT_HOGS: usize = 8;
+
+/// Eight connections each send an 88 MB Metadata frame (1.7 million names, which decode to
+/// more than the inline limit and so wait for a large-decode slot) while eight hostile
+/// connections keep both slots and their queue busy with Produce requests of 10 MB of
+/// empty gzip blocks (each holds a slot for its two-second decode time limit). A frame
+/// waiting for a slot is charged to the 512 MiB frame budget as a frame still arriving is:
+/// no more than five of them wait at once, and the broker closes the connection of a frame
+/// the budget cannot take (as it closes one whose arriving frame the budget cannot take),
+/// instead of holding 700 MB of frames the budget does not count. Ordinary clients keep
+/// working.
+pub async fn test_frames_waiting_to_decode_stay_within_the_frame_budget() -> TestResult {
+    println!(
+        "=== Test: frames waiting for a large-decode slot are charged to the frame budget ===\n"
+    );
+    let ctx = TestContext::new().await?;
+    let hog_topic = ctx.unique_topic("net-wait-hog").await;
+    let created = create_topics_raw(vec![creatable(&hog_topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+
+    println!("Step 1: {SLOT_HOGS} hostile connections keep the large-decode slots busy");
+    let mut hog_request = produce_request(&hog_topic, vec![(0, empty_blocks_batch(900_000))], 1);
+    hog_request.timeout_ms = 30_000;
+    let hog_frame = Arc::new(request_frame(7, 1, &hog_request));
+    println!("  hostile frame: {} bytes", hog_frame.len());
+    let stop = Arc::new(AtomicBool::new(false));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let flooders: Vec<_> = (0..SLOT_HOGS)
+        .map(|_| {
+            tokio::spawn(flood(
+                Ipv4Addr::new(127, 0, 0, 2),
+                Arc::clone(&hog_frame),
+                Arc::clone(&stop),
+                Arc::clone(&closed),
+            ))
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let prefix = uuid::Uuid::new_v4().simple().to_string();
+    let frame = request_frame(
+        4,
+        1,
+        &metadata_of((0..1_700_000).map(|i| format!("{prefix}-{i:0>17}"))),
+    );
+    println!(
+        "Step 2: {WAITING_CONNECTIONS} connections send a {} byte Metadata frame each",
+        frame.len()
+    );
+    let mut waiting = Vec::new();
+    for i in 0..WAITING_CONNECTIONS {
+        let mut s = connect_from(Ipv4Addr::new(127, 0, 0, 40 + i), port()).await?;
+        let client = s.local_addr()?;
+        let sent = matches!(
+            tokio::time::timeout(Duration::from_secs(20), s.write_all(&frame)).await,
+            Ok(Ok(()))
+        );
+        println!("  connection {i}: frame sent: {sent}");
+        waiting.push((s, client));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut open = 0usize;
+    for (_, client) in &waiting {
+        if broker_side_state(*client)? == Some(ESTABLISHED) {
+            open += 1;
+        }
+    }
+    println!("  connections still waiting: {open}");
+    let still_waiting = open;
+
+    println!("Step 3: an rdkafka client works meanwhile");
+    let rd_topic = ctx.unique_topic("net-wait-rd").await;
+    let roundtrip = rdkafka_roundtrip(client_config(port()), &rd_topic, 3)
+        .await
+        .map_err(|e| e.to_string());
+    stop.store(true, Ordering::Relaxed);
+    for f in flooders {
+        let _ = tokio::time::timeout(Duration::from_secs(5), f).await;
+    }
+    drop(waiting);
+    roundtrip?;
+    assert!(
+        still_waiting * frame.len() <= FRAME_BUDGET_BYTES,
+        "{still_waiting} frames of {} bytes wait at once: more than the {FRAME_BUDGET_BYTES} \
+         byte frame budget",
+        frame.len()
+    );
+    assert!(
+        still_waiting > 0,
+        "frames wait for a slot instead of being refused"
+    );
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

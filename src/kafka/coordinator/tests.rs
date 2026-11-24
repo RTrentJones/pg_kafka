@@ -1784,3 +1784,102 @@ fn test_memory_budget_bounds_never_synced_joins() {
     assert_eq!(admitted, 4);
     assert_eq!(c.held_bytes(), counted_afresh(&c));
 }
+
+/// Join a new group under a long id and leave it, leaving an Empty group behind.
+fn join_and_leave(c: &GroupCoordinator, group: &str) -> Result<()> {
+    let slot = join_with(c, &params(group, None, &[("range", b"sub")]));
+    let outcome = slot.lock().unwrap().take().expect("join answered at once");
+    let member = outcome?.member_id;
+    c.leave_group(group, &member)
+}
+
+#[test]
+fn test_empty_groups_are_forgotten_when_memory_is_short() {
+    // The review's reproduction, scaled down: each JoinGroup and LeaveGroup under a long
+    // group id leaves an Empty group holding that id. Those groups must not keep their bytes
+    // in the budget: the least recently active are forgotten to make room, as at the group
+    // count cap.
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(300_000);
+    let long = |i: usize| format!("{i}-{}", "x".repeat(30_000));
+    for i in 0..40 {
+        join_and_leave(&c, &long(i))
+            .unwrap_or_else(|e| panic!("group {i}: error {}", e.to_kafka_error_code()));
+        assert!(c.held_bytes() <= 300_000, "{} bytes", c.held_bytes());
+    }
+    // A new group, and a new member of a group in use, still fit.
+    let a = joined(&join(&c, "orders", None));
+    let slot = join_with(&c, &big_params("orders", None, 100_000));
+    assert!(is_pending(&slot), "joins the rebalance");
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    // The least recently active Empty groups went first; the latest is still there.
+    assert!(c.get_group_state(&long(0)).is_none());
+    assert_eq!(
+        c.get_group_state(&long(39)).map(|g| g.state),
+        Some(GroupState::Empty)
+    );
+    // A leader's assignments make room the same way.
+    for i in 40..44 {
+        join_and_leave(&c, &long(i)).unwrap();
+    }
+    let l = joined(&join(&c, "orders", Some(&a.member_id)));
+    let follower = joined(&slot);
+    c.sync_now(
+        "orders".to_string(),
+        l.member_id.clone(),
+        l.generation_id,
+        vec![
+            (l.member_id.clone(), vec![1; 30_000]),
+            (follower.member_id.clone(), vec![2; 30_000]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(state(&c, "orders"), GroupState::Stable);
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() <= 300_000, "{} bytes", c.held_bytes());
+}
+
+#[test]
+fn test_empty_groups_stay_when_forgetting_them_would_not_make_room() {
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(1_000_000);
+    joined(&join_with(&c, &big_params("busy", None, 800_000)));
+    join_and_leave(&c, &"e".repeat(30_000)).unwrap();
+    // 800 kB in use plus a 300 kB member cannot fit even without the Empty group.
+    assert_eq!(
+        join_error_code(&join_with(&c, &big_params("new", None, 300_000))),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert_eq!(
+        c.get_group_state(&"e".repeat(30_000)).map(|g| g.state),
+        Some(GroupState::Empty)
+    );
+    // The Empty group a JoinGroup targets is not forgotten to make room for it.
+    let target = "t".repeat(30_000);
+    join_and_leave(&c, &target).unwrap();
+    joined(&join_with(&c, &big_params(&target, None, 100_000)));
+    assert!(c.get_group_state(&"e".repeat(30_000)).is_none());
+    assert_eq!(c.get_group_state(&target).map(|g| g.members.len()), Some(1));
+}
+
+#[test]
+fn test_new_group_is_priced_with_what_the_join_stores() {
+    // A group-creating JoinGroup stores the group's own copies of the protocol type, the
+    // leader's id and the protocol name besides the member: the admission must price them.
+    let mut p = params("g", None, &[]);
+    p.protocol_type = "t".repeat(30_000);
+    p.protocols = vec![("p".repeat(30_000), Vec::new())];
+    let unbounded = GroupCoordinator::new();
+    joined(&join_with(&unbounded, &p));
+    let held = unbounded.held_bytes();
+    assert_eq!(held, counted_afresh(&unbounded));
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(held - 1);
+    assert_eq!(
+        join_error_code(&join_with(&c, &p)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    c.set_memory_limit(held);
+    joined(&join_with(&c, &p));
+    assert_eq!(c.held_bytes(), held);
+}

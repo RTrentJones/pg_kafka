@@ -17,7 +17,12 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 For current figures, see `bench.json` on the `evidence` branch (produce/consume
 throughput, latency percentiles, raw-INSERT floor, shadow-forwarding rates).
 The E2E performance suite (`kafka_test --category performance`) enforces
-regression floors in CI.
+regression bounds in CI, every test of it, each 5-100x from dev-machine measurements so that
+only order-of-magnitude regressions fail: produce and consume throughput floors
+(`throughput.rs`: awaited single sends, consume; `regression.rs`: 1000 concurrent sends and
+their consume), concurrent sends no slower than half the sequential ones, P50/P99 ceilings of
+an awaited produce, a time ceiling for ten producers' first sends, and a ceiling on the
+listener's CPU time while a consumer long-polls an empty topic.
 
 ### Architecture ceiling
 

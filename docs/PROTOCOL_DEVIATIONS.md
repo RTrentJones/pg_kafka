@@ -454,8 +454,12 @@ pg_kafka.compression_type = 'gzip'
   never sync; an allocation failure aborts the worker and sends Postgres into crash
   recovery. A JoinGroup whose member state does not fit, or a leader SyncGroup whose
   assignments do not, gets COORDINATOR_NOT_AVAILABLE (15), retriable, as for a full
-  `max_consumer_groups`: the memory frees as members leave or time out, and the budget is the
-  broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
+  `max_consumer_groups`: the memory frees as members leave or time out, and before refusing,
+  the least recently active Empty groups (no members; their committed offsets stay, so they
+  remain listed as Empty groups) are forgotten until the state fits, as at the group-count cap,
+  unless forgetting all of them would not make room. (Kafka removes an Empty group without
+  offsets at its ~10-minute offsets cleanup; an Empty group here otherwise stays in memory for
+  24 hours.) The budget is the broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
   the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
   nothing and the group stays in its sync phase. A rejoin that holds no more than before is
   always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
@@ -803,10 +807,20 @@ librdkafka producer and answers every record with an ack.
   again while the worker tracks it (no lease: a slow ack never causes a re-send). Consumers of the
   external topic that need exactly-once semantics must deduplicate, for example on an
   application id.
-- **Order.** The first copy of every record of a local partition reaches the external topic in
-  local-offset order (duplicates may follow it).
+- **Order.** The forwarder sends the records of a local partition in local-offset order, never
+  one ahead of an earlier one's retry, but the external partition is chosen by key
+  (`murmur2_random`, the Java client's partitioner; random for a null key), so the order the
+  external topic keeps is per external partition: the first copies of the records of one local
+  partition that land in the same external partition (for keyed records, those of one key) are in
+  local-offset order there (duplicates may follow them). Records with different keys, or null
+  keys, may land in different external partitions with no order between them. A dead-lettered
+  record that is replayed later lands after the records that followed it.
 - **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
-  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised.
+  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised. Only
+  the record a partition waits on is charged an attempt when nothing is sent for reasons outside
+  it (the 120 s delivery timeout, or shadow settings no producer can be built from, such as an
+  unknown `shadow_security_protocol`); the records behind it wait uncounted, so a bad setting
+  dead-letters each partition's records one at a time, not a whole backlog at once.
 - **Local state is exact.** The local write and the outbox row commit together; a delivered row
   records its external offset once (a duplicate ack matches nothing).
 
@@ -842,10 +856,13 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Network edge limits:** connections are capped per listener
   (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
-  where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
-  connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
-  must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
-  first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
+  where Kafka's default is unlimited); over a cap the socket is closed at accept. A
+  connection closes after `pg_kafka.connections_max_idle_ms` (600000, as Kafka) without a byte
+  read or written, once nothing it sent is still being answered or its responses wait for it to
+  read them (a client that stops reading: as Kafka's idle expiry closes a muted connection whose
+  response does not go out); a request still being answered (a long-poll Fetch, a JoinGroup
+  waiting for its group) keeps it open. A request frame must arrive within
+  `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
   incomplete incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over
   1 MiB (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame
   would exceed the budget is closed. That budget covers only the raw bytes of frames still
@@ -860,20 +877,24 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   the connection for a frame over `socket.request.max.bytes` (100 MB): Kafka accepts such a
   request if its frame is under 100 MB, pg_kafka does not. 64 MiB is what a Metadata request of
   some 300,000 topic names of 50 bytes decodes to, or a Fetch of some 500,000 partitions, far
-  beyond what clients send. Decoded requests then hold at most 256 MiB together until their
-  responses are written, 32 MiB of it kept for requests of at most 64 KiB (Heartbeats,
-  ApiVersions, commits), so a few large requests cannot lock control traffic out; a decoded
-  request that finds no room is freed and decodes again once there is, waiting up to 10 s
-  (its connection reads nothing meanwhile), after which the connection closes. Responses are not size-capped (they are bounded by the request's
-  `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  beyond what clients send. Decoded requests then hold at most 256 MiB together until the
+  DB thread has run them (not until their responses are written: a connection whose client
+  stops reading holds at most its 128 in-flight responses, until the idle timeout), 32 MiB of it
+  kept for requests of at most 64 KiB (Heartbeats, ApiVersions, commits), so a few large
+  requests cannot lock control traffic out; a decoded request that finds no room is freed and
+  decodes again once there is, waiting up to 10 s (its connection reads nothing meanwhile),
+  after which the connection closes. Responses are not size-capped (they are bounded by the
+  request's `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
   Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the
   256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
   at most two at a time; a request that finds no
   room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
-  frame counts against the frame budget while it waits, as an incomplete frame does (one the
-  exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).
+  frame counts against the frame budget while it waits (for a large-decode slot, or for room
+  in either budget), as an incomplete frame does; one the exhausted budget cannot take is
+  refused at once: a Produce is answered REQUEST_TIMED_OUT, any other request closes the
+  connection.
 
 ## Compatibility Testing
 

@@ -4,14 +4,16 @@
 
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::protocol::decode_request_header_from_buffer;
+use std::sync::atomic::AtomicUsize;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::decode_budget::{
-    DecodePool, DecodedCharge, NotRun, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES,
+    DecodePool, HeldFrame, LargeDecodes, NotRun, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES,
     LARGE_DECODES, MAX_DECODE_WAIT, MAX_REQUEST_DECODE_BYTES,
 };
 use super::decode_meter::{metered, MeteredBuf};
+use super::framing::FRAME_RESERVE_REMAINING;
 use crate::kafka::api::{self, Decoded, ResponseBody};
 use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
 use crate::kafka::error::{KafkaError, Result};
@@ -48,9 +50,9 @@ pub fn parse_request(
     }
 }
 
-/// Decode one request frame on the network thread, with the results of [`parse_request`]
-/// and, for a request the DB thread must run, the share of [`DECODED_REQUESTS`] the decoded
-/// request holds (to keep until its response is written).
+/// Decode one request frame on the network thread, with the results of [`parse_request`].
+/// A request the DB thread must run carries the share of [`DECODED_REQUESTS`] it holds
+/// ([`KafkaRequest::decode_charge`]), given back when the request is dropped once it ran.
 ///
 /// The decode runs on the I/O thread under [`INLINE_REQUEST_DECODE_BYTES`]; one that
 /// needs more is stopped there and runs again under a large-decode slot, off the I/O
@@ -58,21 +60,60 @@ pub fn parse_request(
 /// closes it for a frame over `socket.request.max.bytes`. A decoded request the budget has
 /// no room for is dropped and decodes again once there is, waiting up to
 /// [`MAX_DECODE_WAIT`] without holding a thread (this connection reads nothing more
-/// meanwhile); past that the connection closes.
+/// meanwhile); past that the connection closes. While the request waits (for a slot, or for
+/// room), its frame is charged to the frame budget as a frame still arriving is
+/// ([`HeldFrame`]); a frame the budget cannot take closes the connection at once, as the
+/// frame codec closes one whose arriving frame it cannot take: waiting for room would keep
+/// the frame in memory uncounted. A Produce whose records wait to decode charges its own
+/// ([`finish_request`]); a decode running in a slot needs none (at most
+/// [`super::decode_budget::LARGE_DECODE_SLOTS`] frames).
 pub async fn decode_request(
     frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
-) -> Result<Option<(KafkaRequest, DecodedCharge)>> {
-    decode_request_in(frame, response_tx, &DECODED_REQUESTS, MAX_DECODE_WAIT).await
+) -> Result<Option<KafkaRequest>> {
+    decode_request_in(frame, response_tx, &GLOBAL_BUDGETS, MAX_DECODE_WAIT).await
 }
 
-/// [`decode_request`], charging `pool` and waiting for it up to `wait`.
+/// The budgets a decode charges and the slots it waits for (tests use their own).
+struct Budgets {
+    /// What decoded requests hold.
+    requests: &'static DecodePool,
+    /// The large decodes.
+    slots: &'static LargeDecodes,
+    /// The frame budget, charged for a frame while its request waits.
+    frames: &'static AtomicUsize,
+}
+
+/// The network thread's budgets.
+static GLOBAL_BUDGETS: Budgets = Budgets {
+    requests: &DECODED_REQUESTS,
+    slots: &LARGE_DECODES,
+    frames: &FRAME_RESERVE_REMAINING,
+};
+
+/// Charge `frame` to the frame budget while its request waits, or the error that closes
+/// the connection when the budget cannot take it.
+fn hold_frame(frame: &Bytes, frames: &'static AtomicUsize) -> Result<HeldFrame> {
+    HeldFrame::charge_to(frame.len(), frames).ok_or_else(|| {
+        warn!(
+            "Closing connection: no room in the frame budget for a {} byte frame waiting to decode",
+            frame.len()
+        );
+        KafkaError::encoding(format!(
+            "no room in the frame budget for a {} byte frame waiting to decode",
+            frame.len()
+        ))
+    })
+}
+
+/// [`decode_request`] against `budgets`, waiting for them up to `wait`.
 async fn decode_request_in(
     frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
-    pool: &'static DecodePool,
+    budgets: &Budgets,
     wait: std::time::Duration,
-) -> Result<Option<(KafkaRequest, DecodedCharge)>> {
+) -> Result<Option<KafkaRequest>> {
+    let pool = budgets.requests;
     let frame = frame.freeze();
     let deadline = tokio::time::Instant::now() + wait;
     let mut inline = true;
@@ -84,9 +125,13 @@ async fn decode_request_in(
                 INLINE_REQUEST_DECODE_BYTES,
             )
         } else {
+            // Charged while the request waits for a slot; the decode itself holds none.
+            let waiting = hold_frame(&frame, budgets.frames)?;
             let (frame, tx) = (frame.clone(), response_tx.clone());
-            match LARGE_DECODES
+            match budgets
+                .slots
                 .run(deadline, move || {
+                    drop(waiting);
                     parse_within(frame, tx, MAX_REQUEST_DECODE_BYTES)
                 })
                 .await
@@ -113,10 +158,14 @@ async fn decode_request_in(
             Attempt::Parsed(other, _) => return other.map(|_| None),
         };
         if let Some(charge) = pool.charge_request(held) {
-            return Ok(finish_request(request).await?.map(|r| (r, charge)));
+            let mut request = request;
+            request.decode_charge = charge;
+            return finish_request(request).await;
         }
-        // No room for what the request holds: free it, and decode it again once there is.
+        // No room for what the request holds: free it (a Produce's own frame charge with
+        // it), and decode it again once there is, its frame charged meanwhile.
         drop(request);
+        let _waiting = hold_frame(&frame, budgets.frames)?;
         if !pool
             .wait_for(DecodePool::request_room(held), deadline)
             .await

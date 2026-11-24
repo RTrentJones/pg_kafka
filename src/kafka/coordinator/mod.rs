@@ -449,43 +449,43 @@ impl GroupCoordinator {
     }
 
     /// Whether the member state a JoinGroup stores fits the coordinator's memory budget
-    /// (`pg_kafka.max_group_memory`): what all groups hold, less what this member held
-    /// before, plus what it will hold (and, for a new group, the group's own record). A
-    /// rejoin that holds no more than before is always admitted. Kafka has no such bound
-    /// (its member metadata is bounded by the heap); the refusal is the retriable
-    /// COORDINATOR_NOT_AVAILABLE, as for a full `pg_kafka.max_consumer_groups`, since memory
-    /// frees as other members leave or time out (GROUP_MAX_SIZE_REACHED would be fatal to the
-    /// Java consumer, and names the group's size, which is not what is exhausted).
+    /// (`pg_kafka.max_group_memory`): what all groups hold, less what this member and the
+    /// group's own fields (protocol type, leader, protocol name) held before, plus what they
+    /// will hold after the join (and, for a new group, the group's own record). A rejoin
+    /// that holds no more than before is always admitted. When the state does not fit, the
+    /// least recently active Empty groups are forgotten until it does (see
+    /// [`make_room`]). Kafka has no such bound (its member metadata is bounded by the heap);
+    /// the refusal is the retriable COORDINATOR_NOT_AVAILABLE, as for a full
+    /// `pg_kafka.max_consumer_groups`, since memory frees as other members leave or time
+    /// out (GROUP_MAX_SIZE_REACHED would be fatal to the Java consumer, and names the
+    /// group's size, which is not what is exhausted).
     fn admit_memory(
-        groups: &HashMap<String, ConsumerGroup>,
+        groups: &mut HashMap<String, ConsumerGroup>,
         params: &JoinGroupParams,
         member_id: &str,
         max_memory: usize,
     ) -> Result<()> {
-        let (before, assignment, group_record) = match groups.get(&params.group_id) {
-            Some(group) => {
-                let member = group.members.get(member_id);
-                (
-                    member.map_or(0, GroupMember::held_bytes),
-                    member.and_then(|m| m.assignment.as_deref()),
-                    0,
-                )
-            }
-            None => (
-                0,
-                None,
-                ConsumerGroup::new(params.group_id.clone()).held_bytes(),
-            ),
+        let (before, assignment, group_after) = if let Some(group) = groups.get(&params.group_id) {
+            let member = group.members.get(member_id);
+            let (fields_now, fields_after) = group.join_fields_held_bytes(member_id, params);
+            (
+                member.map_or(0, GroupMember::held_bytes) + fields_now,
+                member.and_then(|m| m.assignment.as_deref()),
+                fields_after,
+            )
+        } else {
+            let group = ConsumerGroup::new(params.group_id.clone());
+            let (_, fields_after) = group.join_fields_held_bytes(member_id, params);
+            (0, None, group.held_bytes() + fields_after)
         };
-        let after = group::member_held_bytes(member_id, params, assignment) + group_record;
+        let after = group::member_held_bytes(member_id, params, assignment) + group_after;
         if after <= before {
             return Ok(());
         }
-        let held = total_held_bytes(groups);
-        let needed = held.saturating_sub(before).saturating_add(after);
-        if needed <= max_memory {
+        if make_room(groups, &params.group_id, after - before, max_memory) {
             return Ok(());
         }
+        let held = total_held_bytes(groups);
         crate::pg_warning!(
             "JoinGroup for group '{}' refused: its member state ({} bytes) does not fit the {} bytes groups hold of pg_kafka.max_group_memory ({} bytes)",
             params.group_id,
@@ -697,6 +697,17 @@ impl GroupCoordinator {
         let stores_assignments = groups.get(group_id).is_some_and(|g| {
             g.state == GroupState::CompletingRebalance && g.leader.as_deref() == Some(member_id)
         });
+        // Room for the assignments is made first (forgetting least recently active Empty
+        // groups), so the check below sees what is left.
+        if stores_assignments {
+            let growth = groups.get(group_id).map_or(0, |g| {
+                g.held_bytes_after_sync(&assignments)
+                    .saturating_sub(g.held_bytes)
+            });
+            if growth > 0 {
+                make_room(groups, group_id, growth, max_memory);
+            }
+        }
         let held_elsewhere = if stores_assignments {
             groups
                 .iter()
@@ -1269,6 +1280,42 @@ struct SyncRequest<'a> {
 /// What all groups hold in coordinator memory, as last counted.
 fn total_held_bytes(groups: &HashMap<String, ConsumerGroup>) -> usize {
     groups.values().map(|g| g.held_bytes).sum()
+}
+
+/// Make `extra` more bytes fit `max_memory` by forgetting the least recently active Empty
+/// groups other than `keep`, as `admit_new_group` does at the group-count cap: an Empty group
+/// holds no members, its committed offsets stay in the database (it remains visible as an
+/// Empty group), and without this the Empty groups a JoinGroup and LeaveGroup leave behind
+/// would keep their bytes for `EMPTY_GROUP_TTL_SECS`. Nothing is forgotten when forgetting
+/// every Empty group would still not make room. Returns whether `extra` fits.
+fn make_room(
+    groups: &mut HashMap<String, ConsumerGroup>,
+    keep: &str,
+    extra: usize,
+    max_memory: usize,
+) -> bool {
+    let mut held = total_held_bytes(groups);
+    if held.saturating_add(extra) <= max_memory {
+        return true;
+    }
+    let mut victims: Vec<(Instant, String, usize)> = groups
+        .values()
+        .filter(|g| g.state == GroupState::Empty && g.group_id != keep)
+        .map(|g| (g.last_activity, g.group_id.clone(), g.held_bytes))
+        .collect();
+    let reclaimable: usize = victims.iter().map(|(_, _, bytes)| bytes).sum();
+    if held.saturating_sub(reclaimable).saturating_add(extra) > max_memory {
+        return false;
+    }
+    victims.sort_unstable();
+    for (_, group_id, bytes) in victims {
+        if held.saturating_add(extra) <= max_memory {
+            break;
+        }
+        groups.remove(&group_id);
+        held = held.saturating_sub(bytes);
+    }
+    true
 }
 
 /// Run a group's rebalance timeout and recount what it holds if that changed it (an

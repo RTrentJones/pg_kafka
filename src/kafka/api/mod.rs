@@ -338,6 +338,8 @@ fn decode_api<A: KafkaApi>(
             body: wrap_request(request),
             header,
             response_tx,
+            // Charged by the network thread once it knows what the decode holds.
+            decode_charge: crate::kafka::protocol::DecodedCharge::default(),
         }),
         Some(Err(Rejection::Reply { error_code, echo })) => {
             reply(
@@ -681,9 +683,10 @@ macro_rules! kafka_apis {
             Err((header, response_tx))
         }
 
-        /// Run `request` on the DB thread.
+        /// Run `request` on the DB thread. What the decoded request holds of the
+        /// decoded-request budget is given back once its handler returns.
         pub fn dispatch(request: KafkaRequest, env: &ApiEnv<'_>) -> RequestOutcome {
-            let KafkaRequest { header, body, response_tx } = request;
+            let KafkaRequest { header, body, response_tx, decode_charge: _held } = request;
             match body {
                 $(RequestBody::$variant(r) => <$api as KafkaApi>::handle(
                     r,

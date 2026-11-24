@@ -1,5 +1,5 @@
 {
-  "_comment": "The 23 Kafka APIs implemented by pg_kafka (single source of truth for the conformance harnesses + merge). Mirrors the 'Implemented APIs' table in README.md.",
+  "_comment": "The conformance matrix: 23 of the Kafka APIs pg_kafka implements (single source of truth for the conformance harnesses + merge). The others (DeleteRecords, DescribeConfigs, IncrementalAlterConfigs, SaslHandshake, SaslAuthenticate) are listed in evidence/README.md.",
   "apis": [
     { "key": 0, "name": "Produce" },
     { "key": 1, "name": "Fetch" },

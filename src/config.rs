@@ -379,7 +379,7 @@ gucs! {
     /// librdkafka linger.ms of the shadow producer.
     int SHADOW_LINGER_MS = DEFAULT_SHADOW_LINGER_MS => c"pg_kafka.shadow_linger_ms" {
         short: c"Batching delay for shadow forwarding (milliseconds)",
-        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Default: 10ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Every sync-mode response waits for it too: a linger near pg_kafka.shadow_sync_timeout_ms makes held responses time out (their records are forwarded later). Default: 10ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_LINGER_MS, MAX_SHADOW_LINGER_MS),
     }
@@ -387,7 +387,7 @@ gucs! {
     /// Base of the shadow retry back-off (librdkafka and the outbox).
     int SHADOW_RETRY_BACKOFF_MS = DEFAULT_SHADOW_RETRY_BACKOFF_MS => c"pg_kafka.shadow_retry_backoff_ms" {
         short: c"Retry backoff for shadow forwarding (milliseconds)",
-        long: c"librdkafka retry.backoff.ms (its first retry backoff, doubling up to retry.backoff.max.ms, which is set to the larger of this and 1000 ms), and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka retry.backoff.ms, capped at 10 s (its first retry backoff inside one delivery attempt, doubling up to retry.backoff.max.ms, which is set to the larger of that and 1000 ms; the cap keeps librdkafka's own retries well inside the forwarder's 120 s delivery timeout), and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_RETRY_BACKOFF_MS, MAX_SHADOW_RETRY_BACKOFF_MS),
     }

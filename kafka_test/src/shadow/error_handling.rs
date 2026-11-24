@@ -3,8 +3,9 @@
 //!   is stored locally, and the record is forwarded once the broker is back;
 //! - ExternalOnly with a forward that keeps failing: the record is
 //!   dead-lettered and then served by local reads (the fallback);
-//! - settings no producer can be built from fail every record (counted,
-//!   dead-lettered), also after a working producer was retired by the change;
+//! - settings no producer can be built from fail each partition's head
+//!   (counted, dead-lettered), not the records behind it, also after a working
+//!   producer was retired by the change;
 //! - a dead-lettered external-primary forward is served locally (RV-6).
 
 use crate::common::{
@@ -279,14 +280,18 @@ pub async fn test_external_only_fallback() -> TestResult {
 
 /// Settings no producer can be built from, set while a working producer holds
 /// the records: the change retires that producer (its records come back
-/// uncounted, as they should), and from then on every record the forwarder
-/// cannot send is a failed attempt, so the records reach the retry cap and are
-/// dead-lettered with the error recorded. (They were answered as collateral of
-/// the retired producer instead: never counted, never dead-lettered, and claimed
-/// again and again every outbox tick.)
+/// uncounted, as they should), and from then on the record each partition waits
+/// on (its head) is a failed attempt, so it reaches the retry cap and is
+/// dead-lettered with the error recorded, and the next record takes its place.
+/// The records behind a head are not charged: they were all answered as failed
+/// attempts, so with the default backoff every claimed row was a dead letter
+/// within a minute of one bad setting, and the rest of the backlog followed
+/// claim by claim.
 pub async fn test_shadow_unbuildable_settings_dead_letter_after_a_working_producer() -> TestResult {
-    const RECORDS: usize = 5_000;
+    const RECORDS: usize = 500;
     const CAP: i32 = 3;
+    /// Dead letters to wait for: several heads in turn reach the cap.
+    const DEAD: i64 = 4;
     println!("=== Test: unbuildable shadow settings after a working producer ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-unbuildable").await;
@@ -363,46 +368,73 @@ pub async fn test_shadow_unbuildable_settings_dead_letter_after_a_working_produc
         )
         .await?;
 
-        println!("Step 3: every record fails until it is a dead letter at {CAP}");
+        println!("Step 3: each partition's head fails until it is a dead letter at {CAP}");
         let rows = i64::try_from(RECORDS)?;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let (all, _, dead) = outbox_state(ctx.db(), topic_id, CAP).await?;
-            if all == rows && dead == rows {
+            assert_eq!(all, rows);
+            if dead >= DEAD {
                 break;
             }
             if Instant::now() > deadline {
-                let row = ctx
-                    .db()
-                    .query_one(
-                        "SELECT COUNT(*) FILTER (WHERE retry_count = 0), \
-                                COUNT(*) FILTER (WHERE error_message IS NULL) \
-                         FROM kafka.shadow_tracking WHERE topic_id = $1",
-                        &[&topic_id],
-                    )
-                    .await?;
-                let (unfailed, no_error): (i64, i64) = (row.get(0), row.get(1));
-                return Err(format!(
-                    "after 90 s {dead} of {all} rows are dead letters; {unfailed} never \
-                     counted a failure, {no_error} have no error message"
-                )
-                .into());
+                return Err(
+                    format!("after 90 s only {dead} of {all} rows are dead letters").into(),
+                );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let row = ctx
             .db()
             .query_one(
-                "SELECT COUNT(*) FILTER (WHERE retry_count = $2 \
+                "SELECT COUNT(*) FILTER (WHERE dead), \
+                        COUNT(*) FILTER (WHERE dead \
                           AND error_message LIKE '%invalid shadow configuration%'), \
-                        COUNT(*) FILTER (WHERE external_offset IS NOT NULL) \
-                 FROM kafka.shadow_tracking WHERE topic_id = $1",
-                &[&topic_id, &CAP],
+                        COUNT(*) FILTER (WHERE NOT dead AND retry_count > 0), \
+                        COUNT(*) FILTER (WHERE external_offset IS NOT NULL), \
+                        COUNT(*) FILTER (WHERE dead AND EXISTS ( \
+                            SELECT 1 FROM kafka.shadow_tracking lo \
+                            WHERE lo.topic_id = st.topic_id \
+                              AND lo.partition_id = st.partition_id \
+                              AND lo.local_offset < st.local_offset AND NOT lo.dead)), \
+                        (SELECT COUNT(DISTINCT partition_id) FROM kafka.shadow_tracking \
+                         WHERE topic_id = $1) \
+                 FROM kafka.shadow_tracking st WHERE topic_id = $1",
+                &[&topic_id],
             )
             .await?;
-        let (with_error, delivered): (i64, i64) = (row.get(0), row.get(1));
-        println!("  {with_error} of {rows} dead letters record the configuration error");
-        assert_eq!(with_error, rows, "every dead letter records why it failed");
+        let (dead, with_error, charged, delivered, out_of_order, partitions): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = (
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            row.get(5),
+        );
+        println!(
+            "  {dead} dead letters ({with_error} record the configuration error), \
+             {charged} live rows charged an attempt, {partitions} partition(s)"
+        );
+        assert_eq!(with_error, dead, "every dead letter records why it failed");
+        assert_eq!(
+            out_of_order, 0,
+            "the dead letters are their partitions' heads"
+        );
+        assert!(
+            charged <= partitions,
+            "only each partition's head is charged, not the rows behind it"
+        );
+        assert!(
+            dead < rows / 2,
+            "the backlog is not dead-lettered wholesale"
+        );
         assert_eq!(delivered, 0, "nothing can have been delivered");
         Ok::<(), Box<dyn std::error::Error>>(())
     }

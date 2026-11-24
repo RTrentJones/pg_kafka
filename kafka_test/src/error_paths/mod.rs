@@ -51,7 +51,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lifecycle_tests::test_failed_request_rolls_back_alone,
         lifecycle_tests::test_group_commit_concurrent_acks_visible,
         lifecycle_tests::test_group_commit_pipelined_produces_in_order,
-        metrics_tests::test_metrics_count_produce_and_fetch,
+        metrics_tests::test_metrics_count_produce_and_fetch: sequential,
         metrics_tests::test_consumer_lag_view,
         bug_hunt::test_fetch_into_cleaned_up_aborted_rows_is_in_range,
         bug_hunt::test_fetch_bad_partition_or_offset_returns_error,

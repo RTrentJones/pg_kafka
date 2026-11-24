@@ -41,14 +41,18 @@ impl Dispatcher {
                     header,
                     body: RequestBody::Fetch(fetch),
                     response_tx,
+                    decode_charge,
                 },
             ) => {
                 let long_poll =
                     LongPoll::new(header, fetch, self.request_lanes.main.clone(), response_tx);
                 let registry = Arc::clone(&self.registry);
                 tokio::spawn(async move {
-                    // Hold the per-connection slot for the task's lifetime.
+                    // Hold the per-connection slot, and the decoded request's share of the
+                    // decoded-request budget (the task holds the request), for the task's
+                    // lifetime.
                     let _slot = permit;
+                    let _held = decode_charge;
                     if let Err(e) = long_poll.run(&registry, poll_interval).await {
                         warn!("Long poll handler error: {e}");
                     }

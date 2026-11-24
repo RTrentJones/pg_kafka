@@ -450,7 +450,7 @@ crate::config::gucs! {
     }
     int CONNECTIONS_MAX_IDLE_MS = crate::kafka::conn_limits::DEFAULT_CONNECTIONS_MAX_IDLE_MS => c"pg_kafka.connections_max_idle_ms" {
         short: c"Close Kafka client connections idle for this long",
-        long: c"Kafka's connections.max.idle.ms: a connection with no request read, no response written and nothing outstanding for this long is closed. Read when the worker starts.",
+        long: c"Kafka's connections.max.idle.ms: a connection that reads no request and writes no response bytes for this long is closed, unless a request it sent is still being answered (a response waiting for the client to read it does not count). Read when the worker starts.",
         context: Sighup,
         range: (100, i32::MAX),
         flags: GucFlags::UNIT_MS,

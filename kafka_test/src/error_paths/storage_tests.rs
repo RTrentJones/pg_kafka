@@ -18,8 +18,13 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 /// Number of expired rows seeded by the retention test: well above one sweep batch
-/// (10,000 rows), so a sweep must loop to catch up.
+/// (10,000 rows), so the sweep must run more than one batch to catch up.
 const RETENTION_BACKLOG: i64 = 25_000;
+
+/// The most sweep passes the retention test allows for the backlog. A pass deletes at least
+/// one 10,000-row batch per step before its time budget stops it, so three suffice; the
+/// margin covers passes that skip while another test's sweep holds the maintenance lock.
+const MAX_SWEEP_PASSES: usize = 10;
 
 /// Create a topic directly in SQL (no broker round trip) and return its id.
 async fn create_topic_sql(
@@ -38,12 +43,14 @@ async fn create_topic_sql(
         .get(0))
 }
 
-/// The retention sweep must catch up on a backlog in one pass instead of deleting a
-/// single 10,000-row batch per pass (which let the table grow without bound above
-/// ~167 records/s), and must still advance the partition's durable log start.
+/// The retention sweep catches up on a backlog of expired rows: each pass deletes in
+/// batches until its time budget is spent (not one batch per pass, which let the table grow
+/// without bound above ~167 records/s), passes drain the rest, and the partition's durable
+/// log start advances to the oldest surviving offset. Fresh rows survive.
 ///
-/// One `pg_kafka_run_retention_sweep()` call must not leave expired rows behind (a
-/// sweep bounded to one batch would leave 15,000 of the 25,000).
+/// Other tests' sweeps may run at the same time (they delete these expired rows too, or hold
+/// the maintenance lock for a while): the seed commits in one transaction, so no sweep sees
+/// the rows without their offsets row, and the test sweeps until nothing expired is left.
 pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     println!("=== Test: Retention Sweep Catches Up On A Backlog ===\n");
 
@@ -52,50 +59,46 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
     // retention.ms = 1 hour: every seeded row (created a day ago) is expired.
     let topic_id = create_topic_sql(&ctx, &topic, 1, Some(3_600_000)).await?;
 
-    println!("Step 1: seed {RETENTION_BACKLOG} expired rows...");
+    println!("Step 1: seed {RETENTION_BACKLOG} expired rows and 2 fresh ones...");
+    // One transaction: the rows and their offsets row become visible together. A sweep
+    // that saw the messages first could create the offsets row itself, hence ON CONFLICT.
     ctx.db()
-        .execute(
-            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
-             SELECT $1::int, 0, g, 'v'::bytea, NOW() - INTERVAL '1 day' + g * INTERVAL '1 millisecond'
-             FROM generate_series(0::bigint, $2::bigint - 1) AS g",
-            &[&topic_id, &RETENTION_BACKLOG],
-        )
-        .await?;
-    ctx.db()
-        .execute(
-            "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
-             VALUES ($1, 0, $2)",
-            &[&topic_id, &RETENTION_BACKLOG],
-        )
-        .await?;
-    // Two fresh rows that must survive the sweep.
-    ctx.db()
-        .execute(
-            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-             VALUES ($1, 0, $2::bigint, 'fresh'::bytea), ($1, 0, $2::bigint + 1, 'fresh'::bytea)",
-            &[&topic_id, &RETENTION_BACKLOG],
-        )
-        .await?;
-    ctx.db()
-        .execute(
-            "UPDATE kafka.partition_offsets SET next_offset = $2::bigint + 2 WHERE topic_id = $1",
-            &[&topic_id, &RETENTION_BACKLOG],
-        )
+        .batch_execute(&format!(
+            "BEGIN;
+             INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+             SELECT {topic_id}, 0, g, 'v'::bytea, NOW() - INTERVAL '1 day' + g * INTERVAL '1 millisecond'
+             FROM generate_series(0::bigint, {RETENTION_BACKLOG} - 1) AS g;
+             INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
+             VALUES ({topic_id}, 0, {RETENTION_BACKLOG}, 'fresh'::bytea),
+                    ({topic_id}, 0, {RETENTION_BACKLOG} + 1, 'fresh'::bytea);
+             INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+             VALUES ({topic_id}, 0, {RETENTION_BACKLOG} + 2)
+             ON CONFLICT (topic_id, partition_id) DO UPDATE SET next_offset = EXCLUDED.next_offset;
+             COMMIT;"
+        ))
         .await?;
 
-    println!("Step 2: one on-demand sweep...");
-    ctx.db()
-        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
-        .await?;
-
-    let remaining: i64 = ctx
-        .db()
-        .query_one(
-            "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
-            &[&topic_id],
-        )
-        .await?
-        .get(0);
+    println!("Step 2: sweep until caught up (at most {MAX_SWEEP_PASSES} passes)...");
+    let mut remaining = 0i64;
+    let mut passes = 0;
+    while passes < MAX_SWEEP_PASSES {
+        ctx.db()
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
+            .await?;
+        passes += 1;
+        remaining = ctx
+            .db()
+            .query_one(
+                "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1",
+                &[&topic_id],
+            )
+            .await?
+            .get(0);
+        println!("   after pass {passes}: {remaining} rows");
+        if remaining <= 2 {
+            break;
+        }
+    }
     let log_start: i64 = ctx
         .db()
         .query_one(
@@ -104,11 +107,11 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
         )
         .await?
         .get(0);
-    println!("   remaining rows={remaining} log_start_offset={log_start}");
+    println!("   remaining rows={remaining} log_start_offset={log_start} after {passes} passes");
 
     if remaining != 2 {
         return Err(format!(
-            "expected only the 2 fresh rows to survive one sweep, found {remaining} rows \
+            "expected only the 2 fresh rows to survive {passes} sweeps, found {remaining} rows \
              (the sweep did not catch up on the backlog)"
         )
         .into());

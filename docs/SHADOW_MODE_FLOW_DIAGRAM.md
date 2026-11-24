@@ -56,8 +56,8 @@ GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads t
 | `pg_kafka.shadow_sasl_username` / `_password` | '' | Superuser-only, hidden from SHOW ALL. |
 | `pg_kafka.shadow_ssl_ca_location` | '' | CA file for SSL. |
 | `pg_kafka.shadow_batch_size` | 1000 | Records per outbox claim, and librdkafka `batch.num.messages`. |
-| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms` (0-5000). |
-| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms` (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
+| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms` (0-5000). A sync-mode response waits for it as well: a linger near `shadow_sync_timeout_ms` (default 5000 too) makes held responses time out. |
+| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, capped at 10 s so that librdkafka's own retries stay well inside the 120 s delivery timeout (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it; `topic.metadata.refresh.fast.interval.ms`, which would follow it, is pinned to librdkafka's default 100 ms), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
 | `pg_kafka.shadow_max_retries` | 10 | Failed delivery attempts after which a row is a dead letter. |
 | `pg_kafka.shadow_sync_timeout_ms` | 5000 | How long a sync-mode produce response is held for the external ack (0 = not held). |
 | `pg_kafka.shadow_metrics_enabled` | true | Write `kafka.shadow_metrics`. |
@@ -69,11 +69,15 @@ Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.co
 Any change to a producer setting (servers, protocol, SASL, CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
 within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
 without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
-or unbuildable config is logged once per distinct error and, until it is fixed, every record the
-forwarder receives fails without being sent: a `Failed` attempt that counts against its retry
-budget and leads to a dead letter, also when the change retired a working producer or the producer
-went fatal and cannot be rebuilt. Each failure fences the record's partition, so once a producer
-can be built again nothing later of the partition goes out ahead of the failed record's retry.
+or unbuildable config is logged once per distinct error and, until it is fixed, nothing is sent:
+the record each partition waits on (the first one the fence admits) fails, a `Failed` attempt that
+counts against its retry budget and leads to a dead letter, also when the change retired a working
+producer or the producer went fatal and cannot be rebuilt; the failure fences the partition, so
+the records behind it are `NotAttempted` (not charged, as for the delivery timeout) and wait for
+its retry, and once a producer can be built again nothing later of the partition goes out ahead of
+it. So one bad setting dead-letters each partition's records one at a time, after
+`shadow_max_retries` backoffs each, not a whole backlog at once (which with `external_only` topics
+would also switch their consumers to local reads).
 
 Per-topic settings are rows of `kafka.shadow_config` (`mode`, `forward_percentage`,
 `external_topic_name`, `sync_mode`, `write_mode`), reloaded into the `TopicConfigCache` on SIGHUP or
@@ -100,8 +104,15 @@ producer sent none, which is what local consumers see). `partition` is left to t
 
 ### Ordering
 
-The records of one local partition reach the external topic in local-offset order (the first copy
-of each; see duplicates below). That rests on:
+The forwarder sends the records of one local partition in local-offset order, and none of them
+goes out ahead of an earlier one's retry. What the external topic keeps of that order is per
+external partition: the partitioner (`murmur2_random`) places each record by its key, so the
+records of one local partition that land in the same external partition (for keyed records, the
+records of one key) are in local-offset order there (the first copy of each; see duplicates
+below), while records with different keys, and records with a null key (placed at random), may
+land in different external partitions with no order between them. A record that is dead-lettered
+lets its partition move on: if it is replayed later, it lands after the records that followed it.
+The sending order rests on:
 
 1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with a row due (its lowest due offsets; partitions holding only dead letters or rows in flight or backing off take no share), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A claim that leaves rows due is followed by the next one at once (5 ms at the earliest). A row is
    never claimed behind an earlier row of its partition that is backing off after a failure.
@@ -125,9 +136,11 @@ of each; see duplicates below). That rests on:
    stays in order.
 3. **The fence.** Once a record of a partition fails, every later record of that partition the
    forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
-   a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
-   the lowest pending row, which is how a partition moves on after its failed record is
-   dead-lettered). When a producer is replaced (settings change) or goes fatal, every partition
+   the failed record's retry, or a record above it that the claim marks as the partition head
+   (`restart`, the lowest pending row, which is how a partition moves on after its failed record
+   is delivered or dead-lettered). A record below the failed offset (one a replay made due) is
+   sent but leaves the fence in place, so the later records of its claim cannot overtake the
+   failed record's retry. When a producer is replaced (settings change) or goes fatal, every partition
    with a record still outstanding on it is fenced at once, at its lowest outstanding offset:
    those records fail later, and nothing of their partitions may go out on the replacement ahead
    of their retry. A replaced producer's queued and in-flight records are purged, the fatal one's
@@ -138,7 +151,8 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
-retry budget. A record no producer can be built for (see Configuration) is `Failed`. Of the
+retry budget. A record no producer can be built for (see Configuration) is `Failed` if it is
+the record its partition waits on and `NotAttempted` behind it. Of the
 records purged by the delivery timeout, the lowest outstanding record of each local partition that has been held for at least half the timeout is `Failed` (the record the
 partition waits on); the records behind it, and a head received less than half a timeout ago (a
 partition that was flowing), are `NotAttempted`. A record that runs out of time in the backlog is
