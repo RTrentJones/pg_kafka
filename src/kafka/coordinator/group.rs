@@ -90,11 +90,67 @@ pub struct GroupMember {
     /// SyncGroup. Only ever true while the group is CompletingRebalance.
     pub awaiting_sync: bool,
 
+    /// True from the completion of a join phase until this member sends a SyncGroup for its
+    /// generation (Kafka's `pendingSyncMembers`). A member still pending when the group's
+    /// rebalance timeout has passed since the join completed is removed, heartbeating or not.
+    pub pending_sync: bool,
+
     /// Static group instance ID (KIP-345) for static membership
     pub group_instance_id: Option<String>,
 }
 
+/// Fixed cost counted for each heap allocation a member or group holds (a `String` or
+/// `Vec` header plus allocator overhead), so that many tiny entries cannot hide behind a
+/// byte count of only their contents.
+const ALLOCATION_OVERHEAD: usize = 48;
+
+/// What one protocol list holds in coordinator memory: each name and metadata, plus a
+/// fixed cost per allocation.
+pub(super) fn protocols_held_bytes(protocols: &[(String, Vec<u8>)]) -> usize {
+    protocols
+        .iter()
+        .map(|(name, metadata)| name.len() + metadata.len() + 2 * ALLOCATION_OVERHEAD)
+        .sum()
+}
+
+/// What a member with these fields holds in coordinator memory (counted against
+/// `pg_kafka.max_group_memory`): its strings, protocols and assignment, plus the member
+/// record itself and the fixed cost of each allocation.
+pub(super) fn member_held_bytes(
+    member_id: &str,
+    params: &JoinGroupParams,
+    assignment: Option<&[u8]>,
+) -> usize {
+    size_of::<GroupMember>()
+        // The member map's key, the member id itself, the client id and host, the protocol
+        // type and the instance id.
+        + 2 * member_id.len()
+        + params.client_id.len()
+        + params.client_host.len()
+        + params.protocol_type.len()
+        + params.group_instance_id.as_ref().map_or(0, String::len)
+        + 6 * ALLOCATION_OVERHEAD
+        + protocols_held_bytes(&params.protocols)
+        + assignment.map_or(0, |a| a.len() + ALLOCATION_OVERHEAD)
+}
+
 impl GroupMember {
+    /// What this member holds in coordinator memory (see [`member_held_bytes`]).
+    pub(super) fn held_bytes(&self) -> usize {
+        size_of::<GroupMember>()
+            + 2 * self.member_id.len()
+            + self.client_id.len()
+            + self.client_host.len()
+            + self.protocol_type.len()
+            + self.group_instance_id.as_ref().map_or(0, String::len)
+            + 6 * ALLOCATION_OVERHEAD
+            + protocols_held_bytes(&self.protocols)
+            + self
+                .assignment
+                .as_ref()
+                .map_or(0, |a| a.len() + ALLOCATION_OVERHEAD)
+    }
+
     /// Check if member's session has timed out
     pub fn is_timed_out(&self) -> bool {
         // A non-positive session timeout is invalid; it counts as already expired, so the
@@ -192,10 +248,20 @@ pub struct ConsumerGroup {
     /// When the current join or sync phase started (for the rebalance timeout)
     pub rebalance_started_at: Option<Instant>,
 
+    /// When the last join phase completed, while members of its generation have not sent
+    /// their SyncGroup (`GroupMember::pending_sync`): those still pending a rebalance timeout
+    /// later are removed, in CompletingRebalance or Stable (Kafka's DelayedSync).
+    pub sync_started_at: Option<Instant>,
+
     /// The group's protocol type ("consumer", "connect", ...), set by the first member to join
     /// and kept when the group empties, as in Kafka. Every later member must use
     /// the same one (INCONSISTENT_GROUP_PROTOCOL otherwise) while the group has members.
     pub protocol_type: Option<String>,
+
+    /// What the group held in coordinator memory when last counted ([`Self::recount`]): the
+    /// coordinator recounts a group after every operation that changes it, and bounds the
+    /// sum over all groups by `pg_kafka.max_group_memory`.
+    pub(super) held_bytes: usize,
 }
 
 impl ConsumerGroup {
@@ -211,8 +277,83 @@ impl ConsumerGroup {
             previous_assignments: HashMap::new(),
             last_activity: Instant::now(),
             rebalance_started_at: None,
+            sync_started_at: None,
             protocol_type: None,
+            held_bytes: 0,
         }
+        .recounted()
+    }
+
+    fn recounted(mut self) -> Self {
+        self.recount();
+        self
+    }
+
+    /// What the group holds in coordinator memory, counted from its current state: the
+    /// group record, its id, protocol name, protocol type and leader, every member and every
+    /// previous assignment kept for the sticky assignor.
+    pub(super) fn count_held_bytes(&self) -> usize {
+        let text = |s: &Option<String>| s.as_ref().map_or(0, |s| s.len() + ALLOCATION_OVERHEAD);
+        size_of::<ConsumerGroup>()
+            + 2 * (self.group_id.len() + ALLOCATION_OVERHEAD)
+            + text(&self.protocol_name)
+            + text(&self.protocol_type)
+            + text(&self.leader)
+            + self
+                .members
+                .values()
+                .map(GroupMember::held_bytes)
+                .sum::<usize>()
+            + self
+                .previous_assignments
+                .iter()
+                .map(|(member_id, a)| member_id.len() + a.len() + 2 * ALLOCATION_OVERHEAD)
+                .sum::<usize>()
+    }
+
+    /// Bring [`Self::held_bytes`] up to date after the group changed.
+    pub(super) fn recount(&mut self) {
+        self.held_bytes = self.count_held_bytes();
+    }
+
+    /// What the group holds in coordinator memory as last counted.
+    pub fn held_bytes(&self) -> usize {
+        self.held_bytes
+    }
+
+    /// What the group would hold once the leader's SyncGroup stored `assignments` and
+    /// [`Self::complete_sync`] ran: every member's assignment (the last one the leader gave
+    /// it, its current one, or an empty one) replaces its current one, and the non-empty
+    /// ones replace the previous assignments kept for the sticky assignor. Assignments for
+    /// ids that are not members are not stored. Assumes [`Self::held_bytes`] is current.
+    pub(super) fn held_bytes_after_sync(&self, assignments: &[(String, Vec<u8>)]) -> usize {
+        let given: HashMap<&str, &[u8]> = assignments
+            .iter()
+            .map(|(member_id, a)| (member_id.as_str(), a.as_slice()))
+            .collect();
+        let assignment_cost = |a: Option<&[u8]>| a.map_or(0, |a| a.len() + ALLOCATION_OVERHEAD);
+        let previous: usize = self
+            .previous_assignments
+            .iter()
+            .map(|(member_id, a)| member_id.len() + a.len() + 2 * ALLOCATION_OVERHEAD)
+            .sum();
+        let mut after = self.held_bytes.saturating_sub(previous);
+        for member in self.members.values() {
+            let current = member.assignment.as_deref();
+            let new = given
+                .get(member.member_id.as_str())
+                .copied()
+                .or(current)
+                .unwrap_or_default();
+            after = after
+                .saturating_sub(assignment_cost(current))
+                .saturating_add(assignment_cost(Some(new)));
+            if !new.is_empty() {
+                after = after
+                    .saturating_add(member.member_id.len() + new.len() + 2 * ALLOCATION_OVERHEAD);
+            }
+        }
+        after
     }
 
     /// Kafka's `supportsProtocols` rule for a JoinGroup: joining an Empty group
@@ -256,6 +397,7 @@ impl ConsumerGroup {
         let assignment = existing.and_then(|m| m.assignment.clone());
         let awaiting_join = existing.is_some_and(|m| m.awaiting_join);
         let awaiting_sync = existing.is_some_and(|m| m.awaiting_sync);
+        let pending_sync = existing.is_some_and(|m| m.pending_sync);
         let member = GroupMember {
             member_id: member_id.to_string(),
             client_id: params.client_id.clone(),
@@ -268,6 +410,7 @@ impl ConsumerGroup {
             last_heartbeat: Instant::now(),
             awaiting_join,
             awaiting_sync,
+            pending_sync,
             group_instance_id: params.group_instance_id.clone(),
         };
         self.members.insert(member_id.to_string(), member);
@@ -346,6 +489,8 @@ impl ConsumerGroup {
                 }),
             ));
         }
+        // The generation's pending syncs no longer matter: a new join phase starts.
+        self.clear_pending_syncs();
         self.state = GroupState::PreparingRebalance;
         self.rebalance_started_at = Some(Instant::now());
         pg_log!(
@@ -389,7 +534,10 @@ impl ConsumerGroup {
             member.assignment = None;
             // The held JoinGroup counted as liveness; the session clock restarts now.
             member.last_heartbeat = now;
+            // Every member must sync this generation within the rebalance timeout.
+            member.pending_sync = true;
         }
+        self.sync_started_at = Some(now);
 
         let mut member_ids: Vec<String> = self.members.keys().cloned().collect();
         member_ids.sort();
@@ -499,6 +647,7 @@ impl ConsumerGroup {
             self.protocol_name = None;
             self.leader = None;
             self.rebalance_started_at = None;
+            self.sync_started_at = None;
             self.last_activity = Instant::now();
         }
         true
@@ -515,48 +664,80 @@ impl ConsumerGroup {
         }
     }
 
+    /// The rebalance timeout of the group: the largest rebalance timeout its members
+    /// advertised, as in Kafka.
+    fn rebalance_timeout_ms(&self) -> u128 {
+        self.members
+            .values()
+            .map(GroupMember::effective_rebalance_timeout_ms)
+            .max()
+            .unwrap_or(u128::from(DEFAULT_REBALANCE_TIMEOUT_MS))
+    }
+
+    /// Forget which members have yet to sync (a new join phase starts, or none is left).
+    pub(super) fn clear_pending_syncs(&mut self) {
+        for member in self.members.values_mut() {
+            member.pending_sync = false;
+        }
+        self.sync_started_at = None;
+    }
+
+    /// Record a member's SyncGroup for the current generation.
+    pub(super) fn record_sync(&mut self, member_id: &str) {
+        if let Some(member) = self.members.get_mut(member_id) {
+            member.pending_sync = false;
+        }
+        if !self.members.values().any(|m| m.pending_sync) {
+            self.sync_started_at = None;
+        }
+    }
+
     /// Handle a rebalance phase that exceeded its rebalance timeout (the largest
     /// rebalance timeout the members advertised, as in Kafka):
     /// - join phase (PreparingRebalance): evict the members that did not rejoin, then
     ///   complete the join with the ones that did (answering their held JoinGroups);
-    /// - sync phase (CompletingRebalance): the leader never delivered assignments, so
-    ///   evict it and start a new join phase with the remaining members.
+    /// - after the join completed (CompletingRebalance or Stable): evict every member that
+    ///   has not sent its SyncGroup for the generation, heartbeating or not, and start a new
+    ///   join phase with the rest, as Kafka 3.7 does (`onExpirePendingSync`). In the sync
+    ///   phase the leader is always one of them (its SyncGroup ends the phase).
     ///
     /// Returns the evicted member ids.
     pub(super) fn expire_stuck_rebalance(&mut self, out: &mut Vec<Delivery>) -> Vec<String> {
-        if !matches!(
-            self.state,
-            GroupState::PreparingRebalance | GroupState::CompletingRebalance
-        ) {
-            return Vec::new();
-        }
-        let Some(started) = self.rebalance_started_at else {
+        let started = match self.state {
+            GroupState::PreparingRebalance => self.rebalance_started_at,
+            GroupState::CompletingRebalance | GroupState::Stable => self.sync_started_at,
+            GroupState::Empty => None,
+        };
+        let Some(started) = started else {
             return Vec::new();
         };
-        // Honour the members' advertised rebalance_timeout_ms (the max across the
-        // group, matching Kafka) rather than a hardcoded value.
-        let effective_timeout_ms = self
-            .members
-            .values()
-            .map(GroupMember::effective_rebalance_timeout_ms)
-            .max()
-            .unwrap_or(u128::from(DEFAULT_REBALANCE_TIMEOUT_MS));
-        if started.elapsed().as_millis() <= effective_timeout_ms {
+        if started.elapsed().as_millis() <= self.rebalance_timeout_ms() {
             return Vec::new();
         }
 
-        if self.state == GroupState::CompletingRebalance {
-            let Some(leader) = self.leader.clone() else {
-                return Vec::new();
-            };
+        if self.state != GroupState::PreparingRebalance {
+            let mut unsynced: Vec<String> = self
+                .members
+                .values()
+                .filter(|m| m.pending_sync)
+                .map(|m| m.member_id.clone())
+                .collect();
+            unsynced.sort();
+            self.sync_started_at = None;
+            if unsynced.is_empty() {
+                return unsynced;
+            }
             pg_log!(
-                "Group {} leader {} did not sync within the rebalance timeout; evicting it",
+                "Group {} generation {}: evicting {} member(s) that did not sync within the rebalance timeout",
                 self.group_id,
-                leader
+                self.generation_id,
+                unsynced.len()
             );
-            self.remove_member(&leader, out);
+            for member_id in &unsynced {
+                self.remove_member(member_id, out);
+            }
             self.on_members_removed(out);
-            return vec![leader];
+            return unsynced;
         }
 
         let mut stragglers: Vec<String> = self

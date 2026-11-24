@@ -43,6 +43,16 @@ pub fn handle_find_coordinator(
 
     crate::pg_debug!("FindCoordinator: key={}, key_type={}", key, key_type);
 
+    // Kafka 3.7 knows two coordinator types (0 group, 1 transaction) and answers any other
+    // INVALID_REQUEST ("Unknown coordinator type received").
+    if !(0..=1).contains(&key_type) {
+        return Ok(
+            crate::kafka::response_builders::build_find_coordinator_error_response(
+                crate::kafka::constants::ERROR_INVALID_REQUEST,
+            ),
+        );
+    }
+
     // Build response - we are always the coordinator for all groups
     let mut response = FindCoordinatorResponse::default();
     response.throttle_time_ms = 0;
@@ -194,6 +204,8 @@ where
         crate::kafka::limits::max_consumer_groups(),
         crate::kafka::limits::group_max_size(),
     );
+    ctx.coordinator
+        .set_memory_limit(crate::kafka::limits::max_group_memory_bytes());
     // Only used if the group has not selected a protocol (never after a completed
     // join), so the response is never without one.
     let fallback_protocol = protocols.first().map(|(name, _)| name.clone());
@@ -411,6 +423,7 @@ pub fn handle_sync_group<F>(
 {
     let coordinator = ctx.coordinator;
     let store = ctx.store;
+    coordinator.set_memory_limit(crate::kafka::limits::max_group_memory_bytes());
 
     crate::pg_debug!(
         "SyncGroup: group_id={}, member_id={}, generation_id={}, assignments={}",
@@ -616,8 +629,12 @@ pub fn handle_describe_groups(
     Ok(response)
 }
 
-/// DescribeGroups for a group the coordinator holds: its state, protocol and members.
+/// DescribeGroups for a group the coordinator holds: its state, protocol and members. As in
+/// Kafka 3.7 (`GroupMetadata.summary`), only a Stable group reports its protocol and each
+/// member's metadata and assignment; in any other state they are empty (the protocol
+/// chosen by a join phase in progress, and the metadata members sent for it, are not settled).
 fn describe_held_group(group_id: &str, group: &ConsumerGroup) -> DescribedGroup {
+    let stable = group.state == crate::kafka::coordinator::GroupState::Stable;
     let mut described_group = DescribedGroup::default();
     described_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
     described_group.error_code = ERROR_NONE;
@@ -628,12 +645,22 @@ fn describe_held_group(group_id: &str, group: &ConsumerGroup) -> DescribedGroup 
             .clone()
             .unwrap_or_else(|| "consumer".to_string()),
     );
-    described_group.protocol_data =
-        StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+    described_group.protocol_data = if stable {
+        StrBytes::from_string(group.protocol_name.clone().unwrap_or_default())
+    } else {
+        StrBytes::default()
+    };
     described_group.members = group
         .members
         .values()
-        .map(|member| describe_member(member, group.protocol_name.as_ref()))
+        .map(|member| {
+            let mut described = describe_member(member, group.protocol_name.as_ref());
+            if !stable {
+                described.member_metadata = bytes::Bytes::default();
+                described.member_assignment = bytes::Bytes::default();
+            }
+            described
+        })
         .collect();
     described_group
 }
@@ -712,13 +739,12 @@ pub fn handle_list_groups(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Filter groups by state if requested (v4+), case-insensitively. The filter is a set,
-    // as in Kafka, so a long filter list costs once, not once per group.
+    // Filter groups by state if requested (v4+), case-sensitively as Kafka 3.7 does
+    // (`kafka-consumer-groups --state` sends the canonical names). The filter is a set, as in
+    // Kafka, so a long filter list costs once, not once per group.
     let filter_enabled = !states_filter.is_empty();
-    let wanted_states: std::collections::HashSet<String> = states_filter
-        .iter()
-        .map(|f| f.to_ascii_lowercase())
-        .collect();
+    let wanted_states: std::collections::HashSet<&str> =
+        states_filter.iter().map(String::as_str).collect();
 
     let mut listed: Vec<(String, String, &'static str)> = coordinator_groups
         .iter()
@@ -745,7 +771,7 @@ pub fn handle_list_groups(
 
     for (group_id, protocol_type, state) in listed {
         // Apply state filter if provided (v4+)
-        if filter_enabled && !wanted_states.contains(&state.to_ascii_lowercase()) {
+        if filter_enabled && !wanted_states.contains(state) {
             continue;
         }
 
@@ -890,6 +916,59 @@ mod tests {
         assert_eq!(response.node_id, DEFAULT_BROKER_ID);
         assert_eq!(response.host.as_str(), "localhost");
         assert_eq!(response.port, 9092);
+    }
+
+    /// Kafka 3.7 knows coordinator types 0 (group) and 1 (transaction) and answers any
+    /// other INVALID_REQUEST.
+    #[test]
+    fn test_handle_find_coordinator_unknown_key_type() {
+        let f = Fixture::new();
+        assert_eq!(
+            handle_find_coordinator(&f.ctx(), "txn", 1)
+                .unwrap()
+                .error_code,
+            ERROR_NONE
+        );
+        for key_type in [2, 5, 7, -1] {
+            let response = handle_find_coordinator(&f.ctx(), "g", key_type).unwrap();
+            assert_eq!(
+                response.error_code,
+                crate::kafka::constants::ERROR_INVALID_REQUEST,
+                "key_type {key_type}"
+            );
+            assert_eq!(response.node_id, -1);
+        }
+    }
+
+    /// As Kafka 3.7's `GroupMetadata.summary`: outside Stable, DescribeGroups reports no
+    /// protocol and no member metadata or assignment; Stable reports all three.
+    #[test]
+    fn test_describe_groups_reports_metadata_only_when_stable() {
+        let f = Fixture::new();
+        let join = f.join_now("g", "");
+        let describe = || {
+            handle_describe_groups(&f.ctx(), vec!["g".to_string()])
+                .unwrap()
+                .groups
+                .remove(0)
+        };
+        let group = describe();
+        assert_eq!(group.group_state.as_str(), "CompletingRebalance");
+        assert_eq!(group.protocol_data.as_str(), "");
+        assert!(group.members[0].member_metadata.is_empty());
+        assert!(group.members[0].member_assignment.is_empty());
+        let member = join.member_id.to_string();
+        let assignment = SyncGroupAssignment {
+            member_id: member.clone(),
+            assignment: vec![9, 9],
+        };
+        let synced = f.sync("g", &member, join.generation_id, vec![assignment]);
+        assert_eq!(take_sync(&synced).unwrap().error_code, ERROR_NONE);
+        let group = describe();
+        assert_eq!(group.group_state.as_str(), "Stable");
+        assert_eq!(group.protocol_data.as_str(), "range");
+        assert_eq!(group.members[0].member_metadata.as_ref(), [0, 1, 2, 3]);
+        assert_eq!(group.members[0].member_assignment.as_ref(), [9, 9]);
     }
 
     #[test]
@@ -1404,12 +1483,13 @@ mod tests {
                 ("live", "consumer", "CompletingRebalance")
             ]
         );
-        let empty_only = handle_list_groups(&ctx, &["empty".to_string()]).unwrap();
-        assert_eq!(
-            empty_only.groups.len(),
-            1,
-            "state filter is case-insensitive"
-        );
+        let empty_only = handle_list_groups(&ctx, &["Empty".to_string()]).unwrap();
+        assert_eq!(empty_only.groups.len(), 1);
+        // The filter is case-sensitive, as in Kafka 3.7.
+        for filter in ["empty", "EMPTY"] {
+            let listed = handle_list_groups(&ctx, &[filter.to_string()]).unwrap();
+            assert!(listed.groups.is_empty(), "{filter}");
+        }
     }
 
     /// ListGroups takes time linear in its groups and in its states filter together: a
@@ -1425,7 +1505,7 @@ mod tests {
             let env = TestEnv::new();
             let filter: Vec<String> = (0..n)
                 .map(|i| format!("NotAState{i}"))
-                .chain(["EMPTY".to_string()])
+                .chain(["Empty".to_string()])
                 .collect();
             let listed = handle_list_groups(&env.ctx(&store), &filter).unwrap();
             assert_eq!(listed.groups.len(), n);

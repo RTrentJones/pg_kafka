@@ -440,7 +440,7 @@ impl PostgresStore {
     pub(super) fn get_partition_bounds(
         topic_id: i32,
         partition_id: i32,
-        isolation_level: IsolationLevel,
+        _isolation_level: IsolationLevel,
     ) -> Result<PartitionBounds> {
         Spi::connect(|client| {
             let table = select_cached(
@@ -467,7 +467,6 @@ impl PostgresStore {
                 row.get_by_name("min_offset")?,
                 row.get_by_name("max_offset")?,
                 row.get_by_name("min_pending_offset")?,
-                isolation_level,
             ))
         })
         .map_err(internal("get_partition_bounds"))

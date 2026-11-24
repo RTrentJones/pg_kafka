@@ -172,7 +172,8 @@ impl IsolationLevel {
 pub struct PartitionBounds {
     /// Log-end offset; never regresses (BUG-4).
     pub high_watermark: i64,
-    /// Lowest pending transactional offset (ReadCommitted), or the high watermark.
+    /// Lowest pending transactional offset, or the high watermark: reported to every consumer
+    /// as Kafka reports it, whatever its isolation level (a read_committed one reads up to it).
     pub last_stable_offset: i64,
     /// Earliest retained offset: GREATEST(first surviving row, durable log start).
     pub earliest_offset: i64,
@@ -192,16 +193,12 @@ impl PartitionBounds {
         min_offset: Option<i64>,
         max_offset: Option<i64>,
         min_pending_offset: Option<i64>,
-        isolation_level: IsolationLevel,
     ) -> Self {
         let log_start = log_start_offset.unwrap_or(0);
         let high_watermark = next_offset
             .unwrap_or(0)
             .max(max_offset.map_or(0, |m| m.saturating_add(1)));
-        let last_stable_offset = match isolation_level {
-            IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
-            IsolationLevel::ReadUncommitted => high_watermark,
-        };
+        let last_stable_offset = min_pending_offset.unwrap_or(high_watermark);
         PartitionBounds {
             high_watermark,
             last_stable_offset,
@@ -448,9 +445,9 @@ pub trait LogStore {
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
     /// All offset bounds a Fetch response reports for one partition, in one storage
-    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
-    /// to the high watermark for ReadUncommitted), earliest offset and durable log
-    /// start. Each field matches the corresponding single-value method
+    /// round trip: high watermark, last stable offset (the same for both isolation levels, as
+    /// Kafka reports it; `isolation_level` does not change any bound), earliest offset and
+    /// durable log start. Each field matches the corresponding single-value method
     /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
     /// `get_log_start_offset`).
     ///
@@ -462,13 +459,10 @@ pub trait LogStore {
         &self,
         topic_id: i32,
         partition_id: i32,
-        isolation_level: IsolationLevel,
+        _isolation_level: IsolationLevel,
     ) -> Result<PartitionBounds> {
         let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
-        let last_stable_offset = match isolation_level {
-            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
-            IsolationLevel::ReadUncommitted => high_watermark,
-        };
+        let last_stable_offset = self.get_last_stable_offset(topic_id, partition_id)?;
         let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
         let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
         Ok(PartitionBounds {

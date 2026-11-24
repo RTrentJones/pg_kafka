@@ -43,8 +43,8 @@ const CONFIG_SOURCE_DYNAMIC_TOPIC: i8 = 1;
 const CONFIG_SOURCE_DEFAULT: i8 = 5;
 
 /// Kafka `ConfigType` ordinals (subset used here).
-const CONFIG_TYPE_STRING: i8 = 2;
 const CONFIG_TYPE_LONG: i8 = 5;
+const CONFIG_TYPE_LIST: i8 = 7;
 
 /// `AlterConfigOpType` wire values.
 const OP_SET: i8 = 0;
@@ -95,7 +95,8 @@ fn effective_topic_configs(
             name: "cleanup.policy",
             value: "delete".to_string(),
             source: CONFIG_SOURCE_DEFAULT,
-            config_type: CONFIG_TYPE_STRING,
+            // A list-valued config (Kafka 3.7 reports LIST).
+            config_type: CONFIG_TYPE_LIST,
         },
     ])
 }
@@ -308,6 +309,17 @@ fn alter_topic_configs(
                 format!("Unknown topic '{resource_name}'"),
             )
         })?;
+    // Kafka 3.7 refuses a SET, APPEND or SUBTRACT without a value as a malformed request
+    // (INVALID_REQUEST), whatever the key, before it validates any config.
+    if let Some((name, _, _)) = configs
+        .iter()
+        .find(|(_, op, value)| *op != OP_DELETE && value.is_none())
+    {
+        return Err((
+            ERROR_INVALID_REQUEST,
+            format!("Null value not supported for : {name}"),
+        ));
+    }
     let planned = plan_retention_change(configs).map_err(|msg| (ERROR_INVALID_CONFIG, msg))?;
     if let (false, Some(change)) = (validate_only, planned) {
         let retention_ms = match change {

@@ -214,6 +214,7 @@ fn test_handle_fetch_storage_error() {
     });
 
     mock.expect_get_high_watermark().returning(|_, _| Ok(1));
+    mock.expect_get_last_stable_offset().returning(|_, _| Ok(1));
     mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
     mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
     mock.expect_fetch_records_with_isolation()

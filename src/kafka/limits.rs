@@ -3,8 +3,8 @@
 //! Every count a client can choose and the broker then materialises in memory is capped here:
 //! partitions per topic (Metadata and the assignors allocate one entry per partition, so an
 //! unbounded count could abort the worker with an allocation failure and send Postgres into crash
-//! recovery on every Metadata request), members per consumer group, and the number of groups the
-//! in-memory coordinator holds.
+//! recovery on every Metadata request), members per consumer group, the number of groups the
+//! in-memory coordinator holds, and the memory all groups' member state may take together.
 //!
 //! The GUCs are `Sighup`: the worker re-reads them on its config reload. Code reads them through
 //! the accessors below, which also work in unit tests (they return the boot values there).
@@ -41,10 +41,25 @@ pub const MAX_MEMBER_PROTOCOL_BYTES: usize = 1024 * 1024;
 /// Largest number of protocols (assignors) one member may advertise.
 pub const MAX_MEMBER_PROTOCOLS: usize = 64;
 
+/// Default for `pg_kafka.max_group_memory`, in kB: 128 MB. The per-member and per-group caps
+/// above still let the coordinator hold `max_consumer_groups * group_max_size` members of up
+/// to 1 MiB each (about 1e14 bytes); members of groups that never sync stay in memory until
+/// their session timeout (up to 30 minutes), so without a total bound a client could grow the
+/// worker until an allocation fails, which aborts the backend and sends Postgres into crash
+/// recovery. Real member state is small (a subscription and an assignment, typically well
+/// under 10 kB per member), so 128 MB holds over ten thousand members.
+pub const DEFAULT_MAX_GROUP_MEMORY_KB: i32 = 128 * 1024;
+/// Lower bound of `pg_kafka.max_group_memory`, in kB: one member of the largest protocol list
+/// must fit.
+pub const MIN_MAX_GROUP_MEMORY_KB: i32 = 2 * 1024;
+/// `DEFAULT_MAX_GROUP_MEMORY_KB` in bytes.
+pub const DEFAULT_MAX_GROUP_MEMORY_BYTES: usize = DEFAULT_MAX_GROUP_MEMORY_KB as usize * 1024;
+
 static MAX_PARTITIONS_PER_TOPIC: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_MAX_PARTITIONS_PER_TOPIC);
 static GROUP_MAX_SIZE: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_GROUP_MAX_SIZE);
 static MAX_CONSUMER_GROUPS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CONSUMER_GROUPS);
+static MAX_GROUP_MEMORY_KB: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_GROUP_MEMORY_KB);
 
 /// Register the limit GUCs (called from `config::init`).
 pub fn register_gucs() {
@@ -78,6 +93,16 @@ pub fn register_gucs() {
         GucContext::Sighup,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"pg_kafka.max_group_memory",
+        c"Maximum memory consumer group member state may take in the coordinator",
+        c"The member ids, protocols, metadata and assignments of all groups together. A JoinGroup or a leader's SyncGroup whose state does not fit gets COORDINATOR_NOT_AVAILABLE (retriable; the memory frees as members leave or time out). Default 128MB. Reloadable.",
+        &MAX_GROUP_MEMORY_KB,
+        MIN_MAX_GROUP_MEMORY_KB,
+        i32::MAX,
+        GucContext::Sighup,
+        GucFlags::UNIT_KB,
+    );
 }
 
 /// A GUC's current value. pgrx only allows GUC reads on the backend's main thread, so unit tests
@@ -109,6 +134,15 @@ pub fn max_consumer_groups() -> usize {
         read(&MAX_CONSUMER_GROUPS, DEFAULT_MAX_CONSUMER_GROUPS).clamp(1, MAX_MAX_CONSUMER_GROUPS),
     )
     .expect("clamped to a positive i32")
+}
+
+/// The configured memory budget for coordinator member state, in bytes
+/// (`pg_kafka.max_group_memory`).
+pub fn max_group_memory_bytes() -> usize {
+    let kb = read(&MAX_GROUP_MEMORY_KB, DEFAULT_MAX_GROUP_MEMORY_KB).max(MIN_MAX_GROUP_MEMORY_KB);
+    usize::try_from(kb)
+        .expect("clamped to a positive i32")
+        .saturating_mul(1024)
 }
 
 /// Why a requested partition count is refused, or `Ok` if `1 <= count <= max`.
@@ -169,6 +203,10 @@ mod tests {
         assert_eq!(max_partitions_per_topic(), DEFAULT_MAX_PARTITIONS_PER_TOPIC);
         assert_eq!(group_max_size(), DEFAULT_GROUP_MAX_SIZE as usize);
         assert_eq!(max_consumer_groups(), DEFAULT_MAX_CONSUMER_GROUPS as usize);
+        assert_eq!(max_group_memory_bytes(), DEFAULT_MAX_GROUP_MEMORY_BYTES);
+        assert_eq!(DEFAULT_MAX_GROUP_MEMORY_BYTES, 128 << 20);
+        // The smallest budget holds one member of the largest protocol list.
+        assert!(MIN_MAX_GROUP_MEMORY_KB as usize * 1024 >= MAX_MEMBER_PROTOCOL_BYTES + (64 << 10));
         assert_eq!(auto_create_partitions(3), 3);
         assert_eq!(
             auto_create_partitions(50_000),

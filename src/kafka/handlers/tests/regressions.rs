@@ -164,6 +164,8 @@ fn fetch_mock(partition_count: i32, hwm: i64, log_start: i64) -> MockKafkaStore 
     });
     mock.expect_get_high_watermark()
         .returning(move |_, _| Ok(hwm));
+    mock.expect_get_last_stable_offset()
+        .returning(move |_, _| Ok(hwm));
     mock.expect_get_earliest_offset()
         .returning(move |_, _| Ok(log_start));
     mock.expect_get_log_start_offset()
@@ -226,6 +228,7 @@ fn fetch_into_cleaned_up_aborted_hole_is_not_out_of_range() {
         }])
     });
     mock.expect_get_high_watermark().returning(|_, _| Ok(2));
+    mock.expect_get_last_stable_offset().returning(|_, _| Ok(2));
     // First surviving row is offset 1 (aborted offset 0 was cleaned up) ...
     mock.expect_get_earliest_offset().returning(|_, _| Ok(1));
     // ... but nothing retired offset 0, so the durable log start is still 0.

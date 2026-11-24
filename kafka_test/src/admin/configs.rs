@@ -440,3 +440,42 @@ pub async fn test_per_topic_retention_override_enforced_by_sweep() -> TestResult
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Kafka 3.7 answers an IncrementalAlterConfigs SET without a value INVALID_REQUEST (a
+/// malformed request), whatever the key, where pg_kafka answered INVALID_CONFIG; and its
+/// DescribeConfigs reports cleanup.policy as a LIST config (type 7), not STRING (2).
+pub async fn test_config_api_answers_match_kafka() -> TestResult {
+    use kafka_protocol::messages::describe_configs_request::{
+        DescribeConfigsRequest, DescribeConfigsResource,
+    };
+    println!("=== Test: IncrementalAlterConfigs null SET, DescribeConfigs config types ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::topic_with_partitions(&ctx, "configs-parity", 1).await?;
+    for (key, op) in [("retention.ms", OP_SET), ("max.message.bytes", OP_SET)] {
+        let (code, _) = alter_topic_config(&topic, key, op, None).await?;
+        assert_eq!(code, error_codes::INVALID_REQUEST, "SET {key} = null");
+    }
+    assert_eq!(db_topic_retention(ctx.db(), &topic).await?, None);
+    let request =
+        DescribeConfigsRequest::default().with_resources(vec![DescribeConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_TOPIC)
+            .with_resource_name(StrBytes::from_string(topic.clone()))
+            .with_configuration_keys(None)]);
+    let response = call(4, 7003, &request).await?;
+    let types: Vec<(String, i8)> = response.results[0]
+        .configs
+        .iter()
+        .map(|c| (c.name.to_string(), c.config_type))
+        .collect();
+    assert!(
+        types.contains(&("cleanup.policy".to_string(), 7)),
+        "{types:?}"
+    );
+    assert!(
+        types.contains(&("retention.ms".to_string(), 5)),
+        "{types:?}"
+    );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

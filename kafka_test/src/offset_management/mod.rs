@@ -10,6 +10,7 @@ mod by_timestamp;
 mod commit_fetch;
 mod commit_rules;
 mod edge_cases;
+mod fetch_parity;
 mod list_offsets_isolation;
 mod no_reuse;
 mod require_stable;
@@ -30,5 +31,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         commit_rules::test_offset_commit_generation_and_member_rules,
         list_offsets_isolation::test_list_offsets_isolation_max_timestamp_and_partitions,
         require_stable::test_offset_fetch_require_stable,
+        fetch_parity::test_offset_fetch_of_a_missing_topic_is_no_offset,
+        fetch_parity::test_offset_commit_metadata_longer_than_4096_is_refused,
     ]
 }

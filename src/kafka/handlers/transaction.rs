@@ -225,12 +225,9 @@ pub fn handle_end_txn(
         Some(crate::kafka::storage::TransactionState::Ongoing) => {
             // Good, can commit or abort
         }
-        Some(crate::kafka::storage::TransactionState::Empty) => {
-            // Empty transaction - no-op commit/abort
-            let mut response = EndTxnResponse::default();
-            response.error_code = ERROR_NONE;
-            return Ok(response);
-        }
+        // An Empty transaction (nothing added since InitProducerId) falls through to
+        // INVALID_TXN_STATE, as in Kafka 3.7; the Java client and librdkafka send no EndTxn
+        // for a transaction they added nothing to.
         // A retried EndTxn (its first response was lost) finds the transaction already
         // finished. When the outcome matches what the client asks for, Kafka answers
         // NONE; INVALID_TXN_STATE would be fatal to the client for a commit that did
@@ -408,6 +405,12 @@ fn store_txn_topic_offsets(
                     if partition_id < 0 || partition_id >= partition_count =>
                 {
                     ERROR_UNKNOWN_TOPIC_OR_PARTITION
+                }
+                // Kafka 3.7 stores the other partitions and answers this one.
+                Some(_)
+                    if crate::kafka::constants::offset_metadata_too_large(metadata.as_deref()) =>
+                {
+                    crate::kafka::constants::ERROR_OFFSET_METADATA_TOO_LARGE
                 }
                 Some((topic_id, _)) => match store.store_txn_pending_offset(
                     transactional_id,

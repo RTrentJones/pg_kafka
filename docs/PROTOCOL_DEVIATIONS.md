@@ -298,7 +298,10 @@ pg_kafka.compression_type = 'gzip'
   producer with the next epoch (a new producer id when the epoch is exhausted)
 - ✅ AddOffsetsToTxn includes consumer offsets in transaction: it registers the group in
   the open transaction (`kafka.txn_groups`, cleared with `kafka.txn_partitions`)
-- ✅ EndTxn commits or aborts atomically
+- ✅ EndTxn commits or aborts atomically. EndTxn of a transaction that added nothing since
+  InitProducerId (Empty) is INVALID_TXN_STATE (48), commit or abort, as in Kafka 3.7 (the Java
+  client and librdkafka send no EndTxn for such a transaction); a retried EndTxn whose
+  transaction already ended the way it asks is NONE
 - ✅ TxnOffsetCommit commits offsets within transaction context; for a group the
   transaction did not add with AddOffsetsToTxn it is INVALID_TXN_STATE (48) on every
   partition and version and stores nothing, as in Kafka 3.7. **Deviation:** Kafka verifies
@@ -368,10 +371,24 @@ pg_kafka.compression_type = 'gzip'
   and answered with its assignment (empty if the leader left it out) when the
   leader's SyncGroup arrives; the generation does not move. A held SyncGroup is
   answered REBALANCE_IN_PROGRESS if a new rebalance starts first (a member joins or
-  leaves, or the leader misses the rebalance timeout and the sweep evicts it), and
+  leaves, or the sweep evicts the members that did not sync, below), and
   UNKNOWN_MEMBER_ID if the member itself is removed. Like a waiting joiner, a member
   whose SyncGroup is held is exempt from its session timeout. Server-side
   assignment (a leader sending empty assignments) is computed only for the leader.
+- ✅ As in Kafka 3.0+ (`pendingSyncMembers`, checked against a 3.7 broker): every member of
+  a new generation must send its SyncGroup within the group's rebalance timeout of the
+  join's completion. The sweep removes those that have not, though they heartbeat and
+  whether the group is still CompletingRebalance or already Stable (the leader's SyncGroup
+  came), and the others rebalance (their Heartbeat gets REBALANCE_IN_PROGRESS).
+- ✅ DescribeGroups reports the protocol and each member's metadata and assignment only for a
+  Stable group; in PreparingRebalance and CompletingRebalance the protocol is "" and the
+  members carry neither, as Kafka 3.7's `GroupMetadata.summary` does. **Deviation:** every
+  member's `client_host` is "localhost"; Kafka reports the member's address (for example
+  "/127.0.0.1"). The DB-thread handler is not given the connection's peer address.
+- ✅ ListGroups' `states_filter` (v4) matches state names case-sensitively, as Kafka 3.7
+  does (`kafka-consumer-groups --state` sends the canonical names).
+- ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
+  INVALID_REQUEST (42), as Kafka 3.7 does.
 
 **What's Not Implemented:**
 - ❌ Static group membership (KIP-345): `group_instance_id` is not honored
@@ -429,7 +446,19 @@ pg_kafka.compression_type = 'gzip'
   in memory, beyond which the least recently active Empty group is forgotten (its offsets stay)
   or, if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE; a member's
   protocol list is limited to 64 protocols and 1 MiB (Kafka bounds it by the 1 MiB
-  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST.
+  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST; and
+  `pg_kafka.max_group_memory` (default 128MB) bounds the member state of all groups together
+  (member ids, protocols and their metadata, assignments and the copies kept for the sticky
+  assignor). Kafka has no such bound (its heap is the limit), but without it the caps above
+  still allowed about 1e14 bytes, held up to the 30-minute session timeout by members that
+  never sync; an allocation failure aborts the worker and sends Postgres into crash
+  recovery. A JoinGroup whose member state does not fit, or a leader SyncGroup whose
+  assignments do not, gets COORDINATOR_NOT_AVAILABLE (15), retriable, as for a full
+  `max_consumer_groups`: the memory frees as members leave or time out, and the budget is the
+  broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
+  the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
+  nothing and the group stays in its sync phase. A rejoin that holds no more than before is
+  always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
@@ -448,7 +477,19 @@ pg_kafka.compression_type = 'gzip'
   transaction is still open is answered UNSTABLE_OFFSET_COMMIT (88) with offset -1, at
   partition level as Kafka 3.7 does, so a read_committed consumer waits for it
 - ✅ Consumer groups can track progress across restarts
-- ✅ Supports offset metadata field
+- ✅ Supports offset metadata field: metadata longer than 4096 characters (Kafka's default
+  `offset.metadata.max.bytes`, a length in UTF-16 code units) is answered
+  OFFSET_METADATA_TOO_LARGE (12) on its partition by OffsetCommit and TxnOffsetCommit, and
+  the request's other partitions are committed, as in Kafka 3.7. OffsetFetch answers ""
+  for metadata committed as null and for a partition without an offset, as Kafka does
+- ✅ OffsetFetch of a topic that does not exist (never created, or deleted) answers its
+  partitions offset -1 with NONE, as Kafka 3.7 does on every version, like any partition
+  without a committed offset (UNKNOWN_TOPIC_OR_PARTITION there made the Java consumer's
+  poll() throw for a consumer that assign()s such a topic)
+- **Deviation:** the committed leader epoch (OffsetCommit v6+) is not stored, and
+  OffsetFetch v5+ answers `committed_leader_epoch` -1; Kafka echoes the committed one. A
+  client that sees -1 skips its leader-epoch validation of the fetched position (KIP-320),
+  which on a single broker whose leader epoch never changes validates nothing anyway.
 
 **Difference:**
 - PostgreSQL table instead of Kafka's compacted topic
@@ -465,7 +506,9 @@ pg_kafka.compression_type = 'gzip'
 - ✅ RecordBatch v2 encoding
 - ✅ Record headers returned to consumers
 - ✅ Empty fetch responses (returns empty bytes)
-- ✅ Partition watermarks (high watermark, log start offset)
+- ✅ Partition watermarks (high watermark, log start offset) and the last stable offset (the
+  first offset of an open transaction, else the high watermark), reported for both isolation
+  levels as Kafka does; a read_uncommitted consumer still reads to the high watermark
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count
 - ✅ Request-level `max_bytes` (KIP-74): partitions are filled in request order until
@@ -611,7 +654,8 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 - **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
-- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
+- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted. A SET, APPEND or SUBTRACT without a value is INVALID_REQUEST (42) whatever the key, checked first, as in Kafka 3.7.
+- **DescribeConfigs config types** are Kafka 3.7's: `retention.ms` LONG (5), `cleanup.policy` LIST (7).
 - **AlterConfigs (33)** is not implemented.
 - **Repeated entries follow Kafka 3.7** (checked against a 3.7 broker). OffsetCommit, TxnOffsetCommit, DeleteRecords, OffsetFetch and Fetch act on a partition the request names more than once a single time, with its last entry, and answer it once, under one entry per distinct topic; ListOffsets answers every entry of a repeated partition INVALID_REQUEST; DeleteTopics and CreatePartitions answer a repeated name with one INVALID_REQUEST "Duplicate topic name." entry; IncrementalAlterConfigs answers every entry of a repeated resource INVALID_REQUEST "Each resource must appear at most once."; DeleteGroups deletes and answers a repeated group once; DescribeConfigs and AddPartitionsToTxn answer every entry. Whatever a request repeats, its topics (and, for DescribeGroups/DeleteGroups, its groups' committed offsets) are looked up in one statement, so a small request cannot hold the DB thread, which serves every client, for one round trip per entry. Remaining difference: entries are answered in the order first named; Kafka answers merged entries in no particular order.
 
