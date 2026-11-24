@@ -375,7 +375,10 @@ pub const DEFAULT_SHADOW_LINGER_MS: i32 = 10;
 pub const MIN_SHADOW_LINGER_MS: i32 = 0;
 
 /// Maximum shadow linger time: what the shadow producer applies (`ShadowConfig::validate`
-/// clamps to it), and well under the sync-mode hold timeout's default.
+/// clamps to it). It equals the sync-mode hold timeout's default
+/// ([`DEFAULT_SHADOW_SYNC_TIMEOUT_MS`]): librdkafka holds each record for up to the linger
+/// before sending it, so a linger near `pg_kafka.shadow_sync_timeout_ms` makes held
+/// sync-mode responses time out (their records stay pending and are forwarded later).
 pub const MAX_SHADOW_LINGER_MS: i32 = 5_000;
 
 /// Default shadow retry backoff (milliseconds).

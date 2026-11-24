@@ -360,7 +360,7 @@ gucs! {
     /// librdkafka linger.ms of the shadow producer.
     int SHADOW_LINGER_MS = DEFAULT_SHADOW_LINGER_MS => c"pg_kafka.shadow_linger_ms" {
         short: c"Batching delay for shadow forwarding (milliseconds)",
-        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Default: 10ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Every sync-mode response waits for it too: a linger near pg_kafka.shadow_sync_timeout_ms makes held responses time out (their records are forwarded later). Default: 10ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_LINGER_MS, MAX_SHADOW_LINGER_MS),
     }
