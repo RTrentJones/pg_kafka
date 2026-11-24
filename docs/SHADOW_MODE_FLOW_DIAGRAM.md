@@ -104,11 +104,15 @@ producer sent none, which is what local consumers see). `partition` is left to t
 
 ### Ordering
 
-The forwarder sends the records of one local partition in local-offset order, and none of them
-goes out ahead of an earlier one's retry. What the external topic keeps of that order is per
+The forwarder sends the records of one local partition in local-offset order among those in the
+outbox, and none of them goes out ahead of an earlier one's retry. A transaction's outbox rows are
+written only when it commits (`ShadowStore::commit_transaction`), so records of different
+producers are forwarded in commit order: a later offset written meanwhile by another producer (a
+non-transactional one, or a transaction that commits first) can be forwarded before an open
+transaction's earlier offsets. What the external topic keeps of the sending order is per
 external partition: the partitioner (`murmur2_random`) places each record by its key, so the
 records of one local partition that land in the same external partition (for keyed records, the
-records of one key) are in local-offset order there (the first copy of each; see duplicates
+records of one key) are in sending order there (the first copy of each; see duplicates
 below), while records with different keys, and records with a null key (placed at random), may
 land in different external partitions with no order between them. A record that is dead-lettered
 lets its partition move on: if it is replayed later, it lands after the records that followed it.

@@ -782,7 +782,7 @@ fire-and-forget with no response frame and no durability claim — see §1.)
 
 ## Shadow Forwarding Delivery Semantics
 
-**Status:** At-least-once, in order per local partition, by design. Full description:
+**Status:** At-least-once, in commit order per local partition, by design. Full description:
 [SHADOW_MODE_FLOW_DIAGRAM.md](SHADOW_MODE_FLOW_DIAGRAM.md).
 
 Shadow forwarding to an external Kafka cluster goes through a durable outbox
@@ -809,12 +809,16 @@ librdkafka producer and answers every record with an ack.
   again while the worker tracks it (no lease: a slow ack never causes a re-send). Consumers of the
   external topic that need exactly-once semantics must deduplicate, for example on an
   application id.
-- **Order.** The forwarder sends the records of a local partition in local-offset order, never
-  one ahead of an earlier one's retry, but the external partition is chosen by key
-  (`murmur2_random`, the Java client's partitioner; random for a null key), so the order the
-  external topic keeps is per external partition: the first copies of the records of one local
-  partition that land in the same external partition (for keyed records, those of one key) are in
-  local-offset order there (duplicates may follow them). Records with different keys, or null
+- **Order.** The forwarder sends the records of a local partition in local-offset order among
+  those in the outbox, never one ahead of an earlier one's retry. A transaction's records enter
+  the outbox only when it commits, so records of different producers are forwarded in commit
+  order: a later offset written meanwhile by another producer can go out before an open
+  transaction's earlier offsets (a read_committed consumer of the local topic stops at the open
+  transaction and reads them in offset order). The external partition
+  is chosen by key (`murmur2_random`, the Java client's partitioner; random for a null key), so
+  the order the external topic keeps is per external partition: the first copies of the records
+  of one local partition that land in the same external partition (for keyed records, those of
+  one key) are in sending order there (duplicates may follow them). Records with different keys, or null
   keys, may land in different external partitions with no order between them. A dead-lettered
   record that is replayed later lands after the records that followed it.
 - **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
