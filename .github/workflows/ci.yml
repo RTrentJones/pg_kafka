@@ -231,8 +231,9 @@ jobs:
         run: docker compose down -v || true
 
       - name: Performance E2E tests
-        # Blocking. The thresholds are conservative floors (~5-10x below dev-machine
-        # measurements), so this fails only on order-of-magnitude regressions.
+        # Blocking. Every test in the category gates on a throughput floor or a latency, time
+        # or CPU ceiling 5-100x from dev-machine measurements, so this fails only on
+        # order-of-magnitude regressions.
         if: matrix.pg == 14
         timeout-minutes: 10
         working-directory: kafka_test
