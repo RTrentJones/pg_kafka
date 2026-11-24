@@ -21,6 +21,12 @@ pub const RETENTION_DELETE_BATCH: i64 = 10_000;
 /// backlog. A backlog larger than one pass can clear drains over the following passes.
 pub const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(1500);
 
+/// The pass budget: [`RETENTION_PASS_BUDGET`], unless the test-only
+/// `pg_kafka.test_retention_pass_budget_ms` (`test_override_ms` >= 0) replaces it.
+pub fn pass_budget(test_override_ms: i32) -> Duration {
+    u64::try_from(test_override_ms).map_or(RETENTION_PASS_BUDGET, Duration::from_millis)
+}
+
 /// Upper clamp for a retention window in milliseconds (1e13 ms, about 317 years).
 /// Larger values, such as `i64::MAX` used for "forever", overflow the interval or
 /// timestamp arithmetic in SQL and would abort the whole sweep.
@@ -148,16 +154,30 @@ pub const PARTITIONS_AHEAD: i32 = 2;
 /// over them ([`next_probe_start`]) instead of always starting from the oldest.
 pub const MAX_CONTENTS_PROBES_PER_PASS: usize = 64;
 
-/// Rotation cursor for the contents probes (see [`MAX_CONTENTS_PROBES_PER_PASS`]).
+/// Rotation cursor for the contents probes: the candidate index after the last one
+/// probed (see [`next_probe_start`]).
 static PROBE_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-/// The index to start this pass's contents probes from, advancing the cursor by the
-/// probes a pass makes, so consecutive capped passes cover every candidate.
-pub fn next_probe_start(candidates: usize) -> usize {
-    if candidates <= MAX_CONTENTS_PROBES_PER_PASS {
+/// Where a pass with `candidates` probe candidates starts, given the rotation cursor.
+pub fn probe_start(cursor: usize, candidates: usize) -> usize {
+    if candidates == 0 {
         return 0;
     }
-    PROBE_CURSOR.fetch_add(MAX_CONTENTS_PROBES_PER_PASS, Ordering::Relaxed) % candidates
+    cursor % candidates
+}
+
+/// The index to start this pass's contents probes from. The pass reports the probes
+/// it made with [`record_probes`], so the next pass starts at the first candidate this
+/// one did not reach, whatever the list size: a pass cut short by the cap or by the
+/// pass budget (another step may have spent it) does not probe the same leaves again,
+/// and consecutive passes cover every candidate.
+pub fn next_probe_start(candidates: usize) -> usize {
+    probe_start(PROBE_CURSOR.load(Ordering::Relaxed), candidates)
+}
+
+/// Advance the rotation cursor past the `probes` made from `start`.
+pub fn record_probes(start: usize, probes: usize) {
+    PROBE_CURSOR.store(start.wrapping_add(probes), Ordering::Relaxed);
 }
 
 /// Whether a past leaf needs the full contents probe: only a leaf where some topic
@@ -349,12 +369,35 @@ mod tests {
 
     #[test]
     fn probe_rotation_covers_every_candidate() {
-        assert_eq!(next_probe_start(0), 0);
-        assert_eq!(next_probe_start(MAX_CONTENTS_PROBES_PER_PASS), 0);
-        let n = MAX_CONTENTS_PROBES_PER_PASS * 2 + 5;
-        for _ in 0..10 {
-            assert!(next_probe_start(n) < n);
+        assert_eq!(probe_start(7, 0), 0);
+        assert_eq!(probe_start(7, 5), 2);
+        // Passes that each make only one probe (the budget spent elsewhere), on a list
+        // shorter than the cap and on one longer than it: every candidate is reached.
+        for n in [3, MAX_CONTENTS_PROBES_PER_PASS * 2] {
+            let mut seen = vec![false; n];
+            for _ in 0..n {
+                let start = next_probe_start(n);
+                assert!(start < n);
+                seen[start] = true;
+                record_probes(start, 1);
+            }
+            assert!(seen.iter().all(|&s| s), "{n} candidates: {seen:?}");
         }
+        // A full pass of the cap moves the next one past every leaf it probed.
+        let n = MAX_CONTENTS_PROBES_PER_PASS + 5;
+        let start = next_probe_start(n);
+        record_probes(start, MAX_CONTENTS_PROBES_PER_PASS);
+        assert_eq!(
+            next_probe_start(n),
+            (start + MAX_CONTENTS_PROBES_PER_PASS) % n
+        );
+    }
+
+    #[test]
+    fn pass_budget_override_is_test_only() {
+        assert_eq!(pass_budget(-1), RETENTION_PASS_BUDGET);
+        assert_eq!(pass_budget(0), Duration::ZERO);
+        assert_eq!(pass_budget(40), Duration::from_millis(40));
     }
 
     #[test]

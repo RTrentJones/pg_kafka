@@ -275,6 +275,20 @@ gucs! {
         range: (0, 10_000),
     }
 
+    /// Test-only: the retention sweep's pass budget in milliseconds, so the E2E suite
+    /// can run passes in which every bounded step makes exactly one statement (0) and
+    /// check what such passes still reach. -1 keeps the built-in 1.5 s. Read by the
+    /// worker's sweep and by `pg_kafka_run_retention_sweep()`. Never set in production.
+    pub(crate) int TEST_RETENTION_PASS_BUDGET_MS = -1 => c"pg_kafka.test_retention_pass_budget_ms" {
+        short: c"TEST ONLY: retention sweep pass budget (ms); -1 = the built-in 1500 ms",
+        long: c"Fault-injection knob for the retention-sweep E2E tests: the wall-clock \
+          budget of one sweep pass. 0 makes every bounded step of a pass run exactly \
+          one statement. -1 (default) keeps the built-in 1500 ms. Do not set in \
+          production. Reloadable via SIGHUP.",
+        context: Sighup,
+        range: (-1, 1500),
+    }
+
     /// Let a FetchRequest wait up to its max_wait_ms for data.
     bool ENABLE_LONG_POLLING = true => c"pg_kafka.enable_long_polling" {
         short: c"Enable long polling for FetchRequest",

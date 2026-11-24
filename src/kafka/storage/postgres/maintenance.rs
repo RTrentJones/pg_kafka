@@ -13,7 +13,6 @@ use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::retention::{
     self, LeafAction, MaintenanceLockWait, TimePartition, MAINTENANCE_LOCK_KEY,
     MAX_CONTENTS_PROBES_PER_PASS, MAX_RETENTION_WINDOW_MS, RETENTION_DELETE_BATCH,
-    RETENTION_PASS_BUDGET,
 };
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
@@ -35,6 +34,12 @@ const PRODUCER_ID_RETENTION: Duration = Duration::from_hours(168);
 const TERMINAL_TXN_RETENTION: Duration = PRODUCER_ID_RETENTION;
 /// Age after which successfully forwarded shadow-outbox rows are deleted.
 const SHADOW_DELIVERED_RETENTION: Duration = Duration::from_hours(24);
+
+/// The sweep's pass budget ([`retention::RETENTION_PASS_BUDGET`], or the test-only
+/// `pg_kafka.test_retention_pass_budget_ms`).
+fn pass_budget() -> Duration {
+    retention::pass_budget(crate::config::TEST_RETENTION_PASS_BUDGET_MS.get())
+}
 
 /// Row counts deleted by one retention sweep (see [`PostgresStore::run_retention_sweep`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +211,7 @@ impl PostgresStore {
     /// delivered and orphaned outbox rows through idx_shadow_tracking_delivered and the
     /// primary key), runs bounded statements ([`RETENTION_DELETE_BATCH`] rows, one
     /// leaf), and stops between statements once the pass has spent
-    /// [`RETENTION_PASS_BUDGET`] (after at least one statement per step, so no step
+    /// [`retention::RETENTION_PASS_BUDGET`] (after at least one statement per step, so no step
     /// starves). The full contents probe of a leaf runs only where some topic can be
     /// wholly expired, at most [`MAX_CONTENTS_PROBES_PER_PASS`] per pass; the other
     /// past leaves get one emptiness check (a single statement for all of them).
@@ -555,11 +560,7 @@ fn delete_aborted_rows(
             continue;
         }
         loop {
-            if !retention::step_may_continue(
-                statements,
-                pass_start.elapsed(),
-                RETENTION_PASS_BUDGET,
-            ) {
+            if !retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
                 return Ok(deleted);
             }
             let n = delete_batch(client, filter, delete_target(leaf, partitioned), None)?;
@@ -569,7 +570,7 @@ fn delete_aborted_rows(
                 n,
                 RETENTION_DELETE_BATCH,
                 Duration::ZERO,
-                RETENTION_PASS_BUDGET,
+                pass_budget(),
             ) {
                 break;
             }
@@ -654,13 +655,15 @@ fn plan_expiry(
             plan.drops.push((oid, Vec::new()));
         }
     }
-    let probe = retention::rotated(&probe, retention::next_probe_start(probe.len()));
-    for (probes, leaf) in probe.into_iter().enumerate() {
+    let probe_start = retention::next_probe_start(probe.len());
+    let mut probes = 0usize;
+    for leaf in retention::rotated(&probe, probe_start) {
         if probes >= MAX_CONTENTS_PROBES_PER_PASS
-            || !retention::step_may_continue(probes, pass_start.elapsed(), RETENTION_PASS_BUDGET)
+            || !retention::step_may_continue(probes, pass_start.elapsed(), pass_budget())
         {
             break;
         }
+        probes += 1;
         let row = client.select(
             "SELECT topic_ids, has_pending
              FROM kafka.message_partition_contents($1::bigint::oid::regclass)",
@@ -692,6 +695,7 @@ fn plan_expiry(
             LeafAction::Keep => {}
         }
     }
+    retention::record_probes(probe_start, probes);
     for &(topic_id, window_ms) in &windows.finite {
         for leaf in &partitions {
             if plan.drops.iter().any(|(oid, _)| *oid == leaf.oid) {
@@ -711,7 +715,7 @@ fn plan_expiry(
 }
 
 /// Run the row deletes in [`RETENTION_DELETE_BATCH`] batches per work item, until
-/// caught up (a short batch) or the pass has spent [`RETENTION_PASS_BUDGET`]. Returns
+/// caught up (a short batch) or the pass has spent [`retention::RETENTION_PASS_BUDGET`]. Returns
 /// the number of rows deleted and records the partitions they came from.
 ///
 /// Each statement is confined to one leaf: through the parent with the leaf's bounds
@@ -737,11 +741,7 @@ fn delete_expired_rows(
     let mut statements = 0usize;
     'work: for item in work {
         loop {
-            if !retention::step_may_continue(
-                statements,
-                pass_start.elapsed(),
-                RETENTION_PASS_BUDGET,
-            ) {
+            if !retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
                 break 'work;
             }
             let target = if !partitioned {
@@ -762,7 +762,7 @@ fn delete_expired_rows(
                 deleted,
                 RETENTION_DELETE_BATCH,
                 pass_start.elapsed(),
-                RETENTION_PASS_BUDGET,
+                pass_budget(),
             ) {
                 break;
             }
@@ -1004,7 +1004,7 @@ fn delete_stale_producers(client: &mut SpiClient<'_>) -> Result<u64> {
 fn delete_delivered_shadow_rows(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
     let mut deleted = 0u64;
     let mut statements = 0usize;
-    while retention::step_may_continue(statements, pass_start.elapsed(), RETENTION_PASS_BUDGET) {
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
         let table = client.update(
             "WITH RECURSIVE parts AS (
                  (SELECT s.topic_id, s.partition_id FROM kafka.shadow_tracking s
@@ -1058,7 +1058,7 @@ fn delete_delivered_shadow_rows(client: &mut SpiClient<'_>, pass_start: Instant)
             n,
             RETENTION_DELETE_BATCH,
             Duration::ZERO,
-            RETENTION_PASS_BUDGET,
+            pass_budget(),
         ) {
             break;
         }
@@ -1078,7 +1078,7 @@ fn delete_delivered_shadow_rows(client: &mut SpiClient<'_>, pass_start: Instant)
 fn delete_orphaned_shadow_rows(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
     let mut deleted = 0u64;
     let mut statements = 0usize;
-    while retention::step_may_continue(statements, pass_start.elapsed(), RETENTION_PASS_BUDGET) {
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
         let table = client.update(
             "DELETE FROM kafka.shadow_tracking
              WHERE ctid = ANY (ARRAY(
@@ -1101,7 +1101,7 @@ fn delete_orphaned_shadow_rows(client: &mut SpiClient<'_>, pass_start: Instant) 
             n,
             RETENTION_DELETE_BATCH,
             Duration::ZERO,
-            RETENTION_PASS_BUDGET,
+            pass_budget(),
         ) {
             break;
         }

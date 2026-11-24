@@ -13,7 +13,7 @@ worker starts: reload, then `pg_terminate_backend()` the `pg_kafka_listener` wor
 `SET` it in a session, but only the server-wide value (reload) reaches the worker. A string shown
 as "(unset)" has no boot value; the code then applies the default its description names.
 
-<!--gen:guc-count-->49<!--/gen--> settings:
+<!--gen:guc-count-->50<!--/gen--> settings:
 
 <!--gen:guc-table-->
 | Name | Type | Default | Range | Changes take effect | Description |
@@ -64,6 +64,7 @@ as "(unset)" has no boot value; the code then applies the default its descriptio
 | `pg_kafka.ssl_key_file` | string | (unset) |  | reload | PEM private key for SSL / SASL_SSL listeners. Read when the worker starts. |
 | `pg_kafka.test_forward_ack_delay_ms` | integer | `0` | 0-30000 | reload | TEST ONLY: delay (ms) before the shadow forwarder returns each ForwardAck. Fault-injection knob for the shadow outbox in-flight gate E2E test (issue #93): the network-thread forwarder sleeps this long after a delivery before acking it to the DB thread. 0 (default) disables it. Do not set in production. Reloadable via SIGHUP. |
 | `pg_kafka.test_pre_commit_delay_ms` | integer | `0` | 0-10000 | reload | TEST ONLY: delay (ms) between a Produce handler and its commit. Fault-injection knob for the response-after-commit barrier E2E test: sleeps on the DB thread inside the transaction after a Produce handler runs, before commit. 0 (default) disables it. Do not set in production. Reloadable via SIGHUP. |
+| `pg_kafka.test_retention_pass_budget_ms` | integer | `-1` | -1-1500 | reload | TEST ONLY: retention sweep pass budget (ms); -1 = the built-in 1500 ms. Fault-injection knob for the retention-sweep E2E tests: the wall-clock budget of one sweep pass. 0 makes every bounded step of a pass run exactly one statement. -1 (default) keeps the built-in 1500 ms. Do not set in production. Reloadable via SIGHUP. |
 | `pg_kafka.test_shadow_delivery_timeout_ms` | integer | `0` | 0-120000 | reload | TEST ONLY: shadow forwarder delivery timeout (ms); 0 = the built-in 120 s. Fault-injection knob for the shadow forwarding-order E2E test: how long a record may stay undelivered before the forwarder fails it and every record outstanding on the same producer. 0 (default) keeps the built-in 120 s. Do not set in production. Reloadable via SIGHUP. |
 | `pg_kafka.transaction_max_timeout_ms` | integer | `900000` | 1-2147483647 | reload | Largest transaction timeout a transactional producer may request (milliseconds). InitProducerId with a transaction_timeout_ms <= 0 or above this value is refused with INVALID_TRANSACTION_TIMEOUT, as Kafka's transaction.max.timeout.ms. Default 900000 (15 minutes). Reloadable. |
 | `pg_kafka.worker_lock_timeout_ms` | integer | `5000` | 0-600000 ms | reload | lock_timeout of the pg_kafka background worker, in milliseconds (0 = wait forever). Bounds every lock wait of the worker's transactions, so one session holding a lock the broker needs fails one request batch (retriable error) instead of wedging the single database thread. Default 5000. Reloadable with pg_reload_conf(). |

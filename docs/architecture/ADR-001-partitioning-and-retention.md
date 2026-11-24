@@ -85,7 +85,8 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
    + the shortest finite window <= now) it asks `kafka.message_partition_contents(leaf)` for
    the (topic, partition) pairs present (a loose index scan, one descent per pair) and whether a
    pending transactional row is there, at most 64 leaves per pass (rotating over the
-   candidates), then `retention::classify_leaf` decides:
+   candidates: each pass starts at the first candidate the previous pass's probes did not
+   reach, so passes cut short by the cap or the budget still cover every leaf), then `retention::classify_leaf` decides:
    **Drop** when every topic present is wholly expired (`upper + window <= now`) and nothing is
    pending; **Trim** when some topics are wholly expired but the leaf must stay (a longer or
    infinite window, or a pending row): those topics' rows in that leaf get the existing bounded

@@ -4,6 +4,7 @@
 mod drop_extension;
 mod lock_order;
 mod lock_races;
+mod sweep_budget;
 mod sweep_concurrency;
 mod sweep_cost;
 pub mod time_partitions;
@@ -29,5 +30,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
         sweep_cost::test_sweep_reads_only_what_it_deletes: sequential,
         sweep_cost::test_sweep_reaps_outbox_rows_of_removed_messages: sequential,
+        sweep_budget::test_sweep_probe_rotation_reaches_every_leaf: sequential,
     ]
 }
