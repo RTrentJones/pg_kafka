@@ -69,11 +69,15 @@ Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.co
 Any change to a producer setting (servers, protocol, SASL, CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
 within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
 without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
-or unbuildable config is logged once per distinct error and, until it is fixed, every record the
-forwarder receives fails without being sent: a `Failed` attempt that counts against its retry
-budget and leads to a dead letter, also when the change retired a working producer or the producer
-went fatal and cannot be rebuilt. Each failure fences the record's partition, so once a producer
-can be built again nothing later of the partition goes out ahead of the failed record's retry.
+or unbuildable config is logged once per distinct error and, until it is fixed, nothing is sent:
+the record each partition waits on (the first one the fence admits) fails, a `Failed` attempt that
+counts against its retry budget and leads to a dead letter, also when the change retired a working
+producer or the producer went fatal and cannot be rebuilt; the failure fences the partition, so
+the records behind it are `NotAttempted` (not charged, as for the delivery timeout) and wait for
+its retry, and once a producer can be built again nothing later of the partition goes out ahead of
+it. So one bad setting dead-letters each partition's records one at a time, after
+`shadow_max_retries` backoffs each, not a whole backlog at once (which with `external_only` topics
+would also switch their consumers to local reads).
 
 Per-topic settings are rows of `kafka.shadow_config` (`mode`, `forward_percentage`,
 `external_topic_name`, `sync_mode`, `write_mode`), reloaded into the `TopicConfigCache` on SIGHUP or
@@ -138,7 +142,8 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
-retry budget. A record no producer can be built for (see Configuration) is `Failed`. Of the
+retry budget. A record no producer can be built for (see Configuration) is `Failed` if it is
+the record its partition waits on and `NotAttempted` behind it. Of the
 records purged by the delivery timeout, the lowest outstanding record of each local partition that has been held for at least half the timeout is `Failed` (the record the
 partition waits on); the records behind it, and a head received less than half a timeout ago (a
 partition that was flowing), are `NotAttempted`. A record that runs out of time in the backlog is

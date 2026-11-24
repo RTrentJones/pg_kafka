@@ -490,21 +490,30 @@ impl ForwarderCore {
         }
     }
 
-    /// No producer could be built for `key` (invalid or unbuildable settings,
-    /// also after the previous producer was retired by a settings change or went
-    /// fatal): a real delivery failure of this record, retried and eventually
+    /// No producer could be built for `record` (invalid or unbuildable
+    /// settings, also after the previous producer was retired by a settings
+    /// change or went fatal): a real delivery failure, retried and eventually
     /// dead-lettered like any other. It is not attributed to a producer
     /// generation: the record never reached one, and the latest generation may
     /// be retired already, which would make the failure collateral
     /// (`NotAttempted`, never counted) and leave the record to be claimed again
     /// and again without ever reaching the retry cap.
     ///
-    /// Every record answered this way counts, whether or not its partition is
-    /// fenced: nothing is sent while no producer can be built, so the claim's
-    /// partition order is not at stake, and each record had its attempt. The
-    /// partition is fenced at the record, so once a producer can be built again
-    /// nothing later of the partition goes out ahead of the record's retry.
-    pub(crate) fn producer_unavailable(&mut self, key: RowKey, error: String) {
+    /// As for a record that runs out of time in the backlog
+    /// ([`Self::expire_backlog`]), only the record its partition waits on is
+    /// charged the attempt: the first record of the partition the fence admits.
+    /// It fences the partition, so the records behind it are answered
+    /// `NotAttempted` (a partition is not charged an attempt for waiting behind
+    /// another) and wait for its retry. Charging every record would dead-letter
+    /// a whole backlog within a few backoffs of one bad setting, and switch
+    /// `external_only` consumers to local reads with it, when the cause is one
+    /// the operator fixes once.
+    pub(crate) fn producer_unavailable(&mut self, record: &ForwardRecord, error: String) {
+        let key = record.row;
+        if self.admit(record) == Admit::Fenced {
+            self.not_attempted(key, "an earlier record of the partition failed");
+            return;
+        }
         self.fence(key);
         self.acks
             .push_back(ForwardAck::new(key, ForwardOutcome::Failed(error)));
@@ -946,7 +955,7 @@ fn forward_one(
     let (producer, generation) = match slot.current(core, &config) {
         Ok(p) => p,
         Err(e) => {
-            core.producer_unavailable(key, e);
+            core.producer_unavailable(record, e);
             return None;
         }
     };
@@ -1030,6 +1039,43 @@ mod tests {
         // The retry of 5 restarts the partition.
         assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
         assert_eq!(core.admit(&rec(0, 6, false)), Admit::Send);
+    }
+
+    #[test]
+    fn unbuildable_producer_charges_only_each_partitions_head() {
+        let mut core = ForwarderCore::default();
+        let failed = |o: &ForwardOutcome| matches!(o, ForwardOutcome::Failed(_));
+        // One claim, two partitions: only the record each partition waits on
+        // has its attempt counted; the rest wait behind it, uncounted.
+        for r in [
+            rec(0, 5, true),
+            rec(0, 6, false),
+            rec(1, 3, true),
+            rec(0, 7, false),
+        ] {
+            core.producer_unavailable(&r, "invalid shadow configuration".into());
+        }
+        let got: Vec<(i32, i64, bool)> = outcomes(&mut core)
+            .iter()
+            .map(|(k, o)| (k.partition_id, k.local_offset, failed(o)))
+            .collect();
+        assert_eq!(
+            got,
+            [(0, 5, true), (0, 6, false), (1, 3, true), (0, 7, false)]
+        );
+        // The retry of 5: charged again; 6 still waits.
+        core.producer_unavailable(&rec(0, 5, true), "x".into());
+        core.producer_unavailable(&rec(0, 6, false), "x".into());
+        let got: Vec<bool> = outcomes(&mut core).iter().map(|(_, o)| failed(o)).collect();
+        assert_eq!(got, [true, false]);
+        // 5 was dead-lettered: 6 is the partition's head and has its turn.
+        core.producer_unavailable(&rec(0, 6, true), "x".into());
+        core.producer_unavailable(&rec(0, 7, false), "x".into());
+        let got: Vec<bool> = outcomes(&mut core).iter().map(|(_, o)| failed(o)).collect();
+        assert_eq!(got, [true, false]);
+        // Once a producer can be built, nothing of the partition overtakes 6.
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
     }
 
     #[test]
@@ -1119,23 +1165,41 @@ mod tests {
         outcomes(core)
     }
 
-    fn assert_unbuildable_failures(got: &[(RowKey, ForwardOutcome)], offsets: &[i64]) {
+    /// `got` answers `failed` (offsets of partition 0 that failed with the
+    /// configuration error) and `waiting` (answered `NotAttempted`), in order.
+    fn assert_unbuildable_failures(
+        got: &[(RowKey, ForwardOutcome)],
+        failed: &[i64],
+        waiting: &[i64],
+    ) {
         let keys: Vec<RowKey> = got.iter().map(|(k, _)| *k).collect();
-        let expected: Vec<RowKey> = offsets.iter().map(|&o| RowKey::new(1, 0, o)).collect();
+        let expected: Vec<RowKey> = failed
+            .iter()
+            .chain(waiting)
+            .map(|&o| RowKey::new(1, 0, o))
+            .collect();
         assert_eq!(keys, expected);
-        for (key, outcome) in got {
-            assert!(
-                matches!(outcome, ForwardOutcome::Failed(e) if e.contains("invalid shadow configuration")),
-                "{key:?}: {outcome:?}"
-            );
+        for (i, (key, outcome)) in got.iter().enumerate() {
+            if i < failed.len() {
+                assert!(
+                    matches!(outcome, ForwardOutcome::Failed(e) if e.contains("invalid shadow configuration")),
+                    "{key:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ForwardOutcome::NotAttempted(_)),
+                    "{key:?}: {outcome:?}"
+                );
+            }
         }
     }
 
-    /// Settings no producer can be built from are a delivery failure of every
-    /// record the forwarder cannot send, also right after a settings change has
-    /// retired the previous producer: the failure is not that retired
-    /// generation's (whose failures are collateral and never counted), or the
-    /// records would be claimed again and again and never dead-lettered.
+    /// Settings no producer can be built from are a delivery failure of the
+    /// record its partition waits on (the records behind it wait, uncounted),
+    /// also right after a settings change has retired the previous producer:
+    /// the failure is not that retired generation's (whose failures are
+    /// collateral and never counted), or the record would be claimed again and
+    /// again and never dead-lettered.
     #[test]
     fn an_unbuildable_producer_fails_records_after_a_settings_change() {
         let mut core = ForwarderCore::default();
@@ -1151,7 +1215,7 @@ mod tests {
             &mut slot,
             &[(0, true), (1, false), (2, false)],
         );
-        assert_unbuildable_failures(&got, &[0, 1, 2]);
+        assert_unbuildable_failures(&got, &[0], &[1, 2]);
         // Every later attempt fails the same way.
         let got = forward_records(
             unreachable_config("BOGUS"),
@@ -1159,7 +1223,7 @@ mod tests {
             &mut slot,
             &[(0, true)],
         );
-        assert_unbuildable_failures(&got, &[0]);
+        assert_unbuildable_failures(&got, &[0], &[]);
 
         // Valid settings again: the partition is fenced at its first failed
         // record, so nothing later goes out ahead of its retry.
@@ -1188,7 +1252,7 @@ mod tests {
             &mut slot,
             &[(0, true), (1, false)],
         );
-        assert_unbuildable_failures(&got, &[0, 1]);
+        assert_unbuildable_failures(&got, &[0], &[1]);
     }
 
     /// A replaced producer's outstanding records fail later; until they do, a

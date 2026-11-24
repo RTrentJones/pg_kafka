@@ -810,7 +810,11 @@ librdkafka producer and answers every record with an ack.
 - **Order.** The first copy of every record of a local partition reaches the external topic in
   local-offset order (duplicates may follow it).
 - **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
-  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised.
+  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised. Only
+  the record a partition waits on is charged an attempt when nothing is sent for reasons outside
+  it (the 120 s delivery timeout, or shadow settings no producer can be built from, such as an
+  unknown `shadow_security_protocol`); the records behind it wait uncounted, so a bad setting
+  dead-letters each partition's records one at a time, not a whole backlog at once.
 - **Local state is exact.** The local write and the outbox row commit together; a delivered row
   records its external offset once (a duplicate ack matches nothing).
 
