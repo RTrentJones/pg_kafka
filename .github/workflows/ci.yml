@@ -137,8 +137,8 @@ jobs:
     name: E2E pg${{ matrix.pg }}
     runs-on: ubuntu-24.04
     needs: [lint, kafka-test-build]
-    # Cold build ~20 min + suite (9.6 min measured on 4 shared cores, 365 functional tests
-    # including listener restarts) + shadow (~13 min locally) and performance on pg14.
+    # Cold build ~20 min + functional suite (9.6 min measured on 4 shared cores, including
+    # listener restarts) + shadow (~16 min locally) and performance on pg14.
     timeout-minutes: 100
     strategy:
       fail-fast: false
@@ -191,7 +191,7 @@ jobs:
         run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
       - name: Functional E2E tests
-        # Measured 9.6 min (365 tests) on PG16 in a 4-core sandbox shared with two other builds;
+        # Measured 9.6 min on PG16 in a 4-core sandbox shared with two other builds;
         # the margin covers slow runners.
         timeout-minutes: 25
         working-directory: kafka_test
@@ -212,10 +212,13 @@ jobs:
 
       - name: Generated test counts are current (docs/TEST_STRATEGY.md)
         if: matrix.pg == 14
-        timeout-minutes: 20
+        # Lists the unit and property test binaries the steps above built (the same features
+        # and the same empty RUSTFLAGS, so nothing is rebuilt) and the kafka_test artifact.
+        timeout-minutes: 5
         run: python3 scripts/gen-docs.py --check --only tests
         env:
           GEN_DOCS_FEATURES: ${{ env.FEATURES }}
+          RUSTFLAGS: ""
 
       - name: Start external Kafka (shadow tests)
         if: matrix.pg == 14
