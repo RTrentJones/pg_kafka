@@ -574,17 +574,17 @@ pub async fn test_shadow_order_preserved_across_a_delivery_timeout() -> TestResu
 
 /// The external broker, paused until [`BrokerPause::resume`] (or the drop,
 /// so a failing test never leaves it stopped).
-struct BrokerPause {
+pub(super) struct BrokerPause {
     resumed: bool,
 }
 
 impl BrokerPause {
-    fn new() -> Result<Self, String> {
+    pub(super) fn new() -> Result<Self, String> {
         run_shell("EXTERNAL_KAFKA_PAUSE_CMD", "docker pause external_kafka")?;
         Ok(Self { resumed: false })
     }
 
-    fn resume(mut self) -> Result<(), String> {
+    pub(super) fn resume(mut self) -> Result<(), String> {
         self.resumed = true;
         run_shell("EXTERNAL_KAFKA_RESUME_CMD", "docker unpause external_kafka")
     }

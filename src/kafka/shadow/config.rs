@@ -117,10 +117,17 @@ pub const VALID_SECURITY_PROTOCOLS: &[&str] = &["PLAINTEXT", "SASL_PLAINTEXT", "
 /// Valid SASL mechanisms.
 pub const VALID_SASL_MECHANISMS: &[&str] = &["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"];
 
-/// `validate` clamps `batch_size` into this range.
-const BATCH_SIZE_RANGE: (i32, i32) = (1, 100_000);
-/// `validate` clamps `linger_ms` into this range.
-const LINGER_MS_RANGE: (i32, i32) = (0, 5000);
+/// `validate` clamps `batch_size` into this range (the GUC's).
+const BATCH_SIZE_RANGE: (i32, i32) = (
+    crate::kafka::constants::MIN_SHADOW_BATCH_SIZE,
+    crate::kafka::constants::MAX_SHADOW_BATCH_SIZE,
+);
+/// `validate` clamps `linger_ms` into this range (the GUC's, so a value the GUC
+/// accepts is applied as set).
+const LINGER_MS_RANGE: (i32, i32) = (
+    crate::kafka::constants::MIN_SHADOW_LINGER_MS,
+    crate::kafka::constants::MAX_SHADOW_LINGER_MS,
+);
 
 /// The settings the external producer is built from (the shadow GUCs).
 #[derive(Clone)]

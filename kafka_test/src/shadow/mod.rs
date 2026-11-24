@@ -65,8 +65,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         transaction_integration::test_committed_transaction_uses_durable_outbox: sequential,
         transaction_integration::test_committed_txn_leaves_no_orphan_outbox_rows: sequential,
         // Error handling tests
-        error_handling::test_dual_write_external_down: sequential,
-        error_handling::test_external_only_fallback: sequential,
+        error_handling::test_dual_write_external_down: sequential, // Pauses the external broker
+        error_handling::test_external_only_fallback: sequential, // Mutates shadow_max_retries, shadow_retry_backoff_ms
+        error_handling::test_shadow_unbuildable_settings_dead_letter_after_a_working_producer: sequential, // Mutates shadow_bootstrap_servers, shadow_security_protocol, shadow_max_retries, shadow_retry_backoff_ms
         error_handling::test_external_primary_dead_letter_serves_local: sequential,
         // Replay test
         replay::test_replay_historical_messages: sequential,

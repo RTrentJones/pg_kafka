@@ -72,6 +72,10 @@ pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// queue holds back only the forwarder's later records (see `forwarder_task`).
 const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 
+/// librdkafka's default `retry.backoff.max.ms`, kept unless `retry.backoff.ms`
+/// is larger (see [`build_producer_settings`]).
+const LIBRDKAFKA_RETRY_BACKOFF_MAX_MS: i32 = 1000;
+
 /// Assemble the ordered librdkafka settings for the shadow forwarding producer.
 ///
 /// Pure — no client creation, no IO — so the security/idempotence invariants can
@@ -85,7 +89,10 @@ const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 /// - `shadow_linger_ms` → `linger.ms`;
 /// - `shadow_retry_backoff_ms` → `retry.backoff.ms` (librdkafka's own retries
 ///   inside one delivery attempt; the outbox uses the same base for its re-attempt
-///   backoff, see `ShadowStore`);
+///   backoff, see `ShadowStore`), and `retry.backoff.max.ms` to the larger of it
+///   and librdkafka's default 1000 ms: librdkafka caps the backoff at
+///   `retry.backoff.max.ms`, so a larger `retry.backoff.ms` alone would be
+///   ignored (with only a configuration warning);
 /// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
 ///   librdkafka retries (its default `retries`, which is what idempotence
@@ -126,6 +133,13 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     settings.push(("batch.num.messages", config.batch_size.to_string()));
     settings.push(("linger.ms", config.linger_ms.to_string()));
     settings.push(("retry.backoff.ms", config.retry_backoff_ms.to_string()));
+    settings.push((
+        "retry.backoff.max.ms",
+        config
+            .retry_backoff_ms
+            .max(LIBRDKAFKA_RETRY_BACKOFF_MAX_MS)
+            .to_string(),
+    ));
 
     // Compression (use none for maximum compatibility)
     settings.push(("compression.type", "none".to_string()));
@@ -495,9 +509,28 @@ mod tests {
         assert!(!has_key(&s, "batch.size"));
         assert!(has(&s, "linger.ms", "25"));
         assert!(has(&s, "retry.backoff.ms", "200"));
+        // librdkafka's default cap, above the backoff.
+        assert!(has(&s, "retry.backoff.max.ms", "1000"));
         assert!(has(&s, "request.timeout.ms", "30000"));
         // Infinite: the forwarder enforces the delivery timeout itself, so a
         // timeout can never fail one record alone.
         assert!(has(&s, "message.timeout.ms", "0"));
+    }
+
+    /// A backoff above librdkafka's default cap raises the cap with it, or
+    /// librdkafka would apply the cap instead.
+    #[test]
+    fn test_build_producer_settings_applies_a_long_retry_backoff() {
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "a:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            retry_backoff_ms: crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS,
+            ..Default::default()
+        };
+        let s = build_producer_settings(&config);
+        let max = crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS.to_string();
+        assert!(has(&s, "retry.backoff.ms", &max));
+        assert!(has(&s, "retry.backoff.max.ms", &max));
     }
 }

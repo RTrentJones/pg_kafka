@@ -776,32 +776,39 @@ fire-and-forget with no response frame and no durability claim — see §1.)
 
 ## Shadow Forwarding Delivery Semantics
 
-**Status:** At-least-once on decoupled paths, by design.
+**Status:** At-least-once, in order per local partition, by design. Full description:
+[SHADOW_MODE_FLOW_DIAGRAM.md](SHADOW_MODE_FLOW_DIAGRAM.md).
 
-Shadow forwarding to an external Kafka cluster uses a durable outbox
-(`kafka.shadow_tracking`) drained by a poll loop:
+Shadow forwarding to an external Kafka cluster goes through a durable outbox
+(`kafka.shadow_tracking`): a produce writes its records locally and, in the same transaction, one
+pending outbox row per forwarded record. The worker's outbox tick claims due rows after the commit
+and hands them to the forwarder on the network thread, which produces them with an idempotent
+librdkafka producer and answers every record with an ack.
 
-- **Sync mode** (`forward_sync_after_commit`): effectively exactly-once at the
-  external broker in normal operation — after the local commit, and before the
-  produce response is sent, the worker forwards the request's rows and waits
-  (bounded, 5 s) for the external acks. Rows of a request that rolled back are
-  never forwarded, so the external broker never holds a record pg_kafka did
-  not store.
-- **Async / forward-on-commit modes:** **at-least-once**. A row whose forward
-  ack is lost (worker crash between delivery and finalization, dropped ack on
-  a full channel) is re-forwarded after its retry lease expires, so the
-  external topic can receive duplicates in failure windows. This is the
-  standard Kafka mirroring guarantee; consumers of the external topic that
-  need exactly-once semantics must deduplicate (e.g. by key + producer
-  metadata).
-- **In-flight gating:** a row whose forward is merely *slow* (ack pending) is
-  not re-claimed at lease expiry — the DB thread tracks dispatched
-  forwards and the outbox claim skips them until the ack resolves or the
-  entry ages out (`INFLIGHT_EVICT_AFTER`, 150 s, sized above the
-  forwarder's 120 s delivery timeout, which runs from when the forwarder
-  receives the record, time in its backlog included). Duplicates therefore occur only on genuine ack
-  *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
-  finalization remain exactly-once in all modes.
+- **One path for sync and async.** `sync_mode` changes only when the client gets its response:
+  a sync-mode response is held (by the forwarder, never by the worker) until its records are
+  delivered or `pg_kafka.shadow_sync_timeout_ms` (default 5 s) passes; on timeout the records stay
+  pending and are forwarded like any other. Both modes write the same outbox rows and are
+  dispatched by the same claim. Nothing is sent before the local commit, so a rolled-back request
+  never leaves a copy on the external broker. Some sync-mode responses are not held (an
+  idempotent producer's retry of an appended batch, records beyond 10 000 sync rows in one
+  group-commit batch, transactional records): see "Sync vs Async Forwarding" there.
+- **At-least-once.** The idempotent producer suppresses duplicates of its own retries within one
+  producer session. A record can land twice when it is re-sent by a new producer (rebuilt after a
+  fatal error, a settings change or the 120 s delivery timeout: the old producer's purged
+  in-flight requests may still have been written), or when its ack is lost (the worker restarted
+  before applying it, or the row's in-flight entry was evicted after 150 s): the claim then takes
+  the row again and counts the lost attempt. Acks are never dropped on the way back (the
+  forwarder keeps those the bounded channel cannot take yet), and a row in flight is not claimed
+  again while the worker tracks it (no lease: a slow ack never causes a re-send). Consumers of the
+  external topic that need exactly-once semantics must deduplicate, for example on an
+  application id.
+- **Order.** The first copy of every record of a local partition reaches the external topic in
+  local-offset order (duplicates may follow it).
+- **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
+  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised.
+- **Local state is exact.** The local write and the outbox row commit together; a delivered row
+  records its external offset once (a duplicate ack matches nothing).
 
 ## Network Security Posture
 

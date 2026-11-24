@@ -56,8 +56,8 @@ GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads t
 | `pg_kafka.shadow_sasl_username` / `_password` | '' | Superuser-only, hidden from SHOW ALL. |
 | `pg_kafka.shadow_ssl_ca_location` | '' | CA file for SSL. |
 | `pg_kafka.shadow_batch_size` | 1000 | Records per outbox claim, and librdkafka `batch.num.messages`. |
-| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms`. |
-| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
+| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms` (0-5000). |
+| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms` (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
 | `pg_kafka.shadow_max_retries` | 10 | Failed delivery attempts after which a row is a dead letter. |
 | `pg_kafka.shadow_sync_timeout_ms` | 5000 | How long a sync-mode produce response is held for the external ack (0 = not held). |
 | `pg_kafka.shadow_metrics_enabled` | true | Write `kafka.shadow_metrics`. |
@@ -69,13 +69,20 @@ Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.co
 Any change to a producer setting (servers, protocol, SASL, CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
 within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
 without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
-or unbuildable config is logged once per distinct error and every record fails (and is eventually
-dead-lettered) until it is fixed.
+or unbuildable config is logged once per distinct error and, until it is fixed, every record the
+forwarder receives fails without being sent: a `Failed` attempt that counts against its retry
+budget and leads to a dead letter, also when the change retired a working producer or the producer
+went fatal and cannot be rebuilt. Each failure fences the record's partition, so once a producer
+can be built again nothing later of the partition goes out ahead of the failed record's retry.
 
 Per-topic settings are rows of `kafka.shadow_config` (`mode`, `forward_percentage`,
 `external_topic_name`, `sync_mode`, `write_mode`), reloaded into the `TopicConfigCache` on SIGHUP or
-every `pg_kafka.config_reload_interval_ms`. The reload replaces the cache (a deleted row stops
-forwarding) only when the query succeeds. A row with `write_mode = 'external_only'` and
+every `pg_kafka.config_reload_interval_ms`. The reload replaces the cache only when the query succeeds.
+Setting `mode = 'local_only'` (or `forward_percentage = 0`) or deleting the row stops queueing the
+topic's new records; rows already in the outbox are still forwarded (the claim does not consult
+the topic's config). To drop them as well, delete them:
+`DELETE FROM kafka.shadow_tracking WHERE topic_id = ... AND external_offset IS NULL` (an attempt
+in flight then has its ack match nothing). A row with `write_mode = 'external_only'` and
 `forward_percentage <> 100` is forced to 100% with a warning, because a sampled-out record would
 otherwise be readable nowhere.
 
@@ -131,8 +138,8 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
-retry budget. Of the records purged by the delivery timeout, the lowest outstanding record of each
-local partition that has been held for at least half the timeout is `Failed` (the record the
+retry budget. A record no producer can be built for (see Configuration) is `Failed`. Of the
+records purged by the delivery timeout, the lowest outstanding record of each local partition that has been held for at least half the timeout is `Failed` (the record the
 partition waits on); the records behind it, and a head received less than half a timeout ago (a
 partition that was flowing), are `NotAttempted`. A record that runs out of time in the backlog is
 `Failed` if it is the record its partition waits on and `NotAttempted` behind an earlier failure. In a persistent outage each stuck partition's head
@@ -199,8 +206,22 @@ What sync guarantees: an OK response means the record was committed locally, and
 expired first, delivered externally. It does not stall the broker: only that client's response
 waits (and the responses behind it on the same connection, which Kafka orders), the worker and every
 other client carry on. The old design waited on the DB thread for up to 5 s per batch, stalling all
-clients while the external cluster was slow or down. With `shadow_sync_timeout_ms = 0` sync topics
-behave like async ones.
+clients while the external cluster was slow or down.
+
+These sync-mode responses are not held, so their OK says only that the records are committed
+locally:
+
+- an idempotent producer's retry of a batch already appended (Kafka answers it with the original
+  offsets, nothing is inserted, so no outbox row is written for it), even while the original's
+  records are not delivered yet; the original's own response was held, and its rows are forwarded
+  as usual;
+- the records of a group-commit batch beyond the first 10 000 sync rows awaiting the commit
+  (`SYNC_PENDING_CAP` in `store.rs`, a bound on the worker's memory): a response whose records are
+  all beyond it goes out at once, one with some of them waits only for those within it; all of
+  them are forwarded as usual;
+- transactional records (see Transactional Produce).
+
+With `shadow_sync_timeout_ms = 0` sync topics behave like async ones.
 
 ## Outbox Rows, Retries and Dead Letters
 

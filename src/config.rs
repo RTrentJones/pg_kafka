@@ -368,7 +368,7 @@ gucs! {
     /// Base of the shadow retry back-off (librdkafka and the outbox).
     int SHADOW_RETRY_BACKOFF_MS = DEFAULT_SHADOW_RETRY_BACKOFF_MS => c"pg_kafka.shadow_retry_backoff_ms" {
         short: c"Retry backoff for shadow forwarding (milliseconds)",
-        long: c"librdkafka retry.backoff.ms, and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka retry.backoff.ms (its first retry backoff, doubling up to retry.backoff.max.ms, which is set to the larger of this and 1000 ms), and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_RETRY_BACKOFF_MS, MAX_SHADOW_RETRY_BACKOFF_MS),
     }
@@ -794,7 +794,7 @@ mod tests {
             ("MIN_SHADOW_BATCH_SIZE", MIN_SHADOW_BATCH_SIZE, 1),
             ("MAX_SHADOW_BATCH_SIZE", MAX_SHADOW_BATCH_SIZE, 100_000),
             ("MIN_SHADOW_LINGER_MS", MIN_SHADOW_LINGER_MS, 0),
-            ("MAX_SHADOW_LINGER_MS", MAX_SHADOW_LINGER_MS, 60_000),
+            ("MAX_SHADOW_LINGER_MS", MAX_SHADOW_LINGER_MS, 5_000),
             (
                 "MIN_SHADOW_RETRY_BACKOFF_MS",
                 MIN_SHADOW_RETRY_BACKOFF_MS,
