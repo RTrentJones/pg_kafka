@@ -290,7 +290,7 @@ impl PostgresStore {
             )?;
             // Whole-leaf drops last, so the ACCESS EXCLUSIVE lock a drop takes on
             // kafka.messages is held only until this transaction commits.
-            stats.dropped_partitions = drop_leaves(client, plan.drops, &mut affected)?;
+            stats.dropped_partitions = drop_leaves(client, plan.drops, &mut affected, pass_start)?;
             advance_log_start(client, affected)?;
 
             stats.terminal_transactions = delete_terminal_transactions(client)?;
@@ -861,22 +861,40 @@ fn delete_batch(
 }
 
 /// Drop the planned leaves (each re-checked under its lock by
-/// `kafka.drop_message_partition`). Returns how many were dropped and records the
-/// partitions they held.
+/// `kafka.drop_message_partition`), within the pass budget (at least one per pass),
+/// stopping after a drop that ran out of a lock wait: each call can wait its 2 s
+/// lock_timeout for a session that holds a lock on kafka.messages or a leaf (a reader
+/// idle in transaction, a long query, autovacuum), and that session blocks every
+/// further drop of the pass just as long, so continuing would only stall the DB thread.
+/// The leaves not dropped stay candidates for the next pass. Returns how many were
+/// dropped and records the partitions they held.
 fn drop_leaves(
     client: &mut SpiClient<'_>,
     drops: Vec<(u32, Vec<i32>)>,
     affected: &mut AffectedPartitions,
+    pass_start: Instant,
 ) -> Result<u64> {
     let mut dropped = 0;
-    for (leaf_oid, expired_topics) in drops {
+    let mut lock_timed_out = false;
+    for (attempts, (leaf_oid, expired_topics)) in drops.into_iter().enumerate() {
+        if !retention::drop_may_continue(
+            attempts,
+            lock_timed_out,
+            pass_start.elapsed(),
+            pass_budget(),
+        ) {
+            break;
+        }
         let row = client.update(
-            "SELECT dropped, topic_ids, partition_ids, next_offsets
+            "SELECT dropped, topic_ids, partition_ids, next_offsets, lock_timed_out
              FROM kafka.drop_message_partition($1::bigint::oid::regclass, $2::int4[])",
             None,
             &[i64::from(leaf_oid).into(), expired_topics.into()],
         )?;
         let row = row.first();
+        lock_timed_out = row
+            .get_by_name::<bool, _>("lock_timed_out")?
+            .unwrap_or(false);
         if row.get_by_name::<bool, _>("dropped")?.unwrap_or(false) {
             dropped += 1;
             let topic_ids: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();

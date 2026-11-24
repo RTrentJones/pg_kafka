@@ -100,7 +100,14 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
    unambiguous; the DEFAULT leaf is addressed directly).
 3. Drops last (at most 64 per pass), through `kafka.drop_message_partition(leaf, expired_topics)`,
    which re-checks under `ACCESS EXCLUSIVE` on `kafka.messages` that the leaf holds only listed
-   topics and no pending row, so a concurrent writer cannot lose a row.
+   topics and no pending row, so a concurrent writer cannot lose a row. The drops are a bounded
+   step like the others (at least one per pass, then only within the pass budget), and the step
+   stops after a drop that ran out of a lock wait (`lock_timed_out`): each call can wait its
+   2 s `lock_timeout` for any session holding a lock on `kafka.messages` or a leaf (a reader
+   idle in transaction after a SELECT, a long query, an autovacuum or ANALYZE of a leaf), and
+   that session blocks the next drop just as long. The leaves left stay candidates for the next
+   pass. The 2 s is the functions' own `lock_timeout`, not `pg_kafka.worker_lock_timeout_ms`
+   (default 5 s, sized for request batches), so one blocked drop stalls the worker at most 2 s.
 4. `log_start_offset` of every touched (topic, partition) advances to the oldest surviving offset
    or the HWM, only forward (GREATEST), exactly as for row deletes. Offsets are assigned in
    `created_at` order, so a dropped leaf is an offset prefix of each partition it held; the only
@@ -211,8 +218,8 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
 * **Every lock wait in maintenance is bounded and handled.** A session that ran maintenance
   and stayed open makes the next pass skip with a WARNING instead of stalling it (and, for
   the worker, the whole broker). `drop_message_partition` takes its table locks inside a
-  `lock_not_available` handler, so a timeout skips that leaf instead of rolling back the
-  caller's whole sweep. Any ERROR in the worker's maintenance (a lock timeout, a deadlock
+  `lock_not_available` handler, so a timeout skips that leaf (and, in a sweep, the pass's
+  remaining drops) instead of rolling back the caller's whole sweep. Any ERROR in the worker's maintenance (a lock timeout, a deadlock
   with a client's own transaction) rolls back that task's subtransaction only; the worker
   logs a WARNING, keeps serving, and the next interval retries.
 * **A leaf dropped concurrently is "not dropped", not an error.** When two sweeps pick

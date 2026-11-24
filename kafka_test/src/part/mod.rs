@@ -31,5 +31,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_cost::test_sweep_reads_only_what_it_deletes: sequential,
         sweep_cost::test_sweep_reaps_outbox_rows_of_removed_messages: sequential,
         sweep_budget::test_sweep_probe_rotation_reaches_every_leaf: sequential,
+        sweep_budget::test_sweep_drops_bounded_behind_a_held_reader: sequential,
     ]
 }

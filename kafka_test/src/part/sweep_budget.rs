@@ -1,8 +1,19 @@
-//! Retention-sweep passes that run out of budget: what such passes still reach.
+//! Retention-sweep passes that run out of budget: what such passes still reach, and
+//! that a pass stays within its budget when its leaf drops are blocked.
 
-use crate::common::TestResult;
-use crate::worker::{boxed, into_test_result, session, set_guc, unique, SendResult};
+use crate::common::{create_producer, TestResult};
+use crate::worker::{boxed, into_test_result, send, session, set_guc, unique, SendResult};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_postgres::Client;
+
+/// Empty past leaves a blocked drop step faces: dropped one after another, each
+/// waiting its 2 s lock_timeout, they would hold a pass for about 16 s.
+const BLOCKED_LEAVES: i32 = 8;
+/// What a pass may take with its drops blocked: the 1.5 s budget, one 2 s drop, and
+/// slack (including waiting for a worker pass in progress, bounded the same way).
+const BLOCKED_PASS_LIMIT: Duration = Duration::from_secs(6);
 
 /// Test-only GUC: the sweep's pass budget in ms (0 = every bounded step runs exactly
 /// one statement per pass).
@@ -160,4 +171,127 @@ async fn probe_rotation() -> SendResult<()> {
     result?;
     println!("✅ every probe candidate was reached");
     Ok(())
+}
+
+/// The whole-leaf drop step is bounded like the others: within the pass budget, and it
+/// stops after a drop that ran out of a lock wait. Each `drop_message_partition` call can
+/// wait 2 s for a session holding a lock on kafka.messages or a leaf (here a reader idle
+/// in transaction after a SELECT on kafka.messages), and without the bound a pass tried
+/// every planned leaf in turn, holding the worker's single DB thread for 2 s per leaf.
+///
+/// Asserts: with a reader holding ACCESS SHARE on kafka.messages and eight empty past
+/// leaves, a sweep returns within 6 s having dropped none, a producer running meanwhile
+/// sees no ack slower than 2 s; once the reader ends, the next sweep drops all eight.
+pub async fn test_sweep_drops_bounded_behind_a_held_reader() -> TestResult {
+    into_test_result(blocked_drops().await)
+}
+
+async fn blocked_drops() -> SendResult<()> {
+    println!("=== Test: a sweep's leaf drops stay within its budget behind a reader ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '60s'")
+        .await
+        .map_err(boxed)?;
+    let base_hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let mut leaves = Vec::new();
+    for k in 0..BLOCKED_LEAVES {
+        leaves.push(hour_leaf(&db, base_hour + k).await?);
+    }
+    println!(
+        "Step 0: {} empty past leaves from {}",
+        leaves.len(),
+        leaves[0]
+    );
+
+    let reader = session().await?;
+    reader
+        .batch_execute("BEGIN; SELECT count(*) FROM kafka.messages")
+        .await
+        .map_err(boxed)?;
+
+    let topic = unique("blocked-drops");
+    let stop = Arc::new(AtomicBool::new(false));
+    let producing = {
+        let stop = stop.clone();
+        let topic = topic.clone();
+        tokio::spawn(async move {
+            let producer = create_producer().map_err(boxed)?;
+            let mut slowest = Duration::ZERO;
+            while !stop.load(Ordering::SeqCst) {
+                let t = Instant::now();
+                send(&producer, &topic, "p").await?;
+                slowest = slowest.max(t.elapsed());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            SendResult::Ok(slowest)
+        })
+    };
+    // Let the producer create its topic before the sweep starts.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let result: SendResult<()> = async {
+        let t = Instant::now();
+        let dropped = dropped_partitions(&db).await?;
+        let took = t.elapsed();
+        println!("Step 1: sweep behind the reader took {took:?}, dropped {dropped}");
+        assert!(
+            took < BLOCKED_PASS_LIMIT,
+            "a sweep with blocked drops took {took:?}"
+        );
+        assert_eq!(
+            dropped, 0,
+            "no leaf can be dropped while the reader holds its lock"
+        );
+        Ok(())
+    }
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    let slowest = producing.await.map_err(boxed)?;
+    reader.batch_execute("ROLLBACK").await.map_err(boxed)?;
+    result?;
+    let slowest = slowest?;
+    println!("Step 2: slowest produce ack during the sweep {slowest:?}");
+    assert!(
+        slowest < Duration::from_secs(2),
+        "a produce ack took {slowest:?} during the sweep"
+    );
+
+    let mut left = leaves.len();
+    for _ in 0..3 {
+        dropped_partitions(&db).await?;
+        left = 0;
+        for leaf in &leaves {
+            if leaf_exists(&db, leaf).await? {
+                left += 1;
+            }
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        left, 0,
+        "the leaves must be dropped once the reader is gone"
+    );
+    println!("✅ the blocked pass stayed bounded and the next one dropped every leaf");
+    Ok(())
+}
+
+/// One sweep (global retention off, aborted grace 1 h); returns dropped_partitions.
+async fn dropped_partitions(db: &Client) -> SendResult<i64> {
+    let rows = db
+        .query(
+            "SELECT category, deleted FROM pg_kafka_run_retention_sweep(0, 3600)",
+            &[],
+        )
+        .await
+        .map_err(boxed)?;
+    rows.iter()
+        .find(|r| r.get::<_, String>(0) == "dropped_partitions")
+        .map(|r| r.get::<_, i64>(1))
+        .ok_or_else(|| "missing dropped_partitions".into())
 }

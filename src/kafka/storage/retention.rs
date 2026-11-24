@@ -79,6 +79,18 @@ pub fn step_may_continue(statements_run: usize, elapsed: Duration, budget: Durat
     statements_run == 0 || elapsed < budget
 }
 
+/// Whether the whole-leaf drop step may try another leaf: a bounded step
+/// ([`step_may_continue`]) that also stops after a drop that ran out of a lock wait,
+/// since the session holding that lock blocks the next drop just as long.
+pub fn drop_may_continue(
+    attempts: usize,
+    last_lock_timed_out: bool,
+    elapsed: Duration,
+    budget: Duration,
+) -> bool {
+    !last_lock_timed_out && step_may_continue(attempts, elapsed, budget)
+}
+
 /// Rotation cursor for the topic order, so a pass that runs out of budget on one
 /// large backlog does not starve the topics after it: the next pass starts one
 /// topic further along.
@@ -357,6 +369,26 @@ mod tests {
         assert!(step_may_continue(0, budget * 2, budget));
         assert!(step_may_continue(3, Duration::from_millis(10), budget));
         assert!(!step_may_continue(1, budget, budget));
+    }
+
+    #[test]
+    fn drops_stop_at_the_budget_or_after_a_lock_timeout() {
+        let budget = Duration::from_millis(1500);
+        // The first drop of a pass always runs, even with the budget spent.
+        assert!(drop_may_continue(0, false, budget * 2, budget));
+        assert!(drop_may_continue(
+            5,
+            false,
+            Duration::from_millis(10),
+            budget
+        ));
+        assert!(!drop_may_continue(1, false, budget, budget));
+        assert!(!drop_may_continue(
+            1,
+            true,
+            Duration::from_millis(10),
+            budget
+        ));
     }
 
     #[test]

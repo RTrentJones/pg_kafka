@@ -502,16 +502,20 @@ $$;
 -- Returns whether it dropped the leaf, the (topic_id, partition_id) pairs the leaf
 -- held and, for each, the offset after the last one it held (MAX + 1, one btree descent
 -- per pair), so the caller advances their log_start_offset and keeps their offset
--- counter past the dropped offsets even where no counter row existed. Dropping a leaf
--- is equivalent to deleting its rows, which the worker may already do; the function
--- grants no more.
+-- counter past the dropped offsets even where no counter row existed. lock_timed_out
+-- says the leaf was kept because a lock wait ran out (the maintenance lock, or the
+-- locks the DROP needs, within the 2 s lock_timeout): a caller dropping several leaves
+-- stops there, since the session holding the lock blocks the next drop just as long.
+-- Dropping a leaf is equivalent to deleting its rows, which the worker may already do;
+-- the function grants no more.
 CREATE FUNCTION kafka.drop_message_partition(
     p_partition REGCLASS,
     p_expired_topics INT[],
     OUT dropped BOOLEAN,
     OUT topic_ids INT[],
     OUT partition_ids INT[],
-    OUT next_offsets BIGINT[]
+    OUT next_offsets BIGINT[],
+    OUT lock_timed_out BOOLEAN
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -521,6 +525,7 @@ DECLARE
     v_contents RECORD;
 BEGIN
     dropped := false;
+    lock_timed_out := false;
     -- Already gone (a concurrent sweep dropped it): nothing to do, not an error.
     IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
         RETURN;
@@ -529,6 +534,7 @@ BEGIN
     -- below opens every leaf). A retention sweep already holds it.
     IF NOT kafka.try_maintenance_lock() THEN
         RAISE WARNING 'pg_kafka: could not drop time partition % (another session holds the maintenance lock); will retry', p_partition;
+        lock_timed_out := true;
         RETURN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM kafka.message_partitions() p
@@ -575,6 +581,7 @@ BEGIN
     EXCEPTION WHEN lock_not_available THEN
         RAISE WARNING 'pg_kafka: could not drop time partition % (lock timeout); will retry', p_partition;
         dropped := false;
+        lock_timed_out := true;
         topic_ids := NULL;
         partition_ids := NULL;
         next_offsets := NULL;
