@@ -1250,7 +1250,7 @@ mod tests {
     fn batch_ranges_encode_alone_as_they_do_together() {
         let mut sets = byte_limit_record_sets();
         sets.extend(
-            overhead_heavy_record_sets(20, 5)
+            overhead_heavy_record_sets(20, 5, 0)
                 .into_iter()
                 .filter(|(n, _)| !n.starts_with("large")),
         );
@@ -1275,6 +1275,7 @@ mod tests {
     fn overhead_heavy_record_sets(
         lone: i64,
         tail: i64,
+        large: usize,
     ) -> Vec<(&'static str, Vec<FetchedMessage>)> {
         use rand::{RngCore, SeedableRng};
         let now = 1_700_000_000_000;
@@ -1326,7 +1327,7 @@ mod tests {
                 "large random values",
                 with_tail(
                     (0..3)
-                        .map(|o| record(o, random(4 << 20), now, None))
+                        .map(|o| record(o, random(large), now, None))
                         .collect(),
                 ),
             ),
@@ -1339,6 +1340,12 @@ mod tests {
     /// trailing records by their estimates and re-encoding the rest until the batches fit
     /// would compress the whole set again per round, each round shedding only the ~2
     /// encoded bytes of every well-compressing record dropped.
+    ///
+    /// The shapes are the smallest that loop exceeds the bound on: 100 lone records with
+    /// tails of up to 12 records (gzip, snappy and lz4 each past it on every lone shape) and
+    /// 1 MiB random values at the tails it exceeds it on for snappy and lz4, plus (in an
+    /// optimized build) 4 MiB random values under gzip, whose ~5 bytes per 64 KiB block take
+    /// that size to add up.
     #[test]
     fn fitting_records_to_the_limit_encodes_each_batch_once() {
         let codecs = [
@@ -1351,67 +1358,74 @@ mod tests {
         let size = |m: &FetchedMessage| {
             1 + m.key.as_ref().map_or(0, Vec::len) + m.value.as_ref().map_or(0, Vec::len)
         };
-        let mut too_costly = Vec::new();
+        let mut cases = Vec::new();
         for compression in codecs {
-            for tail in (0..=60).step_by(3) {
-                for (name, set) in overhead_heavy_record_sets(1000, tail) {
-                    if name == "large random values" && tail > 30 {
-                        continue;
-                    }
-                    let limit = set.iter().map(message_size_estimate).sum::<i64>();
-                    let (records, bytes) = (set.len(), set.iter().map(size).sum::<usize>());
-                    for returned_any in [false, true] {
-                        let mut work = (0usize, 0usize);
-                        let encode = |r: &[Record], c| {
-                            work.0 += r.len();
-                            work.1 += r
-                                .iter()
-                                .map(|r| {
-                                    1 + r.key.as_ref().map_or(0, bytes::Bytes::len)
-                                        + r.value.as_ref().map_or(0, bytes::Bytes::len)
-                                })
-                                .sum::<usize>();
-                            encode_records(r, c)
-                        };
-                        let (encoded, counted) = encode_within_limit_with(
-                            set.clone(),
-                            compression,
-                            limit,
-                            returned_any,
-                            encode,
-                        )
-                        .unwrap()
-                        .unwrap();
-                        let case = format!("{compression:?}, {name}, tail {tail}");
-                        if work.0 > 3 * records || work.1 > 3 * bytes {
-                            too_costly.push(format!(
-                                "{case}: {work:?} records and bytes encoded for {records} \
-                                 records of {bytes} bytes"
-                            ));
-                        }
-                        let len = i64::try_from(encoded.len()).unwrap();
-                        assert!(len <= limit, "{case}: {len} bytes for a limit of {limit}");
-                        // The records returned are a prefix of the set: no record is skipped.
-                        let mut b = encoded.clone();
-                        let offsets: Vec<i64> = RecordBatchDecoder::decode_all(&mut b)
-                            .unwrap()
-                            .iter()
-                            .flat_map(|batch| batch.records.iter().map(|r| r.offset))
-                            .collect();
-                        assert!(!offsets.is_empty(), "{case}");
-                        assert!(
-                            offsets
-                                .iter()
-                                .copied()
-                                .eq(set.iter().map(|m| m.partition_offset).take(offsets.len())),
-                            "{case}"
-                        );
-                        assert!(
-                            counted >= len && counted <= limit,
-                            "{case}: counted {counted}"
-                        );
+            for tail in (0..=12).step_by(3) {
+                for (name, set) in overhead_heavy_record_sets(100, tail, 1 << 20) {
+                    if name != "large random values" || tail == 3 || tail == 9 {
+                        cases.push((compression, name, tail, set));
                     }
                 }
+            }
+        }
+        // Some 12 MiB compressed several times over: too slow unoptimized.
+        if cfg!(not(debug_assertions)) {
+            let large = overhead_heavy_record_sets(0, 21, 4 << 20);
+            let (name, set) = large
+                .into_iter()
+                .find(|(n, _)| n.starts_with("large"))
+                .unwrap();
+            cases.push((Compression::Gzip, name, 21, set));
+        }
+        let mut too_costly = Vec::new();
+        for (compression, name, tail, set) in cases {
+            let limit = set.iter().map(message_size_estimate).sum::<i64>();
+            let (records, bytes) = (set.len(), set.iter().map(size).sum::<usize>());
+            for returned_any in [false, true] {
+                let mut work = (0usize, 0usize);
+                let encode = |r: &[Record], c| {
+                    work.0 += r.len();
+                    work.1 += r
+                        .iter()
+                        .map(|r| {
+                            1 + r.key.as_ref().map_or(0, bytes::Bytes::len)
+                                + r.value.as_ref().map_or(0, bytes::Bytes::len)
+                        })
+                        .sum::<usize>();
+                    encode_records(r, c)
+                };
+                let (encoded, counted) =
+                    encode_within_limit_with(set.clone(), compression, limit, returned_any, encode)
+                        .unwrap()
+                        .unwrap();
+                let case = format!("{compression:?}, {name}, tail {tail}");
+                if work.0 > 3 * records || work.1 > 3 * bytes {
+                    too_costly.push(format!(
+                        "{case}: {work:?} records and bytes encoded for {records} \
+                                 records of {bytes} bytes"
+                    ));
+                }
+                let len = i64::try_from(encoded.len()).unwrap();
+                assert!(len <= limit, "{case}: {len} bytes for a limit of {limit}");
+                // The records returned are a prefix of the set: no record is skipped.
+                let mut b = encoded.clone();
+                let offsets: Vec<i64> = RecordBatchDecoder::decode_all(&mut b)
+                    .unwrap()
+                    .iter()
+                    .flat_map(|batch| batch.records.iter().map(|r| r.offset))
+                    .collect();
+                assert!(!offsets.is_empty(), "{case}");
+                assert!(
+                    offsets
+                        .iter()
+                        .copied()
+                        .eq(set.iter().map(|m| m.partition_offset).take(offsets.len())),
+                    "{case}"
+                );
+                assert!(
+                    counted >= len && counted <= limit,
+                    "{case}: counted {counted}"
+                );
             }
         }
         assert!(too_costly.is_empty(), "{}", too_costly.join("\n"));
