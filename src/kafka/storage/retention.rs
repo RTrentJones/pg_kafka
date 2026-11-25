@@ -1,35 +1,81 @@
-//! Pure planning logic for the expired-message part of the retention sweep.
+//! Pure planning and scheduling logic of the retention sweep.
 //!
 //! `PostgresStore::run_retention_sweep` (SPI, not unit-testable) expires messages by
-//! dropping whole time partitions or deleting rows in bounded batches. The decisions it
-//! makes (which retention window a topic has, what to do with a leaf, whether to run
-//! another batch, where a pass resumes each step) live here so they are unit tested.
+//! dropping whole time partitions or deleting rows in bounded batches, and prunes the
+//! auxiliary tables. The decisions it makes (which retention window a topic has, what to
+//! do with a leaf, which step runs the next statement, where a pass resumes each step,
+//! what earlier passes found still to do) live here so they are unit tested.
+//!
+//! # How a pass is scheduled
+//!
+//! A pass is a list of steps (the aborted-row cleanup, the contents probes, row expiry,
+//! the leaf drops, the transaction and producer prunes, the two outbox reapers). A step
+//! does its work in *turns*, each one bounded statement (at most
+//! [`RETENTION_DELETE_BATCH`] rows, one leaf, one probe or one drop), and says whether it
+//! has work left ([`PassStep`]). [`run_pass`] runs them in two phases:
+//!
+//! 1. every step that has work takes one turn, in list order, whatever the budget;
+//! 2. then, while the pass is within its budget and some step has work, the step with
+//!    work that has spent the least time this pass takes the next turn.
+//!
+//! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
+//! through a [`Lap`]: the items in key order, starting after the key of the last item
+//! the step served ([`KeyCursor`]), wrapping, each item served until caught up. Probes
+//! *find* work (a leaf to drop, a topic to trim in a leaf to keep) and record it in
+//! [`FoundWork`], which carries it across passes until it is done or no longer valid, so
+//! the expiry and drop steps take their items from it, not from what this pass's probes
+//! reached.
+//!
+//! # Guarantees
+//!
+//! 1. **Bounded passes to every item, at any budget >= 0, whatever the other steps'
+//!    backlogs.** Phase 1 gives every step with work a turn every pass, so a step's
+//!    progress does not depend on the budget or on another step. A lapped step's items
+//!    persist from pass to pass (a leaf, a (topic, leaf) pair, a found drop or trim stays
+//!    an item until it is done or gone), and each pass serves at least the first item
+//!    after the cursor, so with `N` items every item gets a turn within `N` passes
+//!    ([`KeyCursor`]), and one that needs `b` turns (`b` batches of rows) is done within
+//!    `b * N`. So a trim or a drop of a leaf among `P` probe candidates is found within
+//!    `P` passes of becoming due (an empty leaf: the next pass), a found trim is done
+//!    within `b * E` more passes (`E` expiry items: topics with a window times leaves in
+//!    their scope, plus found trims), and a found drop within `D` more passes (`D` found
+//!    drops), one more for each drop of that leaf that ran out of its lock wait. The
+//!    prunes and reapers delete their due rows oldest first (or by key), one batch a
+//!    turn, so a due row goes within one pass per batch of due rows ahead of it, and the
+//!    producer prune's cursor examines every idle id within one pass per
+//!    [`RETENTION_DELETE_BATCH`] idle ids.
+//! 2. **A pass costs at most the budget plus one turn per step.** Phase 1 is one turn per
+//!    step; phase 2 starts a turn only within the budget, so a pass ends by
+//!    `max(budget + one turn, one turn per step)`. (Plus the pass's fixed setup reads and
+//!    its final log-start update, each one statement.)
+//! 3. **No share is wasted while a step has work.** Phase 2 stops only at the budget or
+//!    when no step has work; the time one step does not use goes to the others, and a
+//!    step with work all pass gets at least `budget / steps - one turn` of it (each turn
+//!    goes to the least-served step with work, so no step ends more than one turn ahead
+//!    of it).
+//! 4. **Found work does not depend on the pass that found it.** A trim or drop a probe
+//!    finds stays in [`FoundWork`] until its delete catches up or its drop runs (or the
+//!    leaf, the topic or its window changes so that it no longer applies), so the turn
+//!    that does it can come in any later pass; the steps also take work found earlier in
+//!    the same pass.
 
-use std::sync::{Mutex, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// Rows deleted per DELETE statement. Small enough that one statement holds the DB
-/// thread briefly; the sweep runs as many batches as fit in [`RETENTION_PASS_BUDGET`].
+/// thread briefly; a pass runs as many as fit in [`RETENTION_PASS_BUDGET`].
 pub const RETENTION_DELETE_BATCH: i64 = 10_000;
 
 /// Wall-clock budget for one sweep pass. The sweep runs on the single worker DB
-/// thread, so a pass must stay bounded: every step whose cost grows with the data
-/// (the aborted-row cleanup, the leaf contents probes, the expired-message deletes,
-/// the leaf drops, the producer and transaction prunes, the shadow-outbox reaping)
-/// checks it between statements, each statement itself bounded
-/// ([`RETENTION_DELETE_BATCH`] rows, one leaf), and runs at least one statement per
-/// pass ([`step_may_continue`]). The two steps that run before the expiry, the
-/// aborted-row cleanup and the contents probes, stop at a third of the budget each
-/// ([`share_may_continue`]), so a backlog there (aborted rows are client-driven) leaves
-/// row expiry at least a third of every pass, not only its one statement. A pass costs
-/// at most the budget plus one statement per step (a drop's statement includes its
+/// thread, so a pass must stay bounded: every step whose cost grows with the data runs
+/// bounded statements ([`RETENTION_DELETE_BATCH`] rows, one leaf, one probe, one drop),
+/// and [`run_pass`] starts a statement past the first one per step only within the
+/// budget, giving the budget to the steps that have work, least-served first. A pass
+/// costs at most the budget plus one statement per step (a drop's statement includes its
 /// lock wait of up to 2 s); a backlog larger than one pass can clear drains over the
 /// following passes, each step resuming where the last pass left it.
 pub const RETENTION_PASS_BUDGET: Duration = Duration::from_millis(1500);
-
-/// The steps that run before row expiry get at most `1 / STEP_SHARE_DIVISOR` of the
-/// pass budget each ([`share_may_continue`]).
-pub const STEP_SHARE_DIVISOR: u32 = 3;
 
 /// The pass budget: [`RETENTION_PASS_BUDGET`], unless the test-only
 /// `pg_kafka.test_retention_pass_budget_ms` (`test_override_ms` >= 0) replaces it.
@@ -68,62 +114,138 @@ pub fn effective_retention_window_ms(
     }
 }
 
-/// Whether the sweep should run another delete batch for the current topic: the
-/// last batch was full (so more expired rows may remain) and the pass is still
-/// within its time budget.
-pub fn should_run_another_batch(
-    last_batch_deleted: u64,
-    batch_size: i64,
-    elapsed: Duration,
+/// Whether a delete batch that removed `deleted` rows was full, so more rows may
+/// remain: a short batch means its item is caught up.
+pub fn batch_was_full(deleted: u64, batch_size: i64) -> bool {
+    u64::try_from(batch_size).is_ok_and(|size| size > 0 && deleted >= size)
+}
+
+/// The clock a pass is scheduled by: time since the pass started.
+pub trait PassClock {
+    fn elapsed(&self) -> Duration;
+}
+
+/// One step of a sweep pass, as [`run_pass`] schedules it. `C` is the pass's shared
+/// state (the SPI client, what the steps found and removed), `E` the error a statement
+/// can fail with.
+pub trait PassStep<C, E> {
+    /// Whether the step has work left in this pass. A step that can only learn this
+    /// from a statement (a prune) answers `true` until a batch comes back short.
+    fn has_work(&self, ctx: &C) -> bool;
+    /// One turn: one bounded statement (for the orphan reaper, the log-start update its
+    /// delete reads, then the delete).
+    fn turn(&mut self, ctx: &mut C) -> Result<(), E>;
+}
+
+/// What [`run_pass`] did: per step, the turns it took and the time they took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassReport {
+    pub turns: Vec<u32>,
+    pub service: Vec<Duration>,
+}
+
+/// Run one pass of `steps` (see the module docs, "How a pass is scheduled"): one turn
+/// for every step with work, in order, then, within `budget`, turns for the steps with
+/// work, least time spent this pass first (ties in list order).
+pub fn run_pass<C: PassClock, E>(
+    steps: &mut [&mut dyn PassStep<C, E>],
+    ctx: &mut C,
     budget: Duration,
-) -> bool {
-    u64::try_from(batch_size).is_ok_and(|size| size > 0 && last_batch_deleted >= size)
-        && elapsed < budget
-}
-
-/// Whether a bounded sweep step may run another statement: always its first one in
-/// a pass (so a step never starves behind another step's backlog), then only while the
-/// pass is within its budget. A pass therefore costs at most the budget plus one
-/// statement per step.
-pub fn step_may_continue(statements_run: usize, elapsed: Duration, budget: Duration) -> bool {
-    statements_run == 0 || elapsed < budget
-}
-
-/// Whether a step with a capped share of the pass may run another statement: always its
-/// first one, then only while the step has used less than its share of the budget
-/// ([`STEP_SHARE_DIVISOR`]) and the pass is within the budget.
-pub fn share_may_continue(
-    statements_run: usize,
-    step_elapsed: Duration,
-    pass_elapsed: Duration,
-    budget: Duration,
-) -> bool {
-    statements_run == 0 || (step_elapsed < budget / STEP_SHARE_DIVISOR && pass_elapsed < budget)
-}
-
-/// Whether the whole-leaf drop step may try another leaf: a bounded step
-/// ([`step_may_continue`]) that also stops after a drop that ran out of a lock wait,
-/// since the session holding that lock blocks the next drop just as long.
-pub fn drop_may_continue(
-    attempts: usize,
-    last_lock_timed_out: bool,
-    elapsed: Duration,
-    budget: Duration,
-) -> bool {
-    !last_lock_timed_out && step_may_continue(attempts, elapsed, budget)
-}
-
-/// `items` rotated so that iteration starts at `start` and wraps around.
-pub fn rotated<T: Clone>(items: &[T], start: usize) -> Vec<T> {
-    if items.is_empty() {
-        return Vec::new();
+) -> Result<PassReport, E> {
+    let mut report = PassReport {
+        turns: vec![0; steps.len()],
+        service: vec![Duration::ZERO; steps.len()],
+    };
+    for i in 0..steps.len() {
+        if steps[i].has_work(ctx) {
+            take_turn(i, steps, ctx, &mut report)?;
+        }
     }
-    let start = start % items.len();
-    items[start..]
-        .iter()
-        .chain(&items[..start])
-        .cloned()
-        .collect()
+    while ctx.elapsed() < budget {
+        let next = (0..steps.len())
+            .filter(|&i| steps[i].has_work(ctx))
+            .min_by_key(|&i| (report.service[i], i));
+        let Some(i) = next else { break };
+        take_turn(i, steps, ctx, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// Step `i` takes one turn; its time goes to its service.
+fn take_turn<C: PassClock, E>(
+    i: usize,
+    steps: &mut [&mut dyn PassStep<C, E>],
+    ctx: &mut C,
+    report: &mut PassReport,
+) -> Result<(), E> {
+    let before = ctx.elapsed();
+    steps[i].turn(ctx)?;
+    report.service[i] += ctx.elapsed().saturating_sub(before);
+    report.turns[i] += 1;
+    Ok(())
+}
+
+/// One pass of a step over a list of keyed items: the items in key order, starting at
+/// the first whose key is greater than the step's [`KeyCursor`] and wrapping, at most
+/// `cap` of them. Each turn serves the current item; the cursor then holds its key, so
+/// the next pass starts after it, and the lap moves on once the item is caught up.
+/// Items found during the pass ([`Lap::push`]) join at the end.
+pub struct Lap<'c, K, T> {
+    items: Vec<(K, T)>,
+    pos: usize,
+    cap: usize,
+    cursor: &'c KeyCursor<K>,
+}
+
+impl<'c, K: Ord + Copy, T> Lap<'c, K, T> {
+    /// The lap over `items` (any order; of items with the same key, the first is kept).
+    pub fn new(mut items: Vec<(K, T)>, cursor: &'c KeyCursor<K>, cap: usize) -> Self {
+        items.sort_by_key(|item| item.0);
+        items.dedup_by(|later, first| later.0 == first.0);
+        let keys: Vec<K> = items.iter().map(|(k, _)| *k).collect();
+        let start = cursor.start(&keys);
+        items.rotate_left(start);
+        items.truncate(cap);
+        Lap {
+            items,
+            pos: 0,
+            cap,
+            cursor,
+        }
+    }
+
+    /// The item the next turn serves, if any.
+    pub fn current(&self) -> Option<&(K, T)> {
+        self.items.get(self.pos)
+    }
+
+    /// Whether every item of the lap is done (or the lap was stopped).
+    pub fn is_done(&self) -> bool {
+        self.pos >= self.items.len()
+    }
+
+    /// A turn ran a statement on the current item: the next pass starts after it, and
+    /// `caught_up` moves this lap on to the next item.
+    pub fn served(&mut self, caught_up: bool) {
+        if let Some((key, _)) = self.items.get(self.pos) {
+            self.cursor.set(Some(*key));
+        }
+        if caught_up {
+            self.pos += 1;
+        }
+    }
+
+    /// Add an item found during the pass, unless the lap already has it or is full.
+    pub fn push(&mut self, key: K, item: T) {
+        if self.items.len() < self.cap && !self.items.iter().any(|(k, _)| *k == key) {
+            self.items.push((key, item));
+        }
+    }
+
+    /// End the lap for this pass (the step cannot go on: a drop ran out of a lock wait).
+    pub fn stop(&mut self) {
+        self.pos = self.items.len();
+    }
 }
 
 // Time partitions (ADR-001): kafka.messages is RANGE-partitioned on created_at. The
@@ -172,20 +294,25 @@ pub const PARTITIONS_AHEAD: i32 = 2;
 /// Upper bound on `kafka.message_partition_contents` probes per sweep pass (each costs
 /// one btree descent per (topic, partition) present in the leaf). Leaves kept past
 /// their window by a longer one stay candidates every pass, so the probes rotate
-/// over them ([`PROBE_ROTATION`]) instead of always starting from the oldest.
+/// over them ([`SweepState::probe`]) instead of always starting from the oldest.
 pub const MAX_CONTENTS_PROBES_PER_PASS: usize = 64;
 
-/// Where a budget-limited sweep step resumes: the key of the last item a pass ran a
+/// Where a lapped sweep step resumes ([`Lap`]): the key of the last item a pass ran a
 /// statement on. A step walks its items in key order (an item's identity: a leaf's
 /// upper bound, a (topic, leaf) pair) and starts each pass at the first item whose key
 /// is greater than the cursor, wrapping to the first ([`start_after`]). So a pass cut
-/// short (by a cap, or by the pass budget another step may have spent) does not walk
-/// the same leading items again, consecutive passes cover every item, and since the
-/// cursor is a key, not a position, items that disappear (a leaf dropped) or appear
-/// between passes do not shift it. An item the previous pass was cut short in gets its
-/// next turn after the others, not first: a backlog in one item then takes one turn
-/// per rotation (and whatever budget is left once the others are caught up) instead
-/// of every pass, so one topic's backlog cannot stall the expiry of the others.
+/// short (by a cap, or by the pass budget) does not walk the same leading items again,
+/// and since the cursor is a key, not a position, items that disappear (a leaf dropped)
+/// or appear between passes do not shift it. An item the previous pass was cut short in
+/// gets its next turn after the others, not first: a backlog in one item takes one turn
+/// per rotation (and whatever budget is left once the others are caught up) instead of
+/// every pass, so one topic's backlog cannot stall the expiry of the others.
+///
+/// The bound: every pass serves at least the first item after the cursor (phase 1 of
+/// [`run_pass`]), and serves items in key order from there, so the cursor moves forward
+/// (wrapping) every pass. An item present at every pass is therefore served within `N`
+/// passes, where `N` is the number of distinct items present over those passes: each
+/// pass serves at least one more of the items between the cursor and it.
 pub struct KeyCursor<K>(Mutex<Option<K>>);
 
 impl<K: Ord + Copy> KeyCursor<K> {
@@ -206,14 +333,6 @@ impl<K: Ord + Copy> KeyCursor<K> {
     /// Where this pass starts in `sorted_keys` (ascending).
     pub fn start(&self, sorted_keys: &[K]) -> usize {
         start_after(sorted_keys, self.get().as_ref())
-    }
-
-    /// The pass ran its last statement on the item `last_served`, if any: the next
-    /// pass starts after it. A pass that ran none leaves the cursor where it was.
-    pub fn record(&self, last_served: Option<K>) {
-        if last_served.is_some() {
-            self.set(last_served);
-        }
     }
 }
 
@@ -238,26 +357,53 @@ pub fn leaf_key(leaf: &TimePartition) -> i64 {
     leaf.upper_ms.unwrap_or(i64::MAX)
 }
 
-/// Rotation of the contents probes over their candidates (see
-/// [`MAX_CONTENTS_PROBES_PER_PASS`]), keyed by [`leaf_key`]: a pass records the last
-/// leaf whose probe result it used.
-pub static PROBE_ROTATION: KeyCursor<i64> = KeyCursor::new();
+/// What the sweep carries from pass to pass in one backend: each step's cursor and the
+/// work the probes found. All of it is a hint, re-checked every pass (and a drop under
+/// its lock), so losing it (a new backend, a worker restart) only means rediscovering it.
+pub struct SweepState {
+    /// The contents probes over their candidates, keyed by [`leaf_key`].
+    pub probe: KeyCursor<i64>,
+    /// The aborted-row cleanup over the leaves that may hold aborted rows past the grace,
+    /// keyed by [`leaf_key`]: each leaf costs at least one probe of its partial index.
+    pub aborted: KeyCursor<i64>,
+    /// Row expiry over its items, keyed by [`ExpiryItem::key`].
+    pub expiry: KeyCursor<(i32, i64)>,
+    /// The drops over the found drops, keyed by [`leaf_key`].
+    pub drop: KeyCursor<i64>,
+    /// Where the stale-producer prune resumes: the (last_active_at in epoch microseconds,
+    /// producer id) of the last candidate it examined. Candidates it keeps (a producer
+    /// still referenced by a transaction, or active through its sequences) stay below the
+    /// idle cutoff, so without a cursor every pass would examine them again first.
+    pub producer_prune: KeyCursor<(i64, i64)>,
+    found: Mutex<FoundWork>,
+}
 
-/// Rotation of the aborted-row cleanup over the leaves that may hold aborted rows past
-/// the grace, keyed by [`leaf_key`]: each leaf costs at least one probe of its partial
-/// index, so a pass whose budget runs out before the newest leaves must not start from
-/// the oldest again.
-pub static ABORTED_ROTATION: KeyCursor<i64> = KeyCursor::new();
+impl SweepState {
+    pub const fn new() -> Self {
+        SweepState {
+            probe: KeyCursor::new(),
+            aborted: KeyCursor::new(),
+            expiry: KeyCursor::new(),
+            drop: KeyCursor::new(),
+            producer_prune: KeyCursor::new(),
+            found: Mutex::new(FoundWork::new()),
+        }
+    }
 
-/// Rotation of the row-level expiry over its work items, keyed by (topic id,
-/// [`leaf_key`]).
-pub static EXPIRY_ROTATION: KeyCursor<(i32, i64)> = KeyCursor::new();
+    /// The found work, for the length of a pass.
+    pub fn found(&self) -> MutexGuard<'_, FoundWork> {
+        self.found.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
-/// Where the stale-producer prune resumes: the (last_active_at in epoch microseconds,
-/// producer id) of the last candidate it examined. Candidates it keeps (a producer
-/// still referenced by a transaction, or active through its sequences) stay below the
-/// idle cutoff, so without a cursor every pass would examine them again first.
-pub static PRODUCER_PRUNE_CURSOR: KeyCursor<(i64, i64)> = KeyCursor::new();
+impl Default for SweepState {
+    fn default() -> Self {
+        SweepState::new()
+    }
+}
+
+/// The state of this backend's sweeps (the worker's, or a session's on-demand ones).
+pub static SWEEP_STATE: SweepState = SweepState::new();
 
 /// The prune cursor after a statement that examined `examined` candidates (at most
 /// `batch`), the last one `last`: a short batch reached the end of the candidates, so
@@ -358,6 +504,199 @@ pub fn classify_leaf(
     }
 }
 
+/// The past leaves that need the contents probe ([`needs_contents_probe`]) and the
+/// others, which can only be dropped if empty; both oldest first.
+pub fn split_past_leaves(
+    leaves: &[TimePartition],
+    now_ms: i64,
+    shortest_window_ms: Option<i64>,
+) -> (Vec<&TimePartition>, Vec<&TimePartition>) {
+    past_time_partitions(leaves, now_ms)
+        .into_iter()
+        .partition(|l| needs_contents_probe(leaf_key(l), now_ms, shortest_window_ms))
+}
+
+/// A past leaf found droppable (every topic in it wholly expired and nothing pending,
+/// or empty), with the expired topics the drop function re-checks under its lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundDrop {
+    pub oid: u32,
+    pub expired_topics: Vec<i32>,
+}
+
+/// The work the contents probes and the emptiness check found, carried from pass to
+/// pass until it is done: the leaves to drop, keyed by [`leaf_key`], and the (topic,
+/// leaf) trims (a wholly expired topic's rows in a leaf that must stay). A trim leaves
+/// once its delete comes back short, a drop once it is tried (dropped, or refused by the
+/// re-check under the lock; one that ran out of its lock wait stays), and both once the
+/// leaf is gone or a new probe of it decides otherwise; a trim also once its topic has no
+/// window that expires the whole leaf. So a probe's finding does not depend on the
+/// expiry or drop step reaching it in the same pass.
+///
+/// Size: at most one drop per past leaf and one trim per (topic, past leaf) pair.
+#[derive(Debug, Default)]
+pub struct FoundWork {
+    drops: BTreeMap<i64, FoundDrop>,
+    /// (topic, leaf key) -> leaf oid.
+    trims: BTreeMap<(i32, i64), u32>,
+}
+
+impl FoundWork {
+    pub const fn new() -> Self {
+        FoundWork {
+            drops: BTreeMap::new(),
+            trims: BTreeMap::new(),
+        }
+    }
+
+    /// Record what a probe of `leaf` decided; it replaces whatever was found there before.
+    pub fn record_probe(&mut self, leaf: &TimePartition, action: &LeafAction) {
+        let key = leaf_key(leaf);
+        self.trims.retain(|&(_, k), _| k != key);
+        self.drops.remove(&key);
+        match action {
+            LeafAction::Drop { expired_topics } => {
+                self.drops.insert(
+                    key,
+                    FoundDrop {
+                        oid: leaf.oid,
+                        expired_topics: expired_topics.clone(),
+                    },
+                );
+            }
+            LeafAction::Trim { topics } => {
+                for &topic in topics {
+                    self.trims.insert((topic, key), leaf.oid);
+                }
+            }
+            LeafAction::Keep => {}
+        }
+    }
+
+    /// Record a past leaf the emptiness check found empty.
+    pub fn record_empty(&mut self, leaf: &TimePartition) {
+        self.record_probe(
+            leaf,
+            &LeafAction::Drop {
+                expired_topics: Vec::new(),
+            },
+        );
+    }
+
+    /// Forget what no longer applies: work in leaves that are gone (or whose key now
+    /// names another leaf), and trims whose topic has no window that wholly expires the
+    /// leaf now (`window_of`, as in [`classify_leaf`]: a deleted topic has none).
+    pub fn retain_current(
+        &mut self,
+        leaves: &[TimePartition],
+        now_ms: i64,
+        window_of: impl Fn(i32) -> Option<i64>,
+    ) {
+        let past: BTreeMap<i64, u32> = past_time_partitions(leaves, now_ms)
+            .into_iter()
+            .map(|l| (leaf_key(l), l.oid))
+            .collect();
+        self.drops.retain(|k, d| past.get(k) == Some(&d.oid));
+        self.trims.retain(|&(topic, k), oid| {
+            past.get(&k) == Some(oid) && wholly_expired(k, now_ms, window_of(topic))
+        });
+    }
+
+    /// The found drops, by leaf key.
+    pub fn drops(&self) -> Vec<(i64, FoundDrop)> {
+        self.drops.iter().map(|(k, d)| (*k, d.clone())).collect()
+    }
+
+    /// Whether the leaf `oid` with key `key` is a found drop.
+    pub fn has_drop(&self, key: i64, oid: u32) -> bool {
+        self.drops.get(&key).is_some_and(|d| d.oid == oid)
+    }
+
+    /// The found trims: ((topic, leaf key), leaf oid).
+    pub fn trims(&self) -> Vec<((i32, i64), u32)> {
+        self.trims.iter().map(|(k, oid)| (*k, *oid)).collect()
+    }
+
+    /// The drop of the leaf with this key was tried: dropped, or refused by its re-check.
+    pub fn drop_done(&mut self, key: i64) {
+        self.drops.remove(&key);
+    }
+
+    /// The trim with this key is caught up.
+    pub fn trim_done(&mut self, key: (i32, i64)) {
+        self.trims.remove(&key);
+    }
+}
+
+/// One unit of row expiry: delete `topic_id`'s rows older than `window_ms` in the leaf
+/// `leaf_oid`, whose [`leaf_key`] is `leaf_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryItem {
+    pub topic_id: i32,
+    pub window_ms: i64,
+    pub leaf_oid: u32,
+    pub leaf_key: i64,
+}
+
+impl ExpiryItem {
+    /// The item's identity for [`SweepState::expiry`]: a trim and a row-level item of
+    /// the same (topic, leaf) are the same delete.
+    pub fn key(&self) -> (i32, i64) {
+        (self.topic_id, self.leaf_key)
+    }
+}
+
+/// When a pass decides: the database time and the partition width (epoch ms, ms).
+#[derive(Debug, Clone, Copy)]
+pub struct SweepClock {
+    pub now_ms: i64,
+    pub width_ms: i64,
+}
+
+/// Row expiry's items for a pass: the found trims, plus the row-level items: a topic
+/// whose window is shorter than one leaf ([`row_level_expiry`]) in every leaf that may
+/// hold its expired rows, and every topic with a window in the DEFAULT leaf, unless it is
+/// empty (`default_has_rows`); none in a leaf found droppable (its drop removes them).
+/// `finite` lists the topics with a window.
+pub fn expiry_items(
+    leaves: &[TimePartition],
+    finite: &[(i32, i64)],
+    clock: SweepClock,
+    default_has_rows: bool,
+    found: &FoundWork,
+) -> Vec<ExpiryItem> {
+    let windows: BTreeMap<i32, i64> = finite.iter().copied().collect();
+    let mut items: Vec<ExpiryItem> = found
+        .trims()
+        .into_iter()
+        .filter_map(|((topic_id, leaf_key), leaf_oid)| {
+            windows.get(&topic_id).map(|&window_ms| ExpiryItem {
+                topic_id,
+                window_ms,
+                leaf_oid,
+                leaf_key,
+            })
+        })
+        .collect();
+    for &(topic_id, window_ms) in finite {
+        for leaf in leaves {
+            if found.has_drop(leaf_key(leaf), leaf.oid) || (leaf.is_default && !default_has_rows) {
+                continue;
+            }
+            let in_scope = leaf.is_default || row_level_expiry(window_ms, clock.width_ms);
+            if in_scope && may_hold_expired(leaf, clock.now_ms, window_ms) {
+                items.push(ExpiryItem {
+                    topic_id,
+                    window_ms,
+                    leaf_oid: leaf.oid,
+                    leaf_key: leaf_key(leaf),
+                });
+            }
+        }
+    }
+    items
+}
+
 /// Whether a topic's retention is enforced row by row (as before partitioning) rather
 /// than a leaf at a time. Windows shorter than one leaf keep exact row expiry, so a
 /// short `retention.ms` is not stretched to a whole leaf width. Windows of at least
@@ -382,6 +721,9 @@ pub fn may_hold_expired(leaf: &TimePartition, now_ms: i64, window_ms: i64) -> bo
 pub fn partition_width_ms(minutes: i32) -> i64 {
     i64::from(minutes.clamp(MIN_PARTITION_MINUTES, MAX_PARTITION_MINUTES)) * MS_PER_MINUTE
 }
+
+#[cfg(test)]
+mod scheduling_tests;
 
 #[cfg(test)]
 mod tests {
@@ -420,56 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn batches_continue_only_when_full_and_within_budget() {
-        let budget = Duration::from_millis(1500);
-        assert!(should_run_another_batch(
-            10_000,
-            10_000,
-            Duration::from_millis(10),
-            budget
-        ));
-        // A short batch means the topic is caught up.
-        assert!(!should_run_another_batch(
-            9_999,
-            10_000,
-            Duration::from_millis(10),
-            budget
-        ));
-        assert!(!should_run_another_batch(0, 10_000, Duration::ZERO, budget));
-        // Budget spent: stop even though more rows may remain.
-        assert!(!should_run_another_batch(10_000, 10_000, budget, budget));
-        assert!(!should_run_another_batch(10_000, 0, Duration::ZERO, budget));
-    }
-
-    #[test]
-    fn steps_run_once_then_only_within_budget() {
-        let budget = Duration::from_millis(1500);
-        assert!(step_may_continue(0, budget * 2, budget));
-        assert!(step_may_continue(3, Duration::from_millis(10), budget));
-        assert!(!step_may_continue(1, budget, budget));
-    }
-
-    #[test]
-    fn drops_stop_at_the_budget_or_after_a_lock_timeout() {
-        let budget = Duration::from_millis(1500);
-        // The first drop of a pass always runs, even with the budget spent.
-        assert!(drop_may_continue(0, false, budget * 2, budget));
-        assert!(drop_may_continue(
-            5,
-            false,
-            Duration::from_millis(10),
-            budget
-        ));
-        assert!(!drop_may_continue(1, false, budget, budget));
-        assert!(!drop_may_continue(
-            1,
-            true,
-            Duration::from_millis(10),
-            budget
-        ));
-    }
-
-    #[test]
     fn contents_probe_only_where_a_topic_can_be_expired() {
         // No finite window anywhere: no leaf needs the probe (only the emptiness check).
         assert!(!needs_contents_probe(1_000, i64::MAX, None));
@@ -499,21 +791,16 @@ mod tests {
             for _ in 0..n {
                 let start = cursor.start(&keys);
                 seen[start] = true;
-                cursor.record(Some(keys[start]));
+                cursor.set(Some(keys[start]));
             }
             assert!(seen.iter().all(|&s| s), "{n} items: {seen:?}");
         }
-        // A pass that served nothing leaves the cursor where it was.
-        let cursor = KeyCursor::new();
-        cursor.record(Some(20));
-        cursor.record(None);
-        assert_eq!(cursor.start(&[10, 20, 30]), 2);
     }
 
     #[test]
     fn key_cursor_ignores_items_that_disappear_or_appear() {
         let cursor = KeyCursor::new();
-        cursor.record(Some(30));
+        cursor.set(Some(30));
         // Leaves before the cursor dropped: a positional cursor (3) would skip 40.
         assert_eq!(cursor.start(&[30, 40, 50]), 1);
         // The served leaf itself gone, a new one before it: still the next key.
@@ -526,9 +813,9 @@ mod tests {
     fn key_cursor_rotates_pairs_by_topic_then_leaf() {
         let keys = [(1, 100), (1, i64::MAX), (2, 100), (2, i64::MAX)];
         let cursor = KeyCursor::new();
-        cursor.record(Some((1, i64::MAX)));
+        cursor.set(Some((1, i64::MAX)));
         assert_eq!(cursor.start(&keys), 2);
-        cursor.record(Some((2, i64::MAX)));
+        cursor.set(Some((2, i64::MAX)));
         assert_eq!(cursor.start(&keys), 0);
         cursor.set(None);
         assert_eq!(cursor.get(), None);
@@ -552,33 +839,12 @@ mod tests {
     }
 
     #[test]
-    fn capped_steps_stop_at_their_share() {
-        let budget = Duration::from_millis(1500);
-        let share = budget / STEP_SHARE_DIVISOR;
-        // The first statement always runs.
-        assert!(share_may_continue(0, budget, budget * 2, budget));
-        assert!(share_may_continue(
-            3,
-            Duration::from_millis(499),
-            share,
-            budget
-        ));
-        assert!(!share_may_continue(3, share, share, budget));
-        // Within the share but the pass is over budget.
-        assert!(!share_may_continue(3, Duration::ZERO, budget, budget));
-        // Budget 0: one statement per step.
-        assert!(share_may_continue(
-            0,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO
-        ));
-        assert!(!share_may_continue(
-            1,
-            Duration::ZERO,
-            Duration::ZERO,
-            Duration::ZERO
-        ));
+    fn full_batches_mean_more_rows() {
+        assert!(batch_was_full(10_000, 10_000));
+        assert!(!batch_was_full(9_999, 10_000));
+        assert!(!batch_was_full(0, 10_000));
+        assert!(!batch_was_full(10_000, 0));
+        assert!(!batch_was_full(10_000, -1));
     }
 
     #[test]
@@ -586,15 +852,6 @@ mod tests {
         assert_eq!(pass_budget(-1), RETENTION_PASS_BUDGET);
         assert_eq!(pass_budget(0), Duration::ZERO);
         assert_eq!(pass_budget(40), Duration::from_millis(40));
-    }
-
-    #[test]
-    fn rotation_wraps_and_keeps_every_item() {
-        let v = vec![1, 2, 3, 4];
-        assert_eq!(rotated(&v, 0), vec![1, 2, 3, 4]);
-        assert_eq!(rotated(&v, 1), vec![2, 3, 4, 1]);
-        assert_eq!(rotated(&v, 5), vec![2, 3, 4, 1]);
-        assert_eq!(rotated::<i32>(&[], 3), Vec::<i32>::new());
     }
 
     fn leaf(oid: u32, lower: Option<i64>, upper: Option<i64>, is_default: bool) -> TimePartition {

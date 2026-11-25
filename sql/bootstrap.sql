@@ -634,8 +634,12 @@ CREATE TABLE kafka.consumer_offsets (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
-CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
+-- Only the primary key (which leads with group_id, so it serves the lookups by group)
+-- and the topic index below: an offset commit updates committed_offset, metadata and
+-- commit_timestamp, none of them indexed, so the update can be HOT (no index entries at
+-- all); an index on commit_timestamp, which nothing reads, made every commit write an
+-- entry in every index.
+
 -- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
 -- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
 -- leading on topic_id reads the whole table once per deleted topic.
@@ -805,6 +809,8 @@ CREATE TABLE kafka.transactions (
     -- NOW() in the timeout sweep (`started_at < NOW() - (timeout_ms||'ms')::interval`),
     -- so a naive column skews the abort deadline by the session/DST offset.
     started_at TIMESTAMPTZ,
+    -- When the row last changed state (an Ongoing transaction's later
+    -- AddPartitionsToTxn/AddOffsetsToTxn leave it, so those updates stay HOT).
     last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -828,7 +834,9 @@ CREATE INDEX idx_transactions_producer
 ON kafka.transactions(producer_id);
 
 -- Terminal transactions oldest first: the retention sweep deletes the ones idle past
--- the transactional-id expiration through it, reading only those.
+-- the transactional-id expiration through it, reading only those. last_updated_at
+-- changes only with the state, so indexing it costs the updates that continue an Ongoing
+-- transaction nothing (they change no indexed column and stay HOT).
 CREATE INDEX idx_transactions_terminal
 ON kafka.transactions(last_updated_at)
 WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');

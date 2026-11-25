@@ -12,6 +12,7 @@ mod atomicity;
 mod basic;
 mod coordinator_codes;
 mod eos;
+mod hot_updates;
 mod invisible_offsets;
 mod isolation;
 mod kafka_parity;
@@ -62,5 +63,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_txn_offset_commit_metadata_longer_than_4096_is_refused,
         kafka_parity::test_read_uncommitted_fetch_reports_the_last_stable_offset,
         kafka_parity::test_delete_groups_drops_pending_txn_offsets,
+        hot_updates::test_continuing_a_transaction_changes_no_indexed_column,
     ]
 }

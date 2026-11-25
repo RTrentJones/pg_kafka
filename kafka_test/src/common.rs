@@ -97,6 +97,30 @@ pub async fn create_db_client() -> Result<Client, Box<dyn std::error::Error>> {
     Ok(client)
 }
 
+/// The columns of `table` that some index of it keys, or names in its predicate or an
+/// expression: an UPDATE that changes any of them is never HOT, so it writes an entry in
+/// every index of the table.
+pub async fn hot_blocking_columns(db: &Client, table: &str) -> DynResult<Vec<String>> {
+    Ok(db
+        .query(
+            r"SELECT DISTINCT a.attname::text
+             FROM pg_index i
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum > 0
+             WHERE i.indrelid = $1::text::regclass
+               AND (a.attnum = ANY (i.indkey::int2[])
+                    OR COALESCE(pg_get_expr(i.indpred, i.indrelid), '')
+                           ~ ('\m' || a.attname || '\M')
+                    OR COALESCE(pg_get_expr(i.indexprs, i.indrelid), '')
+                           ~ ('\m' || a.attname || '\M'))
+             ORDER BY 1",
+            &[&table],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect())
+}
+
 /// Create a Kafka producer with default settings
 pub fn create_producer() -> Result<FutureProducer, Box<dyn std::error::Error>> {
     let producer: FutureProducer = ClientConfig::new()
