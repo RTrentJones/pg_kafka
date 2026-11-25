@@ -1178,6 +1178,12 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for BatchStep {
 /// oldest first, so a pass with none due costs one descent; batches of
 /// [`RETENTION_DELETE_BATCH`] rows (the transactional ids are client-chosen, so their
 /// number is too).
+///
+/// Concurrency: rows another transaction holds (InitProducerId, EndTxn and
+/// AddPartitionsToTxn update or reference them) are skipped, not waited for, and taken
+/// by a later batch: the worker's group commit holds the rows of every request in its
+/// batch until one commit, so an on-demand sweep that waited for one of them while
+/// holding another the batch then needs was a deadlock.
 fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
     let table = client.update(
         "DELETE FROM kafka.transactions
@@ -1185,7 +1191,8 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
              SELECT t.ctid FROM kafka.transactions t
              WHERE t.state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
                AND t.last_updated_at < NOW() - ($1 || ' seconds')::interval
-             LIMIT $2))
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED))
          RETURNING 1",
         None,
         &[
@@ -1211,18 +1218,29 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// key.
 ///
 /// Concurrency: `pg_kafka_run_retention_sweep()` runs this in its own session, beside
-/// the worker. A DELETE that waits for a row another transaction updated re-evaluates
-/// only its own WHERE on that row's newest version (the CTEs and subqueries keep the
-/// statement's snapshot), so the idle condition on producer_ids itself is repeated
-/// there: InitProducerId and an epoch bump (KIP-360, a transactional re-init) set
-/// last_active_at, and the producer they revived stays. The re-check filters the row
-/// the primary-key probe already fetched: no extra read per candidate. An idempotent
-/// Produce writes the sequence rows, which the subquery reads from the snapshot, so
-/// it also sets last_active_at on a producer idle for more than half the window, the
-/// only ones this can take (`producers::read_producer_state`), before it writes them:
-/// a Produce open while this runs holds the producer row, and its producer is kept;
-/// one that comes after this deleted the row waits for this commit and starts the
-/// producer afresh.
+/// the worker, whose group commit holds the rows of every request in a batch until one
+/// commit (a batch of Produce or InitProducerId requests updates several producer rows,
+/// in request order). So the statement never waits for a producer row: it locks the
+/// candidates it would delete with `FOR UPDATE SKIP LOCKED` and leaves a row another
+/// transaction holds to the next lap. Waiting for one row while holding another, in
+/// whatever order its index scan met them, closed a cycle with such a batch (or with
+/// any session writing producer rows in another order): a deadlock. Locking re-checks
+/// the lock query's own WHERE on the newest version of a row updated since the
+/// statement's snapshot (the CTEs and subqueries keep the snapshot), so the idle
+/// condition on producer_ids itself is repeated there: InitProducerId and an epoch bump
+/// (KIP-360, a transactional re-init) set last_active_at, and the producer they revived
+/// stays. The re-check filters the row the primary-key probe already fetched: no extra
+/// read per candidate. An idempotent Produce writes the sequence rows, which the
+/// subquery reads from the snapshot, so it also sets last_active_at on a producer idle
+/// for more than half the window, the only ones this can take
+/// (`producers::read_producer_state`), before it writes them: a Produce open while this
+/// runs holds the producer row, which this skips; one that comes after this deleted the
+/// row waits for this commit and starts the producer afresh. The sequence rows of a
+/// locked producer are written only by a transaction that holds the producer row
+/// first, so their DELETE does not wait either.
+///
+/// Cost: one tuple lock per producer it deletes, no more than the deletes themselves
+/// (at most [`RETENTION_DELETE_BATCH`] a statement); kept candidates are not locked.
 fn producer_prune_sql(with_cursor: bool) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
@@ -1238,13 +1256,17 @@ fn producer_prune_sql(with_cursor: bool) -> String {
              ORDER BY p.last_active_at, p.producer_id
              LIMIT $2
          ),
-         doomed AS (
-             DELETE FROM kafka.producer_ids p
+         -- The candidates to delete, row-locked; a row another transaction holds is
+         -- skipped (examined again on the next lap), so this statement never waits
+         -- for a producer row and cannot close a lock cycle with a transaction that
+         -- writes several of them.
+         victims AS (
+             SELECT p.producer_id FROM kafka.producer_ids p
              WHERE p.producer_id = ANY (ARRAY(SELECT c.producer_id FROM candidates c))
-               -- Repeated from candidates: the DELETE re-checks its own condition on
-               -- the newest version of a row it waited for, never the CTE's, so
-               -- without it an InitProducerId or epoch bump that touched an idle
-               -- producer concurrently would see it deleted after its commit.
+               -- Repeated from candidates: the lock re-checks this condition on the
+               -- newest version of a row updated since the statement's snapshot, so
+               -- an InitProducerId or epoch bump that revived an idle producer and
+               -- committed meanwhile keeps it.
                AND p.last_active_at < NOW() - ($1 || ' seconds')::interval
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
@@ -1258,6 +1280,12 @@ fn producer_prune_sql(with_cursor: bool) -> String {
                    WHERE s.producer_id = p.producer_id
                      AND s.updated_at >= NOW() - ($1 || ' seconds')::interval
                )
+             FOR UPDATE OF p SKIP LOCKED
+         ),
+         doomed AS (
+             DELETE FROM kafka.producer_ids p
+             WHERE p.producer_id = ANY (ARRAY(SELECT v.producer_id FROM victims v))
+               AND p.last_active_at < NOW() - ($1 || ' seconds')::interval
              RETURNING p.producer_id
          ),
          seqs AS (
@@ -1429,20 +1457,32 @@ fn orphaned_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 mod tests {
     use super::{producer_prune_sql, AffectedPartitions};
 
-    /// The prune's DELETE repeats the idle condition on the row itself: it is all a
-    /// DELETE that waited for a concurrently revived producer re-checks.
+    /// The prune locks its victims without waiting and repeats the idle condition on
+    /// the row itself: it is all the lock re-checks on a concurrently revived producer.
     #[test]
-    fn producer_prune_delete_rechecks_the_idle_window() {
+    fn producer_prune_locks_without_waiting_and_rechecks_the_idle_window() {
         for with_cursor in [false, true] {
             let sql = producer_prune_sql(with_cursor);
+            let victims = sql
+                .split("victims AS (")
+                .nth(1)
+                .and_then(|rest| rest.split("doomed AS (").next())
+                .unwrap_or_default();
+            assert!(
+                victims.contains("AND p.last_active_at < NOW() - ($1 || ' seconds')::interval"),
+                "the lock must re-check last_active_at: {victims}"
+            );
+            assert!(
+                victims.contains("FOR UPDATE OF p SKIP LOCKED"),
+                "the prune must skip rows others hold: {victims}"
+            );
             let delete = sql
                 .split("DELETE FROM kafka.producer_ids p")
                 .nth(1)
-                .and_then(|rest| rest.split("RETURNING").next())
                 .unwrap_or_default();
             assert!(
-                delete.contains("AND p.last_active_at < NOW() - ($1 || ' seconds')::interval"),
-                "the DELETE must re-check last_active_at: {delete}"
+                delete.contains("FROM victims v"),
+                "the DELETE must take only locked rows: {delete}"
             );
         }
     }

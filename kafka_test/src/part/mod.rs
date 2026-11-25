@@ -54,5 +54,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_races::test_sweep_log_start_never_passes_a_concurrent_produce: sequential,
         sweep_races::test_sweep_prune_keeps_a_producer_whose_produce_is_open: sequential,
         sweep_races::test_sweep_prune_then_produce_keeps_producer_state: sequential,
+        sweep_races::test_sweep_never_deadlocks_with_a_batch_writing_two_rows: sequential,
     ]
 }
