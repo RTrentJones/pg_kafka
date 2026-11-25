@@ -6,6 +6,7 @@
 //! as idle: `pg_kafka.connections_max_idle_ms` closes it, as Kafka's idle expiry closes a
 //! muted connection whose response never goes out.
 
+use super::fetch_limits::AbortOnDrop;
 use super::{client_config, port, rdkafka_roundtrip};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
@@ -120,12 +121,13 @@ pub async fn test_clients_that_stop_reading_do_not_lock_out_others() -> TestResu
         // requests held the budget until their responses were written, a connection whose
         // request found no room was closed after the 10 s decode wait and this write
         // failed: what counts is whether the fresh client below is served meanwhile.
-        hogs.push(tokio::spawn(async move {
+        // Aborted when `hogs` drops, whichever way the test ends.
+        hogs.push(AbortOnDrop(tokio::spawn(async move {
             let _ = s.write_all(&frames).await;
             // Kept open, reading nothing.
             tokio::time::sleep(Duration::from_secs(600)).await;
             drop(s);
-        }));
+        })));
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -140,9 +142,7 @@ pub async fn test_clients_that_stop_reading_do_not_lock_out_others() -> TestResu
     }
     rdkafka_roundtrip(client_config(port()), &ctx.unique_topic("net-nr").await, 10).await?;
     println!("✅ fresh clients served while the non-reading connections are open");
-    for hog in hogs {
-        hog.abort();
-    }
+    drop(hogs);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
