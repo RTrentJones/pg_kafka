@@ -113,6 +113,10 @@ fn hello_pg_kafka() -> &'static str {
 /// deadlock with the pass it waits for. Only a READ COMMITTED call drops time
 /// partitions: under REPEATABLE READ or SERIALIZABLE the snapshot predates the drop's
 /// lock wait, so the pass skips its drops with a WARNING and does the rest.
+/// Produce, InitProducerId and EndTxn are not serialized with it: a statement of the pass
+/// that waits for one of their rows decides on the committed row (ADR-001, "A manual
+/// sweep decides on committed rows"); at REPEATABLE READ or SERIALIZABLE such a wait
+/// fails the call with a serialization error instead.
 ///
 /// Superusers only: EXECUTE is revoked from PUBLIC (`sql/bootstrap.sql`), since a caller
 /// that waits here holds the extension lock, and any role can hold the maintenance lock.
