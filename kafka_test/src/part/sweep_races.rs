@@ -9,6 +9,8 @@
 use super::drop_extension::MAINTENANCE_LOCK_KEY;
 use super::sweep_budget::create_topic;
 use crate::common::TestResult;
+use crate::wire::records::batch;
+use crate::wire::Wire;
 use crate::worker::{boxed, into_test_result, session, unique, SendResult};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
@@ -328,5 +330,375 @@ async fn log_start_race() -> SendResult<()> {
     release(&sweeper).await?;
     result?;
     println!("✅ the log start stops at the record produced during the sweep");
+    Ok(())
+}
+
+/// A Wire error (not `Send`) as the suite's error type.
+fn wire_err(e: &dyn std::error::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    e.to_string().into()
+}
+
+/// Whether backend `pid` waits for a lock of type `event` (`advisory`, `transactionid`).
+async fn waits_for(db: &Client, pid: i32, event: &str) -> SendResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT COALESCE(wait_event_type = 'Lock' AND wait_event = $2, false)
+             FROM pg_stat_activity WHERE pid = $1",
+            &[&pid, &event],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Poll until backend `pid` waits for a lock of type `event`, at most `within`.
+async fn wait_until_waiting(
+    db: &Client,
+    pid: i32,
+    event: &str,
+    within: Duration,
+) -> SendResult<bool> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if waits_for(db, pid, event).await? {
+            // Let the wait settle into the lock queue before anything wakes it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(false)
+}
+
+/// The listener worker's backend pid.
+async fn listener(db: &Client) -> SendResult<i32> {
+    crate::worker::listener_pid(db)
+        .await?
+        .ok_or_else(|| "no pg_kafka_listener runs".into())
+}
+
+/// A one-partition topic with infinite retention; returns its name and id.
+async fn plain_topic(db: &Client, base: &str) -> SendResult<(String, i32)> {
+    let name = unique(base);
+    let topic: i32 = db
+        .query_one(
+            "INSERT INTO kafka.topics (name, partitions, retention_ms) VALUES ($1, 1, -1)
+             RETURNING id",
+            &[&name],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    Ok((name, topic))
+}
+
+/// A topic, an idempotent producer that appended sequence 0 ("a") to it, and then made
+/// idle for 20 years (its producer row and its sequence row), so the next sweep's
+/// producer prune takes it. Returns (topic name, topic id, producer id, epoch).
+async fn idle_idempotent_producer(
+    db: &Client,
+    wire: &mut Wire,
+) -> SendResult<(String, i32, i64, i16)> {
+    let (name, topic) = plain_topic(db, "prune-produce").await?;
+    let (err, pid, epoch) = wire
+        .init_producer_id(None, 60_000)
+        .await
+        .map_err(|e| wire_err(&*e))?;
+    if err != 0 {
+        return Err(format!("InitProducerId failed with {err}").into());
+    }
+    let (err, offset) = wire
+        .produce(&name, 0, batch(&["a"], pid, epoch, 0, false, None), None)
+        .await
+        .map_err(|e| wire_err(&*e))?;
+    if (err, offset) != (0, 0) {
+        return Err(format!("first produce: ({err}, {offset})").into());
+    }
+    db.execute(
+        "UPDATE kafka.producer_ids SET last_active_at = now() - INTERVAL '20 years'
+         WHERE producer_id = $1",
+        &[&pid],
+    )
+    .await
+    .map_err(boxed)?;
+    db.execute(
+        "UPDATE kafka.producer_sequences SET updated_at = now() - INTERVAL '20 years'
+         WHERE producer_id = $1",
+        &[&pid],
+    )
+    .await
+    .map_err(boxed)?;
+    Ok((name, topic, pid, epoch))
+}
+
+/// Retry the acked batch (sequence 1, "b") and count the topic's records: a retry Kafka deduplicates answers the original offset 1 and stores nothing.
+async fn retry_is_deduplicated(
+    db: &Client,
+    wire: &mut Wire,
+    name: &str,
+    topic: i32,
+    pid: i64,
+    epoch: i16,
+) -> SendResult<()> {
+    let (err, offset) = wire
+        .produce(name, 0, batch(&["b"], pid, epoch, 1, false, None), None)
+        .await
+        .map_err(|e| wire_err(&*e))?;
+    let stored: i64 = db
+        .query_one(
+            "SELECT count(*) FROM kafka.messages WHERE topic_id = $1",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let known: i64 = db
+        .query_one(
+            "SELECT count(*) FROM kafka.producer_ids WHERE producer_id = $1",
+            &[&pid],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    println!(
+        "Retry of the acked batch: ({err}, {offset}); the topic holds {stored} record(s); \
+         producer rows {known}"
+    );
+    if (err, offset) != (0, 1) || stored != 2 {
+        return Err(format!(
+            "the retry of an acked batch was appended again after the prune \
+             (answer ({err}, {offset}), {stored} records stored, expected (0, 1) and 2)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn drop_prune_produce_fixture(db: &Client, topic: i32, pid: i64) -> SendResult<()> {
+    for sql in [
+        "DELETE FROM kafka.messages WHERE topic_id = $1",
+        "DELETE FROM kafka.partition_offsets WHERE topic_id = $1",
+        "DELETE FROM kafka.topics WHERE id = $1",
+    ] {
+        db.execute(sql, &[&topic]).await.map_err(boxed)?;
+    }
+    for sql in [
+        "DELETE FROM kafka.producer_sequences WHERE producer_id = $1",
+        "DELETE FROM kafka.producer_ids WHERE producer_id = $1",
+    ] {
+        db.execute(sql, &[&pid]).await.map_err(boxed)?;
+    }
+    Ok(())
+}
+
+/// The producer prune of an on-demand sweep against a Produce of the producer it
+/// prunes that is still open: a Produce writes only the sequence and batch rows, so a
+/// prune that decided on producer_ids alone deleted the producer after the Produce's
+/// commit (its sequence row with it, the batch cache cascading), right after the batch
+/// was acked; the producer's next batch found no state, was adopted as an unknown
+/// producer at any sequence, and a retry of the acked batch was stored twice. Kafka
+/// never expires state an append just refreshed.
+///
+/// Asserts: an idempotent producer idle past the 7-day window with sequence 0 on topic
+/// A; one real Produce of sequence 1 to A and of sequence 0 to a new topic B, held by
+/// the worker after it wrote A's batch (the test holds B's append lock); an on-demand
+/// sweep run meanwhile waits for the Produce; after both finish, the retry of A's acked
+/// batch answers its original offset and stores nothing.
+pub async fn test_sweep_prune_keeps_a_producer_whose_produce_is_open() -> TestResult {
+    into_test_result(prune_during_produce().await)
+}
+
+async fn prune_during_produce() -> SendResult<()> {
+    println!("=== Test: the producer prune keeps a producer whose Produce is open ===\n");
+    let sweeper = sweeper_session().await?;
+    let observer = session().await?;
+    let blocker = session().await?;
+    let mut wire = Wire::connect().await.map_err(|e| wire_err(&*e))?;
+    let (name, topic, pid, epoch) = idle_idempotent_producer(&sweeper, &mut wire).await?;
+    let (held_name, held_topic) = plain_topic(&sweeper, "prune-produce-held").await?;
+    println!("Step 1: producer {pid} at sequence 0 on topic A, idle for 20 years; topic B new");
+    let result: SendResult<()> = async {
+        let worker = listener(&observer).await?;
+        let sweeper_pid: i32 = sweeper
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .map_err(boxed)?
+            .get(0);
+        blocker
+            .execute("SELECT pg_advisory_lock($1, 0)", &[&held_topic])
+            .await
+            .map_err(boxed)?;
+        println!("Step 2: the test holds topic B's append lock");
+
+        // Topics are written in request order: A's batch first, then B's.
+        let request = [
+            (
+                name.as_str(),
+                vec![(0, batch(&["b"], pid, epoch, 1, false, None))],
+            ),
+            (
+                held_name.as_str(),
+                vec![(0, batch(&["c"], pid, epoch, 0, false, None))],
+            ),
+        ];
+        let produce = async {
+            wire.produce_many(&request, None)
+                .await
+                .map_err(|e| wire_err(&*e))
+        };
+        let control = async {
+            if !wait_until_waiting(&observer, worker, "advisory", BLOCK_WAIT).await? {
+                blocker
+                    .execute("SELECT pg_advisory_unlock($1, 0)", &[&held_topic])
+                    .await
+                    .map_err(boxed)?;
+                return Err("the Produce never reached topic B's append lock".into());
+            }
+            let written: i64 = observer
+                .query_one(
+                    "SELECT count(*) FROM kafka.producer_sequences
+                     WHERE producer_id = $1 AND topic_id = $2 AND xmax <> '0'",
+                    &[&pid, &topic],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            println!(
+                "Step 3: the Produce waits for topic B ({written} locked sequence row(s) of \
+                 topic A)"
+            );
+            let sweep = async {
+                Ok::<i64, Box<dyn std::error::Error + Send + Sync>>(
+                    sweeper
+                        .query_one(
+                            "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
+                             WHERE category = 'stale_producers'",
+                            &[],
+                        )
+                        .await
+                        .map_err(boxed)?
+                        .get(0),
+                )
+            };
+            let release = async {
+                // The worker's lock waits end after worker_lock_timeout_ms (5 s).
+                let waited = wait_until_waiting(
+                    &observer,
+                    sweeper_pid,
+                    "transactionid",
+                    Duration::from_secs(3),
+                )
+                .await?;
+                blocker
+                    .execute("SELECT pg_advisory_unlock($1, 0)", &[&held_topic])
+                    .await
+                    .map_err(boxed)?;
+                Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(waited)
+            };
+            let (pruned, waited) = tokio::join!(sweep, release);
+            Ok::<(i64, bool), Box<dyn std::error::Error + Send + Sync>>((pruned?, waited?))
+        };
+        let (produced, control) = tokio::join!(produce, control);
+        let (pruned, waited) = control?;
+        let produced = produced?;
+        println!(
+            "Step 4: the sweep pruned {pruned} producer(s) (it waited for the Produce: \
+             {waited}); the Produce answered {produced:?}"
+        );
+        if !waited {
+            return Err("the sweep never waited for the open Produce".into());
+        }
+        let acked = |topic: &str| {
+            produced
+                .iter()
+                .find(|p| p.0 == topic)
+                .map(|p| (p.1, p.2, p.3))
+        };
+        if acked(&name) != Some((0, 0, 1)) || acked(&held_name) != Some((0, 0, 0)) {
+            return Err(format!("the Produce answered {produced:?}").into());
+        }
+        retry_is_deduplicated(&sweeper, &mut wire, &name, topic, pid, epoch).await
+    }
+    .await;
+    drop_prune_produce_fixture(&sweeper, topic, pid).await?;
+    drop_prune_produce_fixture(&sweeper, held_topic, pid).await?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ the producer whose Produce was open keeps its state");
+    Ok(())
+}
+
+/// The other order: an on-demand sweep pruned an idle idempotent producer and has not
+/// committed when a Produce of it arrives. The Produce read the producer (the prune's
+/// delete not yet visible), waited for the deleted sequence row and wrote new sequence
+/// and batch rows without a producer row; the producer's next batch then found no
+/// state and was accepted at any sequence, so a retry of the acked batch was stored
+/// twice.
+///
+/// Asserts: an idempotent producer idle past the 7-day window with sequence 0; a sweep
+/// prunes it in an open transaction; a real Produce of sequence 1 waits for that
+/// transaction, which then commits; the Produce is acked and the retry of its batch
+/// answers the same offset and stores nothing.
+pub async fn test_sweep_prune_then_produce_keeps_producer_state() -> TestResult {
+    into_test_result(produce_after_prune().await)
+}
+
+async fn produce_after_prune() -> SendResult<()> {
+    println!("=== Test: a Produce after an uncommitted prune keeps producer state ===\n");
+    let sweeper = sweeper_session().await?;
+    let observer = session().await?;
+    let mut wire = Wire::connect().await.map_err(|e| wire_err(&*e))?;
+    let (name, topic, pid, epoch) = idle_idempotent_producer(&sweeper, &mut wire).await?;
+    println!("Step 1: producer {pid} at sequence 0, idle for 20 years");
+    let result: SendResult<()> = async {
+        let worker = listener(&observer).await?;
+        sweeper.batch_execute("BEGIN").await.map_err(boxed)?;
+        let pruned: i64 = sweeper
+            .query_one(
+                "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
+                 WHERE category = 'stale_producers'",
+                &[],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        println!("Step 2: a sweep pruned {pruned} producer(s) and holds its transaction open");
+        if pruned < 1 {
+            sweeper.batch_execute("ROLLBACK").await.map_err(boxed)?;
+            return Err("the sweep did not prune the idle producer".into());
+        }
+        let produce = async {
+            wire.produce(&name, 0, batch(&["b"], pid, epoch, 1, false, None), None)
+                .await
+                .map_err(|e| wire_err(&*e))
+        };
+        let commit = async {
+            // The worker's lock waits end after worker_lock_timeout_ms (5 s).
+            let waited =
+                wait_until_waiting(&observer, worker, "transactionid", Duration::from_secs(3))
+                    .await?;
+            sweeper.batch_execute("COMMIT").await.map_err(boxed)?;
+            Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(waited)
+        };
+        let (produced, waited) = tokio::join!(produce, commit);
+        let waited = waited?;
+        let produced = produced?;
+        println!(
+            "Step 3: the Produce waited for the sweep: {waited}; after its commit it \
+             answered {produced:?}"
+        );
+        if !waited {
+            return Err("the Produce never waited for the sweep's transaction".into());
+        }
+        if produced != (0, 1) {
+            return Err(format!("the Produce of sequence 1 answered {produced:?}").into());
+        }
+        retry_is_deduplicated(&sweeper, &mut wire, &name, topic, pid, epoch).await
+    }
+    .await;
+    drop_prune_produce_fixture(&sweeper, topic, pid).await?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ the producer keeps deduplicating after a prune it outlived");
     Ok(())
 }

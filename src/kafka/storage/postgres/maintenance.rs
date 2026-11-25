@@ -28,7 +28,7 @@ use pgrx::spi::SpiClient;
 pub const ABORTED_MESSAGE_GRACE: Duration = Duration::from_secs(60);
 /// Idle window after which a producer id (and its sequences) is reclaimed.
 /// Kafka: `transactional.id.expiration.ms` defaults to 7 days.
-const PRODUCER_ID_RETENTION: Duration = Duration::from_hours(168);
+pub(super) const PRODUCER_ID_RETENTION: Duration = Duration::from_hours(168);
 /// Age after which terminal (`CompleteCommit`/`CompleteAbort`) transaction rows are
 /// deleted. Matches [`PRODUCER_ID_RETENTION`] so a transaction row never outlives its
 /// producer.
@@ -1214,7 +1214,13 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// statement's snapshot), so the idle condition on producer_ids itself is repeated
 /// there: InitProducerId and an epoch bump (KIP-360, a transactional re-init) set
 /// last_active_at, and the producer they revived stays. The re-check filters the row
-/// the primary-key probe already fetched: no extra read per candidate.
+/// the primary-key probe already fetched: no extra read per candidate. An idempotent
+/// Produce writes the sequence rows, which the subquery reads from the snapshot, so
+/// it also sets last_active_at on a producer idle for more than half the window, the
+/// only ones this can take (`producers::read_producer_state`), before it writes them:
+/// a Produce open while this runs holds the producer row, and its producer is kept;
+/// one that comes after this deleted the row waits for this commit and starts the
+/// producer afresh.
 fn producer_prune_sql(with_cursor: bool) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
@@ -1242,8 +1248,9 @@ fn producer_prune_sql(with_cursor: bool) -> String {
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
                )
-               -- last_active_at only moves on InitProducerId; a long-running
-               -- producer shows its activity through its sequence rows.
+               -- last_active_at moves on InitProducerId and, at most every half
+               -- window, on a Produce; a producer's appends since then show in its
+               -- sequence rows.
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.producer_sequences s
                    WHERE s.producer_id = p.producer_id

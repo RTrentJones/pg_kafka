@@ -314,7 +314,15 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   and is left for the next pass), or repeats on the row itself every condition a worker
   write can change: the producer prune re-checks `last_active_at` against the window, so
   a producer that InitProducerId or an epoch bump revived while the prune waited for it
-  is kept. The log-start update after a sweep's deletes first upserts the affected
+  is kept. An idempotent Produce writes the sequence and batch rows, which the prune's
+  subqueries read from their snapshot, so it also moves `last_active_at` whenever that is
+  more than half the window old (one UPDATE per producer per 3.5 days, under the row lock
+  the prune then waits for): a producer the prune can take is always one whose Produce
+  writes its row first. A Produce that commits while the prune waits keeps its producer;
+  one that reaches the row after the prune deleted it waits for the prune, finds no row
+  and starts the producer afresh (adopted at its batch's sequence, as a producer the
+  broker holds no state for), so the batch it acks is recorded and its retry is
+  deduplicated. The log-start update after a sweep's deletes first upserts the affected
   `kafka.partition_offsets` rows, which waits for a Produce holding them (it inserts its
   records, then advances the counter, and commits), and only then reads the oldest
   surviving offset with a new snapshot, so the log start never passes a record the sweep
