@@ -437,6 +437,11 @@ impl ForwarderCore {
     /// good) and fences its partition, so no later record overtakes its retry.
     pub(crate) fn send_panicked(&mut self, key: RowKey) {
         error!("Shadow forwarder panicked while sending {key:?}; failing the record");
+        // A panic in `on_result` on the send path (a refused enqueue) is answered here: the
+        // record is no longer being handled. Left set, a later panic of the loop would
+        // answer it again from an index into acks that `flush_acks` has since shifted, and
+        // so clear the in-flight entry of its retry.
+        self.handling = None;
         self.resolved(key);
         self.fence(key);
         self.acks.push_back(ForwardAck::new(
@@ -2353,6 +2358,40 @@ mod tests {
             core.admit(&rec(0, 1, false)),
             Admit::Send,
             "its retry lifts the fence"
+        );
+    }
+
+    /// Two panics: one in `on_result` on the send path (a refused enqueue), answered by
+    /// `send_panicked`, then, after its ack was flushed and its retry sent, one of the loop.
+    /// Recovery answers the retry once (it is outstanding), not a second time for the first
+    /// panic, which would clear the DB thread's in-flight entry of the retry.
+    #[test]
+    fn a_panic_on_the_send_path_is_not_answered_again_by_recovery() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let key = RowKey::new(1, 0, 1);
+        let mut backlog: VecDeque<Queued> = VecDeque::from([Queued {
+            record: rec(0, 1, true),
+            received_at: now,
+        }]);
+        core.panic_in_on_result = true;
+        core.pump_backlog(&mut backlog, now, TIMEOUT, |core, q| {
+            core.on_result(q.record.row, 1, Err("refused".into()), false);
+            None
+        });
+        assert!(core.handling.is_none());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 1);
+        assert!(matches!(&got[0].1, ForwardOutcome::Failed(e) if e.contains("panicked")));
+        // The retry is sent; the loop then panics.
+        assert_eq!(core.admit(&rec(0, 1, true)), Admit::Send);
+        core.sent(key, 2, now);
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        assert_eq!(
+            got.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![key],
+            "{got:?}"
         );
     }
 
