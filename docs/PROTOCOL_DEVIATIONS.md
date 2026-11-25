@@ -233,6 +233,13 @@ pg_kafka.compression_type = 'gzip'
   older than the producer's current one is INVALID_PRODUCER_EPOCH on every partition.
   Kafka compares the epoch with the producer's state on the batch's partition only and
   accepts an older epoch on a partition where the producer has no state.
+- **Deviation:** a producer id that a transactional id owns takes no epoch it presents
+  itself: any batch of it, transactional or not, at an epoch other than its current one is
+  INVALID_PRODUCER_EPOCH, a higher epoch too (its epoch moves only with InitProducerId).
+  Kafka 3.7 (`ProducerAppendInfo.checkProducerEpoch`) refuses only a lower epoch, and
+  accepts a non-transactional batch at a higher one as the producer's new epoch. The one
+  exception is a partition its open transaction has written to, where a higher epoch is
+  answered as Kafka answers it (§4).
 - Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**
@@ -267,8 +274,10 @@ pg_kafka.compression_type = 'gzip'
   refuses the other producer's batch there on its own, 49, where Kafka answers 3); and a non-transactional batch of a producer whose open transaction has written
   to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
   request, after the epoch and sequence checks (one at a bumped epoch must start at
-  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch; a
-  partition the transaction only added takes it, committed). **Deviation:** transactional batches of one producer id at two
+  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch). On a
+  partition the transaction only added, a non-transactional batch at the current epoch is
+  written, committed; one at a bumped epoch is INVALID_PRODUCER_EPOCH (§3: a producer id
+  that a transactional id owns takes no epoch it presents; Kafka 3.7 writes it). **Deviation:** transactional batches of one producer id at two
   epochs are checked per epoch (the current epoch's written, the other refused); Kafka
   verifies all of them with the epoch of whichever partition its request map yields first,
   so it refuses or accepts them all. AddPartitionsToTxn,
