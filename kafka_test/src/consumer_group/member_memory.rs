@@ -2,7 +2,7 @@
 
 use crate::common::{DynResult, TestResult};
 use crate::error_codes;
-use crate::setup::TestContext;
+use crate::setup::{GucError, SystemGucGuard, TestContext};
 use crate::wire::requests::{conn, join_now, join_req, leave, s};
 use crate::wire::roundtrip;
 use bytes::Bytes;
@@ -12,50 +12,18 @@ use tokio_postgres::Client;
 
 const GUC: &str = "pg_kafka.max_group_memory";
 
-/// Set `pg_kafka.max_group_memory` for the test; the returned guard resets it when it drops,
-/// also when an assert panics or the runner aborts the test at its timeout.
-async fn set_budget(db: &Client, value: &str) -> DynResult<BudgetReset> {
-    db.batch_execute(&format!("ALTER SYSTEM SET {GUC} = '{value}'"))
-        .await?;
-    let guard = BudgetReset;
-    db.batch_execute("SELECT pg_reload_conf()").await?;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    Ok(guard)
+/// Set `pg_kafka.max_group_memory` for the test. The guard restores the earlier setting when
+/// the test calls `restore`, and on drop when an assert panics or the runner aborts the test.
+async fn set_budget(db: &Client, value: &str) -> DynResult<SystemGucGuard> {
+    SystemGucGuard::set(db, GUC, value)
+        .await
+        .map_err(widen)?
+        .ok_or_else(|| format!("the server refused {GUC} = {value}").into())
 }
 
-/// Resets `pg_kafka.max_group_memory` on drop. The reset runs on a thread of its own with its
-/// own runtime and connection, and the drop waits for it, so it is in force before the next
-/// test starts whatever state the test's runtime is in (unwinding, or its future dropped).
-struct BudgetReset;
-
-impl Drop for BudgetReset {
-    fn drop(&mut self) {
-        let reset = std::thread::spawn(|| -> Result<(), String> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            runtime.block_on(async {
-                let db = crate::common::create_db_client()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                // Two queries: ALTER SYSTEM cannot run inside a multi-statement query.
-                for sql in [
-                    format!("ALTER SYSTEM RESET {GUC}"),
-                    "SELECT pg_reload_conf()".into(),
-                ] {
-                    db.batch_execute(&sql).await.map_err(|e| e.to_string())?;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                Ok(())
-            })
-        });
-        match reset.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("⚠️  could not reset {GUC}: {e}"),
-            Err(_) => eprintln!("⚠️  resetting {GUC} panicked"),
-        }
-    }
+/// The guard's errors are `Send + Sync`; this file's results are not.
+fn widen(e: GucError) -> Box<dyn std::error::Error> {
+    e
 }
 
 /// The review's reproduction, scaled to a small budget: JoinGroups to new groups that never
@@ -70,7 +38,7 @@ pub async fn test_member_state_beyond_the_memory_budget_is_refused() -> TestResu
     let ctx = TestContext::new().await?;
     let budget = set_budget(ctx.db(), "2MB").await?;
     run(&ctx).await?;
-    drop(budget);
+    budget.restore().await.map_err(widen)?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -150,7 +118,7 @@ pub async fn test_empty_groups_do_not_exhaust_the_memory_budget() -> TestResult 
     let ctx = TestContext::new().await?;
     let budget = set_budget(ctx.db(), "2MB").await?;
     run_empty_groups(&ctx).await?;
-    drop(budget);
+    budget.restore().await.map_err(widen)?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -188,7 +156,7 @@ pub async fn test_a_rejoin_is_priced_with_the_protocol_it_selects() -> TestResul
     let ctx = TestContext::new().await?;
     let budget = set_budget(ctx.db(), "2MB").await?;
     run_rejoin(&ctx).await?;
-    drop(budget);
+    budget.restore().await.map_err(widen)?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
