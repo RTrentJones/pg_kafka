@@ -64,6 +64,17 @@ pub struct ProduceRequestData {
     pub pending: Option<Box<PendingRecords>>,
 }
 
+impl ProduceRequestData {
+    /// End the wait of records still to decode by `deadline` at the latest: a request that
+    /// already waited (for room for its decoded request) has only what is left of its
+    /// `decode_wait`, counted from when its frame was read.
+    pub fn bound_decode_wait(&mut self, deadline: tokio::time::Instant) {
+        if let Some(pending) = &mut self.pending {
+            pending.deadline = pending.deadline.min(deadline);
+        }
+    }
+}
+
 /// The records of a Produce request that could not decode at once: it waits for a
 /// large-decode slot or for decode budget, until `deadline` (see
 /// `protocol::decode_budget`).
@@ -1720,6 +1731,24 @@ mod tests {
         assert_eq!(produce.topic_data[0].partitions.len(), 2);
         assert_eq!(produce.topic_data[0].partitions[1].records.len(), 1);
         assert!(produce.decoded.bytes() > 0, "the decode is charged");
+    }
+
+    #[tokio::test]
+    async fn a_bounded_wait_ends_at_the_earlier_deadline() {
+        // Records that would wait 30 s end at the request's own deadline, 100 ms from now.
+        let (mut request, _rx) = pending_request(
+            1,
+            Wait::Budget(usize::MAX),
+            std::time::Duration::from_secs(30),
+        );
+        let RequestBody::Produce(produce) = &mut request.body else {
+            panic!("expected a Produce request");
+        };
+        produce
+            .bound_decode_wait(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert!(matches!(finish_decode(request).await, Decoded::Answered));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]

@@ -95,7 +95,7 @@ pub(super) struct ActivityClock {
 }
 
 impl ActivityClock {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         ActivityClock {
             epoch: Instant::now(),
             last_ms: AtomicU64::new(0),
@@ -108,7 +108,7 @@ impl ActivityClock {
         self.last_ms.store(ms, Ordering::Relaxed);
     }
 
-    fn last(&self) -> Instant {
+    pub(super) fn last(&self) -> Instant {
         self.epoch + Duration::from_millis(self.last_ms.load(Ordering::Relaxed))
     }
 
@@ -130,12 +130,21 @@ impl ActivityClock {
     }
 }
 
-/// A connection's socket, touching its [`ActivityClock`] whenever response bytes are
-/// written, so a large response that a slow client reads keeps its connection alive and a
-/// client that reads nothing lets it go idle (as Kafka's idle expiry counts every write).
-struct Tracked<S> {
+/// A connection's TCP socket, touching its [`ActivityClock`] whenever bytes are written to
+/// it, so a large response that a slow client reads keeps its connection alive and a client
+/// that reads nothing lets it go idle (as Kafka's idle expiry counts every write). On a TLS
+/// listener it sits under the TLS stream: the records rustls buffers (up to 64 KiB) reach the
+/// socket on a later write or on flush, and each of those writes counts too.
+pub(super) struct Tracked<S> {
     inner: S,
     activity: Arc<ActivityClock>,
+}
+
+impl<S> Tracked<S> {
+    /// `inner`, touching `activity` on every write.
+    pub(super) fn new(inner: S, activity: Arc<ActivityClock>) -> Self {
+        Tracked { inner, activity }
+    }
 }
 
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tracked<S> {
@@ -192,11 +201,13 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<S> {
     }
 }
 
-/// Serve one client connection until it closes.
+/// Serve one client connection until it closes. `activity` is the clock the connection's
+/// [`Tracked`] TCP socket (under `socket`'s TLS, if any) touches.
 ///
 /// Runs on the network thread and MUST NOT call pgrx functions.
 pub(super) async fn handle_connection<S>(
     socket: S,
+    activity: Arc<ActivityClock>,
     dispatcher: Dispatcher,
     auth: ConnectionAuth,
     pre_auth_deadline: tokio::time::Instant,
@@ -216,11 +227,6 @@ pub(super) async fn handle_connection<S>(
         },
     ));
     let clock = Arc::new(FrameClock::new());
-    let activity = Arc::new(ActivityClock::new());
-    let socket = Tracked {
-        inner: socket,
-        activity: Arc::clone(&activity),
-    };
     let (read_half, write_half) = tokio::io::split(socket);
     let reader = FramedRead::new(
         read_half,
@@ -816,8 +822,10 @@ mod tests {
                 long_poll_interval: None,
                 runtime_context: Arc::new(crate::kafka::RuntimeContext::new(config)),
             };
+            let activity = Arc::new(ActivityClock::new());
             handle_connection(
-                socket,
+                Tracked::new(socket, Arc::clone(&activity)),
+                activity,
                 dispatcher,
                 auth,
                 tokio::time::Instant::now() + PRE_AUTH_TIMEOUT,

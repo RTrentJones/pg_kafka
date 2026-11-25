@@ -9,12 +9,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::decode_budget::{
-    DecodePool, HeldFrame, LargeDecodes, NotRun, DECODED_REQUESTS, INLINE_REQUEST_DECODE_BYTES,
-    LARGE_DECODES, MAX_DECODE_WAIT, MAX_REQUEST_DECODE_BYTES,
+    decode_wait, DecodePool, HeldFrame, LargeDecodes, NotRun, DECODED_REQUESTS,
+    INLINE_REQUEST_DECODE_BYTES, LARGE_DECODES, MAX_DECODE_WAIT, MAX_REQUEST_DECODE_BYTES,
 };
 use super::decode_meter::{metered, MeteredBuf};
 use super::framing::FRAME_RESERVE_REMAINING;
-use crate::kafka::api::{self, Decoded, ResponseBody};
+use crate::kafka::api::{self, Decoded, RequestBody, ResponseBody};
 use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
@@ -66,7 +66,9 @@ pub fn parse_request(
 /// frame codec closes one whose arriving frame it cannot take: waiting for room would keep
 /// the frame in memory uncounted. A Produce whose records wait to decode charges its own
 /// ([`finish_request`]); a decode running in a slot needs none (at most
-/// [`super::decode_budget::LARGE_DECODE_SLOTS`] frames).
+/// [`super::decode_budget::LARGE_DECODE_SLOTS`] frames). Once a Produce has been parsed,
+/// every wait it has left (for room for the decoded request, then for its records) ends
+/// [`decode_wait`] of its `timeout_ms` after its frame was read, not later.
 pub async fn decode_request(
     frame: BytesMut,
     response_tx: UnboundedSender<KafkaResponse>,
@@ -115,7 +117,8 @@ async fn decode_request_in(
 ) -> Result<Option<KafkaRequest>> {
     let pool = budgets.requests;
     let frame = frame.freeze();
-    let deadline = tokio::time::Instant::now() + wait;
+    let read_at = tokio::time::Instant::now();
+    let mut deadline = read_at + wait;
     let mut inline = true;
     loop {
         let attempt = if inline {
@@ -154,7 +157,13 @@ async fn decode_request_in(
                 continue;
             }
             Attempt::OverLimit => return Err(over_limit()),
-            Attempt::Parsed(Ok(Some(request)), held) => (request, held),
+            Attempt::Parsed(Ok(Some(mut request)), held) => {
+                if let RequestBody::Produce(produce) = &mut request.body {
+                    deadline = deadline.min(read_at + decode_wait(produce.timeout_ms));
+                    produce.bound_decode_wait(deadline);
+                }
+                (request, held)
+            }
             Attempt::Parsed(other, _) => return other.map(|_| None),
         };
         if let Some(charge) = pool.charge_request(held) {

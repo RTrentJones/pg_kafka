@@ -97,8 +97,9 @@ pg_kafka.compression_type = 'gzip'
   and so does any request that finds the 512 MiB of decoded records waiting for the database
   full, until room comes free. The wait is at most half the request's `timeout_ms` and at most
   10 s (Java and librdkafka send their `request.timeout.ms`, 30 s by default, so the answer
-  reaches them first); past it the request is answered REQUEST_TIMED_OUT (7) on every
-  partition and nothing is written. Clients retry it (an idempotent producer keeps its order;
+  reaches them first), counted from when the request's frame was read, whatever it waited for
+  before its records (room for the rest of the decoded request, below); past it the request is
+  answered REQUEST_TIMED_OUT (7) on every partition and nothing is written. Clients retry it (an idempotent producer keeps its order;
   a non-idempotent one with several requests in flight may reorder, as on any retriable
   error). Kafka has no such limit on decoding: when its request queue is full
   (`queued.max.requests`, 500) or it lacks memory for requests (`queued.max.request.bytes`,
@@ -895,8 +896,9 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   (§7), until the idle timeout), 32 MiB of it
   kept for requests of at most 64 KiB (Heartbeats, ApiVersions, commits), so a few large
   requests cannot lock control traffic out; a decoded request that finds no room is freed and
-  decodes again once there is, waiting up to 10 s (its connection reads nothing meanwhile),
-  after which the connection closes. A Fetch response holds at most the request's `max_bytes`,
+  decodes again once there is, waiting up to 10 s (a Produce: half its `timeout_ms`, at most
+  10 s, from when its frame was read; its connection reads nothing meanwhile), after which the
+  connection closes, a Produce's too. A Fetch response holds at most the request's `max_bytes`,
   lowered to `pg_kafka.fetch_max_bytes` (§7); a large response is written from its own buffer,
   and a connection's read buffer starts small again after a large frame, so neither keeps the
   largest frame's memory for the connection's life (Kafka allocates per receive and send).
@@ -905,12 +907,13 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
   Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the
   256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
-  at most two at a time; a request that finds no
-  room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
-  frame counts against the frame budget while it waits (for a large-decode slot, or for room
-  in either budget), as an incomplete frame does; one the exhausted budget cannot take is
-  refused at once: a Produce is answered REQUEST_TIMED_OUT, any other request closes the
-  connection.
+  at most two at a time; a Produce whose records find no room waits for it, at most half its
+  `timeout_ms` and 10 s from when its frame was read, and is then answered REQUEST_TIMED_OUT
+  (see §2). A request's frame counts against the frame budget while it waits (for a
+  large-decode slot, or for room in either budget), as an incomplete frame does; one the
+  exhausted budget cannot take is refused at once: a Produce waiting for its records' room is
+  answered REQUEST_TIMED_OUT, any other wait (a Produce's included, before its records)
+  closes the connection.
 
 ## Compatibility Testing
 
