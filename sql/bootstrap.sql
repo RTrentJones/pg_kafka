@@ -132,6 +132,15 @@ CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
 
+-- A transactional producer's pending rows, for the statements that end its
+-- transaction (EndTxn's commit and abort, the abort of a fenced epoch or a timed-out
+-- transaction, the shadow outbox's commit enqueue). idx_messages_txn_pending leads
+-- with the partition, so those statements read every pending row of every producer;
+-- this one reads only the producer's own. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_pending_producer
+ON kafka.messages(producer_id, producer_epoch)
+WHERE txn_state = 'pending';
+
 -- Aborted transactional rows, for the retention sweep's aborted-row cleanup (every
 -- pass, whatever the retention settings): without it that DELETE read every block of
 -- every leaf (the BRIN on created_at matches nearly all of them), on the single worker

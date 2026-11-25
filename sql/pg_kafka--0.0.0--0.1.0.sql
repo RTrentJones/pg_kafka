@@ -63,9 +63,10 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 -- is expired under its topic's retention (row deletes until then only for topics with
 -- a window shorter than one partition width). New rows go to the new time leaves.
 --
--- Cost: ACCESS EXCLUSIVE on the old table for the whole script; four sequential
+-- Cost: ACCESS EXCLUSIVE on the old table for the whole script; five sequential
 -- reads of it (MAX(created_at) for the leaf bound, the attach's bound check, and the
--- BRIN and idx_messages_txn_aborted builds). The rows themselves are not copied.
+-- BRIN, idx_messages_txn_aborted and idx_messages_txn_pending_producer builds). The
+-- rows themselves are not copied.
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
 ALTER INDEX kafka.messages_pkey RENAME TO messages_legacy_offset_key;
 ALTER INDEX kafka.messages_global_offset_key RENAME TO messages_legacy_global_offset_key;
@@ -158,6 +159,15 @@ ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 -- read_committed fetches).
 CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
+WHERE txn_state = 'pending';
+
+-- A transactional producer's pending rows, for the statements that end its
+-- transaction (EndTxn's commit and abort, the abort of a fenced epoch or a timed-out
+-- transaction, the shadow outbox's commit enqueue). idx_messages_txn_pending leads
+-- with the partition, so those statements read every pending row of every producer;
+-- this one reads only the producer's own. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_pending_producer
+ON kafka.messages(producer_id, producer_epoch)
 WHERE txn_state = 'pending';
 
 -- Aborted transactional rows, for the retention sweep's aborted-row cleanup (every

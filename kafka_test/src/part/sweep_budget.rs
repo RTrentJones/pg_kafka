@@ -2,6 +2,7 @@
 //! that a pass stays within its budget when its leaf drops are blocked or a step has a
 //! large backlog.
 
+use super::drop_extension::MAINTENANCE_LOCK_KEY;
 use crate::common::{create_producer, TestResult};
 use crate::setup::SystemGucGuard;
 use crate::worker::{boxed, into_test_result, send, session, unique, SendResult};
@@ -46,7 +47,7 @@ impl Drop for StopOnDrop {
 
 /// Create the one-hour leaf starting `hour` hours after 2000-01-01 (a year no other
 /// test's leaves use, so these are the oldest leaves) and return its name.
-async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
+pub(super) async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
     db.query_one(
         "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
          FROM (SELECT timestamptz '2000-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
@@ -66,7 +67,7 @@ async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
 }
 
 /// `rows` committed rows of `topic_id` in the leaf of `hour`, from `first_offset`.
-async fn fill_leaf(
+pub(super) async fn fill_leaf(
     db: &Client,
     topic_id: i32,
     hour: i32,
@@ -94,7 +95,7 @@ async fn leaf_exists(db: &Client, leaf: &str) -> SendResult<bool> {
         .get(0))
 }
 
-async fn create_topic(db: &Client, name: &str, retention_ms: i64) -> SendResult<i32> {
+pub(super) async fn create_topic(db: &Client, name: &str, retention_ms: i64) -> SendResult<i32> {
     Ok(db
         .query_one(
             "INSERT INTO kafka.topics (name, partitions, retention_ms) VALUES ($1, 1, $2)
@@ -1075,9 +1076,10 @@ async fn producer_prune_plan() -> SendResult<()> {
 ///
 /// Asserts: with the pass budget at 0, the oldest past leaf holding only rows of a
 /// one-day topic (wider than the leaf, so only a whole-leaf drop removes them) and the
-/// next one rows of an infinite topic (so the next probe goes there), a
-/// sweep behind a reader drops nothing; after the topic's retention is made infinite and
-/// the reader ends, the next sweep keeps the leaf and all of its rows.
+/// next one rows of an infinite topic (so the next probe goes there), and the worker's
+/// sweep held off by the maintenance lock, a sweep behind a reader tries the drop (it
+/// waits for the reader's lock) and drops nothing; after the topic's retention is made
+/// infinite and the reader ends, the next sweep keeps the leaf and all of its rows.
 pub async fn test_sweep_forgets_a_deferred_drop_when_retention_is_raised() -> TestResult {
     into_test_result(deferred_drop_after_raise().await)
 }
@@ -1094,32 +1096,123 @@ async fn deferred_drop_after_raise() -> SendResult<()> {
     db.batch_execute("SET statement_timeout = '30s'")
         .await
         .map_err(boxed)?;
-    let raised = create_topic(&db, &unique("deferred-raised"), ONE_DAY_MS).await?;
-    let forever = create_topic(&db, &unique("deferred-forever"), -1).await?;
+    // Held from before the leaves exist until they are gone: the worker's own sweep
+    // (every 60 s) skips while this session holds it, so it can neither drop the
+    // expired leaf before the reader holds its lock nor do the deferred drop; this
+    // session's sweeps re-enter it.
+    db.execute("SELECT pg_advisory_lock($1)", &[&MAINTENANCE_LOCK_KEY])
+        .await
+        .map_err(boxed)?;
+    let mut made = DeferredDropFixture::default();
+    let result = deferred_drop_steps(&db, &mut made).await;
+    let cleaned = made.cleanup(&db).await;
+    let unlocked = db
+        .execute("SELECT pg_advisory_unlock($1)", &[&MAINTENANCE_LOCK_KEY])
+        .await
+        .map_err(boxed);
+    result?;
+    cleaned?;
+    unlocked?;
+    println!("✅ the deferred drop was re-checked and the leaf kept");
+    Ok(())
+}
+
+/// What the deferred-drop test created, for its cleanup on every path.
+#[derive(Default)]
+struct DeferredDropFixture {
+    topics: Vec<i32>,
+    leaves: Vec<String>,
+}
+
+impl DeferredDropFixture {
+    async fn cleanup(&self, db: &Client) -> SendResult<()> {
+        db.execute(
+            "DELETE FROM kafka.messages WHERE topic_id = ANY($1)",
+            &[&self.topics],
+        )
+        .await
+        .map_err(boxed)?;
+        for l in &self.leaves {
+            db.query(
+                "SELECT dropped FROM kafka.drop_message_partition(to_regclass($1), '{}')",
+                &[l],
+            )
+            .await
+            .map_err(boxed)?;
+        }
+        db.execute(
+            "DELETE FROM kafka.topics WHERE id = ANY($1)",
+            &[&self.topics],
+        )
+        .await
+        .map_err(boxed)?;
+        Ok(())
+    }
+}
+
+async fn deferred_drop_steps(db: &Client, made: &mut DeferredDropFixture) -> SendResult<()> {
+    let raised = create_topic(db, &unique("deferred-raised"), ONE_DAY_MS).await?;
+    made.topics.push(raised);
+    let forever = create_topic(db, &unique("deferred-forever"), -1).await?;
+    made.topics.push(forever);
     // Before 2000, so these are the oldest leaves and the first probes reach them.
     let hour: i32 = db
         .query_one("SELECT -2 - (random() * 8000)::int", &[])
         .await
         .map_err(boxed)?
         .get(0);
-    let leaf = hour_leaf(&db, hour).await?;
-    let next = hour_leaf(&db, hour + 1).await?;
-    fill_leaf(&db, raised, hour, 0, DEFERRED_ROWS).await?;
-    fill_leaf(&db, forever, hour + 1, 0, DEFERRED_ROWS).await?;
+    let leaf = hour_leaf(db, hour).await?;
+    made.leaves.push(leaf.clone());
+    let next = hour_leaf(db, hour + 1).await?;
+    made.leaves.push(next.clone());
+    fill_leaf(db, raised, hour, 0, DEFERRED_ROWS).await?;
+    fill_leaf(db, forever, hour + 1, 0, DEFERRED_ROWS).await?;
     println!(
         "Step 0: {leaf} holds {DEFERRED_ROWS} rows of a one-day topic, {next} an infinite one's"
     );
 
-    let budget = pass_budget(&db, "0").await?;
+    let budget = pass_budget(db, "0").await?;
     let reader = session().await?;
+    let watcher = session().await?;
     let result: SendResult<()> = async {
         reader
             .batch_execute("BEGIN; SELECT count(*) FROM kafka.messages")
             .await
             .map_err(boxed)?;
-        let dropped = dropped_partitions(&db).await?;
-        assert_eq!(dropped, 0, "no leaf can be dropped behind the reader");
-        assert!(leaf_exists(&db, &leaf).await?, "{leaf} must still exist");
+        let pid: i32 = db
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .map_err(boxed)?
+            .get(0);
+        // The drop is found only if the sweep waits for the reader's lock: watch for
+        // that wait while the sweep runs, so the step cannot pass on a sweep that never
+        // tried the drop.
+        let (dropped, waited) = tokio::join!(dropped_partitions(db), async {
+            for _ in 0..80 {
+                let waiting: bool = watcher
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks
+                                        WHERE pid = $1 AND NOT granted
+                                          AND mode = 'AccessExclusiveLock')",
+                        &[&pid],
+                    )
+                    .await
+                    .map_err(boxed)?
+                    .get(0);
+                if waiting {
+                    return SendResult::Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(false)
+        });
+        let dropped = dropped?;
+        if !waited? {
+            return Err(format!("the sweep never waited to drop {leaf} behind the reader").into());
+        }
+        if dropped != 0 || !leaf_exists(db, &leaf).await? {
+            return Err(format!("{leaf} must not be dropped behind the reader").into());
+        }
         println!("Step 1: the sweep behind the reader found the drop and could not do it");
 
         db.execute(
@@ -1131,8 +1224,8 @@ async fn deferred_drop_after_raise() -> SendResult<()> {
         reader.batch_execute("ROLLBACK").await.map_err(boxed)?;
         println!("Step 2: retention made infinite, then the reader ended");
 
-        let dropped = dropped_partitions(&db).await?;
-        let rows: i64 = if leaf_exists(&db, &leaf).await? {
+        let dropped = dropped_partitions(db).await?;
+        let rows: i64 = if leaf_exists(db, &leaf).await? {
             db.query_one(&format!("SELECT count(*) FROM {leaf}"), &[])
                 .await
                 .map_err(boxed)?
@@ -1141,36 +1234,21 @@ async fn deferred_drop_after_raise() -> SendResult<()> {
             0
         };
         println!("Step 3: the next sweep dropped {dropped}; {leaf} holds {rows} rows");
-        assert_eq!(
-            rows, DEFERRED_ROWS,
-            "the leaf's rows must be kept once its topic's retention is infinite"
-        );
+        if rows != DEFERRED_ROWS {
+            return Err(format!(
+                "{leaf} holds {rows} rows: all {DEFERRED_ROWS} must be kept once its topic's \
+                 retention is infinite"
+            )
+            .into());
+        }
         Ok(())
     }
     .await;
+    // The reader's lock would block the cleanup's drops.
+    let ended = reader.batch_execute("ROLLBACK").await.map_err(boxed);
     let restored = budget.restore().await;
-    db.execute(
-        "DELETE FROM kafka.messages WHERE topic_id = ANY($1)",
-        &[&vec![raised, forever]],
-    )
-    .await
-    .map_err(boxed)?;
-    for l in [&leaf, &next] {
-        db.query(
-            "SELECT dropped FROM kafka.drop_message_partition(to_regclass($1), '{}')",
-            &[l],
-        )
-        .await
-        .map_err(boxed)?;
-    }
-    db.execute(
-        "DELETE FROM kafka.topics WHERE id = ANY($1)",
-        &[&vec![raised, forever]],
-    )
-    .await
-    .map_err(boxed)?;
     result?;
+    ended?;
     restored?;
-    println!("✅ the deferred drop was re-checked and the leaf kept");
     Ok(())
 }

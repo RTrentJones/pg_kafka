@@ -252,10 +252,13 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   timeout) and a later pass moves the rows. Trying the schema lock while holding the tables
   waits for nothing, so it cannot close a cycle. The upgrade scripts take the same lock
   first. No other path waits for the schema lock after a table lock.
-* **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
-  (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
-  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,
-  which needs `ACCESS EXCLUSIVE` there. Two sweeps interleaving those steps form a lock cycle
+* **Sweeps and partition maintenance never overlap.** A retention sweep both deletes rows
+  (the aborted-row cleanup, the expired rows), which leaves its transaction holding
+  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves,
+  which needs `ACCESS EXCLUSIVE` there, in one transaction and in either order: the drop step
+  is the fourth of the pass's eight steps, after the first deletes, and the budget-driven
+  second phase can run more deletes after a drop, while the transaction still holds that
+  `ACCESS EXCLUSIVE`. Two sweeps interleaving those steps form a lock cycle
   (one waits for `ACCESS EXCLUSIVE` behind the other's `ROW EXCLUSIVE`, the other waits for
   the first's deleted rows or for the maintenance lock) and Postgres aborts one with
   `deadlock detected`. So every sweep takes the partition-maintenance advisory lock
@@ -329,8 +332,8 @@ the startup role check verifies them with `has_function_privilege`.
 (renaming its primary key / unique index / constraints to the per-leaf names), creates the
 partitioned parent (same `global_offset` sequence, now owned by the parent) with the DEFAULT leaf,
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied. It
-reads the old table four times (MAX(created_at) for the bound, the attach's bound check, the BRIN
-and `idx_messages_txn_aborted` builds) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
+reads the old table five times (MAX(created_at) for the bound, the attach's bound check, the BRIN,
+`idx_messages_txn_aborted` and `idx_messages_txn_pending_producer` builds) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
 The views that read the table are recreated on the parent. A new binary
 running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
 skips partition maintenance; its retention sweep expires rows row by row on the

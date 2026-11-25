@@ -247,7 +247,7 @@ pub async fn test_maintenance_functions_refuse_public() -> TestResult {
 }
 
 /// The partition-maintenance advisory lock (`retention::MAINTENANCE_LOCK_KEY`).
-const MAINTENANCE_LOCK_KEY: i64 = 8_099_547_369_649_367_905;
+pub(super) const MAINTENANCE_LOCK_KEY: i64 = 8_099_547_369_649_367_905;
 
 const MAINTENANCE_FUNCTIONS: [(&str, &str); 2] = [
     (
