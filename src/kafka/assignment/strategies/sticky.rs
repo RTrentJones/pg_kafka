@@ -1820,4 +1820,24 @@ mod tests {
             assert_balanced(&input, &result);
         }
     }
+
+    #[test]
+    fn test_nested_prefix_shape_against_the_step_budget() {
+        // 999 members over 999 topics, member i subscribed to the first i + 1 (ids in
+        // subscription order), from a fresh group: 10 partitions per topic fit, 12 are
+        // refused (as limits::MAX_ASSIGNMENT_STEPS documents).
+        let names = topic_names("t", 999);
+        let all: Vec<(String, Vec<String>)> = (0..999)
+            .map(|i| (format!("m{i:05}"), names[..=i].to_vec()))
+            .collect();
+        for (parts, fits) in [(10, true), (12, false)] {
+            let input = input_of(
+                &all,
+                &names.iter().map(|t| (t.clone(), parts)).collect::<Vec<_>>(),
+            );
+            let result = StickyStrategy::new()
+                .assign_within(&input, crate::kafka::limits::MAX_ASSIGNMENT_STEPS);
+            assert_eq!(result.is_ok(), fits, "{parts} partitions per topic");
+        }
+    }
 }
