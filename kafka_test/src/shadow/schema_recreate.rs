@@ -105,12 +105,15 @@ async fn run(
     enable_shadow_mode(ctx.db(), old_topic, &async_config(old_external)).await?;
     let old_id = topic_id(ctx.db(), old_topic).await?;
     produce(old_topic, "old").await?;
-    // Let the outbox tick dispatch them; their acks are held by the forwarder.
+    // Let the outbox tick dispatch them; their acks are held by the forwarder. A row that
+    // was never claimed is unacknowledged too, so each must have an open attempt: a
+    // forward dispatched and still in flight when the schema is dropped.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let outstanding: i64 = ctx
         .db()
         .query_one(
-            "SELECT count(*) FROM kafka.shadow_tracking WHERE topic_id = $1 AND external_offset IS NULL",
+            "SELECT count(*) FROM kafka.shadow_tracking
+             WHERE topic_id = $1 AND external_offset IS NULL AND attempt_open",
             &[&old_id],
         )
         .await?
@@ -118,7 +121,7 @@ async fn run(
     assert_eq!(
         outstanding,
         i64::try_from(MESSAGE_COUNT)?,
-        "the old records' forwards must still be unacknowledged"
+        "the old records' forwards must be dispatched and still unacknowledged"
     );
 
     println!(
