@@ -1193,6 +1193,14 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// statement cost the whole table; an array is probed through the primary keys, and the
 /// anti-joins of a few rows through idx_transactions_producer and the sequences' primary
 /// key.
+///
+/// Concurrency: `pg_kafka_run_retention_sweep()` runs this in its own session, beside
+/// the worker. A DELETE that waits for a row another transaction updated re-evaluates
+/// only its own WHERE on that row's newest version (the CTEs and subqueries keep the
+/// statement's snapshot), so the idle condition on producer_ids itself is repeated
+/// there: InitProducerId and an epoch bump (KIP-360, a transactional re-init) set
+/// last_active_at, and the producer they revived stays. The re-check filters the row
+/// the primary-key probe already fetched: no extra read per candidate.
 fn producer_prune_sql(with_cursor: bool) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
@@ -1211,6 +1219,11 @@ fn producer_prune_sql(with_cursor: bool) -> String {
          doomed AS (
              DELETE FROM kafka.producer_ids p
              WHERE p.producer_id = ANY (ARRAY(SELECT c.producer_id FROM candidates c))
+               -- Repeated from candidates: the DELETE re-checks its own condition on
+               -- the newest version of a row it waited for, never the CTE's, so
+               -- without it an InitProducerId or epoch bump that touched an idle
+               -- producer concurrently would see it deleted after its commit.
+               AND p.last_active_at < NOW() - ($1 || ' seconds')::interval
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
@@ -1391,7 +1404,25 @@ fn orphaned_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::AffectedPartitions;
+    use super::{producer_prune_sql, AffectedPartitions};
+
+    /// The prune's DELETE repeats the idle condition on the row itself: it is all a
+    /// DELETE that waited for a concurrently revived producer re-checks.
+    #[test]
+    fn producer_prune_delete_rechecks_the_idle_window() {
+        for with_cursor in [false, true] {
+            let sql = producer_prune_sql(with_cursor);
+            let delete = sql
+                .split("DELETE FROM kafka.producer_ids p")
+                .nth(1)
+                .and_then(|rest| rest.split("RETURNING").next())
+                .unwrap_or_default();
+            assert!(
+                delete.contains("AND p.last_active_at < NOW() - ($1 || ' seconds')::interval"),
+                "the DELETE must re-check last_active_at: {delete}"
+            );
+        }
+    }
 
     #[test]
     fn affected_partitions_keep_the_highest_removed_offset() {

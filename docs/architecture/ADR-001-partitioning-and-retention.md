@@ -304,6 +304,21 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   the same leaf, the second waits for the first's locks; afterwards
   `drop_message_partition` (and `message_partition_contents`) find the leaf gone and
   return `dropped = false` (NULL contents) instead of erroring on the vanished OID.
+* **A manual sweep decides on committed rows, not on its snapshot.** The worker's own sweep
+  runs on the DB thread between requests, but `pg_kafka_run_retention_sweep()` runs beside
+  the worker's transactions, at READ COMMITTED a fresh snapshot per statement. A DELETE or
+  UPDATE that waits for a row a worker transaction holds re-evaluates only its own WHERE
+  (and SET) on the committed version; its CTEs and subqueries keep the statement's
+  snapshot. So each such statement either names its rows by `ctid` (the terminal
+  transaction, outbox and message batches: a concurrently updated row has a new `ctid`
+  and is left for the next pass), or repeats on the row itself every condition a worker
+  write can change: the producer prune re-checks `last_active_at` against the window, so
+  a producer that InitProducerId or an epoch bump revived while the prune waited for it
+  is kept. The log-start update after a sweep's deletes first upserts the affected
+  `kafka.partition_offsets` rows, which waits for a Produce holding them (it inserts its
+  records, then advances the counter, and commits), and only then reads the oldest
+  surviving offset with a new snapshot, so the log start never passes a record the sweep
+  did not delete (`kafka_test/src/part/sweep_races.rs`).
 * **Maintenance locks the parent before any leaf.** Every worker statement on
   `kafka.messages` locks the parent first and then its leaves in bound order, and
   `ensure_message_partitions` takes `ACCESS SHARE` on `kafka.messages` before it reads
