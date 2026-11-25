@@ -85,9 +85,11 @@ macro_rules! fetch_sql {
 /// deltas of one); a record that shares its batch takes at most 31 of its own plus half the
 /// batch header or less. So the count is never under what the record adds. Stored (compressed) sizes
 /// would let a highly compressible record count as a small fraction of what the response
-/// and the DB thread hold of it, and headers would not count at all. Rows written before
-/// headers were stored as an ordered array hold a `{key: hex}` object; `{}` is a record
-/// without headers. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
+/// and the DB thread hold of it, and headers would not count at all. A header key stored
+/// as hex (one holding U+0000, marked `"hex"`, see `encode_headers_json`) counts half its
+/// stored length, as its value does. Rows written before headers were stored as an ordered
+/// array hold a `{key: hex}` object; `{}` is a record without headers. Any other JSON value
+/// (a scalar written out of band) counts no headers, as a fetch decodes none from it. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
 /// `message_size_estimate` uses, counts the same. COALESCE evaluates it only for a row whose
 /// `record_bytes` is NULL; it reads the whole headers value, from TOAST when stored there.
 macro_rules! record_bytes_sql {
@@ -96,8 +98,10 @@ macro_rules! record_bytes_sql {
             + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
                    WHEN jsonb_typeof(headers) = 'array' THEN
                      (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                            / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
+                   WHEN jsonb_typeof(headers) <> 'object' THEN 0
                    ELSE
                      (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
                       FROM jsonb_each_text(headers) e(k, v))
@@ -109,7 +113,11 @@ macro_rules! record_bytes_sql {
 /// rows it stops below the last stable offset: a committed record above a still-open
 /// lower-offset transaction must not be returned, or the consumer moves past the
 /// pending offset and never re-reads it. With nothing pending the COALESCE default
-/// makes the bound a no-op.
+/// (the largest bigint) makes the bound a no-op. The default is a constant, so the bound
+/// is a value computed once (an InitPlan) and ends the index scan at the last stable
+/// offset; a default naming `partition_offset` would make it a per-row filter, and the
+/// scan would read every committed row past an open transaction, as LIMIT counts only
+/// the rows that pass.
 const FETCH_COMMITTED_SQL: &str = fetch_sql!(
     "
      AND txn_state IS NULL
@@ -117,7 +125,7 @@ const FETCH_COMMITTED_SQL: &str = fetch_sql!(
          (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
           WHERE m2.topic_id = $1 AND m2.partition_id = $2
             AND m2.txn_state = 'pending'),
-         partition_offset + 1)"
+         9223372036854775807)"
 );
 
 /// Fetch of every record (ReadUncommitted).
@@ -421,7 +429,7 @@ impl PostgresStore {
             let budget = i64::from(max_bytes.max(0));
             let mut consumed: i64 = 0;
             let mut next_offset = fetch_offset;
-            let mut first_left_out = false;
+            let mut first_left_out = None;
 
             'passes: loop {
                 let remaining = budget - consumed;
@@ -458,13 +466,15 @@ impl PostgresStore {
                 for row in table {
                     // The first row of a pass past what is left of the budget, without its
                     // key, value and headers: nothing more fits.
+                    let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                     if !row.get_by_name::<bool, _>("whole")?.unwrap_or(false) {
-                        first_left_out = messages.is_empty();
+                        if messages.is_empty() {
+                            first_left_out = Some(partition_offset);
+                        }
                         break 'passes;
                     }
                     // cumulative_bytes restarts per query; add the running total.
                     let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
-                    let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                     let headers_json: Option<String> = row.get_by_name("headers_json")?;
                     messages.push(FetchedMessage {
                         partition_offset,
@@ -485,7 +495,7 @@ impl PostgresStore {
             }
 
             crate::pg_debug!(
-                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?}, first left out: {first_left_out})",
+                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?}, first left out: {first_left_out:?})",
                 messages.len()
             );
             Ok(FetchedRecords {
@@ -859,6 +869,18 @@ mod tests {
         );
         assert!(super::FETCH_ALL_SQL.contains("COALESCE(record_bytes, "));
         assert!(super::FETCH_COMMITTED_SQL.contains("COALESCE(record_bytes, "));
+    }
+
+    /// The read_committed bound's default is a constant: one naming `partition_offset` would
+    /// make the bound a per-row filter instead of the end of the index scan.
+    #[test]
+    fn the_last_stable_offset_bound_ends_the_scan() {
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sql = words(super::FETCH_COMMITTED_SQL);
+        assert!(
+            sql.contains("AND m2.txn_state = 'pending'), 9223372036854775807)"),
+            "{sql}"
+        );
     }
 
     #[test]

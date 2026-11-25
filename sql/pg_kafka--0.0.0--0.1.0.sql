@@ -723,8 +723,10 @@ AS $$
             + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
                    WHEN jsonb_typeof(headers) = 'array' THEN
                      (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                            / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
+                   WHEN jsonb_typeof(headers) <> 'object' THEN 0
                    ELSE
                      (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
                       FROM jsonb_each_text(headers) e(k, v))
@@ -763,7 +765,7 @@ COMMENT ON COLUMN kafka.messages.global_offset IS 'Monotonically increasing acro
 COMMENT ON COLUMN kafka.messages.partition_offset IS 'Per-partition offset starting at 0. Kafka clients use this for offset management. Computed atomically on INSERT, no gaps within a partition.';
 COMMENT ON COLUMN kafka.messages.key IS 'Optional message key (nullable). Used for partition routing in real Kafka.';
 COMMENT ON COLUMN kafka.messages.value IS 'Message payload (nullable for tombstone messages in log compaction)';
-COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. Kafka headers are key-value pairs (binary values base64-encoded).';
+COMMENT ON COLUMN kafka.messages.headers IS 'Record headers as JSONB: an array of [key, hex(value)] pairs in record order ([hex(key), hex(value), ''hex''] for a key holding U+0000), or ''{}'' when the record has none. Rows from before 0.1.0 may hold a {key: hex(value)} object.';
 COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional messages. NULL for non-transactional messages. (Phase 10)';
 COMMENT ON COLUMN kafka.messages.producer_epoch IS 'Producer epoch for fencing. Used with producer_id to identify unique producer instance. (Phase 10)';
 COMMENT ON COLUMN kafka.messages.txn_state IS 'Transaction state: NULL (committed or non-transactional), ''pending'' (uncommitted), ''aborted'' (rolled back). (Phase 10)';

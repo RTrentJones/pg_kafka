@@ -719,7 +719,7 @@ COMMENT ON COLUMN kafka.messages.key IS 'Optional message key (nullable). Used f
 
 COMMENT ON COLUMN kafka.messages.value IS 'Message payload (nullable for tombstone messages in log compaction)';
 
-COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. Kafka headers are key-value pairs (binary values base64-encoded).';
+COMMENT ON COLUMN kafka.messages.headers IS 'Record headers as JSONB: an array of [key, hex(value)] pairs in record order ([hex(key), hex(value), ''hex''] for a key holding U+0000), or ''{}'' when the record has none. Rows from before 0.1.0 may hold a {key: hex(value)} object.';
 
 COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional messages. NULL for non-transactional messages. (Phase 10)';
 

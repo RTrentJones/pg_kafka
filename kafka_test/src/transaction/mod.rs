@@ -16,6 +16,7 @@ mod hot_updates;
 mod invisible_offsets;
 mod isolation;
 mod kafka_parity;
+mod lso_reads;
 pub(crate) mod pending_reads;
 mod producer_epochs;
 mod timeouts;
@@ -49,6 +50,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         invisible_offsets::test_consumers_pass_cleaned_up_aborted_rows: sequential,
         invisible_offsets::test_consumers_pass_delete_records_gap,
         invisible_offsets::test_read_committed_consumer_stops_at_open_transaction,
+        invisible_offsets::test_invisible_offsets_before_a_record_that_does_not_fit_are_passed,
         validation::test_transactional_requests_are_validated,
         validation::test_transactional_produce_is_validated_per_partition,
         validation::test_transactional_batches_of_two_producers_are_refused,
@@ -68,5 +70,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         hot_updates::test_continuing_a_transaction_changes_no_indexed_column,
         // Sequential: it ends the worker twice to flush its statistics.
         pending_reads::test_ending_a_transaction_reads_only_its_own_pending_rows: sequential,
+        // Sequential: it ends the worker twice to flush its statistics.
+        lso_reads::test_read_committed_fetch_reads_only_to_the_last_stable_offset: sequential,
     ]
 }

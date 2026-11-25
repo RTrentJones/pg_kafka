@@ -333,3 +333,81 @@ pub async fn test_read_committed_consumer_stops_at_open_transaction() -> TestRes
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Offsets that hold nothing visible before a record that does not fit the response
+/// (here behind an earlier partition's records) are covered by a gap batch up to that
+/// record. An empty answer left the consumer at the same offset, and every fetch from it
+/// scanned the whole invisible run again.
+///
+/// Asserts: with partition 0 holding a 1 000-byte record and partition 1 holding 100
+/// aborted rows then a committed 5 000-byte record, a read_committed fetch of both with
+/// 1 000 bytes left after partition 0 returns partition 1 a gap batch over offsets 0..99;
+/// a fetch of partition 1 from 100 returns the record.
+pub async fn test_invisible_offsets_before_a_record_that_does_not_fit_are_passed() -> TestResult {
+    println!("=== Test: invisible offsets before a record that does not fit are passed ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "txn-nofit")
+        .with_partitions(2)
+        .build()
+        .await?
+        .name;
+    let first = vec![b'a'; 1000];
+    let producer = create_producer()?;
+    producer
+        .send(
+            FutureRecord::<(), _>::to(&topic)
+                .partition(0)
+                .payload(&first),
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    // A negative producer id: never issued, so nothing else touches the rows.
+    ctx.db()
+        .execute(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                         producer_id, producer_epoch, txn_state)
+             SELECT t.id, 1, g, CASE WHEN g = 100 THEN repeat('b', 5000)::bytea
+                                     ELSE 'x'::bytea END,
+                    CASE WHEN g < 100 THEN -1 END, CASE WHEN g < 100 THEN 0 END,
+                    CASE WHEN g < 100 THEN 'aborted' END
+             FROM kafka.topics t, generate_series(0, 100) AS g
+             WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    println!("Step 1: a 1000-byte record on partition 0, 100 aborted rows and a 5000-byte record on partition 1");
+
+    let mut wire = Wire::connect().await?;
+    // Partition 0's record counts 1 084 bytes (value and 84 of framing): 1 000 are left.
+    let parts = wire
+        .fetch_partitions(&topic, &[(0, 0), (1, 0)], 1084 + 1000, 1)
+        .await?;
+    assert_eq!(parts[0].error_code, 0);
+    assert_eq!(
+        batch_headers(&parts[0].records.clone().unwrap_or_default()),
+        vec![(0, 0, 1)],
+        "partition 0 returns its record"
+    );
+    assert_eq!(parts[1].error_code, 0);
+    assert_eq!(
+        batch_headers(&parts[1].records.clone().unwrap_or_default()),
+        vec![(0, 99, 1)],
+        "partition 1 returns a gap batch over its aborted offsets 0..99"
+    );
+    println!("Step 2: partition 1 answered a gap batch over offsets 0..99");
+
+    let parts = wire
+        .fetch_partitions(&topic, &[(0, 1), (1, 100)], 1084 + 1000, 1)
+        .await?;
+    assert_eq!(parts[1].error_code, 0);
+    assert_eq!(
+        batch_headers(&parts[1].records.clone().unwrap_or_default()),
+        vec![(100, 0, 1)],
+        "from 100, partition 1 returns its record"
+    );
+    println!("Step 3: from offset 100 the record is returned");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

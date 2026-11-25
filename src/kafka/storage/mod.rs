@@ -81,16 +81,17 @@ pub struct FetchedMessage {
 pub struct FetchedRecords {
     /// The records, in offset order.
     pub messages: Vec<FetchedMessage>,
-    /// The first visible record from the fetch offset was left out unread: it is larger than
-    /// the byte limit and the fetch did not allow it whole. `messages` is then empty.
-    pub first_left_out: bool,
+    /// The offset of the first visible record from the fetch offset when it was left out
+    /// unread: it is larger than the byte limit and the fetch did not allow it whole.
+    /// `messages` is then empty.
+    pub first_left_out: Option<i64>,
 }
 
 impl From<Vec<FetchedMessage>> for FetchedRecords {
     fn from(messages: Vec<FetchedMessage>) -> Self {
         Self {
             messages,
-            first_left_out: false,
+            first_left_out: None,
         }
     }
 }
@@ -413,7 +414,7 @@ pub trait LogStore {
     /// * `max_bytes` - Most bytes the records may add to the response
     /// * `whole_first_record` - Return the first record even when it alone is larger than
     ///   `max_bytes` (KIP-74: the first partition of a response with data). Without it such a
-    ///   record is not read at all; `first_left_out` reports it
+    ///   record is not read at all; `first_left_out` reports its offset
     /// * `isolation_level` - Consumer isolation level
     ///
     /// # Returns

@@ -101,7 +101,7 @@ The CONTAINER listener advertises `172.18.0.2:9095` instead of `external-kafka:9
 
 3. **Deterministic IP**: `docker-compose.yml` pins the `pg_kafka_network` subnet to `172.18.0.0/16` and gives `external-kafka` the static `ipv4_address: 172.18.0.2`, so the advertised address is stable across container recreation.
 
-4. **Host-run Postgres**: in CI, pg_kafka runs on the runner (pgrx-managed Postgres), where Docker's DNS name `external-kafka` does not resolve. The static IP is reachable from both the host and containers.
+4. **Host-run Postgres**: in CI, pg_kafka runs on the runner (PostgreSQL installed from apt.postgresql.org by `.github/actions/setup-pg`, the extension installed into it with `cargo pgrx install --pg-config`, the cluster started by `scripts/ci-pg.sh`), where Docker's DNS name `external-kafka` does not resolve. The static IP is reachable from both the host and containers.
 
 The test code reads the pg_kafka-side address from `INTERNAL_KAFKA_BOOTSTRAP_SERVERS` (default `172.18.0.2:9095`) and the host-side address from `EXTERNAL_KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9093`); see `kafka_test/src/shadow/external_client.rs`.
 
