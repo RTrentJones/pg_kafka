@@ -373,6 +373,13 @@ impl PostgresStore {
     /// same producer, in one compare-and-swap UPDATE (no check-then-act race). The
     /// timeout clock (`started_at`) starts when the transaction does, as Kafka's
     /// txnStartTimestamp does on Empty/Complete* -> Ongoing; continuing keeps it.
+    ///
+    /// Continuing (every AddPartitionsToTxn and AddOffsetsToTxn of the transaction)
+    /// changes no column at all, `last_updated_at` included: it is a key of
+    /// idx_transactions_terminal, and an UPDATE that changes any indexed column (or
+    /// partial-index predicate column) is never HOT, so it would write a new entry in
+    /// every index of kafka.transactions each time. `last_updated_at` is read only for
+    /// terminal rows (the retention sweep's prune), whose own transitions set it.
     pub(super) fn begin_or_continue_transaction(
         transactional_id: &str,
         producer_id: i64,
@@ -390,7 +397,9 @@ impl PostgresStore {
                      started_at = CASE WHEN state = 'Ongoing'
                                        THEN COALESCE(started_at, NOW())
                                        ELSE NOW() END,
-                     last_updated_at = NOW()
+                     last_updated_at = CASE WHEN state = 'Ongoing'
+                                            THEN last_updated_at
+                                            ELSE NOW() END
                  WHERE transactional_id = $1
                    AND producer_id = $2
                    AND producer_epoch = $3

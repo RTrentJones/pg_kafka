@@ -1113,7 +1113,8 @@ CREATE INDEX idx_transactions_producer
 ON kafka.transactions(producer_id);
 
 -- Terminal transactions oldest first: the retention sweep deletes the ones idle past
--- the transactional-id expiration through it, reading only those.
+-- the transactional-id expiration through it, reading only those (see bootstrap.sql:
+-- last_updated_at changes only with the state, so Ongoing updates stay HOT).
 CREATE INDEX idx_transactions_terminal
 ON kafka.transactions(last_updated_at)
 WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');

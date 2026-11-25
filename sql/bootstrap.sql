@@ -809,6 +809,8 @@ CREATE TABLE kafka.transactions (
     -- NOW() in the timeout sweep (`started_at < NOW() - (timeout_ms||'ms')::interval`),
     -- so a naive column skews the abort deadline by the session/DST offset.
     started_at TIMESTAMPTZ,
+    -- When the row last changed state (an Ongoing transaction's later
+    -- AddPartitionsToTxn/AddOffsetsToTxn leave it, so those updates stay HOT).
     last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -832,7 +834,9 @@ CREATE INDEX idx_transactions_producer
 ON kafka.transactions(producer_id);
 
 -- Terminal transactions oldest first: the retention sweep deletes the ones idle past
--- the transactional-id expiration through it, reading only those.
+-- the transactional-id expiration through it, reading only those. last_updated_at
+-- changes only with the state, so indexing it costs the updates that continue an Ongoing
+-- transaction nothing (they change no indexed column and stay HOT).
 CREATE INDEX idx_transactions_terminal
 ON kafka.transactions(last_updated_at)
 WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
