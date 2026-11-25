@@ -333,16 +333,12 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     Ok(())
 }
 
-/// The records a committed transaction forwards are read from kafka.messages at
-/// commit time, not from the in-RAM buffer filled at produce time. That buffer is
-/// lost on a worker restart, and it is removed before the commit runs (so a failed
-/// commit that the client retries also lost it); either way the transaction
-/// committed locally and nothing reached the external cluster.
-///
-/// The test empties the buffer deterministically: the records are produced while
-/// the topic is not yet shadowed (nothing is buffered), then shadowing is enabled
-/// and the transaction committed. Forwarding is decided at commit time (the
-/// commit path already re-checks the topic's config), so the records must arrive.
+/// The records a committed transaction forwards are found in kafka.messages at
+/// commit time, not in worker memory filled at produce time (which a worker restart
+/// would lose, so the transaction would commit locally and never reach the external
+/// cluster). The records are produced while the topic is not yet shadowed, then
+/// shadowing is enabled and the transaction committed: forwarding is decided at
+/// commit time, so the records must arrive.
 pub async fn test_committed_transaction_forwards_without_ram_buffer() -> TestResult {
     println!("=== Test: Committed Transaction Forwards Without The RAM Buffer ===\n");
 
@@ -386,6 +382,152 @@ pub async fn test_committed_transaction_forwards_without_ram_buffer() -> TestRes
         .await?;
     println!("✅ Committed record reached external Kafka\n");
 
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// RssAnon of a process in bytes (the worker's private heap, not the shared buffers it
+/// touches), if `/proc/<pid>/status` is readable.
+fn rss_anon_bytes(pid: i32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Records of the large transaction, on each of its two topics: a first part that warms
+/// the worker up (plan and relation caches, allocator arenas), then the measured rest.
+const LARGE_TXN_WARMUP_RECORDS: usize = 50_000;
+const LARGE_TXN_RECORDS: usize = 250_000;
+
+/// The worker's private memory may grow by at most this much while the measured
+/// 200,000 records of each topic go into the open transaction: holding a per-record
+/// forward buffer in RAM grows it by about 50 MB there.
+const LARGE_TXN_GROWTH_BOUND: u64 = 8 * 1024 * 1024;
+
+/// A large committed transaction on two shadowed topics, one forwarding everything and
+/// one half of its records (keyless records route by `offset % 100`, so the expected half
+/// is known): every record the routing selects gets exactly one outbox row at the commit,
+/// none other does, and the worker holds nothing per record while the transaction is
+/// open (its records are read from kafka.messages at the commit).
+pub async fn test_large_committed_transaction_is_enqueued_exactly_once() -> TestResult {
+    println!("=== Test: a large committed transaction is enqueued exactly once ===\n");
+    let ctx = TestContext::new().await?;
+    let full = ctx.unique_topic("txn-large-full").await;
+    let half = ctx.unique_topic("txn-large-half").await;
+    let txn_id = format!("shadow-large-{}", ctx.test_id);
+    verify_external_kafka_ready().await?;
+    for (topic, forward_percentage) in [(&full, 100), (&half, 50)] {
+        enable_shadow_mode(
+            ctx.db(),
+            topic,
+            &ShadowTopicConfig {
+                mode: ShadowMode::Shadow,
+                forward_percentage,
+                external_topic_name: None,
+                sync_mode: SyncMode::Async,
+                write_mode: WriteMode::DualWrite,
+            },
+        )
+        .await?;
+    }
+    let pid = crate::worker::listener_pid(ctx.db())
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("no pg_kafka_listener")?;
+
+    let producer: rdkafka::producer::FutureProducer = rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", crate::common::get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("transactional.id", &txn_id)
+        .set("linger.ms", "20")
+        .set("queue.buffering.max.messages", "1000000")
+        .set("message.timeout.ms", "120000")
+        .set("transaction.timeout.ms", "300000")
+        .create()?;
+    producer.init_transactions(Duration::from_secs(10))?;
+    producer.begin_transaction()?;
+    println!("Step 1: {LARGE_TXN_RECORDS} keyed records to {full}, as many keyless to {half}...");
+    let value = vec![b'v'; 32];
+    let mut before = None;
+    let mut sent: Vec<rdkafka::producer::DeliveryFuture> =
+        Vec::with_capacity(2 * LARGE_TXN_RECORDS);
+    for i in 0..LARGE_TXN_RECORDS {
+        if i == LARGE_TXN_WARMUP_RECORDS {
+            for delivery in sent.drain(..) {
+                delivery.await?.map_err(|(e, _)| e)?;
+            }
+            before = rss_anon_bytes(pid);
+        }
+        let key = format!("{i:064}");
+        sent.push(
+            producer
+                .send_result(FutureRecord::to(&full).key(&key).payload(&value))
+                .map_err(|(e, _)| e)?,
+        );
+        sent.push(
+            producer
+                .send_result(FutureRecord::<(), _>::to(&half).payload(&value))
+                .map_err(|(e, _)| e)?,
+        );
+    }
+    for delivery in sent {
+        delivery.await?.map_err(|(e, _)| e)?;
+    }
+    let after = rss_anon_bytes(pid);
+    println!("Step 2: committing...");
+    producer.commit_transaction(Duration::from_secs(120))?;
+
+    println!("=== Database Verification ===\n");
+    for topic in [&full, &half] {
+        // A record is selected when its topic forwards everything, or for the half topic
+        // when `partition_offset % 100 < 50` (a keyless record routes by its offset).
+        let row = ctx
+            .db()
+            .query_one(
+                "WITH t AS (SELECT id, name = $2 AS sampled FROM kafka.topics WHERE name = $1),
+                 sel AS (SELECT m.partition_id, m.partition_offset FROM kafka.messages m, t
+                         WHERE m.topic_id = t.id AND m.txn_state IS NULL
+                           AND (NOT t.sampled OR m.partition_offset % 100 < 50)),
+                 enq AS (SELECT s.partition_id, s.local_offset FROM kafka.shadow_tracking s, t
+                         WHERE s.topic_id = t.id)
+                 SELECT (SELECT COUNT(*) FROM kafka.messages m, t
+                           WHERE m.topic_id = t.id AND m.txn_state IS NULL),
+                        (SELECT COUNT(*) FROM sel),
+                        (SELECT COUNT(*) FROM enq),
+                        (SELECT COUNT(*) FROM (SELECT * FROM sel EXCEPT SELECT * FROM enq) x),
+                        (SELECT COUNT(*) FROM (SELECT * FROM enq EXCEPT SELECT * FROM sel) x)",
+                &[topic, &half],
+            )
+            .await?;
+        let (committed, selected, enqueued, missing, unexpected): (i64, i64, i64, i64, i64) =
+            (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+        println!(
+            "{topic}: {committed} committed, {selected} selected, {enqueued} enqueued \
+             ({missing} missing, {unexpected} unexpected)"
+        );
+        assert_eq!(committed, i64::try_from(LARGE_TXN_RECORDS)?);
+        assert!(selected > 0);
+        assert_eq!(
+            (enqueued, missing, unexpected),
+            (selected, 0, 0),
+            "{topic}: exactly the records routing selects are enqueued, once each"
+        );
+    }
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let growth = after.saturating_sub(before);
+            println!(
+                "Worker RssAnon while the transaction was open: {before} -> {after} (+{growth})"
+            );
+            assert!(
+                growth <= LARGE_TXN_GROWTH_BOUND,
+                "the worker grew by {growth} bytes while the transaction was open"
+            );
+        }
+        _ => println!("/proc/{pid}/status is not readable here; memory not checked"),
+    }
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

@@ -21,17 +21,12 @@
 use super::config::TopicShadowConfig;
 use super::{ForwardRecord, KeyColumns, RowKey};
 use crate::kafka::error::Result;
+use std::collections::HashMap;
 
-/// A transactional record's outbox pointer: the row key plus the record key
-/// (used only for percentage routing at enqueue time). The payload is re-read
-/// from `kafka.messages` by the forwarder.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PendingForwardRecord {
-    /// The record's row (and future outbox row).
-    pub row: RowKey,
-    /// Record key, used only for percentage routing at enqueue time.
-    pub key: Option<Vec<u8>>,
-}
+/// Rows of a transaction read per fetch when its sampled topics' records are routed
+/// at commit ([`ShadowDb::enqueue_pending_txn_records`]): what the worker holds at once,
+/// however large the transaction.
+pub const TXN_ENQUEUE_CHUNK: i64 = 1000;
 
 /// The shadow GUCs the outbox reads on the DB thread (Sighup: read per use, so
 /// a reload takes effect at once and a session-level SET cannot fake one).
@@ -186,17 +181,23 @@ pub trait ShadowDb {
     /// (`kafka.shadow_metrics.messages_skipped`), in the current transaction.
     fn record_skipped(&self, topic_id: i32, partition_id: i32, n: i64) -> Result<()>;
 
-    /// The pending (uncommitted) records of a producer's transaction, read from
-    /// `kafka.messages`, ordered by row key. `None` if the lookup failed.
-    fn pending_txn_records(
+    /// Insert, in the current transaction, a pending outbox row for each pending
+    /// (uncommitted) record of the producer's transaction that routing selects: every
+    /// record on a topic of `forward_all`, and on a topic of `sampled`
+    /// (`(topic_id, forward_percentage)`, below 100) each one [`make_forward_decision`]
+    /// forwards. Existing rows are left alone. Returns how many records of each
+    /// `(topic_id, partition_id)` were sampled out. Memory stays bounded whatever the
+    /// size of the transaction: the `forward_all` records are enqueued by one
+    /// `INSERT ... SELECT`, the sampled ones read [`TXN_ENQUEUE_CHUNK`] rows at a time.
+    ///
+    /// [`make_forward_decision`]: super::routing::make_forward_decision
+    fn enqueue_pending_txn_records(
         &self,
         producer_id: i64,
         producer_epoch: i16,
-    ) -> Option<Vec<PendingForwardRecord>>;
-
-    /// Which of these `(producer_id, producer_epoch)` pairs have a transaction
-    /// still Ongoing in `kafka.transactions`. `None` if the lookup failed.
-    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>>;
+        forward_all: &[i32],
+        sampled: &[(i32, u8)],
+    ) -> Result<HashMap<(i32, i32), u64>>;
 
     /// Claim due outbox rows and return a forward record (payload, headers,
     /// timestamp, external topic name) for each, ordered by row key.
@@ -743,12 +744,9 @@ impl ShadowDb for SpiShadowDb {
         let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
             // Only enqueue an outbox pointer when the backing kafka.messages
-            // row exists. The live-produce enqueue runs in the same
-            // subtransaction as the message insert, so the row is always
-            // visible there. On the txn commit path it drops orphan pointers
-            // left by a transactional produce that buffered offsets in RAM but
-            // whose message rows were rolled back (a panic mid-txn), which
-            // would otherwise be never-claimed, never-cleaned rows. One
+            // row exists, so a pointer can never outlive a write that was not
+            // made: the live-produce enqueue runs in the same subtransaction as
+            // the message insert, so the row is always visible there. One
             // statement per batch; the LATERAL + LIMIT 1 keeps the check an
             // index probe per row (an EXISTS is planned as a hash join over
             // every message).
@@ -789,77 +787,106 @@ impl ShadowDb for SpiShadowDb {
         })
     }
 
-    fn pending_txn_records(
+    fn enqueue_pending_txn_records(
         &self,
         producer_id: i64,
         producer_epoch: i16,
-    ) -> Option<Vec<PendingForwardRecord>> {
+        forward_all: &[i32],
+        sampled: &[(i32, u8)],
+    ) -> Result<HashMap<(i32, i32), u64>> {
+        use super::routing::{make_forward_decision, ForwardDecision};
         use pgrx::prelude::*;
-        let result: std::result::Result<Vec<PendingForwardRecord>, spi::SpiError> =
-            Spi::connect(|client| {
-                let table = client.select(
-                    "SELECT topic_id, partition_id, partition_offset, key
-                     FROM kafka.messages
-                     WHERE producer_id = $1 AND producer_epoch = $2 AND txn_state = 'pending'
-                     ORDER BY topic_id, partition_id, partition_offset",
+        // Both statements lead with the topic on idx_messages_txn_pending (the
+        // pending rows only), then keep the producer's: no other topic's rows and no
+        // committed row are read. No ORDER BY: the outbox claim orders the rows.
+        if !forward_all.is_empty() {
+            Spi::connect_mut(|client| {
+                client.update(
+                    "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
+                     SELECT m.topic_id, m.partition_id, m.partition_offset \
+                     FROM kafka.messages m \
+                     WHERE m.topic_id = ANY($3::int4[]) AND m.txn_state = 'pending' \
+                       AND m.producer_id = $1 AND m.producer_epoch = $2 \
+                     ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
                     None,
-                    &[producer_id.into(), producer_epoch.into()],
+                    &[
+                        producer_id.into(),
+                        producer_epoch.into(),
+                        forward_all.to_vec().into(),
+                    ],
                 )?;
-                let mut records = Vec::new();
-                for row in table {
-                    records.push(PendingForwardRecord {
-                        row: RowKey::new(
-                            row.get_by_name("topic_id")?.unwrap_or(0),
-                            row.get_by_name("partition_id")?.unwrap_or(0),
-                            row.get_by_name("partition_offset")?.unwrap_or(0),
-                        ),
-                        key: row.get_by_name::<Vec<u8>, _>("key")?,
-                    });
-                }
-                Ok(records)
-            });
-        match result {
-            Ok(records) => Some(records),
-            Err(e) => {
-                tracing::warn!("Shadow: failed to read pending txn records: {:?}", e);
-                None
-            }
+                Ok::<(), spi::SpiError>(())
+            })?;
         }
-    }
-
-    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
-        use pgrx::prelude::*;
-        if keys.is_empty() {
-            return Some(Vec::new());
+        let mut skipped: HashMap<(i32, i32), u64> = HashMap::new();
+        if sampled.is_empty() {
+            return Ok(skipped);
         }
-        let producer_ids: Vec<i64> = keys.iter().map(|&(id, _)| id).collect();
-        let epochs: Vec<i16> = keys.iter().map(|&(_, epoch)| epoch).collect();
-        let result: std::result::Result<Vec<(i64, i16)>, spi::SpiError> = Spi::connect(|client| {
-            let table = client.select(
-                "SELECT t.producer_id, t.producer_epoch \
-                 FROM kafka.transactions t \
-                 JOIN unnest($1::int8[], $2::int2[]) AS k(id, epoch) \
-                   ON t.producer_id = k.id AND t.producer_epoch = k.epoch \
-                 WHERE t.state = 'Ongoing'",
-                None,
-                &[producer_ids.into(), epochs.into()],
+        // A sampled topic's decision needs the record key's murmur2 hash, so its
+        // records are routed here, a chunk at a time through a cursor. Each chunk is
+        // fetched and inserted in its own SPI connection, whose end frees that
+        // chunk's tuple table.
+        let percentage: HashMap<i32, u8> = sampled.iter().copied().collect();
+        let topic_ids: Vec<i32> = sampled.iter().map(|&(topic_id, _)| topic_id).collect();
+        let cursor = Spi::connect_mut(|client| {
+            let cursor = client.try_open_cursor_mut(
+                "SELECT m.topic_id, m.partition_id, m.partition_offset, m.key \
+                 FROM kafka.messages m \
+                 WHERE m.topic_id = ANY($3::int4[]) AND m.txn_state = 'pending' \
+                   AND m.producer_id = $1 AND m.producer_epoch = $2",
+                &[producer_id.into(), producer_epoch.into(), topic_ids.into()],
             )?;
-            let mut ongoing = Vec::new();
-            for row in table {
-                ongoing.push((
-                    row.get_by_name("producer_id")?.unwrap_or(0),
-                    row.get_by_name("producer_epoch")?.unwrap_or(0),
-                ));
-            }
-            Ok(ongoing)
-        });
-        match result {
-            Ok(ongoing) => Some(ongoing),
-            Err(e) => {
-                tracing::warn!("Shadow: failed to read the open transactions: {e:?}");
-                None
+            Ok::<String, spi::SpiError>(cursor.detach_into_name())
+        })?;
+        loop {
+            let fetched = Spi::connect_mut(|client| {
+                let mut cursor = client.find_cursor(&cursor)?;
+                let mut rows: Vec<RowKey> = Vec::new();
+                let mut fetched = 0usize;
+                for row in cursor.fetch(TXN_ENQUEUE_CHUNK)? {
+                    fetched += 1;
+                    let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                    let key = RowKey::new(
+                        topic_id,
+                        row.get_by_name("partition_id")?.unwrap_or(0),
+                        row.get_by_name("partition_offset")?.unwrap_or(0),
+                    );
+                    let record_key: Option<Vec<u8>> = row.get_by_name("key")?;
+                    let pct = percentage.get(&topic_id).copied().unwrap_or(0);
+                    match make_forward_decision(record_key.as_deref(), key.local_offset, pct) {
+                        ForwardDecision::Forward => rows.push(key),
+                        ForwardDecision::Skip => {
+                            *skipped.entry(key.partition()).or_default() += 1;
+                        }
+                    }
+                }
+                // Keep the cursor open for the next chunk (dropping it closes it).
+                cursor.detach_into_name();
+                if !rows.is_empty() {
+                    let keys: KeyColumns = rows.iter().collect();
+                    client.update(
+                        "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset) \
+                         SELECT * FROM unnest($1::int4[], $2::int4[], $3::int8[]) \
+                         ON CONFLICT (topic_id, partition_id, local_offset) DO NOTHING",
+                        None,
+                        &[
+                            keys.topic_ids.into(),
+                            keys.partition_ids.into(),
+                            keys.local_offsets.into(),
+                        ],
+                    )?;
+                }
+                Ok::<usize, spi::SpiError>(fetched)
+            })?;
+            if fetched == 0 {
+                break;
             }
         }
+        Spi::connect(|client| {
+            drop(client.find_cursor(&cursor)?);
+            Ok::<(), spi::SpiError>(())
+        })?;
+        Ok(skipped)
     }
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows> {

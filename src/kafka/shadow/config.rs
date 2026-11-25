@@ -326,6 +326,16 @@ impl TopicConfigCache {
         super::read_lock(&self.configs).get(&topic_id).cloned()
     }
 
+    /// Every topic that forwards ([`TopicShadowConfig::should_forward`]), with its
+    /// forward percentage.
+    pub fn forwarding_topics(&self) -> Vec<(i32, u8)> {
+        super::read_lock(&self.configs)
+            .values()
+            .filter(|c| c.should_forward())
+            .map(|c| (c.topic_id, c.forward_percentage))
+            .collect()
+    }
+
     /// Insert or replace one topic's configuration.
     #[cfg(test)]
     pub fn update(&self, config: TopicShadowConfig) {

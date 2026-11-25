@@ -199,11 +199,16 @@ suppression is lifted and the topic is served locally again, so a record is neve
 
 ### Transactional Produce
 
-`insert_transactional_records()` writes locally and, if the topic forwards, buffers the records'
-keys in RAM. `commit_transaction()` reads the transaction's records from `kafka.messages` (falling
-back to the RAM buffer), commits, re-checks the topic config, routes them and inserts their outbox
-rows in the commit transaction. An abort discards them. Transactional records are forwarded by the
-outbox tick (they are never held as sync).
+`insert_transactional_records()` only writes locally; nothing is kept in worker memory for an
+open transaction. `commit_transaction()`, before the inner commit and in the same transaction,
+enqueues the producer's pending records of every forwarding topic, routed by the topic config at
+commit time: for a topic at 100% one `INSERT INTO kafka.shadow_tracking ... SELECT ... FROM
+kafka.messages` (no record passes through the worker), for a sampled topic a cursor read
+`TXN_ENQUEUE_CHUNK` rows at a time, routed by `make_forward_decision` as a plain produce is. An
+existing outbox row is left alone (`ON CONFLICT DO NOTHING`), so a retried EndTxn or a worker
+restart neither loses nor duplicates a record; a failed enqueue fails the EndTxn, whose request
+rolls back whole. An abort enqueues nothing. Transactional records are forwarded by the outbox tick
+(they are never held as sync).
 
 ## Sync vs Async Forwarding
 

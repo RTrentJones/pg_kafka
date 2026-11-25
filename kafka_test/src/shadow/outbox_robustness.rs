@@ -27,7 +27,6 @@
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
-use crate::worker::ServerLog;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::time::{Duration, Instant};
@@ -661,11 +660,11 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
 }
 
 /// A transaction left open by a producer that went away is aborted by the
-/// timeout sweep; the sweep also drops the records the shadow store buffered
-/// for it (they can never be committed), instead of keeping them for the life
-/// of the worker. Needs the server log (the listener's stderr as a file).
-pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult {
-    println!("=== Test: the timeout sweep drops an abandoned transaction's buffer ===\n");
+/// timeout sweep, and nothing of it is ever forwarded: the shadow store keeps
+/// nothing for an open transaction (its records are enqueued at commit, from
+/// kafka.messages), so the abort leaves no outbox row and nothing to drop.
+pub async fn test_shadow_timed_out_transaction_is_not_forwarded() -> TestResult {
+    println!("=== Test: an abandoned transaction's records are never forwarded ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-txn-abandoned").await;
     verify_external_kafka_ready().await?;
@@ -675,11 +674,6 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
         &config(ShadowMode::Shadow, SyncMode::Async),
     )
     .await?;
-    let log = ServerLog::open(ctx.db())
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("the server log is not readable (listener stderr is not a regular file)")?;
-    let log_from = log.end();
 
     println!("Step 1: a transactional produce, never committed (transaction.timeout.ms=2000)...");
     let txn_id = format!("shadow-abandoned-{}", uuid::Uuid::new_v4());
@@ -700,12 +694,7 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
         .await
         .map_err(|(e, _)| e)?;
 
-    // The log line does not name the transaction (a sweep can drop the buffer of
-    // another test's abandoned transaction too), so this transaction's abort is
-    // awaited as well: once the sweep that aborted it has run, its buffer is gone,
-    // and the line is in the log.
-    println!("Step 2: wait for the sweep (every 10 s) to abort it and drop its buffer...");
-    let needle = "forward buffer(s) of transactions that are no longer open";
+    println!("Step 2: wait for the sweep (every 10 s) to abort it...");
     let start = Instant::now();
     loop {
         let state: Option<String> = ctx
@@ -716,27 +705,38 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
             )
             .await?
             .map(|row| row.get(0));
-        let aborted = state.as_deref() == Some("CompleteAbort");
-        if aborted && log.since(log_from).contains(needle) {
+        if state.as_deref() == Some("CompleteAbort") {
             break;
         }
         if start.elapsed() > Duration::from_secs(40) {
             drop(producer);
             ctx.cleanup().await?;
-            return Err(format!(
-                "within 40 s the transaction is {state:?} (expected CompleteAbort) and \
-                 \"{needle}\" is {}in the server log",
-                if log.since(log_from).contains(needle) {
-                    ""
-                } else {
-                    "not "
-                }
-            )
-            .into());
+            return Err(
+                format!("within 40 s the transaction is {state:?}, not CompleteAbort").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    println!("  buffer dropped after {:?}", start.elapsed());
+    println!("  aborted after {:?}", start.elapsed());
+
+    let row = ctx
+        .db()
+        .query_one(
+            "SELECT
+               (SELECT COUNT(*) FROM kafka.messages m WHERE m.topic_id = t.id
+                  AND m.txn_state = 'aborted'),
+               (SELECT COUNT(*) FROM kafka.shadow_tracking s WHERE s.topic_id = t.id)
+             FROM kafka.topics t WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    let (aborted, enqueued): (i64, i64) = (row.get(0), row.get(1));
+    assert_eq!(aborted, 1, "the record is aborted");
+    assert_eq!(
+        enqueued, 0,
+        "nothing of the aborted transaction is enqueued"
+    );
+    super::assertions::assert_external_kafka_empty(&topic, Duration::from_secs(3)).await?;
 
     drop(producer);
     ctx.cleanup().await?;
