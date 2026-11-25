@@ -47,7 +47,10 @@
 //! 2. **A pass costs at most the budget plus one turn per step.** Phase 1 is one turn per
 //!    step; phase 2 starts a turn only within the budget, so a pass ends by
 //!    `max(budget + one turn, one turn per step)`. (Plus the pass's fixed setup reads and
-//!    its final log-start update, each one statement.)
+//!    its final log-start update, each one statement.) The planning between the
+//!    statements is O(n log n) in what the pass reads and holds (topics, leaves, found
+//!    work), so no turn hides work the budget does not see: a lap's push is O(log n)
+//!    ([`Lap`]) and a probe replaces only its own leaf's trims ([`FoundWork`]).
 //! 3. **No share is wasted while a step has work.** Phase 2 stops only at the budget or
 //!    when no step has work; the time one step does not use goes to the others, and a
 //!    step with work all pass gets at least `budget / steps - one turn` of it (each turn
@@ -59,7 +62,7 @@
 //!    that does it can come in any later pass; the steps also take work found earlier in
 //!    the same pass.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -190,8 +193,15 @@ fn take_turn<C: PassClock, E>(
 /// `cap` of them. Each turn serves the current item; the cursor then holds its key, so
 /// the next pass starts after it, and the lap moves on once the item is caught up.
 /// Items found during the pass ([`Lap::push`]) join at the end.
+///
+/// Cost: building a lap of `n` items takes O(n log n) key comparisons and O(n) memory
+/// (the items and a set of their keys); each push O(log n), so a probe that finds a
+/// trim for each of a leaf's `T` topics adds them in O(T log n), not one scan of the
+/// lap per trim.
 pub struct Lap<'c, K, T> {
     items: Vec<(K, T)>,
+    /// The keys of `items`, for [`Lap::push`]'s duplicate check.
+    keys: BTreeSet<K>,
     pos: usize,
     cap: usize,
     cursor: &'c KeyCursor<K>,
@@ -202,12 +212,13 @@ impl<'c, K: Ord + Copy, T> Lap<'c, K, T> {
     pub fn new(mut items: Vec<(K, T)>, cursor: &'c KeyCursor<K>, cap: usize) -> Self {
         items.sort_by_key(|item| item.0);
         items.dedup_by(|later, first| later.0 == first.0);
-        let keys: Vec<K> = items.iter().map(|(k, _)| *k).collect();
-        let start = cursor.start(&keys);
+        let start = cursor.start_in(&items);
         items.rotate_left(start);
         items.truncate(cap);
+        let keys = items.iter().map(|(k, _)| *k).collect();
         Lap {
             items,
+            keys,
             pos: 0,
             cap,
             cursor,
@@ -237,7 +248,7 @@ impl<'c, K: Ord + Copy, T> Lap<'c, K, T> {
 
     /// Add an item found during the pass, unless the lap already has it or is full.
     pub fn push(&mut self, key: K, item: T) {
-        if self.items.len() < self.cap && !self.items.iter().any(|(k, _)| *k == key) {
+        if self.items.len() < self.cap && self.keys.insert(key) {
             self.items.push((key, item));
         }
     }
@@ -333,6 +344,22 @@ impl<K: Ord + Copy> KeyCursor<K> {
     /// Where this pass starts in `sorted_keys` (ascending).
     pub fn start(&self, sorted_keys: &[K]) -> usize {
         start_after(sorted_keys, self.get().as_ref())
+    }
+
+    /// Where this pass starts in `sorted` (ascending by key): [`KeyCursor::start`] over
+    /// the items' keys, by binary search.
+    fn start_in<T>(&self, sorted: &[(K, T)]) -> usize {
+        match self.get() {
+            None => 0,
+            Some(c) => {
+                let at = sorted.partition_point(|(k, _)| *k <= c);
+                if at < sorted.len() {
+                    at
+                } else {
+                    0
+                }
+            }
+        }
     }
 }
 
@@ -533,12 +560,26 @@ pub struct FoundDrop {
 /// window that expires the whole leaf. So a probe's finding does not depend on the
 /// expiry or drop step reaching it in the same pass.
 ///
-/// Size: at most one drop per past leaf and one trim per (topic, past leaf) pair.
+/// Size: at most one drop per past leaf and one trim per (topic, past leaf) pair the
+/// probes found holding rows. Cost: a probe replaces only its own leaf's trims, in
+/// O(r log n) for `r` trims there before and after (an index by leaf, not a scan of all
+/// trims); [`FoundWork::retain_current`] and [`FoundWork::trims`] are linear in the
+/// found work, once per pass.
 #[derive(Debug, Default)]
 pub struct FoundWork {
     drops: BTreeMap<i64, FoundDrop>,
-    /// (topic, leaf key) -> leaf oid.
-    trims: BTreeMap<(i32, i64), u32>,
+    /// Leaf key -> that leaf's trims.
+    trims: BTreeMap<i64, LeafTrims>,
+    /// Trim entries [`FoundWork::record_probe`] examined, for the cost tests.
+    #[cfg(test)]
+    probe_work: u64,
+}
+
+/// The found trims in one leaf: its oid and the wholly expired topics.
+#[derive(Debug)]
+struct LeafTrims {
+    oid: u32,
+    topics: BTreeSet<i32>,
 }
 
 impl FoundWork {
@@ -546,13 +587,21 @@ impl FoundWork {
         FoundWork {
             drops: BTreeMap::new(),
             trims: BTreeMap::new(),
+            #[cfg(test)]
+            probe_work: 0,
         }
     }
 
     /// Record what a probe of `leaf` decided; it replaces whatever was found there before.
     pub fn record_probe(&mut self, leaf: &TimePartition, action: &LeafAction) {
         let key = leaf_key(leaf);
-        self.trims.retain(|&(_, k), _| k != key);
+        let replaced = self.trims.remove(&key).map_or(0, |t| t.topics.len());
+        #[cfg(test)]
+        {
+            self.probe_work += u64::try_from(replaced).unwrap_or(u64::MAX);
+        }
+        #[cfg(not(test))]
+        let _ = replaced;
         self.drops.remove(&key);
         match action {
             LeafAction::Drop { expired_topics } => {
@@ -564,12 +613,16 @@ impl FoundWork {
                     },
                 );
             }
-            LeafAction::Trim { topics } => {
-                for &topic in topics {
-                    self.trims.insert((topic, key), leaf.oid);
-                }
+            LeafAction::Trim { topics } if !topics.is_empty() => {
+                self.trims.insert(
+                    key,
+                    LeafTrims {
+                        oid: leaf.oid,
+                        topics: topics.iter().copied().collect(),
+                    },
+                );
             }
-            LeafAction::Keep => {}
+            LeafAction::Trim { .. } | LeafAction::Keep => {}
         }
     }
 
@@ -605,8 +658,13 @@ impl FoundWork {
                     .iter()
                     .all(|&topic| wholly_expired(k, now_ms, window_of(topic)))
         });
-        self.trims.retain(|&(topic, k), oid| {
-            past.get(&k) == Some(oid) && wholly_expired(k, now_ms, window_of(topic))
+        self.trims.retain(|&k, leaf| {
+            if past.get(&k) != Some(&leaf.oid) {
+                return false;
+            }
+            leaf.topics
+                .retain(|&topic| wholly_expired(k, now_ms, window_of(topic)));
+            !leaf.topics.is_empty()
         });
     }
 
@@ -620,9 +678,12 @@ impl FoundWork {
         self.drops.get(&key).is_some_and(|d| d.oid == oid)
     }
 
-    /// The found trims: ((topic, leaf key), leaf oid).
+    /// The found trims: ((topic, leaf key), leaf oid), by leaf, then topic.
     pub fn trims(&self) -> Vec<((i32, i64), u32)> {
-        self.trims.iter().map(|(k, oid)| (*k, *oid)).collect()
+        self.trims
+            .iter()
+            .flat_map(|(&k, leaf)| leaf.topics.iter().map(move |&t| ((t, k), leaf.oid)))
+            .collect()
     }
 
     /// The drop of the leaf with this key was tried: dropped, or refused by its re-check.
@@ -631,8 +692,13 @@ impl FoundWork {
     }
 
     /// The trim with this key is caught up.
-    pub fn trim_done(&mut self, key: (i32, i64)) {
-        self.trims.remove(&key);
+    pub fn trim_done(&mut self, (topic, leaf_key): (i32, i64)) {
+        if let Some(leaf) = self.trims.get_mut(&leaf_key) {
+            leaf.topics.remove(&topic);
+            if leaf.topics.is_empty() {
+                self.trims.remove(&leaf_key);
+            }
+        }
     }
 }
 
@@ -730,6 +796,8 @@ pub fn partition_width_ms(minutes: i32) -> i64 {
     i64::from(minutes.clamp(MIN_PARTITION_MINUTES, MAX_PARTITION_MINUTES)) * MS_PER_MINUTE
 }
 
+#[cfg(test)]
+mod cost_tests;
 #[cfg(test)]
 mod scheduling_tests;
 

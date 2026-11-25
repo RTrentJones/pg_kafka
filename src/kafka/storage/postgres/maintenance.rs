@@ -260,6 +260,7 @@ impl PostgresStore {
             let default_has_rows = default_leaf_has_rows(client, partitioned)?;
             let partitions: Vec<TimePartition> =
                 leaves.iter().map(|l| l.partition.clone()).collect();
+            let by_oid: HashMap<u32, &Leaf> = leaves.iter().map(|l| (l.partition.oid, l)).collect();
             let state = &SWEEP_STATE;
             let mut found = state.found();
             found.retain_current(&partitions, now_ms, |t| windows.window(t));
@@ -268,11 +269,11 @@ impl PostgresStore {
             let (probe, check_empty) = retention::split_past_leaves(&partitions, now_ms, shortest);
             let check_empty: Vec<&Leaf> = check_empty
                 .iter()
-                .filter_map(|p| leaves.iter().find(|l| l.partition.oid == p.oid))
+                .filter_map(|p| by_oid.get(&p.oid).copied())
                 .collect();
             for oid in empty_leaves(client, &check_empty)? {
-                if let Some(leaf) = partitions.iter().find(|l| l.oid == oid) {
-                    found.record_empty(leaf);
+                if let Some(leaf) = by_oid.get(&oid) {
+                    found.record_empty(&leaf.partition);
                 }
             }
 
@@ -300,7 +301,7 @@ impl PostgresStore {
                     &state.expiry,
                     usize::MAX,
                 ),
-                leaves: &leaves,
+                leaves: &by_oid,
                 partitioned,
             };
             let drops_allowed = read_committed(client)?;
@@ -847,9 +848,13 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for ProbeStep<'_> {
 /// its topic_id-prefixed unique index. Pending transactional rows are never deleted.
 /// The window is built by multiplication: PG14 rejects a text 'N milliseconds' literal
 /// above the int32 range.
+///
+/// Cost per turn: the statement, a hash lookup of its leaf, and pushing the trims this
+/// pass's probes found since the last turn (O(log n) each, [`Lap::push`]).
 struct ExpiryStep<'l> {
     lap: Lap<'static, (i32, i64), ExpiryItem>,
-    leaves: &'l [Leaf],
+    /// The leaves by oid.
+    leaves: &'l HashMap<u32, &'l Leaf>,
     partitioned: bool,
 }
 
@@ -865,10 +870,7 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for ExpiryStep<'_> {
         let Some(&(key, item)) = self.lap.current() else {
             return Ok(());
         };
-        let leaf = self
-            .leaves
-            .iter()
-            .find(|l| l.partition.oid == item.leaf_oid);
+        let leaf = self.leaves.get(&item.leaf_oid).copied();
         let target = match leaf {
             Some(leaf) => delete_target(leaf, self.partitioned),
             None if !self.partitioned => DeleteTarget::Unpartitioned,

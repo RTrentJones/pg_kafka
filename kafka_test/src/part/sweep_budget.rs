@@ -534,6 +534,126 @@ async fn expiry_rotation() -> SendResult<()> {
     Ok(())
 }
 
+/// Wholly expired topics in the kept leaf of the probe-cost test, one row each: a client
+/// can create this many one-partition topics (the default cap is 200,000 partitions),
+/// each with a short `retention.ms`.
+const PROBED_TOPICS: i32 = 100_000;
+/// What that test's pass may take: the 1.5 s budget, one turn per step (the probe of the
+/// leaf reads one btree descent per topic), and slack for a loaded host. When the expiry
+/// step checked each new trim against every item of its lap, the turn after the probe
+/// took about 5.7 s, which the budget does not see.
+const PROBE_PASS_LIMIT: Duration = Duration::from_millis(4_000);
+
+/// A probe can find a trim for every topic of a kept leaf, and the expiry step adds them
+/// all to its lap in its next turn: that costs O(log n) per trim, not a comparison with
+/// every item already there (T^2/2 for T topics), and the probe replaces only that leaf's
+/// found trims, not a scan of all of them.
+///
+/// Asserts: with a past leaf holding one row of each of 100,000 one-second retention
+/// topics and one row of an infinite topic (so the leaf is kept and every short topic is
+/// a trim), an on-demand sweep at the default budget returns within 4 s.
+pub async fn test_sweep_probe_of_many_expired_topics_stays_within_its_budget() -> TestResult {
+    into_test_result(probe_of_many_topics().await)
+}
+
+async fn probe_of_many_topics() -> SendResult<()> {
+    println!("=== Test: a probe finding a trim per topic stays within the budget ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '120s'")
+        .await
+        .map_err(boxed)?;
+    // The worker's own sweep skips while this session holds the maintenance lock.
+    db.execute("SELECT pg_advisory_lock($1)", &[&MAINTENANCE_LOCK_KEY])
+        .await
+        .map_err(boxed)?;
+    let prefix = unique("probe-cost");
+    let forever = create_topic(&db, &format!("{prefix}-forever"), -1).await?;
+    let mut topics: Vec<i32> = db
+        .query(
+            "INSERT INTO kafka.topics (name, partitions, retention_ms)
+             SELECT $1 || '-' || g, 1, 1000 FROM generate_series(1, $2) AS g
+             RETURNING id",
+            &[&prefix, &PROBED_TOPICS],
+        )
+        .await
+        .map_err(boxed)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    // A one-hour leaf in 1995, older than every other test's, so the first probe of the
+    // pass reaches it.
+    let hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    db.execute(
+        "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
+         FROM (SELECT timestamptz '1995-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
+        &[&hour],
+    )
+    .await
+    .map_err(boxed)?;
+    let leaf: String = db
+        .query_one(
+            "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
+             WHERE lower_bound = timestamptz '1995-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
+            &[&hour],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    topics.push(forever);
+    db.execute(
+        "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+         SELECT t, 0, 0, 'v'::bytea,
+                timestamptz '1995-01-01 00:00+00' + $2::int * INTERVAL '1 hour'
+         FROM unnest($1::int[]) AS t",
+        &[&topics, &hour],
+    )
+    .await
+    .map_err(boxed)?;
+    println!("Step 0: {leaf} holds {PROBED_TOPICS} expired topics and an infinite one");
+
+    let started = Instant::now();
+    let result = db
+        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+        .await
+        .map_err(boxed);
+    let took = started.elapsed();
+    let expired: i64 = db
+        .query_one(
+            &format!("SELECT {PROBED_TOPICS} - count(*) FROM {leaf} WHERE topic_id <> $1"),
+            &[&forever],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    println!("Step 1: the sweep took {took:?} and expired {expired} of the topics' rows");
+    db.query(
+        "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
+        &[&leaf, &topics],
+    )
+    .await
+    .map_err(boxed)?;
+    db.execute("DELETE FROM kafka.topics WHERE id = ANY($1)", &[&topics])
+        .await
+        .map_err(boxed)?;
+    db.execute("SELECT pg_advisory_unlock($1)", &[&MAINTENANCE_LOCK_KEY])
+        .await
+        .map_err(boxed)?;
+    result?;
+    if took > PROBE_PASS_LIMIT || expired < 1 {
+        return Err(format!(
+            "a pass whose probe found {PROBED_TOPICS} trims took {took:?} (limit \
+             {PROBE_PASS_LIMIT:?}) and expired {expired} of their rows"
+        )
+        .into());
+    }
+    println!("✅ the pass stayed within its budget");
+    Ok(())
+}
+
 /// Aborted rows a pass deletes before the expiry: 80 full batches, more than the whole
 /// pass budget clears.
 const ABORTED_BACKLOG: i64 = 800_000;
