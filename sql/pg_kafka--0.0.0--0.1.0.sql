@@ -701,6 +701,7 @@ AS $$
             + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
                    WHEN jsonb_typeof(headers) = 'array' THEN
                      (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                            / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
                    ELSE

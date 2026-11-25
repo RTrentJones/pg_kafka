@@ -85,9 +85,10 @@ macro_rules! fetch_sql {
 /// deltas of one); a record that shares its batch takes at most 31 of its own plus half the
 /// batch header or less. So the count is never under what the record adds. Stored (compressed) sizes
 /// would let a highly compressible record count as a small fraction of what the response
-/// and the DB thread hold of it, and headers would not count at all. Rows written before
-/// headers were stored as an ordered array hold a `{key: hex}` object; `{}` is a record
-/// without headers. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
+/// and the DB thread hold of it, and headers would not count at all. A header key stored
+/// as hex (one holding U+0000, marked `"hex"`, see `encode_headers_json`) counts half its
+/// stored length, as its value does. Rows written before headers were stored as an ordered
+/// array hold a `{key: hex}` object; `{}` is a record without headers. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
 /// `message_size_estimate` uses, counts the same. COALESCE evaluates it only for a row whose
 /// `record_bytes` is NULL; it reads the whole headers value, from TOAST when stored there.
 macro_rules! record_bytes_sql {
@@ -96,6 +97,7 @@ macro_rules! record_bytes_sql {
             + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
                    WHEN jsonb_typeof(headers) = 'array' THEN
                      (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                            / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
                    ELSE

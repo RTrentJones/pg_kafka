@@ -88,3 +88,80 @@ pub async fn test_consumer_receives_headers() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A header key holding U+0000 is any other key to Kafka 3.7. JSONB cannot hold the
+/// `\u0000` escape, so storing such a key as JSON text failed the whole Produce with
+/// UNKNOWN_SERVER_ERROR, which a Java producer does not retry.
+///
+/// Asserts: a record whose header keys are "a\0b" and "\0" (values with NUL bytes)
+/// next to a plain "k" header is produced with error 0, and a fetch returns the record
+/// with those three headers, keys and values byte for byte; the stored `record_bytes`
+/// counts the keys at their own lengths.
+pub async fn test_header_key_with_nul_roundtrips() -> TestResult {
+    use crate::setup::TestContext;
+    use crate::wire::records::{encode, plain_record};
+    use crate::wire::Wire;
+    use bytes::Bytes;
+    use kafka_protocol::protocol::StrBytes;
+    use kafka_protocol::records::{Compression, RecordBatchDecoder};
+    println!("=== Test: a header key holding U+0000 roundtrips ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "headers-nul")
+        .build()
+        .await?
+        .name;
+    let headers: [(&str, &[u8]); 3] = [("a\0b", b"\0v\0"), ("k", b"plain"), ("\0", b"")];
+    let mut record = plain_record(0, None, b"value");
+    for (k, v) in headers {
+        record.headers.insert(
+            StrBytes::from_string(k.to_string()),
+            Some(Bytes::copy_from_slice(v)),
+        );
+    }
+    let mut wire = Wire::connect().await?;
+    let produced = wire
+        .produce(&topic, 0, encode(&[record], Compression::None), None)
+        .await?;
+    assert_eq!(produced, (0, 0), "the record is stored at offset 0");
+    println!("Step 1: produced a record with header keys \"a\\0b\", \"k\" and \"\\0\"");
+
+    let p = wire.fetch(&topic, 0, 0, 0).await?;
+    assert_eq!(p.error_code, 0);
+    let mut records = p.records.unwrap_or_default();
+    let batches = RecordBatchDecoder::decode_all(&mut records)?;
+    let fetched: Vec<(String, Vec<u8>)> = batches
+        .iter()
+        .flat_map(|b| b.records.iter())
+        .flat_map(|r| {
+            r.headers.iter().map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.as_ref().map_or_else(Vec::new, |v| v.to_vec()),
+                )
+            })
+        })
+        .collect();
+    let expected: Vec<(String, Vec<u8>)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+        .collect();
+    assert_eq!(fetched, expected, "every header, byte for byte");
+    println!("Step 2: fetched the record with its three headers unchanged");
+
+    let stored: i32 = ctx
+        .db()
+        .query_one(
+            "SELECT m.record_bytes FROM kafka.messages m
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    // Value 5, header keys and values ("a\0b" 3 + 3, "k" 1 + 5, "\0" 1 + 0), 84 per record
+    // and 10 per header.
+    assert_eq!(stored, 5 + 6 + 6 + 1 + 84 + 3 * 10);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
