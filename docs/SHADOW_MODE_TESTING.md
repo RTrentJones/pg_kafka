@@ -215,21 +215,42 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_deterministic_routing` | The same key always gets the same forward decision |
 | `test_dialup_{0,10,25,50,75,100}_percent` | Dial-up routing at 0, 10, 25, 50, 75, 100 percent |
 | `test_topic_name_mapping` | `external_topic_name` maps to a different external topic |
+| `test_committed_transaction_forwards_without_ram_buffer` | Records produced in a transaction before its topic was shadowed are forwarded when it commits: the commit finds them in `kafka.messages`, routed by the topic config at commit time |
 | `test_committed_transaction_forwarded` | Committed transaction records are forwarded |
 | `test_aborted_transaction_not_forwarded` | Aborted transaction records are not forwarded |
 | `test_committed_transaction_uses_durable_outbox` | Committed transaction records go through `kafka.shadow_tracking` |
 | `test_committed_txn_leaves_no_orphan_outbox_rows` | A committed transaction leaves no outbox rows without a backing message |
+| `test_large_committed_transaction_is_enqueued_exactly_once` | A 250 000-record transaction on a 100% and a 50% topic: at commit exactly the records routing selects get one outbox row each, and the worker's private memory does not grow while the transaction is open |
 | `test_dual_write_external_down` | DualWrite (async) with the external broker paused (`EXTERNAL_KAFKA_PAUSE_CMD`): the produce is acked at once and stored locally, its outbox row stays undelivered, and the record is forwarded once the broker resumes |
 | `test_external_only_fallback` | ExternalOnly with a record the external topic refuses (`max.message.bytes`): every attempt fails, the row is dead-lettered at `shadow_max_retries` with its error, and a pg_kafka consumer then reads the record locally |
 | `test_shadow_unbuildable_settings_dead_letter_after_a_working_producer` | A producer setting no producer can be built from (`shadow_security_protocol = 'BOGUS'`), set while a working producer holds 500 records: each partition's head counts failed attempts and is dead-lettered with the configuration error, then the next head; the records behind a head are not charged |
 | `test_external_primary_dead_letter_serves_local` | Once a forward is dead-lettered (`retry_count >= pg_kafka.shadow_max_retries`), an external-primary topic serves the record locally |
 | `test_replay_historical_messages` | `kafka.replay_shadow_messages()` re-queues stored messages and they are forwarded |
 | `test_replay_skips_aborted_records` | Replay never re-queues aborted transactional records |
+| `test_sync_forward_skips_rolled_back_request` | A sync-mode Produce whose request rolls back (a test trigger raises on its second partition) leaves no copy on the external broker; a clean produce afterwards is still delivered |
 | `test_shadow_forward_throughput` | 20 000 records forwarded end to end at ≥ 2000 msg/s with no failed attempts (pipelined forwarder) |
 | `test_shadow_forwards_headers_and_timestamps` | Record headers (in order, binary values) and the producer's CreateTime reach the external topic |
 | `test_shadow_order_preserved_across_a_retried_failure` | An external topic rejects the batch holding an oversized record until its `max.message.bytes` is raised; nothing after the failed record is delivered before its retry and the external order equals the local order |
+| `test_shadow_order_preserved_across_a_delivery_timeout` | With the external broker paused and records enqueued at staggered times (`pg_kafka.test_shadow_delivery_timeout_ms`), the first records' delivery timeout does not let later records overtake them once the broker resumes |
 | `test_shadow_sync_stall_is_bounded_to_its_own_response` | External cluster unreachable: a sync produce is held ~`shadow_sync_timeout_ms` (3 s) while produces to another topic stay < 1 s |
 | `test_shadow_gucs_take_effect_on_reload` | Session `SET` of shadow GUCs is refused; a security-protocol change rebuilds the producer; `shadow_metrics_enabled = off` writes no metrics; sampled-out records are counted in `messages_skipped` |
+| `test_shadow_max_retries_refuses_zero` | `pg_kafka.shadow_max_retries = 0` (no record would ever be claimed) is refused |
+| `test_shadow_backlog_does_not_starve_other_topics` | A large replayed backlog shares each claim with other partitions: another topic's record queued with it is forwarded while most of the backlog still waits |
+| `test_shadow_full_producer_queue_does_not_block_sync_timeouts` | External cluster unreachable and librdkafka's queue full: held sync-mode responses are still released at their timeout |
+| `test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires` | Records waiting in the forwarder's backlog time out from their dispatch, so they are answered before the DB thread's in-flight eviction and never sent twice |
+| `test_shadow_timed_out_transaction_is_not_forwarded` | A transaction abandoned by its producer is aborted by the timeout sweep and leaves no outbox row; nothing of it reaches external Kafka |
+| `test_shadow_ack_application_error_loses_no_ack` | An ERROR while applying a delivery ack rolls the application back; the ack is applied on a later tick, with no lost attempt counted and no second forward |
+| `test_shadow_failed_tick_commit_loses_no_ack` | A failed COMMIT of the tick that applied an ack: the ack is applied again later, the row stays in flight meanwhile, and the record is forwarded once |
+| `test_shadow_stuck_partitions_do_not_throttle_a_backlog` | Partitions whose rows cannot be claimed (orphan pointers, dead letters, rows in flight or backing off) take no share of a claim, and a backlog drains claim after claim |
+| `test_shadow_unconfigured_broker_does_not_spin_the_worker` | With `pg_kafka.shadow_bootstrap_servers` empty the worker does not re-claim the outbox without pause; the rows are forwarded once a broker is configured |
+| `test_shadow_claims_stay_fast_with_a_full_in_flight_window` | The claim's in-flight exclusion is hashed: filling the 8 192-row in-flight window takes well under a second |
+| `test_shadow_claims_stay_fast_behind_a_large_backlog` | A claim's cost does not grow with a 150 000-row backlog (ordered LATERAL probe, not a hash semi join) |
+| `test_shadow_claims_stay_fast_with_a_tiny_work_mem` | The claim raises `work_mem` for itself, so a tiny server `work_mem` does not make it rescan the in-flight list per row |
+| `test_shadow_claims_are_not_jit_compiled` | The claim turns JIT off for itself, so low JIT thresholds do not slow it (skipped without llvmjit) |
+| `test_shadow_worker_stays_idle_beside_a_blocked_partition` | A backing-off head of a 200 000-row backlog does not make each tick read the partition's backlog: the idle worker's CPU stays within 3 points |
+| `test_shadow_worker_stays_idle_beside_dead_letters` | 200 000 dead letters are skipped by the dead flag: the idle worker's CPU stays within bounds |
+| `test_shadow_dead_letters_follow_the_retry_cap` | Dead letters follow `pg_kafka.shadow_max_retries` as it is raised and lowered, and a replay forwards them again |
+| `test_shadow_failure_acks_make_dead_letters` | Failure acks that reach the retry cap flag their rows dead; raising the cap revives them, and they are forwarded once the external topic takes them |
 | `test_shadow_lag_view_is_per_partition` | `kafka.shadow_partition_status` / `kafka.shadow_status` report lag, dead letters and in-flight counts per partition (needs no external Kafka; runs in the shadow job with the rest of the category) |
 
 ## Running Tests
