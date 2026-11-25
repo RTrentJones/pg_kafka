@@ -18,6 +18,7 @@ use rdkafka::producer::FutureRecord;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 
 /// Test long poll min_bytes wakeup behavior
 ///
@@ -152,110 +153,32 @@ pub async fn test_long_poll_min_bytes_threshold() -> TestResult {
     Ok(())
 }
 
-/// Test long poll timeout behavior
-///
-/// Scenario:
-/// 1. Consumer with max_wait_ms set
-/// 2. No messages produced after initial setup
-/// 3. Verify poll eventually returns (doesn't hang forever)
-/// 4. Verify subsequent polling works correctly
-///
-/// This tests that long poll doesn't hang indefinitely.
+/// An empty Fetch is answered after its own `max_wait_ms`, whatever it is: below, at and above
+/// the broker's 1000 ms safety-net re-check (`pg_kafka.fetch_poll_interval_ms`), each wait is
+/// at least `max_wait_ms` and not much more, so the broker neither answers at its first
+/// re-check nor rounds the wait up to the next one.
 pub async fn test_long_poll_timeout_precision() -> TestResult {
-    println!("=== Test: Long Poll Timeout Behavior ===\n");
-
+    println!("=== Test: Long Poll Timeout Precision ===\n");
     let ctx = TestContext::new().await?;
-    let topic = TestTopicBuilder::new(&ctx, "longpoll-precision")
-        .build()
-        .await?;
+    let topic = super::timeout::empty_topic(&ctx, "longpoll-precision").await?;
+    let mut s = TcpStream::connect(("127.0.0.1", crate::common::broker_port())).await?;
+    println!("Step 1: empty topic {topic}");
 
-    // Create topic
-    println!("Step 1: Creating topic...");
-    let producer = create_producer()?;
-    producer
-        .send(
-            FutureRecord::to(&topic.name).payload("setup").key("setup"),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|(err, _)| err)?;
-    println!("  Topic created");
-
-    // Create consumer
-    println!("\nStep 2: Creating consumer...");
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .set(
-            "group.id",
-            format!("precision-group-{}", uuid::Uuid::new_v4()),
-        )
-        .set("auto.offset.reset", "latest")
-        .set("fetch.wait.max.ms", "2000")
-        .set("fetch.min.bytes", "1")
-        .set("session.timeout.ms", "10000")
-        .set("enable.auto.commit", "false")
-        .create()?;
-
-    let consumer = Member::new(consumer);
-    consumer.subscribe(&[&topic.name])?;
-    println!("  Consumer subscribed");
-
-    // Wait for assignment
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Poll multiple times with short client timeouts
-    println!("\nStep 3: Polling multiple times...");
-    let start = Instant::now();
-    let mut poll_count = 0;
-
-    for _ in 0..3 {
-        let poll_start = Instant::now();
-        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
-            Ok(Ok(msg)) => {
-                let value = msg
-                    .payload()
-                    .map(|v| String::from_utf8_lossy(v).to_string());
-                println!(
-                    "  Poll {}: received {:?} in {:?}",
-                    poll_count + 1,
-                    value,
-                    poll_start.elapsed()
-                );
-            }
-            Ok(Err(e)) => {
-                println!(
-                    "  Poll {}: error {} in {:?}",
-                    poll_count + 1,
-                    e,
-                    poll_start.elapsed()
-                );
-            }
-            Err(_) => {
-                println!(
-                    "  Poll {}: client timeout in {:?}",
-                    poll_count + 1,
-                    poll_start.elapsed()
-                );
-            }
-        }
-        poll_count += 1;
+    for (corr, max_wait_ms) in (1..).zip([150, 700, 1_000, 1_300]) {
+        let took = super::timeout::timed_empty_fetch(&mut s, corr, &topic, max_wait_ms, 1).await?;
+        let max_wait = Duration::from_millis(u64::try_from(max_wait_ms)?);
+        println!("  max_wait_ms={max_wait_ms}: answered in {took:?}");
+        assert!(
+            took + super::timeout::EARLY_SLACK >= max_wait,
+            "an empty Fetch with max_wait_ms={max_wait_ms} was answered early, in {took:?}"
+        );
+        assert!(
+            took < max_wait + super::timeout::ANSWER_SLACK,
+            "an empty Fetch with max_wait_ms={max_wait_ms} was answered late, in {took:?}"
+        );
     }
-
-    let total_duration = start.elapsed();
-    println!("\nStep 4: Verifying behavior...");
-    println!("  Total time for {poll_count} polls: {total_duration:?}");
-
-    // Should complete all polls reasonably quickly
-    assert!(
-        total_duration < Duration::from_secs(10),
-        "All polls should complete within 10 seconds"
-    );
-    consumer.close(CLOSE_TIMEOUT).await?;
-    println!("  ✅ Polls completed successfully");
-
     ctx.cleanup().await?;
-    println!("\n✅ Long poll timeout behavior test PASSED\n");
+    println!("\n✅ Long poll timeout precision test PASSED\n");
     Ok(())
 }
 

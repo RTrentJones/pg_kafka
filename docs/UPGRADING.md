@@ -96,9 +96,12 @@ EXTENSION pg_kafka` has run, without a restart.
   the new parent), a DEFAULT leaf `kafka.messages_default` is added, the views
   `kafka.shadow_status` and `kafka.metrics` are recreated on the new parent, and the
   SECURITY DEFINER partition functions are created. The legacy leaf is dropped by the
-  retention sweep once all its rows are expired. This reads the old table five times
-  under ACCESS EXCLUSIVE (bound, attach check, BRIN, aborted-row and pending-producer
-  index builds);
+  retention sweep once all its rows are expired. Under ACCESS EXCLUSIVE this rewrites
+  the old table once (adding `kafka.messages.record_bytes`, the size of each record a
+  Fetch sums, computed for every row: a full read with each row's headers detoasted, a
+  full write and the rebuild of its two unique indexes, so it needs free disk for a
+  second copy of the table) and reads it five more times (bound, attach check, BRIN,
+  aborted-row and pending-producer index builds);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for

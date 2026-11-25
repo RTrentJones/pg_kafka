@@ -217,8 +217,8 @@ gucs! {
           record of the first partition with data is larger, so a consumer always makes \
           progress; later partitions return only what fits. The per-partition limit is the \
           request's partition_max_bytes, within what is left of this. Sizes count each record's \
-          uncompressed key, value and header bytes. It is also each \
-          connection's budget for responses not yet written: past it the connection reads no \
+          uncompressed key, value and header bytes plus 84 bytes per record and 10 per \
+          header for its framing. It is also each connection's budget for responses not yet written: past it the connection reads no \
           further request until its client reads. Default: 57671680 (55 MiB). Reloadable via \
           SIGHUP: the cap applies to requests read after the reload, the budget to \
           connections opened after it.",

@@ -11,7 +11,9 @@ use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{
     ListOffsetsPartitionData, ListOffsetsTopicData, PartitionFetchData, TopicFetchData,
 };
-use crate::kafka::storage::{FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds};
+use crate::kafka::storage::{
+    record_fetch_bytes, FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds,
+};
 use bytes::BufMut;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_response::{
@@ -49,34 +51,16 @@ pub fn handle_fetch(
 /// The bytes one record adds to a Fetch response, the size both byte limits
 /// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
 /// value and header keys and values, 84 bytes per record and 10 per header for its framing
-/// (what a record alone in its RecordBatch adds at most, see [`RECORD_OVERHEAD`]).
-/// Matches the storage layer's own accounting (`record_bytes_sql!` in
-/// `storage/postgres/log.rs`), so storage and this handler cut a partition at the same
-/// record.
+/// (what a record alone in its RecordBatch adds at most, see [`crate::kafka::storage::RECORD_OVERHEAD`]).
+/// [`record_fetch_bytes`] is also what Produce stores with each row for the storage layer's
+/// own accounting, so storage and this handler cut a partition at the same record.
 pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
-    let len = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-    let headers = msg.headers.iter().fold(0i64, |sum, (k, v)| {
-        sum.saturating_add(len(k.len()))
-            .saturating_add(len(v.len()))
-            .saturating_add(HEADER_OVERHEAD)
-    });
-    len(msg.key.as_ref().map_or(0, Vec::len))
-        .saturating_add(len(msg.value.as_ref().map_or(0, Vec::len)))
-        .saturating_add(RECORD_OVERHEAD)
-        .saturating_add(headers)
+    record_fetch_bytes(
+        msg.key.as_ref().map_or(0, Vec::len),
+        msg.value.as_ref().map_or(0, Vec::len),
+        msg.headers.iter().map(|(k, v)| (k.len(), v.len())),
+    )
 }
-
-/// The framing bytes [`message_size_estimate`] counts per record and per header, upper
-/// bounds of what an uncompressed RecordBatch v2 spends on them. A record alone in its batch
-/// (each run of one producer's consecutive offsets is a batch: read_committed skipping
-/// aborted offsets, or alternating producers, leave records alone) carries the whole 61-byte
-/// batch header ([`BATCH_HEADER_LEN`]) and at most 23 bytes of its own: its length, key and
-/// value length and header count varints (at most 5 bytes each), attributes, and timestamp
-/// and offset deltas of 0 (1 byte each). A record sharing its batch takes at most 31 bytes of
-/// its own (both deltas up to 5) and at most half the header. A header's key and value
-/// lengths are two varints of at most 5 bytes.
-const RECORD_OVERHEAD: i64 = 61 + 23;
-const HEADER_OVERHEAD: i64 = 10;
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
 /// records for it. `remaining` is what is left of the request-level `max_bytes`;
@@ -536,11 +520,27 @@ fn read_partition(
             IsolationLevel::ReadCommitted => bounds.last_stable_offset,
             IsolationLevel::ReadUncommitted => bounds.high_watermark,
         };
-        Ok(gap_batch(fetch_offset, readable_end).unwrap_or_default())
+        Ok(gap_batch(fetch_offset, readable_end)
+            .and_then(|gap| take_gap_batch(gap, i64::from(limit), budget))
+            .unwrap_or_default())
     } else {
         Ok(bytes::Bytes::new())
     };
     fetched_partition_data(topic_id, partition_id, bounds, records)
+}
+
+/// `gap` if it fits the partition's `limit`, counted against the response budget as records
+/// are: Kafka 3.7 counts the abort marker batches it returns in the fetch size, and a
+/// partition with only them still stops the later ones returning anything past their limits.
+/// As the first record of the response, it is returned whatever its size.
+fn take_gap_batch(gap: bytes::Bytes, limit: i64, budget: &mut FetchBudget) -> Option<bytes::Bytes> {
+    let len = i64::try_from(gap.len()).unwrap_or(i64::MAX);
+    if budget.returned_any && len > limit {
+        return None;
+    }
+    budget.remaining -= len;
+    budget.returned_any = true;
+    Some(gap)
 }
 
 /// A partition entry for an error that leaves its bounds unknown.
@@ -1062,9 +1062,13 @@ mod tests {
                 });
             let env = TestEnv::new();
             let ctx = env.ctx(&mock);
+            // Partition 0 reads from its end (3): returning no record, it has no gap batch
+            // either (one would count as data, see gap_batches_count_against_the_byte_limits).
+            let mut request = two_partition_request();
+            request[0].partitions[0].fetch_offset = if returned == 0 { 3 } else { 0 };
             handle_fetch_with_max_bytes(
                 &ctx,
-                two_partition_request(),
+                request,
                 IsolationLevel::ReadUncommitted,
                 1 << 20,
                 whole_first_record,
@@ -1354,6 +1358,60 @@ mod tests {
             gap_batch(1, 3).unwrap()
         );
         assert!(fetch_one(&mock, 3, IsolationLevel::ReadCommitted).is_empty());
+    }
+
+    /// A gap batch counts against the byte limits as records do (Kafka 3.7 counts the abort
+    /// markers it returns): the first one of a response is returned whatever its size, a later
+    /// one only if it fits what is left of `max_bytes` and its `partition_max_bytes`, and after
+    /// one no later partition reads an oversized first record.
+    #[test]
+    fn gap_batches_count_against_the_byte_limits() {
+        let gap_len = i32::try_from(gap_batch(0, 3).unwrap().len()).unwrap();
+        // (max_bytes, partition 1's partition_max_bytes) -> whether partition 1 has a gap.
+        let cases = [
+            (1 << 20, 1 << 20, true),
+            (2 * gap_len, 1 << 20, true),
+            (2 * gap_len - 1, 1 << 20, false),
+            (1, 1 << 20, false),
+            (1 << 20, gap_len - 1, false),
+            (1 << 20, gap_len, true),
+        ];
+        for (max_bytes, partition_max, second_gap) in cases {
+            let mut mock = mock_with_two_partitions();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = std::sync::Arc::clone(&asked);
+            mock.expect_fetch_records_with_isolation().returning(
+                move |_, partition, _, _, whole, _| {
+                    seen.lock().unwrap().push((partition, whole));
+                    Ok(Vec::new().into())
+                },
+            );
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            let mut request = two_partition_request();
+            request[0].partitions[1].partition_max_bytes = partition_max;
+            let response = handle_fetch_with_max_bytes(
+                &ctx,
+                request,
+                IsolationLevel::ReadCommitted,
+                max_bytes,
+                true,
+            )
+            .unwrap();
+            let parts = &response.responses[0].partitions;
+            let case = format!("max_bytes {max_bytes}, partition_max_bytes {partition_max}");
+            assert_eq!(parts[0].records, gap_batch(0, 3), "{case}");
+            assert_eq!(parts[1].error_code, ERROR_NONE, "{case}");
+            if second_gap {
+                assert_eq!(parts[1].records, gap_batch(0, 3), "{case}");
+            } else {
+                assert!(parts[1].records.as_ref().unwrap().is_empty(), "{case}");
+            }
+            // Partition 1 is not the first with data: it reads no oversized first record.
+            for &(partition, whole) in asked.lock().unwrap().iter() {
+                assert_eq!(whole, partition == 0, "{case}: partition {partition}");
+            }
+        }
     }
 
     /// The default get_partition_bounds reports the last stable offset to a

@@ -1,160 +1,118 @@
 //! Long polling timeout tests
 //!
-//! Tests for max_wait_ms behavior in FetchRequest.
+//! How the broker answers a Fetch that finds no data: at once for `max_wait_ms = 0` or
+//! `min_bytes = 0`, otherwise after about `max_wait_ms`. Measured at the wire level: an
+//! rdkafka consumer's `recv()` does not return on an empty fetch, so a poll timed through it
+//! only measures the test's own client timeout.
 
-use crate::common::{create_producer, get_bootstrap_servers, TestResult};
-use crate::members::{Member, CLOSE_TIMEOUT};
-use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::producer::FutureRecord;
+use crate::common::{DynResult, TestResult};
+use crate::setup::TestContext;
+use crate::wire::requests::{creatable, create_topics_raw, fetch_request};
+use crate::wire::{decode_response, read_frame_within, request_frame};
+use bytes::Bytes;
+use kafka_protocol::messages::FetchRequest;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
-/// Test that fetch with max_wait_ms=0 returns immediately
-///
-/// When max_wait_ms is 0, the server should return immediately
-/// without waiting, even if no data is available.
-pub async fn test_long_poll_immediate_return() -> TestResult {
-    println!("=== Test: Long Poll Immediate Return (max_wait_ms=0) ===\n");
+/// How much later than its `max_wait_ms` (or than at once) an empty Fetch may be answered:
+/// the broker's own work and the test host's scheduling, well under the 1000 ms safety-net
+/// re-check of a waiting fetch (`pg_kafka.fetch_poll_interval_ms`).
+pub(super) const ANSWER_SLACK: Duration = Duration::from_millis(500);
+/// How much earlier than its `max_wait_ms` an empty Fetch may be answered: the client's
+/// clock starts before the broker's, so a broker that waits `max_wait_ms` is never early by
+/// more than timer granularity.
+pub(super) const EARLY_SLACK: Duration = Duration::from_millis(20);
 
-    let topic = format!("longpoll-immediate-{}", Uuid::new_v4());
-    let group_id = format!("longpoll-group-{}", Uuid::new_v4());
-
-    // Create topic first by producing a message
-    println!("Step 1: Creating topic by producing initial message...");
-    let producer = create_producer()?;
-    producer
-        .send(
-            FutureRecord::to(&topic).payload("setup").key("setup"),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|(err, _)| err)?;
-    println!("   Topic created");
-
-    // Create consumer with very short fetch.wait.max.ms
-    println!("\nStep 2: Creating consumer with fetch.wait.max.ms=0...");
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .set("group.id", &group_id)
-        .set("auto.offset.reset", "latest") // Start from end
-        .set("fetch.wait.max.ms", "0") // Don't wait for data
-        .set("fetch.min.bytes", "1")
-        .set("session.timeout.ms", "10000")
-        .set("enable.auto.commit", "false")
-        .create()?;
-
-    let consumer = Member::new(consumer);
-    consumer.subscribe(&[&topic])?;
-    println!("   Consumer subscribed");
-
-    // Wait briefly for assignment
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Poll should return quickly (no data at end of topic)
-    println!("\nStep 3: Polling with max_wait_ms=0...");
-    let start = Instant::now();
-
-    // Poll a few times - with max_wait_ms=0, each poll should be fast
-    for i in 0..5 {
-        let poll_start = Instant::now();
-        // Use a short timeout since we expect immediate return
-        let _ = tokio::time::timeout(Duration::from_millis(200), consumer.recv()).await;
-        let poll_duration = poll_start.elapsed();
-        println!("   Poll {}: {:?}", i + 1, poll_duration);
+/// A new empty topic of one partition, named after `prefix`.
+pub(super) async fn empty_topic(ctx: &TestContext, prefix: &str) -> DynResult<String> {
+    let topic = ctx.unique_topic(prefix).await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    if created[0].error_code != 0 {
+        return Err(format!("CreateTopics answered {created:?}").into());
     }
+    Ok(topic)
+}
 
-    let total_duration = start.elapsed();
-    println!("\nStep 4: Verifying timing...");
-    println!("   Total duration for 5 polls: {total_duration:?}");
+/// Fetch (v4) partition 0 of the empty `topic` from offset 0, its end, with `max_wait_ms` and
+/// `min_bytes`, on `s`: how long the answer took. Fails unless the answer is an empty success.
+pub(super) async fn timed_empty_fetch(
+    s: &mut TcpStream,
+    corr: i32,
+    topic: &str,
+    max_wait_ms: i32,
+    min_bytes: i32,
+) -> DynResult<Duration> {
+    let mut req = fetch_request(topic, 0, 0, max_wait_ms);
+    req.min_bytes = min_bytes;
+    let started = Instant::now();
+    s.write_all(&request_frame(4, corr, &req)).await?;
+    let frame = read_frame_within(s, Duration::from_secs(30))
+        .await?
+        .ok_or("closed on fetch")?;
+    let took = started.elapsed();
+    let (c, resp) = decode_response::<FetchRequest>(4, &frame)?;
+    let partition = &resp.responses[0].partitions[0];
+    if c != corr
+        || partition.error_code != 0
+        || partition
+            .records
+            .as_ref()
+            .is_some_and(|r: &Bytes| !r.is_empty())
+    {
+        return Err(format!(
+            "expected an empty success for correlation {corr}, got {c}: error {}, {} bytes",
+            partition.error_code,
+            partition.records.as_ref().map_or(0, Bytes::len)
+        )
+        .into());
+    }
+    Ok(took)
+}
 
-    // 5 polls should complete in well under 3 seconds with max_wait_ms=0
-    assert!(
-        total_duration < Duration::from_secs(3),
-        "Polls should complete quickly with max_wait_ms=0, took {total_duration:?}"
-    );
-    consumer.close(CLOSE_TIMEOUT).await?;
+/// An empty Fetch with `max_wait_ms = 0` is answered at once, and so is one with
+/// `min_bytes = 0` whatever its `max_wait_ms` (any amount of data, none included, satisfies
+/// it, as in Kafka 3.7).
+pub async fn test_long_poll_immediate_return() -> TestResult {
+    println!("=== Test: Long Poll Immediate Return (max_wait_ms=0, min_bytes=0) ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = empty_topic(&ctx, "longpoll-immediate").await?;
+    let mut s = TcpStream::connect(("127.0.0.1", crate::common::broker_port())).await?;
+    println!("Step 1: empty topic {topic}");
 
+    for (corr, max_wait_ms, min_bytes) in [(1, 0, 1), (2, 0, 1_000_000), (3, 5_000, 0)] {
+        let took = timed_empty_fetch(&mut s, corr, &topic, max_wait_ms, min_bytes).await?;
+        println!("  max_wait_ms={max_wait_ms}, min_bytes={min_bytes}: answered in {took:?}");
+        assert!(
+            took < ANSWER_SLACK,
+            "an empty Fetch with max_wait_ms={max_wait_ms} and min_bytes={min_bytes} is answered \
+             at once, took {took:?}"
+        );
+    }
+    ctx.cleanup().await?;
     println!("\n✅ Long poll immediate return test PASSED\n");
     Ok(())
 }
 
-/// Test that fetch waits up to max_wait_ms when no data available
-///
-/// When fetching from an empty partition with max_wait_ms > 0,
-/// the server should wait approximately max_wait_ms before returning.
+/// An empty Fetch with `max_wait_ms = 2000` and a `min_bytes` no data meets is answered after
+/// about 2 seconds: not before, and not much later.
 pub async fn test_long_poll_timeout() -> TestResult {
     println!("=== Test: Long Poll Timeout Behavior ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = empty_topic(&ctx, "longpoll-timeout").await?;
+    let mut s = TcpStream::connect(("127.0.0.1", crate::common::broker_port())).await?;
+    println!("Step 1: empty topic {topic}");
 
-    let topic = format!("longpoll-timeout-{}", Uuid::new_v4());
-    let group_id = format!("longpoll-timeout-group-{}", Uuid::new_v4());
-
-    // Create topic first
-    println!("Step 1: Creating empty topic...");
-    let producer = create_producer()?;
-    producer
-        .send(
-            FutureRecord::to(&topic).payload("setup").key("setup"),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|(err, _)| err)?;
-    println!("   Topic created");
-
-    // Create consumer with longer fetch.wait.max.ms
-    println!("\nStep 2: Creating consumer with fetch.wait.max.ms=2000...");
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", get_bootstrap_servers())
-        .set("broker.address.family", "v4")
-        .set("group.id", &group_id)
-        .set("auto.offset.reset", "latest") // Start from end (no new data)
-        .set("fetch.wait.max.ms", "2000") // Wait up to 2 seconds
-        .set("fetch.min.bytes", "1000000") // High min_bytes to force waiting
-        .set("session.timeout.ms", "10000")
-        .set("enable.auto.commit", "false")
-        .create()?;
-
-    let consumer = Member::new(consumer);
-    consumer.subscribe(&[&topic])?;
-    println!("   Consumer subscribed");
-
-    // Wait for assignment
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Single poll should take close to max_wait_ms
-    println!("\nStep 3: Polling (should wait ~2 seconds)...");
-    let poll_start = Instant::now();
-
-    // Use a longer client timeout than server's max_wait_ms
-    let result = tokio::time::timeout(Duration::from_secs(5), consumer.recv()).await;
-    let poll_duration = poll_start.elapsed();
-
-    println!("   Poll returned in {poll_duration:?}");
-    match &result {
-        Ok(Ok(_)) => println!("   Result: received message"),
-        Ok(Err(e)) => println!("   Result: error - {e}"),
-        Err(_) => println!("   Result: timeout"),
+    let max_wait = Duration::from_millis(2_000);
+    for (corr, min_bytes) in [(1, 1), (2, 1_000_000)] {
+        let took = timed_empty_fetch(&mut s, corr, &topic, 2_000, min_bytes).await?;
+        println!("  max_wait_ms=2000, min_bytes={min_bytes}: answered in {took:?}");
+        assert!(
+            took + EARLY_SLACK >= max_wait && took < max_wait + ANSWER_SLACK,
+            "an empty Fetch with max_wait_ms=2000 is answered after about 2 s, took {took:?}"
+        );
     }
-
-    println!("\nStep 4: Verifying timing...");
-    // The poll should take at least 1 second (accounting for network overhead)
-    // but no more than 6 seconds (max_wait_ms + overhead + our timeout)
-    if poll_duration >= Duration::from_millis(1000) {
-        println!("   ✓ Poll waited for data (took {poll_duration:?})");
-    } else {
-        println!("   Note: Poll returned quickly ({poll_duration:?}) - this is acceptable");
-        println!("   (rdkafka may batch requests or server had no data)");
-    }
-
-    // Key assertion: poll completed (didn't hang)
-    assert!(
-        poll_duration < Duration::from_secs(10),
-        "Poll should complete within reasonable time"
-    );
-    drop(result);
-    consumer.close(CLOSE_TIMEOUT).await?;
-
+    ctx.cleanup().await?;
     println!("\n✅ Long poll timeout test PASSED\n");
     Ok(())
 }

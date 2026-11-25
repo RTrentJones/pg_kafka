@@ -58,8 +58,12 @@ trap cleanup EXIT
 "${PSQL[@]}" -d "$OLD_DB" <<'SQL'
 CREATE EXTENSION pg_kafka VERSION '0.0.0';
 INSERT INTO kafka.topics (name, partitions) VALUES ('upgrade-check', 1);
-INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-SELECT id, 0, g, 'v'::bytea FROM kafka.topics, generate_series(0, 99) AS g
+-- Offset 0 has headers as an ordered array, offset 1 as a {key: hex} object (older
+-- rows), the rest none.
+INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, headers)
+SELECT id, 0, g, 'v'::bytea,
+       CASE g WHEN 0 THEN '[["h", "0102"]]'::jsonb WHEN 1 THEN '{"ab": "ff"}'::jsonb END
+FROM kafka.topics, generate_series(0, 99) AS g
 WHERE name = 'upgrade-check';
 INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
 SELECT id, 0, 100 FROM kafka.topics WHERE name = 'upgrade-check';
@@ -224,6 +228,14 @@ if [ "$kept" != "100" ]; then
   status=1
 fi
 rm -f "$FRESH_OUT" "$OLD_OUT"
+
+# The upgrade fills record_bytes for every 0.0.0 row: value, 84 per record, and each
+# header's key, value and 10 bytes.
+sized="$("${PSQL[@]}" -d "$OLD_DB" -c "SELECT count(*) FROM kafka.messages WHERE record_bytes IS DISTINCT FROM CASE partition_offset WHEN 0 THEN 1 + 84 + 1 + 2 + 10 WHEN 1 THEN 1 + 84 + 2 + 1 + 10 ELSE 1 + 84 END")"
+if [ "$sized" != "0" ]; then
+  echo "ERROR: $sized upgraded messages have a wrong or missing record_bytes" >&2
+  status=1
+fi
 
 # The converted 0.0.0 table is one leaf covering [MINVALUE, upgrade time).
 legacy="$("${PSQL[@]}" -d "$OLD_DB" -c "SELECT count(*) || ' ' || (lower_bound IS NULL) FROM kafka.messages_legacy, kafka.message_partitions() p WHERE p.partition_name = 'messages_legacy' GROUP BY lower_bound")"

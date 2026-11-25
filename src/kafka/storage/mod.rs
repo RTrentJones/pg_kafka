@@ -21,6 +21,7 @@ use super::messages::Record;
 
 mod delegate;
 mod headers;
+mod record_bytes;
 mod sequence;
 
 pub(crate) use delegate::{
@@ -28,6 +29,7 @@ pub(crate) use delegate::{
     delegate_topic_store, delegate_transaction_store,
 };
 pub use headers::{decode_headers_json, encode_headers_json};
+pub use record_bytes::{record_fetch_bytes, HEADER_OVERHEAD, RECORD_OVERHEAD};
 pub use sequence::{
     batch_last_sequence, next_sequence, transactional_epoch_is_stale, validate_sequence,
     validate_unknown_producer, CachedBatch, PartitionSequence, ProducerBatch, SequenceCheck,

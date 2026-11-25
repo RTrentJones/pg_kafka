@@ -544,7 +544,8 @@ pg_kafka.compression_type = 'gzip'
   the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
   within both limits, but for the first one above; the database reads (and holds) no more than
   that of a partition, and a later partition whose first record is larger than its limit does
-  not read that record. Kafka counts
+  not read that record (sizes are stored with each record at Produce, so a fetch reads the key,
+  value and headers only of the records it returns). Kafka counts
   the bytes of the record batches as stored, compressed when the producer compressed them,
   so a compressible topic returns fewer records per Fetch than Kafka would, never more
   than the limits
@@ -595,7 +596,12 @@ the log:
   like the marker Kafka writes when a transaction ends. Clients skip control records
   and move their position past it (the Java client to the batch's last offset + 1,
   librdkafka to the marker's offset + 1), so their position and committed offset reach
-  the end and the lag goes to 0. An open transaction still blocks at the LSO.
+  the end and the lag goes to 0. An open transaction still blocks at the LSO. The
+  control batch counts against `partition_max_bytes` and `max_bytes` at its encoded size
+  (about 80 bytes), as Kafka counts the abort markers it returns: the first partition of a
+  response with data or such a batch returns it whatever its size, a later partition only
+  when it fits what is left of both limits (otherwise nothing, and its consumer fetches
+  the same offset again).
 - Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
   offsets written by the same producer id/epoch. Batches of transactional rows carry their producer
   id/epoch and the transactional flag; other batches `producer_id = -1`. The base
