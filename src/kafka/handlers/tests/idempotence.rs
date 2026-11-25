@@ -294,3 +294,89 @@ fn test_handle_produce_non_idempotent_skips_validation() {
     let partition_response = &response.responses[0].partition_responses[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
 }
+
+/// One Produce with an idempotent batch to partition 0 and a plain batch to -1 whose
+/// record routes to 0 (a one-partition topic): the routed record must not join the
+/// idempotent batch, which would be sequence-checked and recorded as two records. The -1
+/// entry is answered UNKNOWN_TOPIC_OR_PARTITION, as Kafka 3.7 answers any -1, whichever
+/// order the two entries come in.
+fn produce_idempotent_next_to_routed(routed_first: bool) {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+    mock.expect_get_or_create_topic()
+        .returning(|_, _| Ok((1, 1)));
+    mock.expect_open_txn_epoch_on_partition()
+        .returning(|_, _, _| Ok(None));
+    mock.expect_check_and_update_sequence()
+        .withf(|_, _, _, partition, base, count| *partition == 0 && *base == 0 && *count == 1)
+        .times(1)
+        .returning(|_, _, _, _, _, _| Ok(crate::kafka::storage::SequenceCheck::Append));
+    mock.expect_insert_records()
+        .withf(|_, partition, records| *partition == 0 && records.len() == 1)
+        .times(1)
+        .returning(|_, _, _| Ok(0));
+    mock.expect_record_producer_batch()
+        .withf(|b| b.first_sequence == 0 && b.last_sequence == 0)
+        .times(1)
+        .returning(|_| Ok(()));
+
+    let record = |value: &[u8]| Record {
+        key: Some(b"k".to_vec()),
+        value: Some(value.to_vec()),
+        headers: vec![],
+        timestamp: None,
+    };
+    let idempotent = PartitionProduceData {
+        partition_index: 0,
+        records: vec![record(b"idempotent")],
+        producer_metadata: Some(ProducerMetadata {
+            producer_id: 1000,
+            producer_epoch: 0,
+            base_sequence: 0,
+            is_transactional: false,
+        }),
+    };
+    let routed = PartitionProduceData {
+        partition_index: -1,
+        records: vec![record(b"plain")],
+        producer_metadata: Some(ProducerMetadata {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            is_transactional: false,
+        }),
+    };
+    let partitions = if routed_first {
+        vec![routed, idempotent]
+    } else {
+        vec![idempotent, routed]
+    };
+    let topic_data = vec![TopicProduceData {
+        name: "test-topic".to_string(),
+        partitions,
+    }];
+
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
+    let mut answers: Vec<(i32, i16)> = response.responses[0]
+        .partition_responses
+        .iter()
+        .map(|p| (p.index, p.error_code))
+        .collect();
+    answers.sort_unstable();
+    assert_eq!(
+        answers,
+        [(-1, ERROR_UNKNOWN_TOPIC_OR_PARTITION), (0, ERROR_NONE)]
+    );
+}
+
+#[test]
+fn test_produce_routed_records_after_idempotent_batch_refused() {
+    produce_idempotent_next_to_routed(false);
+}
+
+#[test]
+fn test_produce_routed_records_before_idempotent_batch_refused() {
+    produce_idempotent_next_to_routed(true);
+}

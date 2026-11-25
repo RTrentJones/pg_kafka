@@ -683,7 +683,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 **Technical Details:**
 - Uses `murmur2` crate with `KAFKA_SEED` for hash compatibility with Kafka
 - When partition_index == -1, server computes: `murmur2(key) % partition_count`
-- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all; clients always pick the partition).
+- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all and answers every -1 entry so; clients always pick the partition). So is a plain -1 batch in a topic of the request that also has an idempotent or transactional batch: its records would join that batch's partition and be written under its producer state (sequence-checked as part of it, or pending in its transaction). A routed batch is answered on the partitions it was written to, not on -1.
 
 ### 12. Null Key Partition Routing (Minor Deviation)
 

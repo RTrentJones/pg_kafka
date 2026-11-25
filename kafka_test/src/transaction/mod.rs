@@ -53,6 +53,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         validation::test_transactional_produce_is_validated_per_partition,
         validation::test_transactional_batches_of_two_producers_are_refused,
         validation::test_non_transactional_batch_inside_an_open_transaction_is_refused,
+        validation::test_routed_records_do_not_join_a_transactional_batch,
         coordinator_codes::test_fenced_epoch_code_follows_the_request_version,
         coordinator_codes::test_unknown_transactional_id_is_invalid_producer_id_mapping,
         coordinator_codes::test_txn_offset_commit_needs_the_group_added,
