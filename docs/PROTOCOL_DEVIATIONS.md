@@ -629,7 +629,11 @@ honored; producer CreateTime timestamps are preserved).
   last offset of that record's batch (KAFKA-16310, fixed in later releases)
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
-  (`read_committed`: the LSO) is offset -1; aborted records are never a match
+  (`read_committed`: the LSO) is offset -1
+- ⚠️ **Deviation:** aborted records are never a match of a timestamp or MAX_TIMESTAMP
+  lookup, at either isolation level; the answer is the next record that matches. Kafka 3.7
+  (`FileRecords.searchForTimestamp`, `LogSegment.findOffsetByTimestamp`) searches the batches
+  without a transactional filter, so it can answer an aborted record's offset and timestamp.
 - ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION
 
 ## Metadata API Deviations
