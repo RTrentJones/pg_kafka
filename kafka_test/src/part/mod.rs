@@ -2,6 +2,7 @@
 //! (ADR-001).
 
 mod drop_extension;
+pub(crate) use drop_extension::MAINTENANCE_LOCK_KEY;
 mod lock_order;
 mod lock_races;
 mod sweep_budget;
