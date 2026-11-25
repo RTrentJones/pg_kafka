@@ -216,7 +216,8 @@ gucs! {
           as Kafka's broker fetch.max.bytes does. Records are still returned if the first \
           record of the first partition with data is larger, so a consumer always makes \
           progress; later partitions return only what fits. The per-partition limit is the \
-          request's partition_max_bytes, within what is left of this. It is also each \
+          request's partition_max_bytes, within what is left of this. Sizes count each record's \
+          uncompressed key, value and header bytes. It is also each \
           connection's budget for responses not yet written: past it the connection reads no \
           further request until its client reads. Default: 57671680 (55 MiB). Reloadable via \
           SIGHUP: the cap applies to requests read after the reload, the budget to \
