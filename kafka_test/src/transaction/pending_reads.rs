@@ -29,7 +29,7 @@ const MAX_ROWS_READ: i64 = FOREIGN_PENDING / 10;
 /// rows) present, a commit, an abort, a fencing InitProducerId and a timeout abort of
 /// the test's own transactions together read fewer than 20 000 rows of kafka.messages
 /// (its leaves' `seq_tup_read + idx_tup_fetch`, the worker's statistics flushed by
-/// ending it before and after), and each of the test's rows ends in its expected state.
+/// ending it before and after and read once they settle), and each of the test's rows ends in its expected state.
 pub async fn test_ending_a_transaction_reads_only_its_own_pending_rows() -> TestResult {
     into_test_result(ending_reads().await)
 }
@@ -223,7 +223,10 @@ struct WorkerReads {
 }
 
 /// The worker flushes its statistics only when it exits, so it is ended first (and
-/// waited for to serve again).
+/// waited for to serve again). The counters are then read until two readings a second
+/// apart agree: statistics reach the views late (PostgreSQL 14's collector lags behind
+/// a busy server, and a backend may defer its flush), so reads from before the window,
+/// such as an earlier test's DELETE of its rows, would otherwise land inside it.
 async fn worker_reads(db: &Client) -> SendResult<WorkerReads> {
     let old = listener_pid(db).await?;
     if let Some(pid) = old {
@@ -232,6 +235,23 @@ async fn worker_reads(db: &Client) -> SendResult<WorkerReads> {
             .map_err(boxed)?;
     }
     wait_for_serving_listener(db, old, Duration::from_secs(30)).await?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = read_counters(db).await?;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = read_counters(db).await?;
+        if now.rows_read == last.rows_read && now.inserted == last.inserted {
+            return Ok(now);
+        }
+        if Instant::now() > deadline {
+            return Err("the statistics of kafka.messages never settled".into());
+        }
+        last = now;
+    }
+}
+
+/// The counters as the statistics views show them now.
+async fn read_counters(db: &Client) -> SendResult<WorkerReads> {
     db.batch_execute("SELECT pg_stat_clear_snapshot()")
         .await
         .map_err(boxed)?;
