@@ -27,11 +27,11 @@ const METADATA: usize = 128;
 const FETCHES: i32 = 30;
 
 /// What one record of no key adds to a Fetch response, as the broker counts it: value and
-/// header bytes uncompressed, 64 bytes a record and 10 a header (the records here have at
+/// header bytes uncompressed, 84 bytes a record and 10 a header (the records here have at
 /// most one).
 fn record_bytes(value: usize, header_bytes: usize) -> usize {
     value
-        + 64
+        + 84
         + if header_bytes > 0 {
             header_bytes + 10
         } else {
@@ -426,6 +426,245 @@ pub async fn test_pipelined_responses_stay_within_the_connection_budget() -> Tes
     }
     delay.restore().await.map_err(widen)?;
     restore_fetch_max_bytes(guc).await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Partitions of the topic [`test_fetch_reads_no_first_record_a_partition_cannot_return`]
+/// fetches.
+const FANOUT_PARTITIONS: i32 = 300;
+/// The first record of each of those partitions: 1 MB of a repeated pattern, which TOAST
+/// stores compressed in a few KB and must decompress to read.
+const FANOUT_LARGE: usize = 1_000_000;
+
+/// A Fetch v4 that answers at once of partitions `0..partitions` of `topic` from `offset`,
+/// each up to `partition_max` bytes, with a `max_bytes` of `i32::MAX`.
+fn fetch_partitions(topic: &str, partitions: i32, offset: i64, partition_max: i32) -> FetchRequest {
+    let mut req = fetch_request(topic, 0, offset, 0);
+    req.max_bytes = i32::MAX;
+    let template = req.topics[0].partitions[0].clone();
+    req.topics[0].partitions = (0..partitions)
+        .map(|p| {
+            let mut entry = template.clone();
+            entry.partition = p;
+            entry.partition_max_bytes = partition_max;
+            entry
+        })
+        .collect();
+    req
+}
+
+/// Fetch `req` on `s`: how long it took to be answered, and per partition its error code and
+/// the encoded length of its records.
+async fn timed_fetch(
+    s: &mut TcpStream,
+    corr: i32,
+    req: &FetchRequest,
+) -> DynResult<(Duration, Vec<(i32, i16, usize)>)> {
+    let started = Instant::now();
+    s.write_all(&request_frame(4, corr, req)).await?;
+    let frame = read_frame_within(s, Duration::from_secs(60))
+        .await?
+        .ok_or("closed on fetch")?;
+    let took = started.elapsed();
+    let (c, resp) = decode_response::<FetchRequest>(4, &frame)?;
+    assert_eq!(c, corr);
+    let partitions = resp.responses[0]
+        .partitions
+        .iter()
+        .map(|p| {
+            (
+                p.partition_index,
+                p.error_code,
+                p.records.as_ref().map_or(0, Bytes::len),
+            )
+        })
+        .collect();
+    Ok((took, partitions))
+}
+
+/// Kafka returns a first record larger than the limits only for the first partition with data
+/// (KIP-74); every later partition returns what fits its `partition_max_bytes`. The broker
+/// still read the first record of each later partition from the database, whatever its size,
+/// and dropped it in the handler: a Fetch of 300 partitions whose first records are 1 MB
+/// (stored compressed, so each read decompresses 1 MB) held the DB thread for 299 such reads,
+/// some 10 times as long as the same Fetch from the small records behind them. Now a
+/// partition that may not return its first record whole does not read it, so the two cost
+/// about the same. The later partitions answer no records (and no gap batch, which would move
+/// their consumers past the records they did not get).
+pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> TestResult {
+    println!("=== Test: Fetch reads no first record a partition cannot return ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-fetch-first").await;
+    let created = create_topics_raw(vec![creatable(&topic, FANOUT_PARTITIONS, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    let large = Bytes::from(b"abcdefgh".repeat(FANOUT_LARGE / 8));
+    let small = Bytes::from(vec![b's'; 100]);
+    let partitions: Vec<i32> = (0..FANOUT_PARTITIONS).collect();
+    for (corr, chunk) in (0..).zip(partitions.chunks(10)) {
+        let parts = chunk
+            .iter()
+            .map(|&p| {
+                let records: Vec<_> = [&large, &small]
+                    .into_iter()
+                    .zip(0..)
+                    .map(|(value, offset)| {
+                        let mut r = plain_record(offset, None, value);
+                        // One batch: offset - sequence is the same for every record.
+                        r.sequence = i32::try_from(offset).unwrap_or(0) - 1;
+                        r
+                    })
+                    .collect();
+                (p, encode(&records, Compression::None))
+            })
+            .collect();
+        let req = produce_request(&topic, parts, 1);
+        s.write_all(&request_frame(3, corr, &req)).await?;
+        let frame = read_frame_within(&mut s, Duration::from_secs(60))
+            .await?
+            .ok_or("closed on produce")?;
+        let (_, resp) = decode_response::<ProduceRequest>(3, &frame)?;
+        let codes: Vec<i16> = resp.responses[0]
+            .partition_responses
+            .iter()
+            .map(|p| p.error_code)
+            .collect();
+        assert!(codes.iter().all(|&c| c == 0), "produce answered {codes:?}");
+    }
+    println!(
+        "Step 1: {FANOUT_PARTITIONS} partitions, each a record of {FANOUT_LARGE} bytes at offset \
+         0 and one of 100 bytes at offset 1"
+    );
+
+    // Each Fetch three times; the fastest of each is compared.
+    let mut large_first = Duration::MAX;
+    let mut small_first = Duration::MAX;
+    for attempt in 0..3 {
+        let (took, answer) = timed_fetch(
+            &mut s,
+            100 + attempt,
+            &fetch_partitions(&topic, FANOUT_PARTITIONS, 0, 1000),
+        )
+        .await?;
+        assert!(answer.iter().all(|&(_, code, _)| code == 0), "{answer:?}");
+        assert!(
+            answer[0].2 > FANOUT_LARGE,
+            "the first partition returns its first record whole: {:?}",
+            answer[0]
+        );
+        let later: Vec<_> = answer[1..].iter().filter(|p| p.2 > 0).collect();
+        assert!(
+            later.is_empty(),
+            "the later partitions return no records, nor a gap batch: {later:?}"
+        );
+        large_first = large_first.min(took);
+
+        let (took, answer) = timed_fetch(
+            &mut s,
+            200 + attempt,
+            &fetch_partitions(&topic, FANOUT_PARTITIONS, 1, 1000),
+        )
+        .await?;
+        assert!(
+            answer.iter().all(|&(_, code, len)| code == 0 && len > 100),
+            "every partition returns its small record: {answer:?}"
+        );
+        small_first = small_first.min(took);
+        println!(
+            "  attempt {attempt}: from the large records {large_first:?}, from the small ones \
+             {small_first:?} (fastest so far)"
+        );
+    }
+    println!(
+        "Step 2: a Fetch from the large records took {large_first:?}, from the small ones \
+         {small_first:?}"
+    );
+    assert!(
+        large_first < small_first * 2 + Duration::from_millis(40),
+        "the Fetch from the large records took {large_first:?}, the one from the small records \
+         {small_first:?}: the later partitions read their first records although they cannot \
+         return them"
+    );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Records of [`test_fetch_limits_count_records_alone_in_their_batch`].
+const LONE_RECORDS: i64 = 400;
+/// The value of each of them.
+const LONE_VALUE: usize = 10;
+
+/// A record alone in its RecordBatch carries the whole 61-byte batch header besides its own
+/// framing: here records whose neighbours were deleted (as aborted-row cleanup deletes them),
+/// so no two returned offsets are consecutive. Each record of 10 bytes takes 78 bytes of the
+/// response, and the byte limits counted 74 (10 plus 64 a record), so a Fetch returned more
+/// than its `partition_max_bytes` and its `max_bytes`. Now a record counts 84 bytes besides
+/// its key, value and headers, what one alone in its batch takes at most, and the records
+/// returned fit both limits.
+pub async fn test_fetch_limits_count_records_alone_in_their_batch() -> TestResult {
+    println!("=== Test: Fetch limits count records alone in their batch ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-fetch-lone").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    let value = [b'v'; LONE_VALUE];
+    let records: Vec<_> = (0..LONE_RECORDS)
+        .map(|offset| {
+            let mut r = plain_record(offset, None, &value);
+            // One batch: offset - sequence is the same for every record.
+            r.sequence = i32::try_from(offset).unwrap_or(0) - 1;
+            r
+        })
+        .collect();
+    produce_batch(&mut s, 1, &topic, encode(&records, Compression::None)).await?;
+    let deleted = ctx
+        .db()
+        .execute(
+            "DELETE FROM kafka.messages m USING kafka.topics t \
+             WHERE t.id = m.topic_id AND t.name = $1 AND m.partition_offset % 2 = 1",
+            &[&topic],
+        )
+        .await?;
+    assert_eq!(i64::try_from(deleted)?, LONE_RECORDS / 2);
+    println!(
+        "Step 1: {LONE_RECORDS} records of {LONE_VALUE} bytes, every second one deleted: each \
+         left is alone in its batch"
+    );
+
+    let limit: i32 = 74 * 100;
+    for (corr, (max_bytes, partition_max)) in [(i32::MAX, limit), (limit, i32::MAX)]
+        .into_iter()
+        .enumerate()
+    {
+        let req = fetch_with_limits(&topic, 0, max_bytes, partition_max);
+        s.write_all(&request_frame(4, i32::try_from(corr)? + 2, &req))
+            .await?;
+        let frame = read_frame_within(&mut s, Duration::from_secs(30))
+            .await?
+            .ok_or("closed on fetch")?;
+        let (_, resp) = decode_response::<FetchRequest>(4, &frame)?;
+        let partition = &resp.responses[0].partitions[0];
+        assert_eq!(partition.error_code, 0);
+        let mut records = partition.records.clone().unwrap_or_default();
+        let bytes = records.len();
+        let sets = RecordBatchDecoder::decode_all(&mut records)?;
+        let count: usize = sets.iter().map(|set| set.records.len()).sum();
+        println!(
+            "Step {}: max_bytes {max_bytes}, partition_max_bytes {partition_max}: {count} \
+             records in {} batches, {bytes} bytes",
+            corr + 2,
+            sets.len()
+        );
+        assert!(count > 1, "{count} records returned");
+        assert!(
+            usize::try_from(limit).is_ok_and(|limit| bytes <= limit),
+            "{bytes} bytes of records returned for a limit of {limit}"
+        );
+    }
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

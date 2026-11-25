@@ -74,6 +74,25 @@ pub struct FetchedMessage {
     pub producer_epoch: Option<i16>,
 }
 
+/// What one fetch of a partition read ([`LogStore::fetch_records_with_isolation`]).
+#[derive(Debug, Clone, Default)]
+pub struct FetchedRecords {
+    /// The records, in offset order.
+    pub messages: Vec<FetchedMessage>,
+    /// The first visible record from the fetch offset was left out unread: it is larger than
+    /// the byte limit and the fetch did not allow it whole. `messages` is then empty.
+    pub first_left_out: bool,
+}
+
+impl From<Vec<FetchedMessage>> for FetchedRecords {
+    fn from(messages: Vec<FetchedMessage>) -> Self {
+        Self {
+            messages,
+            first_left_out: false,
+        }
+    }
+}
+
 /// The producer that owns a transactional id, as InitProducerId judges a presented
 /// producer id and epoch against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,19 +401,23 @@ pub trait LogStore {
     /// * `topic_id` - Topic ID
     /// * `partition_id` - Partition ID
     /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    /// * `max_bytes` - Most bytes the records may add to the response
+    /// * `whole_first_record` - Return the first record even when it alone is larger than
+    ///   `max_bytes` (KIP-74: the first partition of a response with data). Without it such a
+    ///   record is not read at all; `first_left_out` reports it
     /// * `isolation_level` - Consumer isolation level
     ///
     /// # Returns
-    /// Vector of fetched messages respecting isolation level
+    /// The fetched messages respecting isolation level
     fn fetch_records_with_isolation(
         &self,
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>>;
+    ) -> Result<FetchedRecords>;
 
     /// Get high watermark for a topic partition
     ///

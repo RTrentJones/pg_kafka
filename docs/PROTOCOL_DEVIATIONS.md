@@ -538,8 +538,13 @@ pg_kafka.compression_type = 'gzip'
   the response budget is spent, each up to its own `partition_max_bytes`; the first
   partition with data always returns at least one message, later partitions return only
   what still fits. Both limits count what a record adds to the response: its key, value and
-  header keys and values uncompressed, plus 64 bytes per record and 10 per header for its
-  framing; the database reads (and holds) no more than that of a partition. Kafka counts
+  header keys and values uncompressed, plus 84 bytes per record and 10 per header for its
+  framing (the most an uncompressed record batch spends on them: a record alone in its batch,
+  as read_committed skipping aborted offsets or alternating producers leave records, carries
+  the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
+  within both limits, but for the first one above; the database reads (and holds) no more than
+  that of a partition, and a later partition whose first record is larger than its limit does
+  not read that record. Kafka counts
   the bytes of the record batches as stored, compressed when the producer compressed them,
   so a compressible topic returns fewer records per Fetch than Kafka would, never more
   than the limits

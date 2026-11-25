@@ -171,7 +171,7 @@ fn fetch_mock(partition_count: i32, hwm: i64, log_start: i64) -> MockKafkaStore 
     mock.expect_get_log_start_offset()
         .returning(move |_, _| Ok(log_start));
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| Ok(vec![]));
+        .returning(|_, _, _, _, _, _| Ok(vec![].into()));
     mock
 }
 
@@ -234,7 +234,7 @@ fn fetch_into_cleaned_up_aborted_hole_is_not_out_of_range() {
     // ... but nothing retired offset 0, so the durable log start is still 0.
     mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| Ok(vec![]));
+        .returning(|_, _, _, _, _, _| Ok(vec![].into()));
     assert_eq!(fetch_one(&mock, 0, 0).0, ERROR_NONE);
 }
 

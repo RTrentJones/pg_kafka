@@ -816,7 +816,7 @@ fn test_mock_fetch_records_with_isolation() {
 
     // Test read_committed: should only return committed messages
     mock.expect_fetch_records_with_isolation()
-        .withf(|topic_id, partition_id, offset, max_bytes, isolation| {
+        .withf(|topic_id, partition_id, offset, max_bytes, _, isolation| {
             *topic_id == 1
                 && *partition_id == 0
                 && *offset == 0
@@ -824,7 +824,7 @@ fn test_mock_fetch_records_with_isolation() {
                 && *isolation == IsolationLevel::ReadCommitted
         })
         .times(1)
-        .returning(|_, _, _, _, _| {
+        .returning(|_, _, _, _, _, _| {
             // Only committed messages returned (pending filtered out)
             Ok(vec![FetchedMessage {
                 partition_offset: 0,
@@ -834,12 +834,14 @@ fn test_mock_fetch_records_with_isolation() {
                 headers: vec![],
                 producer_id: None,
                 producer_epoch: None,
-            }])
+            }]
+            .into())
         });
 
     let result = mock
-        .fetch_records_with_isolation(1, 0, 0, 1024, IsolationLevel::ReadCommitted)
-        .unwrap();
+        .fetch_records_with_isolation(1, 0, 0, 1024, true, IsolationLevel::ReadCommitted)
+        .unwrap()
+        .messages;
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].key, Some(b"committed-key".to_vec()));
 }

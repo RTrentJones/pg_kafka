@@ -53,8 +53,8 @@ use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
     delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
-    delegate_topic_store, FetchedMessage, IsolationLevel, KafkaStore, LogStore, MaintenanceStore,
-    OffsetStore, ProducerStore, TopicStore, TransactionState, TransactionStore,
+    delegate_topic_store, FetchedMessage, FetchedRecords, IsolationLevel, KafkaStore, LogStore,
+    MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionState, TransactionStore,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1060,17 +1060,19 @@ impl<S: KafkaStore, D: ShadowDb> LogStore for ShadowStore<S, D> {
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         // External-primary read suppression (see fetch_records).
         if self.suppress_external_primary_reads(topic_id) {
-            return Ok(Vec::new());
+            return Ok(FetchedRecords::default());
         }
         self.inner.fetch_records_with_isolation(
             topic_id,
             partition_id,
             fetch_offset,
             max_bytes,
+            whole_first_record,
             isolation_level,
         )
     }

@@ -48,7 +48,8 @@ pub fn handle_fetch(
 
 /// The bytes one record adds to a Fetch response, the size both byte limits
 /// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
-/// value and header keys and values, 64 bytes per record and 10 per header for its framing.
+/// value and header keys and values, 84 bytes per record and 10 per header for its framing
+/// (what a record alone in its RecordBatch adds at most, see [`RECORD_OVERHEAD`]).
 /// Matches the storage layer's own accounting (`record_bytes_sql!` in
 /// `storage/postgres/log.rs`), so storage and this handler cut a partition at the same
 /// record.
@@ -65,8 +66,16 @@ pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
         .saturating_add(headers)
 }
 
-/// The framing bytes [`message_size_estimate`] counts per record and per header.
-const RECORD_OVERHEAD: i64 = 64;
+/// The framing bytes [`message_size_estimate`] counts per record and per header, upper
+/// bounds of what an uncompressed RecordBatch v2 spends on them. A record alone in its batch
+/// (each run of one producer's consecutive offsets is a batch: read_committed skipping
+/// aborted offsets, or alternating producers, leave records alone) carries the whole 61-byte
+/// batch header ([`BATCH_HEADER_LEN`]) and at most 23 bytes of its own: its length, key and
+/// value length and header count varints (at most 5 bytes each), attributes, and timestamp
+/// and offset deltas of 0 (1 byte each). A record sharing its batch takes at most 31 bytes of
+/// its own (both deltas up to 5) and at most half the header. A header's key and value
+/// lengths are two varints of at most 5 bytes.
+const RECORD_OVERHEAD: i64 = 61 + 23;
 const HEADER_OVERHEAD: i64 = 10;
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
@@ -483,11 +492,14 @@ fn read_partition(
         isolation_level,
         compression,
     } = settings;
+    // Only a partition that may keep an oversized first record reads one: any other would
+    // read it only to drop it (Kafka 3.7 applies minOneMessage to the first partition only).
     let fetched = match store.fetch_records_with_isolation(
         topic_id,
         partition_id,
         fetch_offset,
         limit,
+        !budget.returned_any,
         isolation_level,
     ) {
         Ok(records) => records,
@@ -504,9 +516,10 @@ fn read_partition(
             return partition_error(partition_id, e.to_kafka_error_code());
         }
     };
-    let storage_empty = fetched.is_empty();
+    // A first record left out for its size is a visible record: no gap batch over it.
+    let storage_empty = fetched.messages.is_empty() && !fetched.first_left_out;
     let (db_records, used) =
-        trim_to_response_budget(fetched, i64::from(limit), budget.returned_any);
+        trim_to_response_budget(fetched.messages, i64::from(limit), budget.returned_any);
     budget.remaining -= used;
     budget.returned_any |= !db_records.is_empty();
 
@@ -818,11 +831,60 @@ mod tests {
     #[test]
     fn size_estimate_counts_key_value_and_overhead() {
         let mut m = msg(0, 10);
-        assert_eq!(message_size_estimate(&m), 74);
+        assert_eq!(message_size_estimate(&m), 94);
         m.key = Some(vec![1, 2, 3]);
-        assert_eq!(message_size_estimate(&m), 77);
+        assert_eq!(message_size_estimate(&m), 97);
         m.value = None;
-        assert_eq!(message_size_estimate(&m), 67);
+        assert_eq!(message_size_estimate(&m), 87);
+    }
+
+    /// The estimate is never under what a record adds to the response, alone in its batch
+    /// (the most it can add) or sharing one.
+    #[test]
+    fn size_estimate_covers_the_encoded_record() {
+        let mut lone = Vec::new();
+        for (key, value, headers) in [
+            (None, Some(0), 0),
+            (None, Some(10), 0),
+            (Some(3), None, 0),
+            (Some(100), Some(10_000), 2),
+            (Some(70), Some(1 << 20), 1),
+            (None, None, 0),
+        ] {
+            let mut m = msg(0, 0);
+            m.key = key.map(|n| vec![b'k'; n]);
+            m.value = value.map(|n| vec![b'v'; n]);
+            m.timestamp = 1_700_000_000_000;
+            m.headers = (0..headers)
+                .map(|i| (format!("h{i}"), vec![b'x'; 200]))
+                .collect();
+            lone.push(m);
+        }
+        for m in &lone {
+            let estimate = message_size_estimate(m);
+            let encoded = encode_record_batches(vec![m.clone()], Compression::None).unwrap();
+            assert!(
+                i64::try_from(encoded.len()).unwrap() <= estimate,
+                "a record alone in its batch takes {} bytes, counted {estimate}",
+                encoded.len()
+            );
+        }
+        // Alternating producers: one batch a record.
+        let alternating: Vec<_> = (0..6)
+            .map(|o| {
+                let mut m = msg(o, 10);
+                m.producer_id = (o % 2 == 1).then_some(7);
+                m.producer_epoch = m.producer_id.map(|_| 0);
+                m
+            })
+            .collect();
+        // Consecutive records of no producer: one batch.
+        let shared: Vec<_> = (0..6).map(|o| msg(o, 10)).collect();
+        for records in [alternating, shared] {
+            let estimate: i64 = records.iter().map(message_size_estimate).sum();
+            let encoded = encode_record_batches(records, Compression::None).unwrap();
+            assert!(i64::try_from(encoded.len()).unwrap() <= estimate);
+        }
     }
 
     #[test]
@@ -840,7 +902,7 @@ mod tests {
     fn trim_keeps_first_message_of_response_even_if_oversized() {
         let (kept, used) = trim_to_response_budget(vec![msg(0, 500), msg(1, 10)], 100, false);
         assert_eq!(kept.len(), 1);
-        assert_eq!(used, 564);
+        assert_eq!(used, 584);
     }
 
     #[test]
@@ -849,9 +911,9 @@ mod tests {
         assert!(kept.is_empty());
         assert_eq!(used, 0);
         let (kept, used) =
-            trim_to_response_budget(vec![msg(0, 10), msg(1, 10), msg(2, 10)], 150, true);
+            trim_to_response_budget(vec![msg(0, 10), msg(1, 10), msg(2, 10)], 200, true);
         assert_eq!(kept.len(), 2);
-        assert_eq!(used, 148);
+        assert_eq!(used, 188);
     }
 
     fn two_partition_request() -> Vec<TopicFetchData> {
@@ -896,8 +958,8 @@ mod tests {
         let mut mock = mock_with_two_partitions();
         mock.expect_fetch_records_with_isolation()
             .times(1)
-            .withf(|_, partition, _, limit, _| *partition == 0 && *limit == 1)
-            .returning(|_, _, _, _, _| Ok(vec![msg(0, 100), msg(1, 100)]));
+            .withf(|_, partition, _, limit, _, _| *partition == 0 && *limit == 1)
+            .returning(|_, _, _, _, _, _| Ok(vec![msg(0, 100), msg(1, 100)].into()));
         let env = TestEnv::new();
         let ctx = env.ctx(&mock);
 
@@ -921,9 +983,9 @@ mod tests {
     fn size_estimate_counts_headers() {
         let mut m = msg(0, 10);
         m.headers = vec![("trace".to_string(), vec![0; 100_000])];
-        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10);
+        assert_eq!(message_size_estimate(&m), 94 + 5 + 100_000 + 10);
         m.headers.push((String::new(), vec![]));
-        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10 + 10);
+        assert_eq!(message_size_estimate(&m), 94 + 5 + 100_000 + 10 + 10);
     }
 
     /// Records a store returns past a partition's `partition_max_bytes` are dropped even when
@@ -939,12 +1001,14 @@ mod tests {
         };
         mock.expect_fetch_records_with_isolation()
             .times(2)
-            .returning(move |_, partition, _, _, _| {
-                Ok(if partition == 0 {
-                    (0..10).map(|o| msg(o, 400)).collect()
-                } else {
-                    (0..10).map(with_headers).collect()
-                })
+            .returning(move |_, partition, _, _, _, _| {
+                Ok(crate::kafka::storage::FetchedRecords::from(
+                    if partition == 0 {
+                        (0..10).map(|o| msg(o, 400)).collect::<Vec<_>>()
+                    } else {
+                        (0..10).map(with_headers).collect::<Vec<_>>()
+                    },
+                ))
             });
         let env = TestEnv::new();
         let ctx = env.ctx(&mock);
@@ -963,9 +1027,88 @@ mod tests {
         let parts = &response.responses[0].partitions;
         let mut records = parts[0].records.clone().unwrap();
         let batches = RecordBatchDecoder::decode_all(&mut records).unwrap();
-        // 464 bytes a record: two fit 1000.
+        // 484 bytes a record: two fit 1000.
         assert_eq!(batches.iter().map(|b| b.records.len()).sum::<usize>(), 2);
-        // 475 bytes a record (its header counts), over partition 1's 400.
+        // 495 bytes a record (its header counts), over partition 1's 400.
+        assert!(parts[1].records.as_ref().unwrap().is_empty());
+    }
+
+    /// Only the first partition with data may return a first record larger than its limits
+    /// (KIP-74; Kafka 3.7's minOneMessage), so only it asks storage for one: a later partition
+    /// that asked would read an oversized first record from the database just to drop it.
+    #[test]
+    fn only_the_first_partition_with_data_reads_an_oversized_first_record() {
+        // (records partition 0 returns, the request's whole_first_record) -> the flag each
+        // partition passes to storage.
+        let cases = [
+            (1, true, [true, false]),
+            (0, true, [true, true]),
+            (1, false, [false, false]),
+        ];
+        for (returned, whole_first_record, expected) in cases {
+            let mut mock = mock_with_two_partitions();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = std::sync::Arc::clone(&asked);
+            mock.expect_fetch_records_with_isolation()
+                .times(2)
+                .returning(move |_, partition, _, _, whole, _| {
+                    seen.lock().unwrap().push((partition, whole));
+                    Ok(if partition == 0 {
+                        (0..returned).map(|o| msg(o, 100)).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
+                    .into())
+                });
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            handle_fetch_with_max_bytes(
+                &ctx,
+                two_partition_request(),
+                IsolationLevel::ReadUncommitted,
+                1 << 20,
+                whole_first_record,
+            )
+            .unwrap();
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![(0, expected[0]), (1, expected[1])],
+                "partition 0 returned {returned} records, whole_first_record {whole_first_record}"
+            );
+        }
+    }
+
+    /// A first record storage left out for its size is a visible record: the partition
+    /// returns nothing, not a gap batch that would move the consumer past it.
+    #[test]
+    fn a_first_record_left_out_is_not_covered_by_a_gap_batch() {
+        let mut mock = mock_with_two_partitions();
+        mock.expect_fetch_records_with_isolation()
+            .times(2)
+            .returning(|_, partition, _, _, _, _| {
+                Ok(if partition == 0 {
+                    vec![msg(0, 100)].into()
+                } else {
+                    crate::kafka::storage::FetchedRecords {
+                        messages: Vec::new(),
+                        first_left_out: true,
+                    }
+                })
+            });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_fetch_with_max_bytes(
+            &ctx,
+            two_partition_request(),
+            IsolationLevel::ReadUncommitted,
+            1 << 20,
+            true,
+        )
+        .unwrap();
+        let parts = &response.responses[0].partitions;
+        assert!(!parts[0].records.as_ref().unwrap().is_empty());
+        assert_eq!(parts[1].error_code, ERROR_NONE);
+        assert_eq!(parts[1].high_watermark, 3);
         assert!(parts[1].records.as_ref().unwrap().is_empty());
     }
 
@@ -975,7 +1118,7 @@ mod tests {
         let mut mock = mock_with_two_partitions();
         mock.expect_fetch_records_with_isolation()
             .times(2)
-            .returning(|_, _, _, _, _| Ok(vec![msg(0, 100)]));
+            .returning(|_, _, _, _, _, _| Ok(vec![msg(0, 100)].into()));
         let env = TestEnv::new();
         let ctx = env.ctx(&mock);
 
@@ -1008,7 +1151,7 @@ mod tests {
         mock.expect_get_earliest_offset().returning(|_, _| Ok(2));
         mock.expect_get_log_start_offset().returning(|_, _| Ok(1));
         mock.expect_fetch_records_with_isolation()
-            .returning(|_, _, _, _, _| Ok(vec![]));
+            .returning(|_, _, _, _, _, _| Ok(vec![].into()));
         let env = TestEnv::new();
         let ctx = env.ctx(&mock);
 
@@ -1189,7 +1332,7 @@ mod tests {
     fn invisible_tail_is_covered_by_a_gap_batch() {
         let mut mock = one_partition_mock(5, 5);
         mock.expect_fetch_records_with_isolation()
-            .returning(|_, _, _, _, _| Ok(vec![]));
+            .returning(|_, _, _, _, _, _| Ok(vec![].into()));
         let b = fetch_one(&mock, 2, IsolationLevel::ReadCommitted);
         assert_eq!(b, gap_batch(2, 5).unwrap());
         // read_uncommitted after cleanup deleted the rows: up to the HWM.
@@ -1205,7 +1348,7 @@ mod tests {
     fn gap_batch_stops_at_the_last_stable_offset() {
         let mut mock = one_partition_mock(9, 3);
         mock.expect_fetch_records_with_isolation()
-            .returning(|_, _, _, _, _| Ok(vec![]));
+            .returning(|_, _, _, _, _, _| Ok(vec![].into()));
         assert_eq!(
             fetch_one(&mock, 1, IsolationLevel::ReadCommitted),
             gap_batch(1, 3).unwrap()

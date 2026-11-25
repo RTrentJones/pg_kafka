@@ -25,7 +25,7 @@ fn test_handle_fetch_success() {
     });
 
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| {
+        .returning(|_, _, _, _, _, _| {
             Ok(vec![FetchedMessage {
                 partition_offset: 5,
                 key: Some(b"key1".to_vec()),
@@ -34,7 +34,8 @@ fn test_handle_fetch_success() {
                 headers: vec![],
                 producer_id: None,
                 producer_epoch: None,
-            }])
+            }]
+            .into())
         });
 
     mock.expect_get_high_watermark().returning(|_, _| Ok(6));
@@ -81,7 +82,7 @@ fn test_handle_fetch_returns_headers() {
     });
 
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| {
+        .returning(|_, _, _, _, _, _| {
             Ok(vec![FetchedMessage {
                 partition_offset: 0,
                 key: Some(b"key1".to_vec()),
@@ -90,7 +91,8 @@ fn test_handle_fetch_returns_headers() {
                 headers: vec![("trace-id".to_string(), b"abc123".to_vec())],
                 producer_id: None,
                 producer_epoch: None,
-            }])
+            }]
+            .into())
         });
 
     mock.expect_get_high_watermark().returning(|_, _| Ok(1));
@@ -146,7 +148,7 @@ fn test_handle_fetch_hwm_error_returns_partition_error() {
     });
 
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| Ok(vec![]));
+        .returning(|_, _, _, _, _, _| Ok(vec![].into()));
     mock.expect_get_high_watermark()
         .returning(|_, _| Err(KafkaError::Internal("db down".into())));
 
@@ -218,7 +220,7 @@ fn test_handle_fetch_storage_error() {
     mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
     mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| {
+        .returning(|_, _, _, _, _, _| {
             Err(KafkaError::Database {
                 message: "boom".to_string(),
             })
@@ -259,7 +261,7 @@ fn test_handle_fetch_read_committed_uses_lso() {
     });
 
     mock.expect_fetch_records_with_isolation()
-        .returning(|_, _, _, _, _| Ok(vec![]));
+        .returning(|_, _, _, _, _, _| Ok(vec![].into()));
     mock.expect_get_high_watermark().returning(|_, _| Ok(10));
     mock.expect_get_last_stable_offset().returning(|_, _| Ok(7));
     mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
