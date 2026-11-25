@@ -414,14 +414,15 @@ data stored: the aborted-row cleanup goes through the partial index
 the primary key below each partition's log start, and a past leaf gets the full contents
 probe (one descent per (topic, partition)) only where some topic's window can have expired it
 (at most 64 per pass); other past leaves get one emptiness check. Every step runs bounded
-statements (10,000 rows, one leaf) and stops once the pass has used 1.5 s, after at least one
-statement (the aborted-row cleanup and the contents probes, which run before row expiry, at a
-third of that each), so a backlog drains over several passes, each step resuming where the last
-pass left it. The producer and transaction prunes are indexed too (idle producer ids through
-`(last_active_at, producer_id)`, terminal transactions through a partial index on
+statements (10,000 rows, one leaf, one probe, one drop): each step with work runs one per pass
+whatever the budget, then the rest of the 1.5 s goes to the steps that still have work,
+least-served first, so a backlog in one step takes what the others leave, never all of it, and
+drains over several passes, each step resuming where the last pass left it (ADR-001, "Cost",
+has the guarantees). The producer and transaction prunes are indexed too (idle producer ids
+through `(last_active_at, producer_id)`, terminal transactions through a partial index on
 `last_updated_at`, and the foreign key of `kafka.transactions` on each deleted producer id
-through `producer_id`): 40,000 idle producer ids with their terminal transactions took one
-18.6 s statement before (each deleted id's foreign-key check read the whole transactions table),
+through `producer_id`): 40,000 idle producer ids with their terminal transactions took
+one 18.6 s statement before (each deleted id's foreign-key check read the whole transactions table),
 and 2,000,000 now drain 10,000 producer ids and up to 190,000 transactions per 1.6-1.8 s pass;
 with 2,000,000 producer ids none of which is idle, a pass takes 2.5 ms (PG17). Measured on PG16 (3,000,000 committed rows
 in one 521 MB leaf, 500,000 recent delivered outbox rows, retention off):

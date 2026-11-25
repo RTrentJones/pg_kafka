@@ -537,10 +537,10 @@ async fn expiry_rotation() -> SendResult<()> {
 /// pass budget clears.
 const ABORTED_BACKLOG: i64 = 800_000;
 
-/// A backlog in one step cannot take the whole pass: the aborted-row cleanup (and the
-/// contents probes) get at most a third of the budget each, so row expiry, which runs
-/// after them, keeps a share. Without the cap a client that aborts enough transactions
-/// left row expiry its one mandatory statement per pass.
+/// A backlog in one step cannot take the whole pass: the budget goes to the steps with
+/// work, least-served first, so row expiry keeps a share behind the aborted-row cleanup.
+/// When the steps ran in turn, each until the budget, a client that aborts enough
+/// transactions left row expiry its one mandatory statement per pass.
 ///
 /// Asserts: with 800,000 aborted rows due (grace 0) and committed rows of a 1 s
 /// retention topic in the current leaf, the first sweep at the default budget expires
@@ -788,5 +788,153 @@ async fn guard_paths() -> SendResult<()> {
         return Err(format!("the outer guard left {after:?}, expected ({default:?}, None)").into());
     }
     println!("✅ every path restored the setting");
+    Ok(())
+}
+
+/// Kept leaves for the trim test: each holds an infinite-retention topic (so it stays)
+/// and a long-window topic wholly expired (so that topic's rows must be trimmed).
+const KEPT_LEAVES: i32 = 5;
+
+/// A probe finds a trim (a long-window topic's expired rows in a leaf a longer or
+/// infinite topic keeps), and the expiry step does it; when the trim existed only in the
+/// pass whose probe reached that leaf, the probes (rotating over the leaves) and row
+/// expiry (rotating over its (topic, leaf) items, here the short-window topic's in every
+/// leaf) had to meet in the same pass, and on a spent budget they phase-locked: the
+/// trim of a leaf came round only after many rotations, or never. A found trim is now
+/// kept until its delete is done.
+///
+/// Asserts: with the pass budget at 0, five past leaves each holding rows of an
+/// infinite-retention topic and of a topic with a one-partition-width window (wholly
+/// expired there), and a 1 s retention topic (expired row by row in every leaf), repeated
+/// sweeps remove the long-window topic's rows from every leaf within the bound of the
+/// sweep's guarantee (one rotation of the probes plus one of the expiry items, plus
+/// slack), and keep the infinite topic's rows.
+pub async fn test_sweep_trims_reach_every_kept_leaf() -> TestResult {
+    into_test_result(kept_leaf_trims().await)
+}
+
+async fn kept_leaf_trims() -> SendResult<()> {
+    println!("=== Test: found trims reach every kept leaf on a spent budget ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let width_ms: i64 = db
+        .query_one(
+            "SELECT current_setting('pg_kafka.message_partition_minutes')::bigint * 60000",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    // Created in this order, so the long topic's items sort after the short one's.
+    let short = create_topic(&db, &unique("trim-short"), 1000).await?;
+    let long = create_topic(&db, &unique("trim-long"), width_ms).await?;
+    let forever = create_topic(&db, &unique("trim-forever"), -1).await?;
+    let base_hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let mut leaves = Vec::new();
+    for k in 0..KEPT_LEAVES {
+        leaves.push(hour_leaf(&db, base_hour + k).await?);
+        fill_leaf(&db, forever, base_hour + k, i64::from(k) * 3, 3).await?;
+        fill_leaf(&db, long, base_hour + k, i64::from(k) * 3, 3).await?;
+    }
+    println!(
+        "Step 0: {KEPT_LEAVES} past leaves from {} with an infinite and a long-window topic",
+        leaves[0]
+    );
+
+    let budget = pass_budget(&db, "0").await?;
+    let result: SendResult<()> = async {
+        // The bound: probe candidates (every past leaf) plus the expiry items (every
+        // row-level topic's leaves in scope, plus one trim per kept leaf).
+        let bound: i64 = db
+            .query_one(
+                "SELECT (SELECT count(*) FROM kafka.message_partitions()
+                         WHERE NOT is_default AND upper_bound <= now())
+                      + (SELECT count(*) FROM kafka.topics t, kafka.message_partitions() l
+                         WHERE t.retention_ms >= 0 AND t.retention_ms < $1 AND NOT l.is_default
+                           AND (l.lower_bound IS NULL
+                                OR l.lower_bound < now() - t.retention_ms * INTERVAL '1 ms'))
+                      + $2::bigint",
+                &[&width_ms, &i64::from(KEPT_LEAVES)],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        let passes = bound + 4;
+        let left = || async {
+            db.query_one(
+                "SELECT count(*) FROM kafka.messages WHERE topic_id = $1",
+                &[&long],
+            )
+            .await
+            .map(|r| r.get::<_, i64>(0))
+            .map_err(boxed)
+        };
+        let mut done_after = None;
+        for pass in 1..=passes {
+            db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            if left().await? == 0 {
+                done_after = Some(pass);
+                break;
+            }
+        }
+        let Some(pass) = done_after else {
+            let per_leaf = db
+                .query(
+                    "SELECT tableoid::regclass::text, count(*) FROM kafka.messages
+                     WHERE topic_id = $1 GROUP BY 1 ORDER BY 1",
+                    &[&long],
+                )
+                .await
+                .map_err(boxed)?
+                .iter()
+                .map(|r| format!("{} {}", r.get::<_, String>(0), r.get::<_, i64>(1)))
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "long-window rows still in {per_leaf:?} after {passes} sweeps (bound {bound})"
+            )
+            .into());
+        };
+        println!("Step 1: every kept leaf trimmed after {pass} sweep(s) (bound {bound})");
+        let kept: i64 = db
+            .query_one(
+                "SELECT count(*) FROM kafka.messages WHERE topic_id = $1",
+                &[&forever],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        if kept != i64::from(KEPT_LEAVES) * 3 {
+            return Err(format!("the infinite-retention rows must stay: {kept} left").into());
+        }
+        Ok(())
+    }
+    .await;
+    let restored = budget.restore().await;
+    for leaf in &leaves {
+        db.query(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass,
+                                                              ARRAY[$2::int, $3::int, $4::int])",
+            &[leaf, &short, &long, &forever],
+        )
+        .await
+        .map_err(boxed)?;
+    }
+    db.execute(
+        "DELETE FROM kafka.topics WHERE id = ANY($1)",
+        &[&vec![short, long, forever]],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    restored?;
+    println!("✅ every found trim was done");
     Ok(())
 }
