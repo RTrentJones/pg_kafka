@@ -476,6 +476,23 @@ fn read_partition(
         isolation_level,
         compression,
     } = settings;
+    let readable_end = match isolation_level {
+        IsolationLevel::ReadCommitted => bounds.last_stable_offset,
+        IsolationLevel::ReadUncommitted => bounds.high_watermark,
+    };
+    // Nothing is readable from the readable end on (for read_committed, the last stable
+    // offset: a consumer waiting behind an open transaction), and a gap batch covers no
+    // offset there, so there is nothing to read. Kafka reads only up to it. Every long-poll
+    // attempt reruns the fetch, so a read here would cost the DB thread a scan per Produce,
+    // EndTxn and re-check for as long as the transaction stays open.
+    //
+    // With an earlier partition's records in the response, a limit below the smallest gap
+    // batch fits neither a gap batch nor a record (each counts at least RECORD_OVERHEAD
+    // bytes, more than a gap batch): reading would only scan for what cannot be returned.
+    if fetch_offset >= readable_end || (budget.returned_any && i64::from(limit) < MIN_GAP_BATCH_LEN)
+    {
+        return partition_with_bounds(partition_id, bounds);
+    }
     // Only a partition that may keep an oversized first record reads one: any other would
     // read it only to drop it (Kafka 3.7 applies minOneMessage to the first partition only).
     let fetched = match store.fetch_records_with_isolation(
@@ -500,45 +517,60 @@ fn read_partition(
             return partition_error(partition_id, e.to_kafka_error_code());
         }
     };
-    // A first record left out for its size is a visible record: no gap batch over it.
-    let storage_empty = fetched.messages.is_empty() && !fetched.first_left_out;
+    // The first visible record from fetch_offset, whether read or left out for its size.
+    let first_visible = fetched
+        .first_left_out
+        .or_else(|| fetched.messages.first().map(|m| m.partition_offset));
     let (db_records, used) =
         trim_to_response_budget(fetched.messages, i64::from(limit), budget.returned_any);
     budget.remaining -= used;
     budget.returned_any |= !db_records.is_empty();
 
     // One RecordBatch per run of consecutive offsets of one producer.
-    let records = if !db_records.is_empty() {
-        encode_record_batches(db_records, compression)
-    } else if storage_empty {
-        // Nothing visible from fetch_offset up to the readable end. With offsets in
-        // between (aborted rows filtered for read_committed, rows deleted by aborted-row
-        // cleanup or retention), an empty response would leave the consumer polling the
-        // same offset forever; a marker batch covering them moves it to the readable end,
-        // as the abort marker after an aborted transaction does in Kafka.
-        let readable_end = match isolation_level {
-            IsolationLevel::ReadCommitted => bounds.last_stable_offset,
-            IsolationLevel::ReadUncommitted => bounds.high_watermark,
-        };
-        Ok(gap_batch(fetch_offset, readable_end)
-            .and_then(|gap| take_gap_batch(gap, i64::from(limit), budget))
-            .unwrap_or_default())
+    let records = if db_records.is_empty() {
+        // Nothing visible from fetch_offset up to the first visible record, or to the
+        // readable end without one. With offsets in between (aborted rows filtered for
+        // read_committed, rows deleted by aborted-row cleanup or retention), an empty
+        // response would leave the consumer polling the same offset forever, and each poll
+        // would scan those rows again; a marker batch covering them moves it past them, as
+        // the abort marker after an aborted transaction does in Kafka. A first visible
+        // record that does not fit is not covered: the consumer stops at it.
+        let gap_end = first_visible.unwrap_or(readable_end);
+        Ok(take_gap_batch(fetch_offset, gap_end, i64::from(limit), budget).unwrap_or_default())
     } else {
-        Ok(bytes::Bytes::new())
+        encode_record_batches(db_records, compression)
     };
     fetched_partition_data(topic_id, partition_id, bounds, records)
 }
 
-/// `gap` if it fits the partition's `limit`, counted against the response budget as records
-/// are: Kafka 3.7 counts the abort marker batches it returns in the fetch size, and a
-/// partition with only them still stops the later ones returning anything past their limits.
-/// As the first record of the response, it is returned whatever its size.
-fn take_gap_batch(gap: bytes::Bytes, limit: i64, budget: &mut FetchBudget) -> Option<bytes::Bytes> {
-    let len = i64::try_from(gap.len()).unwrap_or(i64::MAX);
-    if budget.returned_any && len > limit {
-        return None;
-    }
-    budget.remaining -= len;
+/// Bytes of the smallest [`gap_batch`] (one whose offset delta is a one-byte varint). Every
+/// record counts more than this against the byte limits.
+const MIN_GAP_BATCH_LEN: i64 = 78;
+const _: () = assert!(MIN_GAP_BATCH_LEN < crate::kafka::storage::RECORD_OVERHEAD);
+
+/// A gap batch over `[from, to)` if it fits the partition's `limit`, counted against the
+/// response budget as records are: Kafka 3.7 counts the abort marker batches it returns in
+/// the fetch size, and a partition with only them still stops the later ones returning
+/// anything past their limits. As the first record of the response, it covers the whole
+/// range whatever its size. Otherwise, when the whole range does not fit, it covers the
+/// longest prefix whose batch does (a shorter offset delta takes fewer varint bytes): any
+/// prefix holds nothing visible, and covering some of it moves the consumer forward.
+fn take_gap_batch(
+    from: i64,
+    to: i64,
+    limit: i64,
+    budget: &mut FetchBudget,
+) -> Option<bytes::Bytes> {
+    let fits = |gap: &bytes::Bytes| {
+        !budget.returned_any || i64::try_from(gap.len()).unwrap_or(i64::MAX) <= limit
+    };
+    // The prefix lengths at which the varint of the offset delta gets a byte shorter.
+    let prefix_ends = [1i64 << 27, 1 << 20, 1 << 13, 64].map(|len| from.saturating_add(len));
+    let gap = std::iter::once(to)
+        .chain(prefix_ends.into_iter().filter(|&end| end < to))
+        .filter_map(|end| gap_batch(from, end))
+        .find(fits)?;
+    budget.remaining -= i64::try_from(gap.len()).unwrap_or(i64::MAX);
     budget.returned_any = true;
     Some(gap)
 }
@@ -935,6 +967,11 @@ mod tests {
     }
 
     fn mock_with_two_partitions() -> MockKafkaStore {
+        mock_with_two_partitions_ending_at(3)
+    }
+
+    /// Two partitions whose high watermark and last stable offset are `end`.
+    fn mock_with_two_partitions_ending_at(end: i64) -> MockKafkaStore {
         let mut mock = MockKafkaStore::new();
         mock.expect_get_topic_metadata().returning(|_| {
             Ok(vec![TopicMetadata {
@@ -943,8 +980,10 @@ mod tests {
                 partition_count: 2,
             }])
         });
-        mock.expect_get_high_watermark().returning(|_, _| Ok(3));
-        mock.expect_get_last_stable_offset().returning(|_, _| Ok(3));
+        mock.expect_get_high_watermark()
+            .returning(move |_, _| Ok(end));
+        mock.expect_get_last_stable_offset()
+            .returning(move |_, _| Ok(end));
         mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
         mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
         mock
@@ -1049,8 +1088,9 @@ mod tests {
             let mut mock = mock_with_two_partitions();
             let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = std::sync::Arc::clone(&asked);
+            // Partition 0 fetching from its end (3) is not read at all.
             mock.expect_fetch_records_with_isolation()
-                .times(2)
+                .times(if returned == 0 { 1 } else { 2 })
                 .returning(move |_, partition, _, _, whole, _| {
                     seen.lock().unwrap().push((partition, whole));
                     Ok(if partition == 0 {
@@ -1062,8 +1102,8 @@ mod tests {
                 });
             let env = TestEnv::new();
             let ctx = env.ctx(&mock);
-            // Partition 0 reads from its end (3): returning no record, it has no gap batch
-            // either (one would count as data, see gap_batches_count_against_the_byte_limits).
+            // Partition 0 fetches from its end (3): it returns no record and no gap batch
+            // (one would count as data, see gap_batches_count_against_the_byte_limits).
             let mut request = two_partition_request();
             request[0].partitions[0].fetch_offset = if returned == 0 { 3 } else { 0 };
             handle_fetch_with_max_bytes(
@@ -1074,9 +1114,14 @@ mod tests {
                 whole_first_record,
             )
             .unwrap();
+            let read = if returned == 0 {
+                vec![(1, expected[1])]
+            } else {
+                vec![(0, expected[0]), (1, expected[1])]
+            };
             assert_eq!(
                 *asked.lock().unwrap(),
-                vec![(0, expected[0]), (1, expected[1])],
+                read,
                 "partition 0 returned {returned} records, whole_first_record {whole_first_record}"
             );
         }
@@ -1095,7 +1140,7 @@ mod tests {
                 } else {
                     crate::kafka::storage::FetchedRecords {
                         messages: Vec::new(),
-                        first_left_out: true,
+                        first_left_out: Some(0),
                     }
                 })
             });
@@ -1411,6 +1456,138 @@ mod tests {
             for &(partition, whole) in asked.lock().unwrap().iter() {
                 assert_eq!(whole, partition == 0, "{case}: partition {partition}");
             }
+        }
+    }
+
+    /// Partition 1 of a fetch whose partition 0 returns one 100-byte record, with
+    /// `remaining` bytes of `max_bytes` left for partition 1 and `fetched` its storage read
+    /// (`None`: it must not be read). Returns partition 1's records.
+    fn second_partition_records(
+        end: i64,
+        remaining: i32,
+        fetched: Option<crate::kafka::storage::FetchedRecords>,
+    ) -> Option<bytes::Bytes> {
+        let first = msg(0, 100);
+        let first_len = i32::try_from(message_size_estimate(&first)).unwrap();
+        let mut mock = mock_with_two_partitions_ending_at(end);
+        let reads = if fetched.is_some() { 2 } else { 1 };
+        mock.expect_fetch_records_with_isolation()
+            .times(reads)
+            .returning(move |_, partition, _, _, _, _| {
+                Ok(if partition == 0 {
+                    vec![first.clone()].into()
+                } else {
+                    fetched.clone().unwrap()
+                })
+            });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let response = handle_fetch_with_max_bytes(
+            &ctx,
+            two_partition_request(),
+            IsolationLevel::ReadCommitted,
+            first_len + remaining,
+            true,
+        )
+        .unwrap();
+        let parts = &response.responses[0].partitions;
+        assert_eq!(parts[1].error_code, ERROR_NONE);
+        parts[1].records.clone()
+    }
+
+    /// Invisible offsets before a visible record that does not fit (left out by storage, or
+    /// read and trimmed) are covered by a gap batch up to that record, so the consumer moves
+    /// past them rather than having them scanned again by every fetch from the same offset.
+    #[test]
+    fn invisible_offsets_before_a_record_that_does_not_fit_are_covered() {
+        let left_out = crate::kafka::storage::FetchedRecords {
+            messages: Vec::new(),
+            first_left_out: Some(2),
+        };
+        assert_eq!(
+            second_partition_records(3, 1000, Some(left_out)),
+            gap_batch(0, 2)
+        );
+        let trimmed = vec![msg(2, 2000)].into();
+        assert_eq!(
+            second_partition_records(3, 1000, Some(trimmed)),
+            gap_batch(0, 2)
+        );
+    }
+
+    /// A gap whose whole range does not fit the limit covers the longest prefix that does: a
+    /// shorter offset delta is a shorter varint.
+    #[test]
+    fn a_gap_batch_too_long_for_the_limit_covers_a_prefix() {
+        let whole = gap_batch(0, 1 << 20).unwrap();
+        let prefix = gap_batch(0, 1 << 13).unwrap();
+        assert_eq!(prefix.len() + 1, whole.len());
+        let remaining = i32::try_from(prefix.len()).unwrap();
+        assert_eq!(
+            second_partition_records(1 << 20, remaining, Some(Vec::new().into())),
+            Some(prefix)
+        );
+        assert_eq!(
+            second_partition_records(1 << 20, remaining + 1, Some(Vec::new().into())),
+            Some(whole)
+        );
+        // Below the smallest gap batch nothing fits and storage is not read.
+        let smallest = i32::try_from(MIN_GAP_BATCH_LEN).unwrap();
+        assert_eq!(
+            second_partition_records(1 << 20, smallest - 1, None),
+            Some(bytes::Bytes::new())
+        );
+        assert_eq!(
+            second_partition_records(3, smallest, Some(Vec::new().into())),
+            gap_batch(0, 3)
+        );
+    }
+
+    /// The smallest gap batch is MIN_GAP_BATCH_LEN bytes.
+    #[test]
+    fn min_gap_batch_len_is_the_smallest_gap_batch() {
+        let smallest = i64::try_from(gap_batch(0, 1).unwrap().len()).unwrap();
+        assert_eq!(smallest, MIN_GAP_BATCH_LEN);
+        assert_eq!(
+            i64::try_from(gap_batch(0, 64).unwrap().len()).unwrap(),
+            MIN_GAP_BATCH_LEN
+        );
+    }
+
+    /// A read_committed fetch at or past the last stable offset, behind an open transaction,
+    /// has nothing to read and does not read storage (Kafka reads only up to it); likewise a
+    /// fetch at the high watermark.
+    #[test]
+    fn a_fetch_at_the_readable_end_does_not_read_storage() {
+        for (isolation, lso) in [
+            (IsolationLevel::ReadCommitted, 2),
+            (IsolationLevel::ReadUncommitted, 5),
+        ] {
+            let mut mock = MockKafkaStore::new();
+            mock.expect_get_topic_metadata().returning(|_| {
+                Ok(vec![TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 1,
+                }])
+            });
+            mock.expect_get_high_watermark().returning(|_, _| Ok(5));
+            mock.expect_get_last_stable_offset()
+                .returning(move |_, _| Ok(lso));
+            mock.expect_get_earliest_offset().returning(|_, _| Ok(0));
+            mock.expect_get_log_start_offset().returning(|_, _| Ok(0));
+            mock.expect_fetch_records_with_isolation().times(0);
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            let mut request = two_partition_request();
+            request[0].partitions.truncate(1);
+            request[0].partitions[0].fetch_offset = lso;
+            let response =
+                handle_fetch_with_max_bytes(&ctx, request, isolation, 1 << 20, true).unwrap();
+            let p = &response.responses[0].partitions[0];
+            assert_eq!(p.error_code, ERROR_NONE, "{isolation:?}");
+            assert_eq!(p.last_stable_offset, lso, "{isolation:?}");
+            assert!(p.records.as_ref().unwrap().is_empty(), "{isolation:?}");
         }
     }
 

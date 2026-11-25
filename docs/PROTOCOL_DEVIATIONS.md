@@ -599,18 +599,21 @@ the log:
 
 - Records between holes carry their own offsets, so consumers skip holes in the
   middle of a response.
-- When nothing is visible from the fetch offset up to the readable end (the LSO for
-  `read_committed`, the high watermark for `read_uncommitted`), the response holds one
-  **control batch** covering the hole, with a single COMMIT marker at its last offset,
-  like the marker Kafka writes when a transaction ends. Clients skip control records
-  and move their position past it (the Java client to the batch's last offset + 1,
-  librdkafka to the marker's offset + 1), so their position and committed offset reach
-  the end and the lag goes to 0. An open transaction still blocks at the LSO. The
-  control batch counts against `partition_max_bytes` and `max_bytes` at its encoded size
-  (about 80 bytes), as Kafka counts the abort markers it returns: the first partition of a
-  response with data or such a batch returns it whatever its size, a later partition only
-  when it fits what is left of both limits (otherwise nothing, and its consumer fetches
-  the same offset again).
+- When a partition returns no record and nothing is visible from the fetch offset up to
+  its first visible record (one that does not fit the response's limits), or up to the
+  readable end without one (the LSO for `read_committed`, the high watermark for
+  `read_uncommitted`), the response holds one **control batch** covering the hole, with a
+  single COMMIT marker at its last offset, like the marker Kafka writes when a transaction
+  ends. Clients skip control records and move their position past it (the Java client to
+  the batch's last offset + 1, librdkafka to the marker's offset + 1), so their position
+  and committed offset reach the end and the lag goes to 0. An open transaction still
+  blocks at the LSO: as in Kafka, a fetch reads nothing past it. The control batch counts
+  against `partition_max_bytes` and `max_bytes` at its encoded size (78 to 82 bytes), as
+  Kafka counts the abort markers it returns: the first partition of a response with data
+  or such a batch returns it whatever its size, a later partition only when it fits what
+  is left of both limits, covering only the first offsets of the hole when that is what
+  fits (a shorter offset delta encodes in fewer bytes). Below 78 bytes nothing fits, and
+  that partition is not read.
 - Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
   offsets written by the same producer id/epoch. Batches of transactional rows carry their producer
   id/epoch and the transactional flag; other batches `producer_id = -1`. The base
