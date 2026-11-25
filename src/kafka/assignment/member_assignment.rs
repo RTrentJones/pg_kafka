@@ -134,6 +134,97 @@ impl MemberAssignment {
         })
     }
 
+    /// Parse like [`Self::parse`], keeping only what the sticky assignor can keep of a
+    /// previous assignment: the entries for topics in `topics` with partitions. The result
+    /// keeps the same partitions per topic as `parse` (where a later entry for a topic
+    /// replaces an earlier one, and an empty or null list keeps nothing), and fails where
+    /// `parse` fails; `user_data` is not kept.
+    ///
+    /// A leader's assignments may hold millions of entries naming topics that do not exist
+    /// or listing no partitions, at a few bytes each. Cost: time linear in `bytes`; memory:
+    /// only the kept entries (a copy of each kept topic name and its partitions), nothing
+    /// for the rest and nothing pre-allocated from a declared length.
+    pub fn parse_kept(bytes: &[u8], topics: &HashMap<String, i32>) -> Result<Self> {
+        let mut kept = Self::default();
+        if bytes.is_empty() {
+            return Ok(kept);
+        }
+        let mut buf = bytes;
+        if buf.remaining() < 6 {
+            return Err(KafkaError::CorruptMessage {
+                message: format!(
+                    "MemberAssignment too short: {} bytes (need at least 6)",
+                    buf.remaining()
+                ),
+            });
+        }
+        kept.version = buf.get_i16();
+        let topics_len = buf.get_i32();
+        let topics_len = usize::try_from(topics_len).map_err(|_| KafkaError::CorruptMessage {
+            message: format!("Invalid topic_partitions array length: {topics_len}"),
+        })?;
+        for _ in 0..topics_len {
+            let Some(name) = read_topic_name_str(&mut buf)? else {
+                continue;
+            };
+            let len = read_partitions_len(&mut buf)?;
+            let wanted = topics.contains_key(name);
+            if wanted && len > 0 {
+                let mut partitions = Vec::with_capacity(len);
+                for _ in 0..len {
+                    partitions.push(buf.get_i32());
+                }
+                kept.topic_partitions.insert(name.to_string(), partitions);
+            } else {
+                buf.advance(len * 4);
+                if wanted {
+                    kept.topic_partitions.remove(name);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The work an assignment's bytes take to parse and keep: its topic entries (null
+    /// names included) plus the partitions they list, read from the lengths without
+    /// copying anything, and counted up to just over `limit` (the walk stops there).
+    /// Entries after data [`Self::parse`] would reject are not counted.
+    ///
+    /// Cost: one step per counted entry, at most `limit + 1`; no memory.
+    pub fn work_hint(bytes: &[u8], limit: usize) -> usize {
+        let mut buf = bytes;
+        if buf.remaining() < 6 {
+            return 0;
+        }
+        buf.advance(2);
+        let Ok(topics_len) = usize::try_from(buf.get_i32()) else {
+            return 0;
+        };
+        let mut work = 0_usize;
+        for _ in 0..topics_len {
+            if work > limit || buf.remaining() < 2 {
+                break;
+            }
+            work += 1;
+            let Ok(name_len) = usize::try_from(buf.get_i16()) else {
+                continue;
+            };
+            if buf.remaining() < name_len + 4 {
+                break;
+            }
+            buf.advance(name_len);
+            let Ok(len) = usize::try_from(buf.get_i32()) else {
+                continue;
+            };
+            if buf.remaining() < len * 4 {
+                break;
+            }
+            buf.advance(len * 4);
+            work = work.saturating_add(len);
+        }
+        work
+    }
+
     /// Encode this assignment to bytes for wire format
     ///
     /// # Returns
@@ -164,6 +255,11 @@ impl MemberAssignment {
 
 /// One topic name of the assignment array, or `None` for a null (negative-length) one.
 fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
+    read_topic_name_str(buf).map(|name| name.map(str::to_string))
+}
+
+/// [`read_topic_name`] without copying the name.
+fn read_topic_name_str<'a>(buf: &mut &'a [u8]) -> Result<Option<&'a str>> {
     if buf.remaining() < 2 {
         return Err(KafkaError::CorruptMessage {
             message: "Unexpected end of data reading topic name length".into(),
@@ -181,9 +277,9 @@ fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
             ),
         });
     }
-    let mut str_bytes = vec![0u8; str_len];
-    buf.copy_to_slice(&mut str_bytes);
-    String::from_utf8(str_bytes)
+    let (name, rest) = buf.split_at(str_len);
+    *buf = rest;
+    std::str::from_utf8(name)
         .map(Some)
         .map_err(|e| KafkaError::CorruptMessage {
             message: format!("Invalid UTF-8 in topic name: {e}"),
@@ -192,13 +288,25 @@ fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
 
 /// One topic's partitions array; a null (negative-length) array is an empty assignment.
 fn read_partitions(buf: &mut &[u8]) -> Result<Vec<i32>> {
+    let partitions_len = read_partitions_len(buf)?;
+    // Capped like the topics array: the declared length is client-controlled.
+    let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
+    for _ in 0..partitions_len {
+        partitions.push(buf.get_i32());
+    }
+    Ok(partitions)
+}
+
+/// The length of one topic's partitions array (0 for a null one), checked against the data
+/// that follows it.
+fn read_partitions_len(buf: &mut &[u8]) -> Result<usize> {
     if buf.remaining() < 4 {
         return Err(KafkaError::CorruptMessage {
             message: "Unexpected end of data reading partitions array length".into(),
         });
     }
     let Ok(partitions_len) = usize::try_from(buf.get_i32()) else {
-        return Ok(Vec::new());
+        return Ok(0);
     };
     if buf.remaining() < partitions_len * 4 {
         return Err(KafkaError::CorruptMessage {
@@ -209,12 +317,7 @@ fn read_partitions(buf: &mut &[u8]) -> Result<Vec<i32>> {
             ),
         });
     }
-    // Capped like the topics array: the declared length is client-controlled.
-    let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
-    for _ in 0..partitions_len {
-        partitions.push(buf.get_i32());
-    }
-    Ok(partitions)
+    Ok(partitions_len)
 }
 
 #[cfg(test)]
