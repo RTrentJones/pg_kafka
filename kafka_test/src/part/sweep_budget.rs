@@ -1066,3 +1066,105 @@ async fn producer_prune_plan() -> SendResult<()> {
     println!("✅ the prune read through its indexes");
     Ok(())
 }
+
+/// A drop found in one sweep and deferred (here because a reader holds kafka.messages
+/// past the drop's lock wait) is done by a later sweep only if retention still expires
+/// every topic of the leaf then. `kafka.drop_message_partition` re-checks the leaf's
+/// topics against the expired set it is given, not against retention, so a found drop
+/// kept across a raised window dropped the leaf with rows the new window keeps.
+///
+/// Asserts: with the pass budget at 0, the oldest past leaf holding only rows of a 1 s
+/// topic and the next one rows of an infinite topic (so the next probe goes there), a
+/// sweep behind a reader drops nothing; after the topic's retention is made infinite and
+/// the reader ends, the next sweep keeps the leaf and all of its rows.
+pub async fn test_sweep_forgets_a_deferred_drop_when_retention_is_raised() -> TestResult {
+    into_test_result(deferred_drop_after_raise().await)
+}
+
+/// Rows of the deferred-drop test's topic in its leaf.
+const DEFERRED_ROWS: i64 = 10;
+
+async fn deferred_drop_after_raise() -> SendResult<()> {
+    println!("=== Test: a deferred leaf drop is re-checked against raised retention ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let raised = create_topic(&db, &unique("deferred-raised"), 1000).await?;
+    let forever = create_topic(&db, &unique("deferred-forever"), -1).await?;
+    // Before 2000, so these are the oldest leaves and the first probes reach them.
+    let hour: i32 = db
+        .query_one("SELECT -2 - (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let leaf = hour_leaf(&db, hour).await?;
+    let next = hour_leaf(&db, hour + 1).await?;
+    fill_leaf(&db, raised, hour, 0, DEFERRED_ROWS).await?;
+    fill_leaf(&db, forever, hour + 1, 0, DEFERRED_ROWS).await?;
+    println!("Step 0: {leaf} holds {DEFERRED_ROWS} rows of a 1 s topic, {next} an infinite one's");
+
+    let budget = pass_budget(&db, "0").await?;
+    let reader = session().await?;
+    let result: SendResult<()> = async {
+        reader
+            .batch_execute("BEGIN; SELECT count(*) FROM kafka.messages")
+            .await
+            .map_err(boxed)?;
+        let dropped = dropped_partitions(&db).await?;
+        assert_eq!(dropped, 0, "no leaf can be dropped behind the reader");
+        assert!(leaf_exists(&db, &leaf).await?, "{leaf} must still exist");
+        println!("Step 1: the sweep behind the reader found the drop and could not do it");
+
+        db.execute(
+            "UPDATE kafka.topics SET retention_ms = -1 WHERE id = $1",
+            &[&raised],
+        )
+        .await
+        .map_err(boxed)?;
+        reader.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        println!("Step 2: retention made infinite, then the reader ended");
+
+        let dropped = dropped_partitions(&db).await?;
+        let rows: i64 = if leaf_exists(&db, &leaf).await? {
+            db.query_one(&format!("SELECT count(*) FROM {leaf}"), &[])
+                .await
+                .map_err(boxed)?
+                .get(0)
+        } else {
+            0
+        };
+        println!("Step 3: the next sweep dropped {dropped}; {leaf} holds {rows} rows");
+        assert_eq!(
+            rows, DEFERRED_ROWS,
+            "the leaf's rows must be kept once its topic's retention is infinite"
+        );
+        Ok(())
+    }
+    .await;
+    let restored = budget.restore().await;
+    db.execute(
+        "DELETE FROM kafka.messages WHERE topic_id = ANY($1)",
+        &[&vec![raised, forever]],
+    )
+    .await
+    .map_err(boxed)?;
+    for l in [&leaf, &next] {
+        db.query(
+            "SELECT dropped FROM kafka.drop_message_partition(to_regclass($1), '{}')",
+            &[l],
+        )
+        .await
+        .map_err(boxed)?;
+    }
+    db.execute(
+        "DELETE FROM kafka.topics WHERE id = ANY($1)",
+        &[&vec![raised, forever]],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    restored?;
+    println!("✅ the deferred drop was re-checked and the leaf kept");
+    Ok(())
+}

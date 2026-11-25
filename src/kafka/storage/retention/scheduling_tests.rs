@@ -303,14 +303,35 @@ fn found_work_follows_the_latest_probe_and_forgets_what_no_longer_applies() {
         )]
     );
 
-    // Still valid at now = 1000 with topic 8's window of 10: kept.
-    let windows = |t: i32| (t == 8).then_some(10);
+    // Still valid at now = 1000 with windows of 10 for topics 8 and 9: kept.
+    let windows = |t: i32| (t == 8 || t == 9).then_some(10);
     found.retain_current(&[a.clone(), b.clone()], 1_000, windows);
     assert_eq!(found.trims().len(), 1);
     assert_eq!(found.drops().len(), 1);
-    // A longer window no longer expires the whole leaf: the trim goes.
+    // A longer window no longer expires the whole leaf: the trim goes, and so does the
+    // drop, which would otherwise remove rows the new window keeps.
     found.retain_current(&[a.clone(), b.clone()], 1_000, |_| Some(5_000));
     assert_eq!(found.trims(), vec![]);
+    assert_eq!(found.drops(), vec![]);
+    // The same for a window made infinite, or a topic deleted: neither has a window.
+    found.record_probe(
+        &b,
+        &LeafAction::Drop {
+            expired_topics: vec![9],
+        },
+    );
+    found.retain_current(&[a.clone(), b.clone()], 1_000, |_| None);
+    assert_eq!(found.drops(), vec![]);
+    // An empty leaf's drop names no topic, so no window change touches it.
+    found.record_empty(&b);
+    found.retain_current(&[a.clone(), b.clone()], 1_000, |_| None);
+    assert_eq!(found.drops().len(), 1);
+    found.record_probe(
+        &b,
+        &LeafAction::Drop {
+            expired_topics: vec![9],
+        },
+    );
     // A leaf gone (or a new leaf with its key): its work goes.
     found.retain_current(&[a.clone(), leaf_at(3, 100, 200)], 1_000, windows);
     assert_eq!(found.drops(), vec![]);

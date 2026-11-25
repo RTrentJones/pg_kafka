@@ -584,8 +584,11 @@ impl FoundWork {
     }
 
     /// Forget what no longer applies: work in leaves that are gone (or whose key now
-    /// names another leaf), and trims whose topic has no window that wholly expires the
-    /// leaf now (`window_of`, as in [`classify_leaf`]: a deleted topic has none).
+    /// names another leaf), trims whose topic has no window that wholly expires the leaf
+    /// now (`window_of`, as in [`classify_leaf`]: a deleted topic has none), and drops
+    /// of which any expired topic has none. `kafka.drop_message_partition` re-checks the
+    /// leaf's topics against the drop's expired set, not against retention, so a drop kept
+    /// across a raised window would remove rows the new window keeps.
     pub fn retain_current(
         &mut self,
         leaves: &[TimePartition],
@@ -596,7 +599,13 @@ impl FoundWork {
             .into_iter()
             .map(|l| (leaf_key(l), l.oid))
             .collect();
-        self.drops.retain(|k, d| past.get(k) == Some(&d.oid));
+        self.drops.retain(|&k, d| {
+            past.get(&k) == Some(&d.oid)
+                && d
+                    .expired_topics
+                    .iter()
+                    .all(|&topic| wholly_expired(k, now_ms, window_of(topic)))
+        });
         self.trims.retain(|&(topic, k), oid| {
             past.get(&k) == Some(oid) && wholly_expired(k, now_ms, window_of(topic))
         });
