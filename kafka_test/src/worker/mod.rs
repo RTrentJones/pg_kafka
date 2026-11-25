@@ -5,12 +5,13 @@
 //! tables, terminate the listener worker, or DROP/CREATE the extension.
 //!
 //! Shared requirements (like the `auth` category): the test process runs on the
-//! database host as a superuser. Two tests read the server log through the listener
+//! database host as a superuser. Three tests read the server log through the listener
 //! worker's stderr (`/proc/<pid>/fd/2`, only when that is a regular file) and two copy
 //! the frozen 0.0.0 install script (`sql/upgrade-test/pg_kafka--0.0.0.sql`) into the
 //! server's extension directory, exactly as `scripts/check-upgrade.sh` does.
 
 mod lifecycle;
+mod same_version;
 
 use crate::common::{create_db_client, get_bootstrap_servers, TestResult};
 use rdkafka::config::ClientConfig;
@@ -203,6 +204,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         lifecycle::test_commit_failure_answered_without_restart: sequential,
         lifecycle::test_old_schema_degrades_gracefully: sequential,
         lifecycle::test_old_schema_refuses_clients_until_update: sequential,
+        same_version::test_same_version_schema_warning_names_recreation: sequential,
         lifecycle::test_extension_ddl_loop_under_load: sequential,
     ]
 }

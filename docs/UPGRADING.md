@@ -19,12 +19,17 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    idempotent Produce reads `kafka.producer_batches`, transactions use
    `kafka.txn_partitions` and `kafka.txn_groups`, SASL logins read `kafka.sasl_credentials` and
    `kafka.sasl_server_secret`, the shadow outbox needs
-   `kafka.shadow_tracking.attempt_open`, maintenance and the metrics flush need the time
-   partitions and `kafka.broker_api_stats` / `kafka.broker_gauges`). At start it checks
+   `kafka.shadow_tracking.attempt_open`, every Produce writes `kafka.messages.record_bytes`,
+   maintenance and the metrics flush need the time partitions and `kafka.broker_api_stats` /
+   `kafka.broker_gauges`). At start it checks
    for each of them and, on an older schema, logs **one** WARNING (`running against an
    older pg_kafka schema (version 0.0.0, library 0.1.0): answering Kafka requests with
    KAFKA_STORAGE_ERROR and running no maintenance until ALTER EXTENSION pg_kafka UPDATE
-   (missing: ...)`). Until step 3, clients see what they see while the extension is
+   (missing: ...)`). A schema at the library's own version that lacks one of them (created
+   by an earlier build of that version) gets a WARNING saying so instead: ALTER EXTENSION
+   UPDATE changes nothing at the same version, so re-create the extension (`DROP EXTENSION
+   pg_kafka CASCADE; CREATE EXTENSION pg_kafka`, which deletes its data) or create the
+   missing objects as `sql/bootstrap.sql` defines them. Until step 3, clients see what they see while the extension is
    dropped: the Kafka port accepts connections and every request the worker serves
    (ApiVersions and Metadata included) is answered with the retriable
    `KAFKA_STORAGE_ERROR` (56). On a SASL listener the network thread still answers

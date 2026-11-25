@@ -165,16 +165,38 @@ pub(super) fn refresh_schema_state(state: &mut SchemaState) -> bool {
         }
     } else {
         pg_warning!(
-            "pg_kafka: running against an older pg_kafka schema (version {}, library {}): \
-             answering Kafka requests with KAFKA_STORAGE_ERROR and running no maintenance \
-             until ALTER EXTENSION pg_kafka UPDATE (missing: {})",
-            now.version,
-            env!("CARGO_PKG_VERSION"),
-            now.missing.join(", ")
+            "{}",
+            unserved_schema_warning(&now, env!("CARGO_PKG_VERSION"))
         );
     }
     *state = now;
     true
+}
+
+/// The WARNING for a schema the worker does not serve (`state` is not current) under a
+/// library of version `library`. ALTER EXTENSION pg_kafka UPDATE helps only from an
+/// older extension version: at the library's own version (a 0.1.0 schema created by an
+/// earlier build, before one of the objects existed) it does nothing, so the warning
+/// names what does.
+fn unserved_schema_warning(state: &SchemaState, library: &str) -> String {
+    let missing = state.missing.join(", ");
+    if state.version == library {
+        format!(
+            "pg_kafka: the pg_kafka schema (version {library}, the library's own) lacks \
+             objects the library uses: answering Kafka requests with KAFKA_STORAGE_ERROR \
+             and running no maintenance until they exist. ALTER EXTENSION pg_kafka UPDATE \
+             changes nothing at the same version: re-create the extension (DROP EXTENSION \
+             pg_kafka CASCADE; CREATE EXTENSION pg_kafka, which deletes its data) or create \
+             the missing objects as sql/bootstrap.sql defines them (missing: {missing})"
+        )
+    } else {
+        format!(
+            "pg_kafka: running against an older pg_kafka schema (version {}, library \
+             {library}): answering Kafka requests with KAFKA_STORAGE_ERROR and running no \
+             maintenance until ALTER EXTENSION pg_kafka UPDATE (missing: {missing})",
+            state.version
+        )
+    }
 }
 
 /// Go back to the bootstrap superuser (`SET ROLE NONE`), in a transaction of its own.
@@ -425,5 +447,49 @@ mod tests {
             Duration::from_secs(150),
             Some(Duration::from_secs(120))
         ));
+    }
+    /// An older extension version is told to update; the library's own version, where
+    /// ALTER EXTENSION UPDATE is a no-op, is told to re-create the extension or add the
+    /// objects instead.
+    #[test]
+    fn test_unserved_schema_warning_fits_the_version() {
+        let mut checks = [true; CURRENT_SCHEMA_OBJECTS.len()];
+        let record_bytes = CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .position(|(name, _)| *name == "kafka.messages.record_bytes")
+            .expect("record_bytes is checked");
+        checks[record_bytes] = false;
+
+        let same =
+            unserved_schema_warning(&SchemaState::from_checks("0.1.0".into(), &checks), "0.1.0");
+        assert!(same.contains("version 0.1.0, the library's own"), "{same}");
+        assert!(
+            same.contains("changes nothing at the same version"),
+            "{same}"
+        );
+        assert!(same.contains("CREATE EXTENSION pg_kafka"), "{same}");
+        assert!(
+            !same.contains("until ALTER EXTENSION pg_kafka UPDATE"),
+            "{same}"
+        );
+        assert!(
+            same.ends_with("(missing: kafka.messages.record_bytes)"),
+            "{same}"
+        );
+
+        let old = unserved_schema_warning(
+            &SchemaState::from_checks("0.0.0".into(), &[false; CURRENT_SCHEMA_OBJECTS.len()]),
+            "0.1.0",
+        );
+        assert!(
+            old.starts_with(
+                "pg_kafka: running against an older pg_kafka schema (version 0.0.0, library 0.1.0)"
+            ),
+            "{old}"
+        );
+        assert!(
+            old.contains("until ALTER EXTENSION pg_kafka UPDATE (missing: kafka.producer_batches,"),
+            "{old}"
+        );
     }
 }
