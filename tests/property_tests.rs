@@ -1,5 +1,6 @@
-//! Property tests of the Kafka wire encodings pg_kafka relies on: header fields, size and
-//! port fields, round-tripping through kafka-protocol for arbitrary values.
+//! Property tests of the kafka-protocol crate's encodings that pg_kafka relies on: header
+//! fields, size and port fields, round-tripping arbitrary values. They exercise only that
+//! crate, no pg_kafka code.
 
 #[cfg(test)]
 mod property_tests {

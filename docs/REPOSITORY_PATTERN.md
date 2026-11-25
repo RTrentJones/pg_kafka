@@ -76,7 +76,7 @@ see one.
 
 ## Testing
 
-Handlers are unit-tested with `MockKafkaStore`, no database needed (`src/kafka/handlers/tests.rs`
+Handlers are unit-tested with `MockKafkaStore`, no database needed (`src/kafka/handlers/tests/`
 and per-file test modules):
 
 ```rust

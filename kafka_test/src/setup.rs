@@ -396,6 +396,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "connects to the test database"]
     async fn test_unique_names_are_unique() {
         let ctx = TestContext::new().await.unwrap();
         let topic1 = ctx.unique_topic("test").await;
