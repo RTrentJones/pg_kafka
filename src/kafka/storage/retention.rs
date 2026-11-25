@@ -601,8 +601,7 @@ impl FoundWork {
             .collect();
         self.drops.retain(|&k, d| {
             past.get(&k) == Some(&d.oid)
-                && d
-                    .expired_topics
+                && d.expired_topics
                     .iter()
                     .all(|&topic| wholly_expired(k, now_ms, window_of(topic)))
         });
