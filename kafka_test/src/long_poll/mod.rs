@@ -4,7 +4,7 @@
 //! - max_wait_ms: Consumer waits for data or timeout
 //! - min_bytes: Consumer waits until threshold is met
 //! - Producer wakeup: Waiting consumers wake when data arrives
-//! - Edge cases: Timeout precision, disconnect handling, multiple waiters
+//! - Edge cases: Timeout precision, disconnect handling, multiple waiters, auto-commit
 
 mod edge_cases;
 mod task_cap;
@@ -18,8 +18,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         timeout::test_long_poll_immediate_return,
         task_cap::test_long_poll_per_connection_task_cap: sequential, // Floods one connection; sensitive to concurrent produce wakeups
         timeout::test_long_poll_timeout,
-        wakeup::test_long_poll_producer_wakeup: sequential, // Tests timing-sensitive behavior
-        wakeup::test_long_poll_multiple_waiters: sequential, // Tests timing-sensitive behavior
+        wakeup::test_long_poll_consumer_receives_before_max_wait: sequential, // Tests timing-sensitive behavior
+        wakeup::test_long_poll_sequential_produce_consume: sequential, // Tests timing-sensitive behavior
         edge_cases::test_long_poll_min_bytes_threshold: sequential, // Timing-sensitive
         edge_cases::test_long_poll_timeout_precision: sequential, // Timing-sensitive
         edge_cases::test_long_poll_consumer_disconnect,

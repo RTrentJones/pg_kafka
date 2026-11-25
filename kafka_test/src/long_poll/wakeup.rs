@@ -13,12 +13,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// Test that producer wakes up a waiting consumer
+/// An rdkafka consumer long polling with fetch.wait.max.ms 30000 receives a record
+/// produced while it waits, long before that wait ends.
 ///
-/// A consumer waiting with max_wait_ms should be woken up
-/// when a producer sends a message, without waiting the full timeout.
-pub async fn test_long_poll_producer_wakeup() -> TestResult {
-    println!("=== Test: Long Poll Producer Wakeup ===\n");
+/// Asserts: the record produced 0.5 s after the consumer starts waiting arrives within 5 s.
+/// The safety-net re-check (`pg_kafka.fetch_poll_interval_ms`, 1 s) alone would deliver it
+/// within that bound too: that a Produce wakes a waiting Fetch at once, not at the next
+/// re-check, is asserted at the wire level by
+/// `error_paths::listener_tests::test_listener_produce_wakes_long_poll_promptly` (and for
+/// several waiters by `edge_cases::test_long_poll_multiple_consumers_same_partition`).
+pub async fn test_long_poll_consumer_receives_before_max_wait() -> TestResult {
+    println!("=== Test: Long Poll Consumer Receives Before max_wait ===\n");
 
     let topic = format!("longpoll-wakeup-{}", Uuid::new_v4());
     let group_id = format!("longpoll-wakeup-group-{}", Uuid::new_v4());
@@ -126,23 +131,24 @@ pub async fn test_long_poll_producer_wakeup() -> TestResult {
         "Consumer should have received the wakeup message"
     );
 
-    // The consumer should have woken up well before the 30s max_wait_ms
-    // With long polling, we expect < 5 seconds after produce
+    // Well before the 30 s fetch.wait.max.ms.
     assert!(
         consumer_duration < Duration::from_secs(5),
-        "Consumer should wake up quickly after produce, took {consumer_duration:?}"
+        "the record should arrive well before the long poll's max wait, took {consumer_duration:?}"
     );
 
-    println!("\n✅ Long poll producer wakeup test PASSED\n");
+    println!("\n✅ Long poll consumer receives before max_wait test PASSED\n");
     Ok(())
 }
 
-/// Test sequential consumers receiving messages via long poll
+/// One long-polling consumer (fetch.wait.max.ms 5000) reads a topic's first record, then
+/// three records produced after it, in order. Several waiters on one partition are
+/// `edge_cases::test_long_poll_multiple_consumers_same_partition`.
 ///
-/// This test verifies that sequential produce/consume operations
-/// work correctly with long polling enabled.
-pub async fn test_long_poll_multiple_waiters() -> TestResult {
-    println!("=== Test: Long Poll Sequential Operations ===\n");
+/// Asserts: the consumer receives "setup", then message-1, message-2 and message-3, in
+/// that order, within 10 s.
+pub async fn test_long_poll_sequential_produce_consume() -> TestResult {
+    println!("=== Test: Long Poll Sequential Produce and Consume ===\n");
 
     let topic = format!("longpoll-seq-{}", Uuid::new_v4());
     let group_id = format!("longpoll-seq-group-{}", Uuid::new_v4());
@@ -182,13 +188,12 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
     // Receive first message (setup)
     println!("\nStep 3: Receiving setup message...");
     let msg = tokio::time::timeout(Duration::from_secs(5), consumer.recv()).await;
-    match msg {
-        Ok(Ok(m)) => {
-            let val = m.payload().map(|v| String::from_utf8_lossy(v).to_string());
-            println!("   Received: {val:?}");
-        }
-        _ => println!("   No message or error"),
-    }
+    let setup = match msg {
+        Ok(Ok(m)) => m.payload().map(|v| String::from_utf8_lossy(v).to_string()),
+        _ => None,
+    };
+    println!("   Received: {setup:?}");
+    assert_eq!(setup.as_deref(), Some("setup"), "the topic's first record");
 
     // Now produce multiple messages and verify consumer receives them
     println!("\nStep 4: Producing 3 messages...");
@@ -207,19 +212,17 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
 
     // Receive all 3 messages
     println!("\nStep 5: Receiving messages...");
-    let mut received = 0;
+    let mut received = Vec::new();
     let start = Instant::now();
-    while received < 3 && start.elapsed() < Duration::from_secs(10) {
+    while received.len() < 3 && start.elapsed() < Duration::from_secs(10) {
         match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
             Ok(Ok(msg)) => {
                 let value = msg
                     .payload()
                     .map(|v| String::from_utf8_lossy(v).to_string());
-                if let Some(v) = &value {
-                    if v.starts_with("message-") {
-                        received += 1;
-                        println!("   Received: {} (in {:?})", v, start.elapsed());
-                    }
+                if let Some(v) = value {
+                    println!("   Received: {} (in {:?})", v, start.elapsed());
+                    received.push(v);
                 }
             }
             Ok(Err(e)) => println!("   Error: {e}"),
@@ -228,12 +231,13 @@ pub async fn test_long_poll_multiple_waiters() -> TestResult {
     }
 
     println!("\nStep 6: Verifying results...");
-    assert!(
-        received >= 2,
-        "Should receive at least 2 of 3 messages, got {received}"
-    );
-    println!("   Received {received} messages");
+    println!("   Received {received:?}");
     consumer.close(CLOSE_TIMEOUT).await?;
+    assert_eq!(
+        received,
+        ["message-1", "message-2", "message-3"],
+        "every record produced, in order"
+    );
 
     println!("\n✅ Long poll sequential operations test PASSED\n");
     Ok(())
