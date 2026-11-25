@@ -27,7 +27,7 @@ cargo test --features pg14 --test property_tests -- --list | grep -c ': test$'  
 cd kafka_test && cargo run --release -- --list                                 # E2E per category
 ```
 
-`kafka_test`'s own runner unit tests (`cargo test --bin kafka_test` in `kafka_test/`)
+`kafka_test`'s own runner unit tests (`cargo test --lib --bin kafka_test` in `kafka_test/`)
 are not counted above.
 
 ---
@@ -207,7 +207,7 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 |-----|--------------|
 | `Lint & Format` | `cargo fmt --check` and clippy `-D warnings` on both crates (pg14), the QA-1 policy check (`.github/scripts/check-coverage-policy.sh`) |
 | `Test Suite` | unit tests under `cargo llvm-cov` (pg14, uploaded to Codecov; includes the API-docs drift test), property tests |
-| `Build kafka_test` | the E2E runner, once, shared with the `e2e` legs as an artifact |
+| `Build kafka_test` | the E2E runner, once (`cargo build --release --locked` in `kafka_test/`), shared with the `e2e` legs as an artifact; the runner's own unit tests (`cargo test --release --locked --lib --bin kafka_test`; those that need a database are `#[ignore]`d) |
 | `E2E pg14` … `E2E pg18` | per major: clippy, unit and property tests, `cargo pgrx install` into that PostgreSQL, `scripts/ci-pg.sh start`, the functional E2E suite (`--exclude performance --exclude shadow`, 25 min step timeout), `scripts/check-upgrade.sh`, the generated GUC reference check; pg14 also the test-count check and the `shadow` and `performance` categories |
 | `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
 | `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
