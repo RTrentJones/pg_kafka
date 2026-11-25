@@ -897,7 +897,10 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   requests cannot lock control traffic out; a decoded request that finds no room is freed and
   decodes again once there is, waiting up to 10 s (its connection reads nothing meanwhile),
   after which the connection closes. A Fetch response holds at most the request's `max_bytes`,
-  lowered to `pg_kafka.fetch_max_bytes` (§7). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  lowered to `pg_kafka.fetch_max_bytes` (§7); a large response is written from its own buffer,
+  and a connection's read buffer starts small again after a large frame, so neither keeps the
+  largest frame's memory for the connection's life (Kafka allocates per receive and send).
+  `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
   Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the

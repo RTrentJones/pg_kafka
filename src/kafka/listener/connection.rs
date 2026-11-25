@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio_util::codec::Framed;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info, warn};
 
 use super::dispatch::{Dispatcher, Route};
@@ -45,7 +45,7 @@ use crate::kafka::handlers;
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::metrics::RequestTimer;
 use crate::kafka::protocol;
-use crate::kafka::protocol::framing::{FrameClock, FrameCodec, PRE_AUTH_MAX_FRAME};
+use crate::kafka::protocol::framing::{FrameClock, FrameCodec, FrameSink, PRE_AUTH_MAX_FRAME};
 
 /// How long a client has, from the moment its TCP connection is accepted, to finish
 /// everything before it is authenticated: the TLS handshake (SSL / SASL_SSL) and, on a
@@ -161,6 +161,22 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<S> {
         written
     }
 
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let written = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if matches!(written, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.touch();
+        }
+        written
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -205,11 +221,12 @@ pub(super) async fn handle_connection<S>(
         inner: socket,
         activity: Arc::clone(&activity),
     };
-    let framed = Framed::new(
-        socket,
+    let (read_half, write_half) = tokio::io::split(socket);
+    let reader = FramedRead::new(
+        read_half,
         FrameCodec::new(Arc::clone(&frame_limit), Arc::clone(&clock)),
     );
-    let (sink, reader) = framed.split();
+    let sink = FrameSink::new(write_half);
 
     // What the connection's unwritten responses may hold: one full Fetch response.
     let budget =
