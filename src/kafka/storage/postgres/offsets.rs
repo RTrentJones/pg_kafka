@@ -167,11 +167,17 @@ impl PostgresStore {
             return Ok(HashSet::new());
         }
         Spi::connect(|client| {
+            // One index probe per asked group and table. `group_id = ANY($1)` in each
+            // branch of a UNION instead filters both tables against the whole array, which
+            // for a DescribeGroups of thousands of groups costs twice as long on the DB thread.
             let table = client.select(
-                "SELECT group_id FROM kafka.consumer_offsets WHERE group_id = ANY($1::text[])
+                "SELECT g.group_id FROM unnest($1::text[]) AS g(group_id)
+                 WHERE EXISTS (SELECT 1 FROM kafka.consumer_offsets c
+                               WHERE c.group_id = g.group_id)
                  UNION
-                 SELECT group_id FROM kafka.txn_pending_offsets
-                 WHERE group_id = ANY($1::text[])",
+                 SELECT g.group_id FROM unnest($1::text[]) AS g(group_id)
+                 WHERE EXISTS (SELECT 1 FROM kafka.txn_pending_offsets p
+                               WHERE p.group_id = g.group_id)",
                 None,
                 &[group_ids.to_vec().into()],
             )?;
