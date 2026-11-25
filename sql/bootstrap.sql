@@ -155,6 +155,20 @@ CREATE INDEX idx_messages_txn_aborted
 ON kafka.messages(created_at)
 WHERE txn_state = 'aborted';
 
+-- Records by producer timestamp, for ListOffsets by timestamp and MAX_TIMESTAMP (-3):
+-- the record with the largest timestamp is one descent, and the earliest offset whose
+-- timestamp is at or after T is found among the rows that match from either side, the
+-- rows below the first match in timestamp order (through the offset key) or the rows at
+-- or after T (index only, partition_offset is a key column), whichever the planner
+-- estimates smaller; without it either lookup read every row of the partition.
+-- Partial on what a lookup can match (rows with a timestamp, not aborted). It costs
+-- every Produce one more btree entry per record (about 40 bytes, and its WAL) and a
+-- transaction commit one more per record (its UPDATE of txn_state is not HOT anyway:
+-- txn_state is in the partial indexes' predicates). Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_timestamp
+ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)
+WHERE timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted';
+
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every
 -- leaf). kafka.ensure_message_partitions() moves them into a proper leaf.

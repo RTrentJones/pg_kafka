@@ -6,9 +6,10 @@
 -- with scripts/check-upgrade.sh.
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
--- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes and reads it
--- five more times (see step 1; once more, and rewrites it again, for an install whose
--- created_at is a naive TIMESTAMP); run it in a quiet period on a large table.
+-- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes (reading it,
+-- writing a copy and reading that copy once per index rebuilt, three) and reads it six more
+-- times: ten full reads (see step 1; an install whose created_at is a naive TIMESTAMP gets
+-- one more rewrite with its three index rebuilds); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
@@ -58,16 +59,21 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 --
 -- The populated 0.0.0 table is not copied into a new one: it is renamed to
 -- kafka.messages_legacy and attached to the new partitioned kafka.messages as one leaf covering
--- [MINVALUE, the upgrade time). It keeps its primary key and unique index (renamed to
+-- [MINVALUE, the upgrade time), or up to just past its latest created_at if a row is dated
+-- later than that (see the ATTACH below). It keeps its primary key and unique index (renamed to
 -- the per-leaf names), its rows, offsets and global_offset sequence. The retention
 -- sweep treats it like any other past leaf: it is dropped whole once every row in it
 -- is expired under its topic's retention (row deletes until then only for topics with
--- a window shorter than one partition width). New rows go to the new time leaves.
+-- a window shorter than one partition width). New rows go to the new time leaves from the
+-- leaf's upper bound on.
 --
 -- Cost: ACCESS EXCLUSIVE on the old table for the whole script; one rewrite of it (the
--- record_bytes fill, which also rebuilds its two unique indexes) and five sequential
--- reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
--- idx_messages_txn_aborted and idx_messages_txn_pending_producer builds).
+-- record_bytes fill: a full read and write, then the rebuild of its three indexes, the two
+-- unique ones and the 0.0.0 pending-row index renamed messages_legacy_txn_pending_idx below,
+-- which ATTACH adopts as idx_messages_txn_pending's leaf, each rebuild a full read of the new
+-- copy) and six sequential reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
+-- idx_messages_txn_aborted, idx_messages_txn_pending_producer and idx_messages_timestamp
+-- builds).
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
 ALTER INDEX kafka.messages_pkey RENAME TO messages_legacy_offset_key;
 ALTER INDEX kafka.messages_global_offset_key RENAME TO messages_legacy_global_offset_key;
@@ -184,6 +190,20 @@ WHERE txn_state = 'pending';
 CREATE INDEX idx_messages_txn_aborted
 ON kafka.messages(created_at)
 WHERE txn_state = 'aborted';
+
+-- Records by producer timestamp, for ListOffsets by timestamp and MAX_TIMESTAMP (-3):
+-- the record with the largest timestamp is one descent, and the earliest offset whose
+-- timestamp is at or after T is found among the rows that match from either side, the
+-- rows below the first match in timestamp order (through the offset key) or the rows at
+-- or after T (index only, partition_offset is a key column), whichever the planner
+-- estimates smaller; without it either lookup read every row of the partition.
+-- Partial on what a lookup can match (rows with a timestamp, not aborted). It costs
+-- every Produce one more btree entry per record (about 40 bytes, and its WAL) and a
+-- transaction commit one more per record (its UPDATE of txn_state is not HOT anyway:
+-- txn_state is in the partial indexes' predicates). Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_timestamp
+ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)
+WHERE timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted';
 
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every
@@ -663,7 +683,8 @@ $$;
 -- 0.0.0 installs from before BUG-7 (no kafka.messages.timestamp_ms) and RV-10 (naive
 -- TIMESTAMP columns compared with NOW()): ATTACH needs the leaf's columns to be the
 -- parent's, and the other two columns get the type a fresh install has. Converting
--- created_at rewrites the legacy table (one more full read and write); the naive
+-- created_at rewrites the legacy table (one more full read and write, and the rebuild of
+-- its three indexes, a full read each); the naive
 -- values are taken in the session's TimeZone, the zone NOW() was stored in.
 ALTER TABLE kafka.messages_legacy ADD COLUMN IF NOT EXISTS timestamp_ms BIGINT NOT NULL DEFAULT -1;
 DO $$
@@ -688,7 +709,8 @@ $$;
 -- Fetches sum the record_bytes of the rows they scan (bootstrap.sql): the 0.0.0 rows get
 -- theirs here, computed as fetches compute it for a row without one (record_bytes_sql! in
 -- src/kafka/storage/postgres/log.rs). ALTER COLUMN TYPE ... USING rewrites the legacy
--- table (one more full read and write, the headers of every row detoasted); its USING
+-- table (one more full read and write, the headers of every row detoasted, and the
+-- rebuild of its three indexes, a full read each); its USING
 -- expression cannot hold the subqueries itself, so a function computes it for the rewrite
 -- only.
 ALTER TABLE kafka.messages_legacy ADD COLUMN record_bytes INT;
@@ -716,7 +738,14 @@ DECLARE
     v_upper TIMESTAMPTZ;
 BEGIN
     -- Every existing row sorts below the bound, including any written with a future
-    -- created_at; rows written after this transaction go to the new time leaves.
+    -- created_at. Rows written after this transaction go to the new time leaves only from
+    -- the bound on: with a 0.0.0 row dated after the upgrade (a clock set ahead, an
+    -- out-of-band INSERT) the bound is that row's time, partition maintenance creates no
+    -- leaf before it (it fills only gaps), so every Produce until then lands in this leaf,
+    -- and the leaf (all of it) is dropped, or a topic's rows trimmed, only once that bound
+    -- is past and its rows' windows have run from it. The bound is not clamped to now():
+    -- the later rows would have to be moved out of the leaf under this lock, and an
+    -- operator can correct their created_at before upgrading (docs/UPGRADING.md).
     SELECT GREATEST(now(), MAX(created_at)) + INTERVAL '1 microsecond'
     INTO v_upper FROM kafka.messages_legacy;
     -- The bound as ISO 8601 text in UTC with a numeric offset: the session's DateStyle

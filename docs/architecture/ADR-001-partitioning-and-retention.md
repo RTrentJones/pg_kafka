@@ -342,15 +342,21 @@ the startup role check verifies them with `has_function_privilege`.
 (renaming its primary key / unique index / constraints to the per-leaf names), creates the
 partitioned parent (same `global_offset` sequence, now owned by the parent) with the DEFAULT leaf,
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied into
-a new table. Under ACCESS EXCLUSIVE it rewrites the old table once (filling `record_bytes`, the
+a new table. The bound is `GREATEST(now(), MAX(created_at)) + 1 µs`: a 0.0.0 row dated after the
+upgrade extends the legacy leaf to that time, maintenance creates no leaf before it (it fills only
+gaps), every Produce until then lands in the legacy leaf, and leaf-granular retention of what it
+holds waits until that bound is past (docs/UPGRADING.md says how to check for such rows first). Under ACCESS EXCLUSIVE it rewrites the old table once (filling `record_bytes`, the
 size a fetch sums, for every row: a full read with each row's headers detoasted, a full write and
-the rebuild of its two unique indexes) and reads it five more times (MAX(created_at) for the bound,
-the attach's bound check, the BRIN, `idx_messages_txn_aborted` and
-`idx_messages_txn_pending_producer` builds). The legacy leaf is then retained and dropped like any past leaf.
+the rebuild of its three indexes, the two unique ones and the 0.0.0 pending-row index adopted at
+ATTACH as a leaf of `idx_messages_txn_pending`, each a full read of the new copy) and reads it six more times (MAX(created_at) for the bound,
+the attach's bound check, the BRIN, `idx_messages_txn_aborted`,
+`idx_messages_txn_pending_producer` and `idx_messages_timestamp` builds). The legacy leaf is then retained and dropped like any past leaf.
 The views that read the table are recreated on the parent. A new binary
-running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
-skips partition maintenance; its retention sweep expires rows row by row on the
-unpartitioned table. `scripts/check-upgrade.sh` compares
+running before the update (docs/UPGRADING.md step 2) detects the older schema and runs no
+maintenance at all (no partition maintenance, no retention sweep, no transaction timeouts):
+it answers every request with KAFKA_STORAGE_ERROR and re-checks the schema every 500 ms until
+the update commits. Only `pg_kafka_run_retention_sweep()` called from SQL in that window expires
+rows, row by row on the unpartitioned table. `scripts/check-upgrade.sh` compares
 the upgraded and fresh schemas with leaves normalized (each leaf's index set and grants must be
 identical; leaf names and counts are data-dependent), then checks that maintenance works on both,
 that the legacy leaf drops whole without losing the sequence, and that `pg_dump` emits no kafka

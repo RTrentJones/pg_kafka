@@ -98,16 +98,17 @@ async fn ending_reads() -> SendResult<()> {
     Ok(())
 }
 
-/// The leaf the foreign rows live in: an hour of 1999 that nothing else writes to, of a
-/// topic with infinite retention, so no maintenance has a reason to read it and its
-/// statistics count only what the transaction ends read.
-const FOREIGN_LEAF: &str = "messages_p19990601_030000";
+/// The leaf the foreign rows live in: an hour of 1998 that nothing else writes to (the
+/// `part` tests' random leaves are in 1999 and later), of a topic with infinite
+/// retention, so no maintenance has a reason to read it and its statistics count only
+/// what the transaction ends read.
+const FOREIGN_LEAF: &str = "messages_p19980601_030000";
 
 /// Create [`FOREIGN_LEAF`] and return its name, schema-qualified.
 async fn foreign_leaf(db: &Client) -> SendResult<String> {
     db.execute(
-        "SELECT kafka.create_message_partition(timestamptz '1999-06-01 03:00+00',
-                                               timestamptz '1999-06-01 04:00+00')",
+        "SELECT kafka.create_message_partition(timestamptz '1998-06-01 03:00+00',
+                                               timestamptz '1998-06-01 04:00+00')",
         &[],
     )
     .await
@@ -131,7 +132,7 @@ async fn steps(db: &Client, foreign_topic: i32, leaf: &str) -> SendResult<()> {
                                      producer_id, producer_epoch, txn_state, created_at)
          SELECT $1, 0, g, 'v'::bytea, -1 - (g % $3::bigint), 0,
                 CASE WHEN g % 2 = 0 THEN 'pending' END,
-                timestamptz '1999-06-01 03:00+00' + g * INTERVAL '1 millisecond'
+                timestamptz '1998-06-01 03:00+00' + g * INTERVAL '1 millisecond'
          FROM generate_series(0::bigint, 2 * $2::bigint - 1) AS g",
         &[&foreign_topic, &FOREIGN_PENDING, &FOREIGN_PRODUCERS],
     )
@@ -286,11 +287,11 @@ async fn write_transaction(producer: &FutureProducer, topic: &str) -> SendResult
 }
 
 /// What the worker's statistics count so far.
-struct WorkerReads {
+pub(crate) struct WorkerReads {
     /// Rows of the foreign rows' leaf read by sequential and index scans.
-    rows_read: i64,
+    pub(crate) rows_read: i64,
     /// Rows inserted into kafka.messages, over all its leaves.
-    inserted: i64,
+    pub(crate) inserted: i64,
 }
 
 /// The worker flushes its statistics only when it exits, so it is ended first (and
@@ -298,7 +299,7 @@ struct WorkerReads {
 /// apart agree: statistics reach the views late (PostgreSQL 14's collector lags behind
 /// a busy server, and a backend may defer its flush), so reads from before the window,
 /// such as an earlier test's DELETE of its rows, would otherwise land inside it.
-async fn worker_reads(db: &Client, leaf: &str) -> SendResult<WorkerReads> {
+pub(crate) async fn worker_reads(db: &Client, leaf: &str) -> SendResult<WorkerReads> {
     let old = listener_pid(db).await?;
     if let Some(pid) = old {
         db.execute("SELECT pg_terminate_backend($1)", &[&pid])

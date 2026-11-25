@@ -19,12 +19,17 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    idempotent Produce reads `kafka.producer_batches`, transactions use
    `kafka.txn_partitions` and `kafka.txn_groups`, SASL logins read `kafka.sasl_credentials` and
    `kafka.sasl_server_secret`, the shadow outbox needs
-   `kafka.shadow_tracking.attempt_open`, maintenance and the metrics flush need the time
-   partitions and `kafka.broker_api_stats` / `kafka.broker_gauges`). At start it checks
+   `kafka.shadow_tracking.attempt_open`, every Produce writes `kafka.messages.record_bytes`,
+   maintenance and the metrics flush need the time partitions and `kafka.broker_api_stats` /
+   `kafka.broker_gauges`). At start it checks
    for each of them and, on an older schema, logs **one** WARNING (`running against an
    older pg_kafka schema (version 0.0.0, library 0.1.0): answering Kafka requests with
    KAFKA_STORAGE_ERROR and running no maintenance until ALTER EXTENSION pg_kafka UPDATE
-   (missing: ...)`). Until step 3, clients see what they see while the extension is
+   (missing: ...)`). A schema at the library's own version that lacks one of them (created
+   by an earlier build of that version) gets a WARNING saying so instead: ALTER EXTENSION
+   UPDATE changes nothing at the same version, so re-create the extension (`DROP EXTENSION
+   pg_kafka CASCADE; CREATE EXTENSION pg_kafka`, which deletes its data) or create the
+   missing objects as `sql/bootstrap.sql` defines them. Until step 3, clients see what they see while the extension is
    dropped: the Kafka port accepts connections and every request the worker serves
    (ApiVersions and Metadata included) is answered with the retriable
    `KAFKA_STORAGE_ERROR` (56). On a SASL listener the network thread still answers
@@ -91,7 +96,7 @@ EXTENSION pg_kafka` has run, without a restart.
 
 - converts `kafka.messages` to a table partitioned by `created_at` (ADR-001): the
   populated 0.0.0 table becomes the leaf `kafka.messages_legacy` covering
-  `[MINVALUE, upgrade time)` without copying rows (it keeps its primary key and unique
+  `[MINVALUE, upgrade time)` (see below for a row dated later) without copying rows (it keeps its primary key and unique
   index as the per-leaf unique indexes and its `global_offset` sequence, now owned by
   the new parent), a DEFAULT leaf `kafka.messages_default` is added, the views
   `kafka.shadow_status` and `kafka.metrics` are recreated on the new parent, and the
@@ -99,9 +104,19 @@ EXTENSION pg_kafka` has run, without a restart.
   retention sweep once all its rows are expired. Under ACCESS EXCLUSIVE this rewrites
   the old table once (adding `kafka.messages.record_bytes`, the size of each record a
   Fetch sums, computed for every row: a full read with each row's headers detoasted, a
-  full write and the rebuild of its two unique indexes, so it needs free disk for a
-  second copy of the table) and reads it five more times (bound, attach check, BRIN,
-  aborted-row and pending-producer index builds);
+  full write and the rebuild of its three indexes, the two unique ones and the 0.0.0
+  pending-row index, each a full read of the new copy, so it needs free disk for a second
+  copy of the table) and reads it six more times (bound, attach check, BRIN, aborted-row,
+  pending-producer and timestamp index builds): ten full reads in all;
+  A 0.0.0 row whose `created_at` is later than the upgrade time (a clock set ahead, an
+  out-of-band INSERT) extends the legacy leaf to just past that time: partition maintenance
+  creates no leaf for the span before it, so every Produce until then is written to
+  `kafka.messages_legacy`, and that leaf, with everything written to it, is dropped (or a
+  topic's rows in it trimmed) only once its upper bound is past and the topics' windows have
+  run from it; until then only windows shorter than one partition width expire its rows
+  (row by row). Check `SELECT max(created_at) FROM kafka.messages` before the upgrade and
+  correct such rows (on 0.0.0 the table is not partitioned, so an UPDATE of `created_at` is
+  safe there);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
@@ -111,6 +126,9 @@ EXTENSION pg_kafka` has run, without a restart.
   sweep's aborted-row cleanup and outbox reaping stop reading whole tables;
 - adds `idx_messages_txn_pending_producer` (partial, `producer_id, producer_epoch` of
   pending rows), so ending a transaction reads only its producer's pending rows;
+- adds `idx_messages_timestamp` (partial, `topic_id, partition_id, timestamp_ms,
+  partition_offset` of non-aborted rows with a timestamp), so ListOffsets by timestamp and
+  MAX_TIMESTAMP stop reading whole partitions;
 - adds `pg_kafka_run_partition_maintenance()`, and revokes EXECUTE on it and on
   `pg_kafka_run_retention_sweep()` from PUBLIC (superusers only, as in a fresh install;
   ADR-001, "Concurrency with the worker and with manual maintenance");
@@ -127,7 +145,7 @@ EXTENSION pg_kafka` has run, without a restart.
   `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
   differs). Converting `kafka.messages.created_at` rewrites the table, one more full
-  read and write under the same lock. Layouts older than these are not supported;
+  read and write and three index rebuilds under the same lock. Layouts older than these are not supported;
 - adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
 - adds indexes on the referencing columns of foreign keys whose parent rows are deleted
   or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,

@@ -16,7 +16,7 @@ use crate::kafka::storage::{
     IsolationLevel, PartitionBounds, MAX_TIMESTAMP,
 };
 use pgrx::prelude::*;
-use pgrx::spi::SpiClient;
+use pgrx::spi::{SpiClient, SpiTupleTable};
 
 /// The log-end offset of one partition (`$1` topic, `$2` partition): the next offset
 /// Produce assigns, which is also the high watermark.
@@ -278,6 +278,82 @@ fn advance_next_offset(
         )
         .map_err(|e| KafkaError::Internal(format!("Failed to advance partition offset: {e}")))?;
     Ok(())
+}
+
+/// What a ListOffsets lookup by timestamp can match: a record with a timestamp that is
+/// not aborted. Also the predicate of the partial index `idx_messages_timestamp`
+/// (bootstrap.sql), which every statement below must repeat verbatim for the planner
+/// to use it.
+macro_rules! timestamp_lookup_rows {
+    () => {
+        "timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted'"
+    };
+}
+
+/// MAX_TIMESTAMP (-3): the record of partition `$1`/`$2` with the largest timestamp,
+/// the lowest offset among equal ones. A backward scan of `idx_messages_timestamp`
+/// (an incremental sort of the rows that share the largest timestamp).
+const MAX_TIMESTAMP_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM kafka.messages
+     WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+     ORDER BY timestamp_ms DESC, partition_offset ASC
+     LIMIT 1"
+);
+
+/// A lookup by timestamp `$3`, first step: the record of partition `$1`/`$2` with the
+/// smallest timestamp at or after `$3` (the lowest offset among equal ones), one
+/// descent of `idx_messages_timestamp`. None means no record matches. Its offset bounds
+/// the answer from above: timestamps need not grow with offsets, so a lower offset can
+/// still have a larger timestamp ([`TIMESTAMP_EARLIER_SQL`]).
+const TIMESTAMP_CANDIDATE_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM kafka.messages
+     WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+       AND timestamp_ms >= $3
+     ORDER BY timestamp_ms, partition_offset
+     LIMIT 1"
+);
+
+/// A lookup by timestamp, second step: the lowest offset below the candidate `$4` whose
+/// timestamp is at or after `$3`, if any (it is then the answer, else the candidate is).
+/// The rows it can match are those below the candidate (through the offset key) and
+/// those at or after `$3` (an index-only range of `idx_messages_timestamp`, the offset
+/// bound checked in the index); planned with the arguments, the planner reads the side
+/// its statistics estimate smaller. With timestamps that grow with offsets that is the
+/// smaller of the records before the answer and the records after it. The inner query
+/// is a fence: as `ORDER BY partition_offset LIMIT 1` over the table, the planner would
+/// expect a match early in an offset-order scan, which reads every row below the
+/// candidate when nothing matches (the usual case).
+const TIMESTAMP_EARLIER_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM (SELECT partition_offset, timestamp_ms
+           FROM kafka.messages
+           WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+             AND timestamp_ms >= $3 AND partition_offset < $4
+           ORDER BY timestamp_ms, partition_offset) AS earlier
+     ORDER BY partition_offset
+     LIMIT 1"
+);
+
+/// `(partition_offset, timestamp_ms)` of the first row of a timestamp lookup's result.
+fn offset_and_timestamp(table: SpiTupleTable<'_>) -> Result<Option<(i64, i64)>> {
+    // Reading the first row of an empty result is an error in SPI.
+    if table.is_empty() {
+        return Ok(None);
+    }
+    let row = table.first();
+    let Some(offset) = row.get_by_name::<i64, _>("partition_offset")? else {
+        return Ok(None);
+    };
+    let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(NO_TIMESTAMP);
+    Ok(Some((offset, timestamp)))
 }
 
 impl PostgresStore {
@@ -575,49 +651,46 @@ impl PostgresStore {
     /// (the lowest offset among equal ones). Records without a timestamp and aborted
     /// records are excluded; pending records count, and the handler bounds the answer
     /// by the high watermark or the last stable offset, as Kafka does.
+    ///
+    /// Every statement runs through `idx_messages_timestamp` (see
+    /// [`TIMESTAMP_CANDIDATE_SQL`]); they are planned with their arguments
+    /// (`client.select`, not kept plans) so the planner can size both sides of
+    /// [`TIMESTAMP_EARLIER_SQL`].
     pub(super) fn get_offset_for_timestamp(
         topic_id: i32,
         partition_id: i32,
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
         Spi::connect(|client| {
-            let table = if timestamp_ms == MAX_TIMESTAMP {
-                client.select(
-                    "SELECT partition_offset, timestamp_ms
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2
-                       AND timestamp_ms >= 0
-                       AND txn_state IS DISTINCT FROM 'aborted'
-                     ORDER BY timestamp_ms DESC, partition_offset ASC
-                     LIMIT 1",
+            if timestamp_ms == MAX_TIMESTAMP {
+                let table = client.select(
+                    MAX_TIMESTAMP_SQL,
                     None,
                     &[topic_id.into(), partition_id.into()],
-                )?
-            } else {
-                client.select(
-                    "SELECT partition_offset, timestamp_ms
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2
-                       AND timestamp_ms >= 0 AND timestamp_ms >= $3
-                       AND txn_state IS DISTINCT FROM 'aborted'
-                     ORDER BY partition_offset ASC
-                     LIMIT 1",
-                    None,
-                    &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
-                )?
-            };
-
-            // No matching record (a timestamp after the last one, or an empty
-            // partition): reading the first row of an empty result is an error in SPI.
-            if table.is_empty() {
-                return Ok(None);
+                )?;
+                return offset_and_timestamp(table);
             }
-            let row = table.first();
-            let Some(offset) = row.get_by_name::<i64, _>("partition_offset")? else {
+            let table = client.select(
+                TIMESTAMP_CANDIDATE_SQL,
+                None,
+                &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
+            )?;
+            // No record at or after the timestamp (it is past the last one, or the
+            // partition is empty): one descent per leaf, nothing else is read.
+            let Some((candidate, candidate_ts)) = offset_and_timestamp(table)? else {
                 return Ok(None);
             };
-            let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(NO_TIMESTAMP);
-            Ok(Some((offset, timestamp)))
+            let table = client.select(
+                TIMESTAMP_EARLIER_SQL,
+                None,
+                &[
+                    topic_id.into(),
+                    partition_id.into(),
+                    timestamp_ms.into(),
+                    candidate.into(),
+                ],
+            )?;
+            Ok(offset_and_timestamp(table)?.or(Some((candidate, candidate_ts))))
         })
         .map_err(internal("get_offset_for_timestamp"))
     }
@@ -711,7 +784,10 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageColumns, TxnStamp, NO_TIMESTAMP};
+    use super::{
+        MessageColumns, TxnStamp, MAX_TIMESTAMP_SQL, NO_TIMESTAMP, TIMESTAMP_CANDIDATE_SQL,
+        TIMESTAMP_EARLIER_SQL,
+    };
     use crate::kafka::messages::{Record, RecordHeader};
     use crate::kafka::storage::encode_headers_json;
 
@@ -796,5 +872,42 @@ mod tests {
         assert_eq!(columns.producer_ids, [Some(7), Some(7)]);
         assert_eq!(columns.producer_epochs, [Some(3), Some(3)]);
         assert_eq!(columns.txn_states, [Some("pending"), Some("pending")]);
+    }
+
+    /// The planner uses a partial index only for a query whose conditions imply its
+    /// predicate: every timestamp lookup repeats the predicate of `idx_messages_timestamp`,
+    /// and the index (in a fresh install and in the upgrade) is the one they are written for.
+    #[test]
+    fn timestamp_lookups_repeat_the_timestamp_index_predicate() {
+        let predicate = timestamp_lookup_rows!();
+        let index = format!(
+            "CREATE INDEX idx_messages_timestamp\n\
+             ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)\n\
+             WHERE {predicate};"
+        );
+        for (name, sql) in [
+            (
+                "bootstrap.sql",
+                include_str!("../../../../sql/bootstrap.sql"),
+            ),
+            (
+                "pg_kafka--0.0.0--0.1.0.sql",
+                include_str!("../../../../sql/pg_kafka--0.0.0--0.1.0.sql"),
+            ),
+        ] {
+            assert_eq!(sql.matches(index.as_str()).count(), 1, "{name}");
+        }
+        for sql in [
+            MAX_TIMESTAMP_SQL,
+            TIMESTAMP_CANDIDATE_SQL,
+            TIMESTAMP_EARLIER_SQL,
+        ] {
+            assert!(
+                sql.contains(&format!(
+                    "topic_id = $1 AND partition_id = $2 AND {predicate}"
+                )),
+                "{sql}"
+            );
+        }
     }
 }

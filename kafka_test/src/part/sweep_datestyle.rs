@@ -61,7 +61,8 @@ async fn datestyle_sweep() -> SendResult<()> {
 }
 
 async fn run(db: &Client, topics: &mut Vec<i32>, leaves: &mut Vec<String>) -> SendResult<()> {
-    // Before 2000, so no other test's leaves are there.
+    // An hour of 1999 (20 to 8020 hours before 2000): the other tests that create leaves
+    // there are sequential part tests that drop them, so no other test's leaves are there.
     let base: i32 = db
         .query_one("SELECT -20 - (random() * 8000)::int", &[])
         .await
