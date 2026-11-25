@@ -297,15 +297,23 @@ pub async fn test_sweep_reaps_outbox_rows_of_removed_messages() -> TestResult {
     Ok(())
 }
 
-/// Topics in the leaf of the drop-cost test, one partition and one row each: a client
-/// can create this many (CreateTopics, the default cap is 200,000 partitions) and give
-/// each a short `retention.ms`.
-const DROP_TOPICS: i32 = 80_000;
-/// What the drop of that leaf may take: its contents probe and its log-end read (one
-/// btree descent per pair each) and the DROP, with slack for a loaded host. Comparing
-/// every topic in the leaf with every expired topic (the array operator `<@`) took
-/// about 6 s here, holding ACCESS EXCLUSIVE on kafka.messages.
-const DROP_LIMIT: Duration = Duration::from_millis(2_500);
+/// Topics in the leaf of the drop-cost test, one partition and one row each.
+const DROP_TOPICS: i32 = 20_000;
+/// The expired set of the larger drop: the leaf's topics after this many times as
+/// many ids of other topics (the sweep's expired set holds every wholly expired topic,
+/// most of them in no given leaf), 160,000 entries, within the default cap of 200,000
+/// partitions a client can create topics for.
+const EXPIRED_FACTOR: i32 = 8;
+/// Runs of each size; the fastest counts (a loaded host only adds time).
+const DROP_RUNS: usize = 3;
+/// How much longer the drop with the eightfold expired set may take: the re-check is
+/// the only part of the drop that reads that set, and a linear one adds tens of
+/// milliseconds to a drop that costs hundreds (the contents probe and the log-end read,
+/// a btree descent per pair each, and the DROP), so the ratio stays near 1. The array
+/// operator `<@` compared every leaf topic with every expired id before it: eight times
+/// the work for an eightfold set, 11 times the whole drop at these sizes (0.5 s and
+/// 5.9 s here, against 0.13 s and 0.16 s for the linear re-check).
+const MAX_DROP_RATIO: f64 = 2.5;
 
 /// The re-check of `kafka.drop_message_partition` (every topic in the leaf is in the
 /// expired set) is linear in the two arrays: one entry per (topic, partition) pair in
@@ -313,9 +321,16 @@ const DROP_LIMIT: Duration = Duration::from_millis(2_500);
 /// element of one with every element of the other, under the drop's ACCESS EXCLUSIVE
 /// lock on kafka.messages, which stops every Produce and Fetch for as long.
 ///
-/// Asserts: a past leaf holding one row of each of 80,000 topics, all wholly expired,
-/// drops (through `drop_message_partition` with the 80,000 expired topics, as the
-/// sweep calls it) within 2.5 s.
+/// The check is a ratio on one host, not a wall-clock bound: the same drop of the same
+/// leaf, rolled back after each run, with the expired set grown eightfold. Only the
+/// re-check reads the expired set, so the ratio is what the re-check's growth adds,
+/// however fast the host is.
+///
+/// Asserts: a past leaf holding one row of each of 20,000 topics (infinite retention,
+/// so the worker leaves it alone; the function trusts the expired set it is given)
+/// drops through `drop_message_partition` with the 20,000 topics as the expired set and
+/// with 140,000 other ids before them, and the fastest of 3 runs of the larger takes at
+/// most 2.5 times the fastest of the smaller.
 pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResult {
     println!("=== Test: a leaf drop's re-check is linear in its topics ===\n");
     let ctx = TestContext::new().await?;
@@ -325,7 +340,7 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
     let topic_ids: Vec<i32> = db
         .query(
             "INSERT INTO kafka.topics (name, partitions, retention_ms)
-             SELECT $1 || '-' || g, 1, 1000 FROM generate_series(1, $2) AS g
+             SELECT $1 || '-' || g, 1, -1 FROM generate_series(1, $2) AS g
              RETURNING id",
             &[&prefix, &DROP_TOPICS],
         )
@@ -333,6 +348,11 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
         .iter()
         .map(|r| r.get(0))
         .collect();
+    // Ids of no topic, first, so `<@` would scan past all of them for every leaf topic.
+    let mut larger: Vec<i32> = (1..=DROP_TOPICS * (EXPIRED_FACTOR - 1))
+        .map(|i| -i)
+        .collect();
+    larger.extend_from_slice(&topic_ids);
     // A one-hour leaf in 2001 (no other test's leaves use that year), a row per topic.
     let hour: i32 = db
         .query_one("SELECT (random() * 8000)::int", &[])
@@ -360,31 +380,89 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
         &[&topic_ids, &hour],
     )
     .await?;
-    println!("Step 1: {leaf} holds one row of each of {DROP_TOPICS} expired topics");
+    db.batch_execute(&format!("ANALYZE {leaf}")).await?;
+    println!(
+        "Step 1: {leaf} holds one row of each of {DROP_TOPICS} topics; expired sets of {} and \
+         {} ids",
+        topic_ids.len(),
+        larger.len()
+    );
 
-    let started = std::time::Instant::now();
-    let dropped: bool = db
-        .query_one(
-            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
-            &[&leaf, &topic_ids],
-        )
-        .await?
-        .get(0);
-    let took = started.elapsed();
-    println!("Step 2: dropped {dropped} in {took:?}");
+    let result = async {
+        let mut best = [Duration::MAX; 2];
+        for _ in 0..DROP_RUNS {
+            for (slot, expired) in [&topic_ids, &larger].into_iter().enumerate() {
+                let took = timed_drop(db, &leaf, expired).await?;
+                best[slot] = best[slot].min(took);
+            }
+        }
+        let ratio = best[1].as_secs_f64() / best[0].as_secs_f64();
+        println!(
+            "Step 2: fastest drop {:?} with {} expired ids, {:?} with {} ({ratio:.2}x)",
+            best[0],
+            topic_ids.len(),
+            best[1],
+            larger.len()
+        );
+        assert!(
+            ratio <= MAX_DROP_RATIO,
+            "an eightfold expired set made the drop {ratio:.2}x as long (limit \
+             {MAX_DROP_RATIO}x): the re-check is not linear"
+        );
+        // Now for good: the leaf goes, so no empty 2001 leaf is left behind.
+        let dropped: bool = db
+            .query_one(
+                "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
+                &[&leaf, &topic_ids],
+            )
+            .await?
+            .get(0);
+        assert!(
+            dropped,
+            "{leaf} holds only listed topics and must be dropped"
+        );
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    }
+    .await;
     db.execute(
         "DELETE FROM kafka.topics WHERE id = ANY ($1::int[])",
         &[&topic_ids],
     )
     .await?;
-    assert!(
-        dropped,
-        "{leaf} holds only expired topics and must be dropped"
-    );
-    assert!(
-        took <= DROP_LIMIT,
-        "dropping a leaf of {DROP_TOPICS} expired topics took {took:?} (limit {DROP_LIMIT:?})"
-    );
+    result.map_err(|e| e as Box<dyn std::error::Error>)?;
     println!("✅ the drop's re-check stays linear");
     Ok(())
+}
+
+/// One drop of `leaf` with `expired` as the expired set, rolled back; returns how long
+/// the call took. A sweep holding the maintenance lock makes the call return at once
+/// without dropping: it is retried.
+async fn timed_drop(
+    db: &Client,
+    leaf: &str,
+    expired: &[i32],
+) -> Result<Duration, Box<dyn std::error::Error + Send + Sync>> {
+    for _ in 0..20 {
+        db.batch_execute("BEGIN").await?;
+        let started = std::time::Instant::now();
+        let row = db
+            .query_one(
+                "SELECT dropped, lock_timed_out
+                 FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
+                &[&leaf, &expired],
+            )
+            .await;
+        let took = started.elapsed();
+        db.batch_execute("ROLLBACK").await?;
+        let row = row?;
+        let (dropped, timed_out): (bool, bool) = (row.get(0), row.get(1));
+        if dropped {
+            return Ok(took);
+        }
+        if !timed_out {
+            return Err(format!("{leaf} holds only listed topics and must be dropped").into());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err("the maintenance lock stayed held".into())
 }
