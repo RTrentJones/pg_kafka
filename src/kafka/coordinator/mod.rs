@@ -321,6 +321,38 @@ impl GroupCoordinator {
         })
     }
 
+    /// Remember that the server-side assignment of `group_id` at `generation_id` was refused
+    /// (POLICY_VIOLATION: over `limits::MAX_ASSIGNMENT_WORK` or `MAX_ASSIGNMENT_STEPS`), so
+    /// that [`Self::assignment_refused`] answers the leader's retries in that generation.
+    ///
+    /// A refusal leaves the group in its sync phase with the same leader and generation, and
+    /// the rebalance timeout that ends the phase is the client's (up to `i32::MAX` ms): without
+    /// this, one connection pipelining empty SyncGroups would recompute a refused assignment
+    /// (up to about a second each) for as long as it liked. The refusal holds until the
+    /// generation moves (a member joins, leaves or is evicted, or the leader rejoins, as a
+    /// client does when its subscribed topics change); a change of the topics' partitions
+    /// within the generation does not lift it.
+    pub fn refuse_assignment(&self, group_id: &str, generation_id: i32) {
+        if let Ok(mut groups) = self.groups.write() {
+            if let Some(group) = groups
+                .get_mut(group_id)
+                .filter(|g| g.generation_id == generation_id)
+            {
+                group.refused_assignment = Some(generation_id);
+            }
+        }
+    }
+
+    /// Whether the server-side assignment of `group_id` at `generation_id`, its current
+    /// generation, was refused ([`Self::refuse_assignment`]).
+    pub fn assignment_refused(&self, group_id: &str, generation_id: i32) -> bool {
+        self.groups.read().is_ok_and(|groups| {
+            groups.get(group_id).is_some_and(|g| {
+                g.generation_id == generation_id && g.refused_assignment == Some(generation_id)
+            })
+        })
+    }
+
     /// Handle a JoinGroup request.
     ///
     /// `responder` is called exactly once with the outcome: before this returns when

@@ -446,12 +446,31 @@ pub fn handle_sync_group<F>(
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
     if assignments_empty && coordinator.awaits_leader_sync(group_id, member_id, generation_id) {
+        // A refused assignment is not computed again in its generation: the leader's
+        // retries get the refusal at the cost of a lookup (see
+        // `GroupCoordinator::refuse_assignment`).
+        if coordinator.assignment_refused(group_id, generation_id) {
+            crate::pg_debug!(
+                "SyncGroup: the server-side assignment of group {} at generation {} was refused before",
+                group_id,
+                generation_id
+            );
+            respond(build_sync_group_response(Err(
+                crate::kafka::error::KafkaError::PolicyViolation {
+                    message: format!(
+                        "the server-side assignment of group '{group_id}' at generation {generation_id} was refused as too large"
+                    ),
+                },
+            )));
+            return;
+        }
         match server_side_assignments(ctx, group_id) {
             Ok(Some(computed)) => coord_assignments = computed,
             Ok(None) => {}
             Err(e) => {
                 // Too large to compute: nothing is stored and the group stays in its sync
                 // phase (the rebalance timeout evicts a leader that cannot sync).
+                coordinator.refuse_assignment(group_id, generation_id);
                 respond(build_sync_group_response(Err(e)));
                 return;
             }
@@ -1307,6 +1326,50 @@ mod tests {
             take_sync(&refused).unwrap().error_code,
             crate::kafka::constants::ERROR_POLICY_VIOLATION
         );
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+    }
+
+    /// A refused server-side assignment is not computed again: the leader's retries in the
+    /// same generation (the group stays in its sync phase, possibly for as long as the
+    /// client's rebalance timeout) are answered POLICY_VIOLATION without reading the topics
+    /// or running the assignor, so pipelined retries cannot hold the DB thread.
+    #[test]
+    fn test_sync_group_retry_of_a_refused_assignment_computes_nothing() {
+        let mut f = Fixture::new();
+        // 21 topics of the most partitions a topic may have: 2,100,000 partitions, over
+        // the work limit once the topics are read.
+        let topics: Vec<String> = (0..21).map(|i| format!("t{i}")).collect();
+        f.store
+            .expect_get_topic_metadata()
+            .times(1)
+            .returning(|names| {
+                Ok(names
+                    .unwrap_or_default()
+                    .iter()
+                    .zip(1..)
+                    .map(|(name, id)| crate::kafka::storage::TopicMetadata {
+                        name: name.clone(),
+                        id,
+                        partition_count: crate::kafka::limits::HARD_MAX_PARTITIONS,
+                    })
+                    .collect())
+            });
+        let metadata = crate::kafka::assignment::MemberSubscription::new(topics)
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        for attempt in 0..3 {
+            let refused = f.sync("g", &member, join.generation_id, vec![]);
+            assert_eq!(
+                take_sync(&refused).unwrap().error_code,
+                crate::kafka::constants::ERROR_POLICY_VIOLATION,
+                "attempt {attempt}"
+            );
+        }
         assert_eq!(
             f.coordinator.get_group_state("g").unwrap().state,
             crate::kafka::coordinator::GroupState::CompletingRebalance

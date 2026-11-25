@@ -11,10 +11,11 @@ use crate::wire::requests::{
 };
 use crate::wire::{recv, send};
 use bytes::{BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::delete_topics_request::DeleteTopicsRequest;
 use kafka_protocol::messages::join_group_request::JoinGroupRequest;
 use kafka_protocol::messages::leave_group_request::{LeaveGroupRequest, MemberIdentity};
 use kafka_protocol::messages::sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment};
-use kafka_protocol::messages::GroupId;
+use kafka_protocol::messages::{GroupId, TopicName};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
@@ -330,6 +331,86 @@ pub async fn test_sticky_rebalance_of_nested_subscriptions_is_bounded() -> TestR
     let left = crate::wire::roundtrip(&mut leader_conn, 3, 60, &leave_all).await?;
     assert_eq!(left.error_code, error_codes::NONE);
 
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Null-name entries in the leader's explicit assignment: 2 bytes each, just over the
+/// 2,000,000 entries a server-side assignment may take.
+const PADDED_ENTRIES: usize = 2_000_001;
+
+/// The leader's SyncGroup at `generation` assigning itself `assignment`.
+fn explicit_sync(
+    group: &str,
+    generation: i32,
+    member: &str,
+    assignment: Bytes,
+) -> SyncGroupRequest {
+    let mut r = empty_sync(group, generation, member);
+    r.assignments[0].assignment = assignment;
+    r
+}
+
+/// A leader that stores millions of empty previous-assignment entries (2 bytes each, so
+/// within `max_group_memory`) makes the next sticky assignment refused before it parses
+/// them (they count toward the work limit), and the leader's retries in that generation get
+/// the refusal without computing again: after the subscribed topic is deleted, which would
+/// let a recomputation succeed (nothing to assign), a retry is still refused. Without the
+/// refusal being remembered, pipelined retries in a sync phase that lasts as long as the
+/// client's rebalance timeout recomputed the assignment (up to about a second each) on the
+/// DB thread.
+pub async fn test_refused_sticky_assignment_is_not_recomputed() -> TestResult {
+    println!("=== Test: a refused sticky assignment is not recomputed ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("refused").await;
+    let group = ctx.unique_group("refused").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, error_codes::NONE, "{created:?}");
+
+    println!(
+        "Step 1: the leader joins on sticky and assigns itself {PADDED_ENTRIES} empty entries..."
+    );
+    let mut c = conn().await?;
+    let mut join = join_req(&group, "", "consumer", &["sticky"]);
+    join.session_timeout_ms = 60_000;
+    join.rebalance_timeout_ms = 60_000;
+    join.protocols[0].metadata = subscription(std::iter::once(topic.clone()));
+    let (e, generation, member, _) = join_now(&mut c, &join).await?;
+    assert_eq!(e, error_codes::NONE);
+    let mut padded = BytesMut::new();
+    padded.put_i16(0);
+    padded.put_i32(i32::try_from(PADDED_ENTRIES)?);
+    for _ in 0..PADDED_ENTRIES {
+        padded.put_i16(-1); // a null topic name
+    }
+    padded.put_i32(-1); // no user data
+    let explicit = explicit_sync(&group, generation, &member, padded.freeze());
+    let (codes, _, _) = pipelined(&mut c, &explicit, 1).await?;
+    assert_eq!(codes, [error_codes::NONE]);
+
+    println!("Step 2: the leader rejoins; its empty SyncGroup is refused...");
+    join.member_id = s(&member);
+    let (e, generation, _, _) = join_now(&mut c, &join).await?;
+    assert_eq!(e, error_codes::NONE);
+    let current = empty_sync(&group, generation, &member);
+    let (codes, _, _) = pipelined(&mut c, &current, 1).await?;
+    assert_eq!(codes, [error_codes::POLICY_VIOLATION]);
+
+    println!("Step 3: the topic is deleted; {PIPELINED} retries are still refused...");
+    let mut delete = DeleteTopicsRequest::default();
+    delete.timeout_ms = 30_000;
+    delete.topic_names = vec![TopicName(s(&topic))];
+    let deleted = crate::wire::roundtrip(&mut c, 1, 70, &delete).await?;
+    assert_eq!(deleted.responses[0].error_code, error_codes::NONE);
+    let (codes, _, took) = pipelined(&mut c, &current, PIPELINED).await?;
+    println!("  answered in {took:?}");
+    assert!(
+        codes.iter().all(|&e| e == error_codes::POLICY_VIOLATION),
+        "{codes:?}"
+    );
+
+    assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

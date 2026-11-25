@@ -2270,3 +2270,23 @@ fn test_previous_assignment_parse_keeps_only_existing_topics() {
     assert_eq!(assignment.partitions("t"), vec![0]);
     assert!(peak < 1 << 20, "computing the assignment held {peak} bytes");
 }
+
+/// A refused server-side assignment is remembered for its generation, so the leader's
+/// retries are answered without computing; the next generation computes again.
+#[test]
+fn test_refused_assignment_is_remembered_for_its_generation() {
+    let c = GroupCoordinator::new();
+    let (leader, _, gen) = completing_pair(&c, "g");
+    assert!(!c.assignment_refused("g", gen));
+    c.refuse_assignment("g", gen);
+    assert!(c.assignment_refused("g", gen));
+    assert!(!c.assignment_refused("g", gen + 1), "another generation");
+    assert!(!c.assignment_refused("other", gen), "another group");
+    // A refusal for a generation the group is no longer at is not recorded.
+    c.refuse_assignment("g", gen - 1);
+    assert!(c.assignment_refused("g", gen));
+    assert!(
+        c.awaits_leader_sync("g", &leader, gen),
+        "the group stays in its sync phase"
+    );
+}
