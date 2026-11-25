@@ -59,6 +59,18 @@ impl MemberSubscription {
     /// # Returns
     /// Parsed subscription or error if format is invalid
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_with(bytes, true)
+    }
+
+    /// Parse like [`Self::parse`] without copying `user_data` (`None` in the result): the
+    /// server-side assignors read only the topics, and a member's metadata may carry up to
+    /// about a megabyte of user data. Cost: time linear in the topics' bytes; memory: the
+    /// topic names, nothing for the user data.
+    pub fn parse_topics(bytes: &[u8]) -> Result<Self> {
+        Self::parse_with(bytes, false)
+    }
+
+    fn parse_with(bytes: &[u8], keep_user_data: bool) -> Result<Self> {
         if bytes.is_empty() {
             return Ok(Self::default());
         }
@@ -121,7 +133,11 @@ impl MemberSubscription {
         }
 
         // Read user_data (optional)
-        let user_data = wire::get_trailing_user_data(&mut buf);
+        let user_data = if keep_user_data {
+            wire::get_trailing_user_data(&mut buf)
+        } else {
+            None
+        };
 
         Ok(Self {
             version,
@@ -228,6 +244,27 @@ mod tests {
 
         let sub = MemberSubscription::parse(&bytes).unwrap();
         assert_eq!(sub.user_data, Some(b"data".to_vec()));
+    }
+
+    /// `parse_topics` reads the same topics as `parse` and keeps none of the user data, and
+    /// fails where `parse` fails.
+    #[test]
+    fn test_parse_topics_skips_user_data() {
+        let sub = MemberSubscription {
+            version: 1,
+            topics: vec!["a".to_string(), "b".to_string()],
+            user_data: Some(vec![7; 512 * 1024]),
+        };
+        let encoded = sub.encode().unwrap();
+        let topics = MemberSubscription::parse_topics(&encoded).unwrap();
+        assert_eq!((topics.version, &topics.topics), (1, &sub.topics));
+        assert!(topics.user_data.is_none());
+        assert_eq!(MemberSubscription::parse(&encoded).unwrap(), sub);
+        assert!(MemberSubscription::parse_topics(&encoded[..9]).is_err());
+        assert_eq!(
+            MemberSubscription::parse_topics(&[]).unwrap(),
+            MemberSubscription::default()
+        );
     }
 
     #[test]

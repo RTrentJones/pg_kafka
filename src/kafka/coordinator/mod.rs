@@ -328,29 +328,44 @@ impl GroupCoordinator {
     /// A refusal leaves the group in its sync phase with the same leader and generation, and
     /// the rebalance timeout that ends the phase is the client's (up to `i32::MAX` ms): without
     /// this, one connection pipelining empty SyncGroups would recompute a refused assignment
-    /// (up to about a second each) for as long as it liked. The refusal holds until the
-    /// generation moves (a member joins, leaves or is evicted, or the leader rejoins, as a
-    /// client does when its subscribed topics change); a change of the topics' partitions
-    /// within the generation does not lift it.
+    /// (reading the subscribed topics and walking every member's subscription and previous
+    /// assignment, up to the work limit, each time) for as long as it liked. The refusal holds
+    /// until the generation moves (a member joins, leaves or is evicted, or the leader rejoins
+    /// with changed metadata, as a client does when its subscribed topics change); a change of
+    /// the topics' partitions within the generation does not lift it. A computed assignment
+    /// refused by the memory budget is remembered the same way ([`Self::sync_group_computed`]).
     pub fn refuse_assignment(&self, group_id: &str, generation_id: i32) {
+        self.remember_refusal(group_id, generation_id, AssignmentRefusal::TooLarge);
+    }
+
+    fn remember_refusal(&self, group_id: &str, generation_id: i32, why: AssignmentRefusal) {
         if let Ok(mut groups) = self.groups.write() {
             if let Some(group) = groups
                 .get_mut(group_id)
                 .filter(|g| g.generation_id == generation_id)
             {
-                group.refused_assignment = Some(generation_id);
+                group.refused_assignment = Some((generation_id, why));
             }
         }
     }
 
-    /// Whether the server-side assignment of `group_id` at `generation_id`, its current
-    /// generation, was refused ([`Self::refuse_assignment`]).
-    pub fn assignment_refused(&self, group_id: &str, generation_id: i32) -> bool {
-        self.groups.read().is_ok_and(|groups| {
-            groups.get(group_id).is_some_and(|g| {
-                g.generation_id == generation_id && g.refused_assignment == Some(generation_id)
-            })
-        })
+    /// Why the server-side assignment of `group_id` at `generation_id`, its current
+    /// generation, was refused ([`Self::refuse_assignment`]), if it was.
+    pub fn assignment_refused(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Option<AssignmentRefusal> {
+        let groups = self.groups.read().ok()?;
+        let group = groups.get(group_id)?;
+        match group.refused_assignment {
+            Some((generation, why))
+                if generation == generation_id && group.generation_id == generation_id =>
+            {
+                Some(why)
+            }
+            _ => None,
+        }
     }
 
     /// Handle a JoinGroup request.
@@ -675,6 +690,47 @@ impl GroupCoordinator {
         assignments: Vec<(String, Vec<u8>)>, // (member_id, assignment_bytes)
         responder: SyncResponder,
     ) {
+        self.sync(
+            group_id,
+            member_id,
+            generation_id,
+            assignments,
+            false,
+            responder,
+        );
+    }
+
+    /// [`Self::sync_group`] for the leader's SyncGroup whose `assignments` the server computed:
+    /// as there, and a refusal by the memory budget (COORDINATOR_NOT_AVAILABLE) is remembered
+    /// for the generation ([`Self::refuse_assignment`]), so the leader's retries do not compute
+    /// the assignment again only to be refused once more.
+    pub fn sync_group_computed(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+        assignments: Vec<(String, Vec<u8>)>,
+        responder: SyncResponder,
+    ) {
+        self.sync(
+            group_id,
+            member_id,
+            generation_id,
+            assignments,
+            true,
+            responder,
+        );
+    }
+
+    fn sync(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+        assignments: Vec<(String, Vec<u8>)>,
+        computed: bool,
+        responder: SyncResponder,
+    ) {
         let mut deliveries = Vec::new();
         let mut replaced = None;
         let mut responder = Some(responder);
@@ -687,6 +743,7 @@ impl GroupCoordinator {
                     member_id,
                     generation_id,
                     assignments,
+                    computed,
                 },
                 self.max_group_memory.load(Ordering::Relaxed),
                 &mut deliveries,
@@ -733,6 +790,7 @@ impl GroupCoordinator {
             member_id,
             generation_id,
             assignments,
+            computed,
         } = request;
         // The member and its generation are checked before anything else: a SyncGroup
         // answered UNKNOWN_MEMBER_ID or ILLEGAL_GENERATION changes nothing, not even the
@@ -806,6 +864,10 @@ impl GroupCoordinator {
                         held_elsewhere,
                         max_memory
                     );
+                    if computed {
+                        group.refused_assignment =
+                            Some((generation_id, AssignmentRefusal::OverMemory));
+                    }
                     return Err(KafkaError::CoordinatorNotAvailable {
                         group_id: group_id.to_string(),
                     });
@@ -1228,7 +1290,7 @@ impl GroupCoordinator {
                 .iter()
                 .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
             {
-                if let Ok(sub) = MemberSubscription::parse(metadata) {
+                if let Ok(sub) = MemberSubscription::parse_topics(metadata) {
                     for topic in sub.topics {
                         topics.insert(topic);
                     }
@@ -1291,7 +1353,8 @@ impl Default for GroupCoordinator {
 
 /// Every member's subscription, parsed from its metadata for the group's selected
 /// protocol. A member without that protocol, or whose metadata does not parse, is
-/// assigned as if it subscribed to nothing.
+/// assigned as if it subscribed to nothing. Only the topics are kept
+/// ([`MemberSubscription::parse_topics`]): no assignor reads the user data.
 fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscription> {
     group
         .members
@@ -1302,7 +1365,7 @@ fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscrip
                 .iter()
                 .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
                 .map_or_else(MemberSubscription::default, |(_, metadata)| {
-                    MemberSubscription::parse(metadata).unwrap_or_else(|e| {
+                    MemberSubscription::parse_topics(metadata).unwrap_or_else(|e| {
                         pg_log!(
                             "Failed to parse subscription for member {}: {}",
                             member_id,
@@ -1437,6 +1500,18 @@ struct SyncRequest<'a> {
     member_id: &'a str,
     generation_id: i32,
     assignments: Vec<(String, Vec<u8>)>,
+    /// Whether the server computed `assignments` (see [`GroupCoordinator::sync_group_computed`]).
+    computed: bool,
+}
+
+/// Why a server-side assignment was refused ([`GroupCoordinator::refuse_assignment`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentRefusal {
+    /// Over `limits::MAX_ASSIGNMENT_WORK` or `MAX_ASSIGNMENT_STEPS`: POLICY_VIOLATION.
+    TooLarge,
+    /// The computed assignments do not fit `pg_kafka.max_group_memory`:
+    /// COORDINATOR_NOT_AVAILABLE.
+    OverMemory,
 }
 
 /// What all groups hold in coordinator memory, as last counted.

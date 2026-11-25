@@ -641,39 +641,52 @@ fn describe_configs_topic_lookup_failure_errors_every_topic_resource() {
     }
 }
 
+/// The named topics' retention is read in one statement, so its failure errors every topic
+/// resource (and no other), and is no handler Err.
 #[test]
-fn describe_configs_retention_lookup_failure_is_per_resource() {
+fn describe_configs_retention_lookup_failure_errors_every_topic_resource() {
     let mut store = MockKafkaStore::new();
     expect_topics(&mut store, |name| {
-        Ok(Some(if name == "bad" { (1, 1) } else { (2, 1) }))
+        Ok(Some(if name == "a" { (1, 1) } else { (2, 1) }))
     });
-    store.expect_get_topic_retention_ms().returning(|id| {
-        if id == 1 {
-            Err(boom())
-        } else {
-            Ok(Some(5))
-        }
-    });
+    store
+        .expect_get_topics_retention_ms()
+        .times(1)
+        .returning(|_| Err(boom()));
 
     let resp = with_ctx(&store, |ctx| {
         handle_describe_configs(
             ctx,
             vec![
-                (RESOURCE_TYPE_TOPIC, "bad".to_string(), None),
-                (RESOURCE_TYPE_TOPIC, "ok".to_string(), None),
+                (RESOURCE_TYPE_TOPIC, "a".to_string(), None),
+                (4, "broker".to_string(), None),
+                (RESOURCE_TYPE_TOPIC, "b".to_string(), None),
             ],
             0,
         )
     })
     .unwrap();
 
-    assert_eq!(resp.results[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
-    assert_eq!(
-        resp.results[0].configs,
-        [] as [kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
-            0]
-    );
-    assert_eq!(resp.results[1].error_code, ERROR_NONE);
+    for i in [0, 2] {
+        assert_eq!(resp.results[i].error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert_eq!(resp.results[i].configs.len(), 0);
+    }
+    assert_eq!(resp.results[1].error_code, ERROR_INVALID_REQUEST);
+}
+
+/// A topic deleted between the topic lookup and the retention lookup is unknown.
+#[test]
+fn describe_configs_of_a_topic_deleted_meanwhile_is_unknown() {
+    let mut store = MockKafkaStore::new();
+    expect_topics(&mut store, |_| Ok(Some((1, 1))));
+    store
+        .expect_get_topics_retention_ms()
+        .returning(|_| Ok(std::collections::HashMap::new()));
+    let resp = with_ctx(&store, |ctx| {
+        handle_describe_configs(ctx, vec![(RESOURCE_TYPE_TOPIC, "a".to_string(), None)], 0)
+    })
+    .unwrap();
+    assert_eq!(resp.results[0].error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
 }
 
 // ========== IncrementalAlterConfigs ==========

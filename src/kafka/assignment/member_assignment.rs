@@ -482,4 +482,144 @@ mod tests {
         let result = MemberAssignment::parse(&bytes);
         assert!(result.is_err());
     }
+
+    /// An assignment of `entries`: a topic name (`None` for a null one, which carries no
+    /// partitions array) and its partitions (`None` for a null array).
+    type Entry<'a> = (Option<&'a [u8]>, Option<&'a [i32]>);
+
+    fn encoded(entries: &[Entry<'_>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.put_i16(0);
+        bytes.put_i32(i32::try_from(entries.len()).unwrap());
+        for (name, partitions) in entries {
+            let Some(name) = name else {
+                bytes.put_i16(-1);
+                continue;
+            };
+            bytes.put_i16(i16::try_from(name.len()).unwrap());
+            bytes.put_slice(name);
+            match partitions {
+                Some(partitions) => {
+                    bytes.put_i32(i32::try_from(partitions.len()).unwrap());
+                    for &p in *partitions {
+                        bytes.put_i32(p);
+                    }
+                }
+                None => bytes.put_i32(-1),
+            }
+        }
+        bytes.put_i32(-1);
+        bytes
+    }
+
+    fn topics(names: &[&str]) -> HashMap<String, i32> {
+        names.iter().map(|n| ((*n).to_string(), 8)).collect()
+    }
+
+    #[test]
+    fn test_work_hint_counts_entries_and_partitions() {
+        let bytes = encoded(&[
+            (Some(b"a"), Some(&[0, 1])),
+            (None, None),
+            (Some(b"b"), None),
+            (Some(b"c"), Some(&[3])),
+        ]);
+        // Four entries, three partitions.
+        assert_eq!(MemberAssignment::work_hint(&bytes, usize::MAX), 7);
+        // The walk stops once the count passes the limit.
+        assert_eq!(MemberAssignment::work_hint(&bytes, 0), 3);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 3), 4);
+    }
+
+    #[test]
+    fn test_work_hint_of_short_or_malformed_bytes() {
+        assert_eq!(MemberAssignment::work_hint(&[], 10), 0);
+        assert_eq!(MemberAssignment::work_hint(&[0, 0, 0, 0, 0], 10), 0);
+        // A negative topics array length.
+        assert_eq!(
+            MemberAssignment::work_hint(&[0, 0, 0xff, 0xff, 0xff, 0xff], 10),
+            0
+        );
+        // A claimed array longer than the data: only the entries present count.
+        let mut bytes = encoded(&[(Some(b"a"), Some(&[0]))]);
+        bytes.truncate(bytes.len() - 4);
+        bytes[2..6].copy_from_slice(&5_i32.to_be_bytes());
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 2);
+        // A name longer than the data: the walk stops at it, uncounted beyond the entry.
+        let mut bytes = encoded(&[(Some(b"abc"), Some(&[0]))]);
+        bytes.truncate(8);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 1);
+        // A partitions array longer than the data.
+        let mut bytes = encoded(&[(Some(b"a"), Some(&[0, 1, 2]))]);
+        bytes.truncate(bytes.len() - 8);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 1);
+    }
+
+    #[test]
+    fn test_parse_kept_keeps_only_wanted_entries_with_partitions() {
+        let bytes = encoded(&[
+            (Some(b"a"), Some(&[0, 1])),
+            (None, None),
+            (Some(b"gone"), Some(&[5, 6])),
+            (Some(b"b"), Some(&[2])),
+            (Some(b"b"), Some(&[3, 4])),
+            (Some(b"c"), Some(&[7])),
+            (Some(b"c"), Some(&[])),
+            (Some(b"d"), Some(&[1])),
+            (Some(b"d"), None),
+        ]);
+        let wanted = topics(&["a", "b", "c", "d"]);
+        let kept = MemberAssignment::parse_kept(&bytes, &wanted).unwrap();
+        // A later entry replaces an earlier one; an empty or null list keeps nothing.
+        assert_eq!(kept.partitions("a"), vec![0, 1]);
+        assert_eq!(kept.partitions("b"), vec![3, 4]);
+        assert!(!kept.topic_partitions.contains_key("c"));
+        assert!(!kept.topic_partitions.contains_key("d"));
+        assert!(!kept.topic_partitions.contains_key("gone"));
+        assert!(kept.user_data.is_none());
+        // The same partitions as `parse` for the kept topics.
+        let parsed = MemberAssignment::parse(&bytes).unwrap();
+        assert_eq!(parsed.partitions("b"), kept.partitions("b"));
+        assert!(MemberAssignment::parse_kept(&[], &wanted)
+            .unwrap()
+            .topic_partitions
+            .is_empty());
+    }
+
+    #[test]
+    fn test_parse_kept_fails_where_parse_fails() {
+        let wanted = topics(&["a"]);
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![0, 0, 0],                      // too short
+            vec![0, 0, 0xff, 0xff, 0xff, 0xff], // negative topics array length
+        ];
+        // A claimed entry with no data.
+        let mut missing = encoded(&[]);
+        missing.truncate(6);
+        missing[2..6].copy_from_slice(&1_i32.to_be_bytes());
+        cases.push(missing);
+        // A name longer than the data.
+        let mut name = encoded(&[(Some(b"abc"), Some(&[0]))]);
+        name.truncate(8);
+        cases.push(name);
+        // A name that is not UTF-8.
+        cases.push(encoded(&[(Some(&[0xff, 0xfe]), Some(&[0]))]));
+        // No partitions array length after the name.
+        let mut no_len = encoded(&[(Some(b"a"), Some(&[0]))]);
+        no_len.truncate(9);
+        cases.push(no_len);
+        // A partitions array longer than the data, for a kept and an unkept topic.
+        for topic in [b"a", b"z"] {
+            let mut partitions = encoded(&[(Some(topic), Some(&[0, 1, 2]))]);
+            partitions.truncate(partitions.len() - 8);
+            cases.push(partitions);
+        }
+        for (i, bytes) in cases.iter().enumerate() {
+            assert!(MemberAssignment::parse(bytes).is_err(), "case {i}: parse");
+            assert!(
+                MemberAssignment::parse_kept(bytes, &wanted).is_err(),
+                "case {i}: parse_kept"
+            );
+        }
+    }
 }

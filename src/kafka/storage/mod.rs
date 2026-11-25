@@ -346,13 +346,17 @@ pub trait TopicStore {
     /// Ok on success
     fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
 
-    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
+    /// The per-topic `retention.ms` override of each of `topic_ids` that exists (API 32
+    /// support), in one statement however many there are.
     ///
     /// # Returns
-    /// `None` when the topic inherits the global
+    /// Per existing topic id, `None` when the topic inherits the global
     /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
-    /// (`ms < 0` = infinite retention for this topic).
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+    /// (`ms < 0` = infinite retention for this topic). A topic that does not exist is absent.
+    fn get_topics_retention_ms(
+        &self,
+        topic_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Option<i64>>>;
 
     /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
     ///

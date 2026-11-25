@@ -336,9 +336,16 @@ pub async fn test_sticky_rebalance_of_nested_subscriptions_is_bounded() -> TestR
     Ok(())
 }
 
-/// Null-name entries in the leader's explicit assignment: 2 bytes each, just over the
-/// 2,000,000 entries a server-side assignment may take.
-const PADDED_ENTRIES: usize = 2_000_001;
+/// Null-name entries in the leader's explicit assignment: 2 bytes each. With the
+/// [`REFUSED_TOPICS`] topics' partitions they take a server-side assignment just over the
+/// 2,000,000 entries it may take; without the partitions, within it.
+const PADDED_ENTRIES: usize = 1_960_000;
+
+/// Topics the leader subscribes to, of [`REFUSED_PARTITIONS`] partitions each.
+const REFUSED_TOPICS: usize = 5;
+
+/// The default `pg_kafka.max_partitions_per_topic`.
+const REFUSED_PARTITIONS: i32 = 10_000;
 
 /// The leader's SyncGroup at `generation` assigning itself `assignment`.
 fn explicit_sync(
@@ -352,21 +359,34 @@ fn explicit_sync(
     r
 }
 
-/// A leader that stores millions of empty previous-assignment entries (2 bytes each, so
-/// within `max_group_memory`) makes the next sticky assignment refused before it parses
-/// them (they count toward the work limit), and the leader's retries in that generation get
-/// the refusal without computing again: after the subscribed topic is deleted, which would
-/// let a recomputation succeed (nothing to assign), a retry is still refused. Without the
-/// refusal being remembered, pipelined retries in a sync phase that lasts as long as the
-/// client's rebalance timeout recomputed the assignment (up to about a second each) on the
-/// DB thread.
+/// A leader on sticky that stores 1,960,000 empty previous-assignment entries (2 bytes
+/// each, so within `max_group_memory`) and subscribes to five topics of 10,000 partitions
+/// has its next server-side assignment refused before anything is parsed (the entries and
+/// partitions together are over the work limit), and its retries in that generation get the
+/// refusal without computing again: after the topics are deleted, a recomputation would
+/// succeed (the entries alone are within the limit, and there is nothing to assign), yet a
+/// retry is still refused. Without the refusal being remembered, pipelined retries in a sync
+/// phase that lasts as long as the client's rebalance timeout each read the subscribed
+/// topics and walked the stored entries' lengths (about two million steps) on the DB thread.
 pub async fn test_refused_sticky_assignment_is_not_recomputed() -> TestResult {
     println!("=== Test: a refused sticky assignment is not recomputed ===\n");
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("refused").await;
     let group = ctx.unique_group("refused").await;
-    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
-    assert_eq!(created[0].error_code, error_codes::NONE, "{created:?}");
+    let mut topics = Vec::new();
+    for i in 0..REFUSED_TOPICS {
+        topics.push(ctx.unique_topic(&format!("refused-{i}")).await);
+    }
+    let created = create_topics_raw(
+        topics
+            .iter()
+            .map(|t| creatable(t, REFUSED_PARTITIONS, 1))
+            .collect(),
+    )
+    .await?;
+    assert!(
+        created.iter().all(|t| t.error_code == error_codes::NONE),
+        "{created:?}"
+    );
 
     println!(
         "Step 1: the leader joins on sticky and assigns itself {PADDED_ENTRIES} empty entries..."
@@ -375,7 +395,7 @@ pub async fn test_refused_sticky_assignment_is_not_recomputed() -> TestResult {
     let mut join = join_req(&group, "", "consumer", &["sticky"]);
     join.session_timeout_ms = 60_000;
     join.rebalance_timeout_ms = 60_000;
-    join.protocols[0].metadata = subscription(std::iter::once(topic.clone()));
+    join.protocols[0].metadata = subscription(topics.iter().cloned());
     let (e, generation, member, _) = join_now(&mut c, &join).await?;
     assert_eq!(e, error_codes::NONE);
     let mut padded = BytesMut::new();
@@ -397,17 +417,24 @@ pub async fn test_refused_sticky_assignment_is_not_recomputed() -> TestResult {
     let (codes, _, _) = pipelined(&mut c, &current, 1).await?;
     assert_eq!(codes, [error_codes::POLICY_VIOLATION]);
 
-    println!("Step 3: the topic is deleted; {PIPELINED} retries are still refused...");
+    println!("Step 3: the topics are deleted; {PIPELINED} retries are still refused...");
     let mut delete = DeleteTopicsRequest::default();
     delete.timeout_ms = 30_000;
-    delete.topic_names = vec![TopicName(s(&topic))];
+    delete.topic_names = topics.iter().map(|t| TopicName(s(t))).collect();
     let deleted = crate::wire::roundtrip(&mut c, 1, 70, &delete).await?;
-    assert_eq!(deleted.responses[0].error_code, error_codes::NONE);
+    assert!(
+        deleted
+            .responses
+            .iter()
+            .all(|r| r.error_code == error_codes::NONE),
+        "{:?}",
+        deleted.responses
+    );
     let (codes, _, took) = pipelined(&mut c, &current, PIPELINED).await?;
     println!("  answered in {took:?}");
     assert!(
         codes.iter().all(|&e| e == error_codes::POLICY_VIOLATION),
-        "{codes:?}"
+        "a retry computed the assignment again (it succeeds once the topics are gone): {codes:?}"
     );
 
     assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);

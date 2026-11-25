@@ -1,8 +1,8 @@
 //! Consumer group handlers: FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
 //! DescribeGroups and ListGroups, over the in-memory `GroupCoordinator`.
 
-use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE};
-use crate::kafka::coordinator::{ConsumerGroup, GroupMember};
+use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, MAX_PREALLOC_ELEMENTS};
+use crate::kafka::coordinator::{AssignmentRefusal, ConsumerGroup, GroupMember};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::describe_groups_response::{
@@ -433,7 +433,7 @@ pub fn handle_sync_group<F>(
     );
 
     // Convert assignments to coordinator format
-    let mut coord_assignments: Vec<(String, Vec<u8>)> = assignments
+    let coord_assignments: Vec<(String, Vec<u8>)> = assignments
         .into_iter()
         .map(|a| (a.member_id, a.assignment))
         .collect();
@@ -449,23 +449,39 @@ pub fn handle_sync_group<F>(
         // A refused assignment is not computed again in its generation: the leader's
         // retries get the refusal at the cost of a lookup (see
         // `GroupCoordinator::refuse_assignment`).
-        if coordinator.assignment_refused(group_id, generation_id) {
+        if let Some(why) = coordinator.assignment_refused(group_id, generation_id) {
             crate::pg_debug!(
                 "SyncGroup: the server-side assignment of group {} at generation {} was refused before",
                 group_id,
                 generation_id
             );
-            respond(build_sync_group_response(Err(
-                crate::kafka::error::KafkaError::PolicyViolation {
+            respond(build_sync_group_response(Err(match why {
+                AssignmentRefusal::TooLarge => crate::kafka::error::KafkaError::PolicyViolation {
                     message: format!(
                         "the server-side assignment of group '{group_id}' at generation {generation_id} was refused as too large"
                     ),
                 },
-            )));
+                AssignmentRefusal::OverMemory => {
+                    crate::kafka::error::KafkaError::CoordinatorNotAvailable {
+                        group_id: group_id.to_string(),
+                    }
+                }
+            })));
             return;
         }
         match server_side_assignments(ctx, group_id) {
-            Ok(Some(computed)) => coord_assignments = computed,
+            Ok(Some(computed)) => {
+                // A refusal by the memory budget is remembered for the generation, like one
+                // for size.
+                coordinator.sync_group_computed(
+                    group_id,
+                    member_id,
+                    generation_id,
+                    computed,
+                    Box::new(move |outcome| respond(build_sync_group_response(outcome))),
+                );
+                return;
+            }
             Ok(None) => {}
             Err(e) => {
                 // Too large to compute: nothing is stored and the group stays in its sync
@@ -634,12 +650,40 @@ pub fn handle_leave_group(
 
 /// Handle DescribeGroups request
 ///
-/// Returns detailed information about consumer groups including members and state.
-/// This is critical for debugging consumer group issues and monitoring group health.
+/// Returns detailed information about consumer groups including members and state, within
+/// [`crate::config::response_max_bytes`] (see [`describe_groups`]).
 pub fn handle_describe_groups(
     ctx: &HandlerContext,
     groups: Vec<String>,
 ) -> Result<DescribeGroupsResponse> {
+    Ok(describe_groups(
+        ctx,
+        groups,
+        crate::config::response_max_bytes(),
+    ))
+}
+
+/// DescribeGroups of `groups` in a response of at most about `max_bytes`.
+///
+/// Every entry is answered, a repeated group as often as it is named, as Kafka 3.7 does. A
+/// held group's entry carries its members' ids, hosts, metadata and assignments, up to
+/// `pg_kafka.max_group_memory` (128 MB by default) for one group, so the entries described
+/// in full are bounded together: an entry whose description ([`described_group_bytes`])
+/// would take the response past `max_bytes` is answered COORDINATOR_NOT_AVAILABLE
+/// (retriable: a client describes it again, in a smaller request), except the first held
+/// group, which is always described so that any one group can be. Each distinct group is
+/// described once; its repeats share that entry's bytes.
+///
+/// Cost, for `n` entries naming `d` distinct held groups of `m` members in all: time
+/// O(n + m) to size and build them plus O(members) per entry described in full, which the
+/// bound limits to O(`max_bytes` / [`DESCRIBED_MEMBER_OVERHEAD`]); memory: one copy of
+/// each distinct group described, plus a response of at most the larger of `max_bytes`
+/// and the first held group's description, plus O(request) for the other entries.
+pub fn describe_groups(
+    ctx: &HandlerContext,
+    groups: Vec<String>,
+    max_bytes: usize,
+) -> DescribeGroupsResponse {
     let coordinator = ctx.coordinator;
 
     let mut response = DescribeGroupsResponse::default();
@@ -667,9 +711,27 @@ pub fn handle_describe_groups(
             .groups_with_offsets(&unheld)
             .map_err(|e| e.to_kafka_error_code())
     };
+    // Each distinct held group's size, and its entry once built.
+    let mut sized: HashMap<String, (usize, Option<DescribedGroup>)> = HashMap::new();
+    let mut described_bytes = 0_usize;
+    response
+        .groups
+        .reserve(groups.len().min(MAX_PREALLOC_ELEMENTS));
     for group_id in groups {
         let described_group = match coordinator_groups.get(&group_id) {
-            Some(group) => describe_held_group(&group_id, group),
+            Some(group) => {
+                let (bytes, entry) = sized
+                    .entry(group_id)
+                    .or_insert_with(|| (described_group_bytes(group), None));
+                if described_bytes > 0 && described_bytes.saturating_add(*bytes) > max_bytes {
+                    refused_described_group(&group.group_id)
+                } else {
+                    described_bytes = described_bytes.saturating_add(*bytes);
+                    entry
+                        .get_or_insert_with(|| describe_held_group(&group.group_id, group))
+                        .clone()
+                }
+            }
             None => describe_unheld_group(
                 &group_id,
                 with_offsets.as_ref().map(|g| g.contains(&group_id)),
@@ -678,7 +740,57 @@ pub fn handle_describe_groups(
         response.groups.push(described_group);
     }
 
-    Ok(response)
+    response
+}
+
+/// What one member adds to a DescribeGroups entry besides its strings and bytes: their
+/// length prefixes, the entry's framing and tagged fields, rounded up.
+const DESCRIBED_MEMBER_OVERHEAD: usize = 32;
+
+/// What a held group's DescribeGroups entry takes when encoded, at most: its id, state,
+/// protocol type and name, and each member's ids, client id, host and (Stable only, as
+/// [`describe_held_group`] reports them) metadata and assignment, with their framing.
+///
+/// Cost: O(members) time, no memory.
+fn described_group_bytes(group: &ConsumerGroup) -> usize {
+    let stable = group.state == crate::kafka::coordinator::GroupState::Stable;
+    let members: usize = group
+        .members
+        .values()
+        .map(|member| {
+            let payload = if stable {
+                member
+                    .protocols
+                    .iter()
+                    .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
+                    .or_else(|| member.protocols.first())
+                    .map_or(0, |(_, metadata)| metadata.len())
+                    + member.assignment.as_ref().map_or(0, Vec::len)
+            } else {
+                0
+            };
+            DESCRIBED_MEMBER_OVERHEAD
+                + member.member_id.len()
+                + member.client_id.len()
+                + member.client_host.len()
+                + member.group_instance_id.as_ref().map_or(0, String::len)
+                + payload
+        })
+        .sum();
+    DESCRIBED_MEMBER_OVERHEAD
+        + group.group_id.len()
+        + group.protocol_type.as_ref().map_or(0, String::len)
+        + group.protocol_name.as_ref().map_or(0, String::len)
+        + members
+}
+
+/// The entry of a held group whose description does not fit the response
+/// ([`describe_groups`]): COORDINATOR_NOT_AVAILABLE, retriable.
+fn refused_described_group(group_id: &str) -> DescribedGroup {
+    let mut described_group = DescribedGroup::default();
+    described_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
+    described_group.error_code = crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE;
+    described_group
 }
 
 /// DescribeGroups for a group the coordinator holds: its state, protocol and members. As in
@@ -976,6 +1088,99 @@ mod tests {
             );
             slot
         }
+    }
+
+    /// A Stable group of one member with `payload` bytes of metadata and of assignment.
+    fn stable_group(f: &Fixture, group: &str, payload: usize) {
+        let join = take(&f.join_protocol(group, "", 30_000, "range", vec![7; payload])).unwrap();
+        let member = join.member_id.to_string();
+        let synced = take_sync(&f.sync(
+            group,
+            &member,
+            join.generation_id,
+            vec![SyncGroupAssignment {
+                member_id: member.clone(),
+                assignment: vec![9; payload],
+            }],
+        ))
+        .unwrap();
+        assert_eq!(synced.error_code, ERROR_NONE);
+    }
+
+    /// A DescribeGroups naming a large group many times copied the group's member state
+    /// into the response once per repeat (a 1.6 kB request repeating a group of 1 MB of
+    /// member state was answered with 400 MB). Every entry is answered, but those described
+    /// in full fit `pg_kafka.fetch_max_bytes` (55 MiB) and share one copy of the group's
+    /// bytes; the rest are COORDINATOR_NOT_AVAILABLE.
+    #[test]
+    fn test_describe_groups_of_a_repeated_group_is_bounded() {
+        const PAYLOAD: usize = 512 << 10;
+        const REPEATS: usize = 80;
+        let f = Fixture::new();
+        stable_group(&f, "g", PAYLOAD);
+        let response = handle_describe_groups(&f.ctx(), vec!["g".to_string(); REPEATS]).unwrap();
+        assert_eq!(response.groups.len(), REPEATS, "every entry is answered");
+        let described: Vec<_> = response
+            .groups
+            .iter()
+            .filter(|g| g.error_code == ERROR_NONE)
+            .collect();
+        let refused = response
+            .groups
+            .iter()
+            .filter(|g| g.error_code == crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE)
+            .count();
+        assert_eq!(described.len() + refused, REPEATS);
+        let payload: usize = described
+            .iter()
+            .flat_map(|g| &g.members)
+            .map(|m| m.member_metadata.len() + m.member_assignment.len())
+            .sum();
+        assert!(
+            payload <= crate::config::response_max_bytes(),
+            "{} entries described in full: {payload} bytes of member state",
+            described.len()
+        );
+        let first = described[0].members[0].member_metadata.as_ptr();
+        assert!(
+            described
+                .iter()
+                .all(|g| g.members[0].member_metadata.as_ptr() == first),
+            "each repeat copied the member state"
+        );
+    }
+
+    /// The bound covers distinct groups too, and the first held group is always described
+    /// whatever its size; groups the coordinator does not hold (a small entry each) are
+    /// always answered, and a group outside its Stable state reports no metadata or
+    /// assignment, so they do not count.
+    #[test]
+    fn test_describe_groups_bounds_the_groups_described_in_full() {
+        let f = Fixture::new();
+        stable_group(&f, "a", 1000);
+        stable_group(&f, "b", 1000);
+        // One member joined, not yet synced: CompletingRebalance.
+        take(&f.join_protocol("c", "", 30_000, "range", vec![7; 100_000])).unwrap();
+        let names = ["a", "missing", "c", "b", "a"].map(String::from).to_vec();
+        let codes = |max_bytes| -> Vec<i16> {
+            describe_groups(&f.ctx(), names.clone(), max_bytes)
+                .groups
+                .iter()
+                .map(|g| g.error_code)
+                .collect()
+        };
+        let busy = crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE;
+        // Smaller than one group: only the first is described.
+        assert_eq!(codes(100), [ERROR_NONE, ERROR_NONE, busy, busy, busy]);
+        // Room for a, c (no payload) and b, but not a again.
+        assert_eq!(
+            codes(5000),
+            [ERROR_NONE, ERROR_NONE, ERROR_NONE, ERROR_NONE, busy]
+        );
+        assert_eq!(codes(1 << 20), [ERROR_NONE; 5]);
+        let refused = &describe_groups(&f.ctx(), names.clone(), 100).groups[3];
+        assert_eq!(refused.group_id.as_str(), "b");
+        assert_eq!(refused.members.len(), 0);
     }
 
     #[test]
@@ -1367,6 +1572,41 @@ mod tests {
             assert_eq!(
                 take_sync(&refused).unwrap().error_code,
                 crate::kafka::constants::ERROR_POLICY_VIOLATION,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+    }
+
+    /// A computed assignment refused by the memory budget is not computed again either: the
+    /// leader's retries in the generation (COORDINATOR_NOT_AVAILABLE, retriable, so clients
+    /// retry it at once) are answered without reading the topics or running the assignor.
+    /// Each computation here reads a topic of 100,000 partitions and encodes a 400 kB
+    /// assignment that a 256 kB budget refuses.
+    #[test]
+    fn test_sync_group_retry_of_an_assignment_over_the_memory_budget_computes_nothing() {
+        crate::kafka::limits::test_max_group_memory::set(256 << 10);
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: crate::kafka::limits::HARD_MAX_PARTITIONS,
+            }])
+        });
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        for attempt in 0..3 {
+            let refused = f.sync("g", &member, join.generation_id, vec![]);
+            assert_eq!(
+                take_sync(&refused).unwrap().error_code,
+                crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE,
                 "attempt {attempt}"
             );
         }

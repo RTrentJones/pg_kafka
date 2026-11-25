@@ -32,7 +32,7 @@ mod store {
             fn delete_topic(&self, topic_id: i32) -> Result<()>;
             fn get_topic_partition_count<'a>(&self, name: &'a str) -> Result<Option<i32>>;
             fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
-            fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+            fn get_topics_retention_ms(&self, topic_ids: &[i32]) -> Result<std::collections::HashMap<i32, Option<i64>>>;
             fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
                 fn colliding_topics<'a>(&self, names: &'a [String]) -> Result<Vec<String>>;
             fn total_partition_count(&self) -> Result<i64>;
