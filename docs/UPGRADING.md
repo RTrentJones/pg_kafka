@@ -144,8 +144,12 @@ EXTENSION pg_kafka` has run, without a restart.
   (`kafka.messages.created_at`, `kafka.transactions.started_at`,
   `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
-  differs). Converting `kafka.messages.created_at` rewrites the table, one more full
-  read and write and three index rebuilds under the same lock. Layouts older than these are not supported;
+  differs). In a session `TimeZone` of a fixed zero UTC offset (`UTC`, `GMT`,
+  `Etc/UTC`), PostgreSQL changes these types without rewriting the tables (only an index
+  on a converted column is rebuilt: `idx_transactions_timeout` on
+  `kafka.transactions`); in any other zone each conversion rewrites its table, for
+  `kafka.messages.created_at` one more full read and write and three index rebuilds
+  under the same lock. Layouts older than these are not supported;
 - adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
 - adds indexes on the referencing columns of foreign keys whose parent rows are deleted
   or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,

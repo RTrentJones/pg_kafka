@@ -51,7 +51,9 @@ pub fn handle_fetch(
 /// The bytes one record adds to a Fetch response, the size both byte limits
 /// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
 /// value and header keys and values, 84 bytes per record and 10 per header for its framing
-/// (what a record alone in its RecordBatch adds at most, see [`crate::kafka::storage::RECORD_OVERHEAD`]).
+/// (what a record alone in its uncompressed RecordBatch adds at most, see
+/// [`crate::kafka::storage::RECORD_OVERHEAD`]; a compressed batch can take more, which
+/// [`encode_within_limit`] checks).
 /// [`record_fetch_bytes`] is also what Produce stores with each row for the storage layer's
 /// own accounting, so storage and this handler cut a partition at the same record.
 pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
@@ -105,16 +107,13 @@ pub(crate) fn trim_to_response_budget(
     (kept, used)
 }
 
-/// Encode fetched rows as RecordBatch v2. Consecutive offsets written by the
+/// The records of fetched rows, for RecordBatch v2. Consecutive offsets written by the
 /// same producer id and epoch form one batch (rows without a producer id, i.e. not
 /// written by a transactional producer, likewise): the batch header (61 bytes) and the
 /// compression are paid per batch instead of per record. Batches of transactional rows
 /// carry the producer id and epoch and the transactional flag; the base sequence is not
 /// stored and is sent as -1. Rows are in offset order.
-pub(crate) fn encode_record_batches(
-    messages: Vec<FetchedMessage>,
-    compression: Compression,
-) -> std::result::Result<bytes::Bytes, String> {
+fn batch_records(messages: Vec<FetchedMessage>) -> std::result::Result<Vec<Record>, String> {
     let mut records: Vec<Record> = Vec::with_capacity(messages.len());
     let mut group_base = 0i64;
     // Smallest and largest timestamp of the current batch: the encoder stores each
@@ -172,6 +171,15 @@ pub(crate) fn encode_record_batches(
         }
         records.push(record);
     }
+    Ok(records)
+}
+
+/// Encode records built by [`batch_records`] (a prefix of them encodes as the batches of
+/// the rows it holds: the encoder splits batches on each record's producer and sequence).
+fn encode_records(
+    records: &[Record],
+    compression: Compression,
+) -> std::result::Result<bytes::Bytes, String> {
     let mut encoded = bytes::BytesMut::new();
     RecordBatchEncoder::encode(
         &mut encoded,
@@ -183,6 +191,47 @@ pub(crate) fn encode_record_batches(
     )
     .map_err(|e| e.to_string())?;
     Ok(encoded.freeze())
+}
+
+/// Encode `messages`, already trimmed to `limit` by their estimates
+/// ([`trim_to_response_budget`]), as record batches of at most `limit` bytes, and the bytes
+/// they count against the response budget: their estimated size, or their encoded size
+/// when larger. `None` when no record fits.
+///
+/// The estimate bounds what a record adds to an uncompressed batch, not to a compressed
+/// one: a codec adds its own framing per batch (gzip some 18 bytes, the xerial snappy
+/// header 16 and 4 per block, an lz4 frame 15 to 19, zstd a frame header) and per block
+/// (gzip about 5 bytes per 64 KiB of incompressible data), so records that compress
+/// poorly can encode past what their estimates sum to. Trailing records are then dropped
+/// until the batches fit, but for the first record of the response (`returned_any`
+/// false), which is returned alone whatever its size, as Kafka returns the first record
+/// batch.
+fn encode_within_limit(
+    messages: Vec<FetchedMessage>,
+    compression: Compression,
+    limit: i64,
+    returned_any: bool,
+) -> std::result::Result<Option<(bytes::Bytes, i64)>, String> {
+    let estimates: Vec<i64> = messages.iter().map(message_size_estimate).collect();
+    let records = batch_records(messages)?;
+    let min_kept = usize::from(!returned_any);
+    let mut kept = records.len();
+    while kept > 0 {
+        let encoded = encode_records(&records[..kept], compression)?;
+        let len = i64::try_from(encoded.len()).unwrap_or(i64::MAX);
+        if len <= limit || kept <= min_kept {
+            let counted = estimates[..kept].iter().sum::<i64>().max(len);
+            return Ok(Some((encoded, counted)));
+        }
+        // Drop the trailing records whose estimates cover the excess (at least one) and
+        // encode again: what they leave out of the encoding can be less than their estimates.
+        let mut excess = len - limit;
+        while kept > min_kept && excess > 0 {
+            kept -= 1;
+            excess -= estimates[kept];
+        }
+    }
+    Ok(None)
 }
 
 /// Bytes of a RecordBatch v2 header (everything but the records).
@@ -521,13 +570,26 @@ fn read_partition(
     let first_visible = fetched
         .first_left_out
         .or_else(|| fetched.messages.first().map(|m| m.partition_offset));
-    let (db_records, used) =
+    let (db_records, _) =
         trim_to_response_budget(fetched.messages, i64::from(limit), budget.returned_any);
-    budget.remaining -= used;
-    budget.returned_any |= !db_records.is_empty();
 
     // One RecordBatch per run of consecutive offsets of one producer.
-    let records = if db_records.is_empty() {
+    let encoded = if db_records.is_empty() {
+        Ok(None)
+    } else {
+        encode_within_limit(
+            db_records,
+            compression,
+            i64::from(limit),
+            budget.returned_any,
+        )
+    };
+    let records = match encoded {
+        Ok(Some((batches, counted))) => {
+            budget.remaining -= counted;
+            budget.returned_any = true;
+            Ok(batches)
+        }
         // Nothing visible from fetch_offset up to the first visible record, or to the
         // readable end without one. With offsets in between (aborted rows filtered for
         // read_committed, rows deleted by aborted-row cleanup or retention), an empty
@@ -535,10 +597,11 @@ fn read_partition(
         // would scan those rows again; a marker batch covering them moves it past them, as
         // the abort marker after an aborted transaction does in Kafka. A first visible
         // record that does not fit is not covered: the consumer stops at it.
-        let gap_end = first_visible.unwrap_or(readable_end);
-        Ok(take_gap_batch(fetch_offset, gap_end, i64::from(limit), budget).unwrap_or_default())
-    } else {
-        encode_record_batches(db_records, compression)
+        Ok(None) => {
+            let gap_end = first_visible.unwrap_or(readable_end);
+            Ok(take_gap_batch(fetch_offset, gap_end, i64::from(limit), budget).unwrap_or_default())
+        }
+        Err(e) => Err(e),
     };
     fetched_partition_data(topic_id, partition_id, bounds, records)
 }
@@ -831,6 +894,14 @@ mod tests {
         }
     }
 
+    /// Every row encoded as one response's batches, with no byte limit.
+    fn encode_record_batches(
+        messages: Vec<FetchedMessage>,
+        compression: Compression,
+    ) -> std::result::Result<bytes::Bytes, String> {
+        encode_records(&batch_records(messages)?, compression)
+    }
+
     fn bounds() -> PartitionBounds {
         PartitionBounds {
             high_watermark: 9,
@@ -870,8 +941,9 @@ mod tests {
         assert_eq!(message_size_estimate(&m), 87);
     }
 
-    /// The estimate is never under what a record adds to the response, alone in its batch
-    /// (the most it can add) or sharing one.
+    /// The estimate is never under what a record adds to an uncompressed response, alone in
+    /// its batch (the most it can add) or sharing one. Compressed batches can take more and
+    /// are checked at their encoded size (`compressed_records_stay_within_the_byte_limits`).
     #[test]
     fn size_estimate_covers_the_encoded_record() {
         let mut lone = Vec::new();
@@ -916,6 +988,165 @@ mod tests {
             let estimate: i64 = records.iter().map(message_size_estimate).sum();
             let encoded = encode_record_batches(records, Compression::None).unwrap();
             assert!(i64::try_from(encoded.len()).unwrap() <= estimate);
+        }
+    }
+
+    /// Record sets the byte limits must hold for under every codec: tiny records (whose
+    /// compression framing outweighs their bytes) and incompressible ones, each alone in its
+    /// batch and sharing one, up to values spanning several compression blocks.
+    fn byte_limit_record_sets() -> Vec<(&'static str, Vec<FetchedMessage>)> {
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut random = |n: usize| {
+            let mut v = vec![0u8; n];
+            rng.fill_bytes(&mut v);
+            v
+        };
+        let record = |offset: i64, key, value, producer_id: Option<i64>| FetchedMessage {
+            partition_offset: offset,
+            key,
+            value,
+            timestamp: 1_700_000_000_000 + offset,
+            headers: vec![],
+            producer_id,
+            producer_epoch: producer_id.map(|_| 0),
+        };
+        let alternating = |offset: i64| (offset % 2 == 1).then_some(7);
+        let mut with_headers = record(0, Some(random(70)), Some(random(100_000)), None);
+        with_headers.headers = vec![("h0".to_string(), random(200))];
+        vec![
+            (
+                "lone 1-byte value",
+                vec![record(0, None, Some(vec![b'v']), None)],
+            ),
+            ("lone empty record", vec![record(0, None, None, None)]),
+            (
+                "lone 1 MiB random value",
+                vec![record(0, None, Some(random(1 << 20)), None)],
+            ),
+            ("lone random key, value and header", vec![with_headers]),
+            (
+                "alternating producers, 1-byte values",
+                (0..40)
+                    .map(|o| record(o, None, Some(vec![b'v']), alternating(o)))
+                    .collect(),
+            ),
+            (
+                "alternating producers, random 300-byte values",
+                (0..40)
+                    .map(|o| record(o, None, Some(random(300)), alternating(o)))
+                    .collect(),
+            ),
+            (
+                "shared batch, 1-byte values",
+                (0..40)
+                    .map(|o| record(o, None, Some(vec![b'v']), None))
+                    .collect(),
+            ),
+            (
+                "shared batch, random 1000-byte values",
+                (0..300)
+                    .map(|o| record(o, None, Some(random(1000)), None))
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// Under every codec the record batches a partition returns stay within its limits (but
+    /// for the first record of a response, returned alone whatever its size), and a response
+    /// within its `max_bytes`: compression adds framing per batch (and per block) that the
+    /// uncompressed size estimate does not count, so a record set that fits by its estimate
+    /// can encode to more.
+    #[test]
+    fn compressed_records_stay_within_the_byte_limits() {
+        let codecs = [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Snappy,
+            Compression::Lz4,
+            Compression::Zstd,
+        ];
+        for compression in codecs {
+            for (name, set) in byte_limit_record_sets() {
+                let limit =
+                    i32::try_from(set.iter().map(message_size_estimate).sum::<i64>()).unwrap();
+                let end = i64::try_from(set.len()).unwrap();
+                let records_len = |b: &bytes::Bytes| i32::try_from(b.len()).unwrap();
+                let decoded_count = |b: &bytes::Bytes| {
+                    let mut b = b.clone();
+                    RecordBatchDecoder::decode_all(&mut b)
+                        .unwrap()
+                        .iter()
+                        .map(|batch| batch.records.len())
+                        .sum::<usize>()
+                };
+                // One partition, its limit and max_bytes the set's estimate, with and without
+                // the whole first record.
+                for whole_first_record in [false, true] {
+                    let mut mock = one_partition_mock(end, end);
+                    let rows = set.clone();
+                    mock.expect_fetch_records_with_isolation()
+                        .returning(move |_, _, _, _, _, _| Ok(rows.clone().into()));
+                    let env = TestEnv::new();
+                    let mut ctx = env.ctx(&mock);
+                    ctx.compression = compression;
+                    let mut request = two_partition_request();
+                    request[0].partitions.truncate(1);
+                    request[0].partitions[0].partition_max_bytes = limit;
+                    let response = handle_fetch_with_max_bytes(
+                        &ctx,
+                        request,
+                        IsolationLevel::ReadUncommitted,
+                        limit,
+                        whole_first_record,
+                    )
+                    .unwrap();
+                    let part = &response.responses[0].partitions[0];
+                    assert_eq!(part.error_code, ERROR_NONE);
+                    let records = part.records.clone().unwrap();
+                    let within = records_len(&records) <= limit;
+                    let lone_first = whole_first_record && decoded_count(&records) == 1;
+                    assert!(
+                        within || lone_first,
+                        "{compression:?}, {name}, whole_first_record {whole_first_record}: \
+                         {} bytes returned for a limit of {limit}",
+                        records.len()
+                    );
+                    if whole_first_record {
+                        assert!(decoded_count(&records) >= 1, "{compression:?}, {name}");
+                    }
+                }
+                // Two partitions sharing a max_bytes of both estimates.
+                let mut mock = mock_with_two_partitions_ending_at(end);
+                let rows = set.clone();
+                mock.expect_fetch_records_with_isolation()
+                    .returning(move |_, _, _, _, _, _| Ok(rows.clone().into()));
+                let env = TestEnv::new();
+                let mut ctx = env.ctx(&mock);
+                ctx.compression = compression;
+                let mut request = two_partition_request();
+                for p in &mut request[0].partitions {
+                    p.partition_max_bytes = limit;
+                }
+                let response = handle_fetch_with_max_bytes(
+                    &ctx,
+                    request,
+                    IsolationLevel::ReadUncommitted,
+                    2 * limit,
+                    false,
+                )
+                .unwrap();
+                let total: i32 = response.responses[0]
+                    .partitions
+                    .iter()
+                    .map(|p| records_len(p.records.as_ref().unwrap()))
+                    .sum();
+                assert!(
+                    total <= 2 * limit,
+                    "{compression:?}, {name}: {total} bytes returned for a max_bytes of {}",
+                    2 * limit
+                );
+            }
         }
     }
 

@@ -561,7 +561,11 @@ pg_kafka.compression_type = 'gzip'
   framing (the most an uncompressed record batch spends on them: a record alone in its batch,
   as read_committed skipping aborted offsets or alternating producers leave records, carries
   the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
-  within both limits, but for the first one above; the database reads (and holds) no more than
+  within both limits, but for the first one above. With `pg_kafka.compression_type` set, a
+  codec adds framing per batch (some 15 to 20 bytes) and per block of incompressible data
+  that this count does not cover, so a partition whose records compress poorly returns them
+  up to the last whose encoded batches still fit its limit (counted at that encoded size
+  against `max_bytes`); the first record of the response is returned whatever its size. The database reads (and holds) no more than
   that of a partition, and a later partition whose first record is larger than its limit does
   not read that record (sizes are stored with each record at Produce, so a fetch reads the key,
   value and headers only of the records it returns). Kafka counts
@@ -966,7 +970,8 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   decodes again once there is, waiting up to 10 s (a Produce: half its `timeout_ms`, at most
   10 s, from when its frame was read; its connection reads nothing meanwhile), after which the
   connection closes, a Produce's too. A Fetch response holds at most the request's `max_bytes`,
-  lowered to `pg_kafka.fetch_max_bytes`, of uncompressed record bytes, and its first record
+  lowered to `pg_kafka.fetch_max_bytes`, of record bytes (counted uncompressed, or encoded
+  when `pg_kafka.compression_type` encodes them larger), and its first record
   whole when that is larger (§7); a large response is written from its own buffer,
   and a connection's read buffer starts small again after a large frame, so neither keeps the
   largest frame's memory for the connection's life (Kafka allocates per receive and send).

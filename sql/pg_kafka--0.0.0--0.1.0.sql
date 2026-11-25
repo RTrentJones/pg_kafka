@@ -682,10 +682,12 @@ END
 $$;
 -- 0.0.0 installs from before BUG-7 (no kafka.messages.timestamp_ms) and RV-10 (naive
 -- TIMESTAMP columns compared with NOW()): ATTACH needs the leaf's columns to be the
--- parent's, and the other two columns get the type a fresh install has. Converting
--- created_at rewrites the legacy table (one more full read and write, and the rebuild of
--- its three indexes, a full read each); the naive
--- values are taken in the session's TimeZone, the zone NOW() was stored in.
+-- parent's, and the other two columns get the type a fresh install has. The naive values
+-- are taken in the session's TimeZone, the zone NOW() was stored in. In a TimeZone of a
+-- fixed zero UTC offset (UTC, GMT) PostgreSQL changes the type without a rewrite (an index
+-- on the column itself, idx_transactions_timeout, is still rebuilt); in any other zone each
+-- conversion rewrites its table, for created_at the legacy table (one more full read and
+-- write, and the rebuild of its three indexes, a full read each).
 ALTER TABLE kafka.messages_legacy ADD COLUMN IF NOT EXISTS timestamp_ms BIGINT NOT NULL DEFAULT -1;
 DO $$
 DECLARE

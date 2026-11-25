@@ -218,7 +218,8 @@ gucs! {
           progress; later partitions return only what fits. The per-partition limit is the \
           request's partition_max_bytes, within what is left of this. Sizes count each record's \
           uncompressed key, value and header bytes plus 84 bytes per record and 10 per \
-          header for its framing. It is also each connection's budget for responses not yet written: past it the connection reads no \
+          header for its framing, or the encoded size of the record batches when \
+          pg_kafka.compression_type encodes them larger. It is also each connection's budget for responses not yet written: past it the connection reads no \
           further request until its client reads. Default: 57671680 (55 MiB). Reloadable via \
           SIGHUP: the cap applies to requests read after the reload, the budget to \
           connections opened after it.",
