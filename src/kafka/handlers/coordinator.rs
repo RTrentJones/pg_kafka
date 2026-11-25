@@ -539,41 +539,44 @@ pub fn handle_heartbeat(
 pub fn handle_leave_group(
     ctx: &HandlerContext,
     group_id: &str,
-    member_id: &str,
-    members: Vec<crate::kafka::messages::MemberIdentity>,
+    leaving: crate::kafka::messages::LeavingMembers,
 ) -> Result<LeaveGroupResponse> {
+    use crate::kafka::messages::LeavingMembers;
     let coordinator = ctx.coordinator;
 
     let mut response = LeaveGroupResponse::default();
     response.throttle_time_ms = 0;
     response.error_code = ERROR_NONE;
 
-    if members.is_empty() {
-        // LeaveGroup v0-2: a single top-level member_id.
-        crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
-        // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable) that map to
-        // Kafka error codes via to_kafka_error_code().
-        coordinator.leave_group(group_id, member_id)?;
-    } else {
-        // LeaveGroup v3+ (the framing kafkajs / Sarama / librdkafka send): the top-level member_id
-        // is empty and the leaving members are batched in `members`. Remove each and report a
-        // per-member result. Without this the member is never removed and the group stays
-        // non-empty, so DeleteGroups keeps returning NON_EMPTY_GROUP after a clean leave.
-        for m in members {
-            crate::pg_debug!(
-                "LeaveGroup(v3+): group_id={}, member_id={}",
-                group_id,
-                m.member_id
-            );
-            let error_code = match coordinator.leave_group(group_id, &m.member_id) {
-                Ok(()) => ERROR_NONE,
-                Err(e) => e.to_kafka_error_code(),
-            };
-            let mut member_response = MemberResponse::default();
-            member_response.member_id = StrBytes::from_string(m.member_id);
-            member_response.group_instance_id = m.group_instance_id.map(StrBytes::from_string);
-            member_response.error_code = error_code;
-            response.members.push(member_response);
+    match leaving {
+        LeavingMembers::Single(member_id) => {
+            crate::pg_debug!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
+            // Coordinator returns typed errors (UnknownMemberId, CoordinatorNotAvailable)
+            // that map to Kafka error codes via to_kafka_error_code().
+            coordinator.leave_group(group_id, &member_id)?;
+        }
+        LeavingMembers::Batch(members) => {
+            // LeaveGroup v3+ (the framing kafkajs / Sarama / librdkafka send): the leaving
+            // members are batched in `members`. Remove each and report a per-member result;
+            // an empty batch removes nothing and is NONE, known group or not, as in Kafka
+            // 3.7. Without this the member is never removed and the group stays non-empty,
+            // so DeleteGroups keeps returning NON_EMPTY_GROUP after a clean leave.
+            for m in members {
+                crate::pg_debug!(
+                    "LeaveGroup(v3+): group_id={}, member_id={}",
+                    group_id,
+                    m.member_id
+                );
+                let error_code = match coordinator.leave_group(group_id, &m.member_id) {
+                    Ok(()) => ERROR_NONE,
+                    Err(e) => e.to_kafka_error_code(),
+                };
+                let mut member_response = MemberResponse::default();
+                member_response.member_id = StrBytes::from_string(m.member_id);
+                member_response.group_instance_id = m.group_instance_id.map(StrBytes::from_string);
+                member_response.error_code = error_code;
+                response.members.push(member_response);
+            }
         }
     }
 
@@ -601,8 +604,8 @@ pub fn handle_describe_groups(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Whether each group the coordinator does not hold has committed offsets, in one
-    // lookup however many groups the request names.
+    // Whether each group the coordinator does not hold has offsets (committed, or pending in
+    // an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = groups
         .iter()
         .filter(|g| !coordinator_groups.contains_key(*g))
@@ -759,9 +762,9 @@ pub fn handle_list_groups(
             )
         })
         .collect();
-    // Groups known only by their committed offsets are Empty "consumer" groups
-    // (see handle_describe_groups), so `kafka-consumer-groups --list` keeps showing them after a
-    // worker restart.
+    // Groups known only by their offsets (committed, or pending in an open transaction) are
+    // Empty "consumer" groups (see handle_describe_groups), so `kafka-consumer-groups --list`
+    // keeps showing them after a worker restart.
     for group_id in ctx.store.list_offset_groups()? {
         if !coordinator_groups.contains_key(&group_id) {
             listed.push((group_id, "consumer".to_string(), "Empty"));
@@ -794,7 +797,7 @@ mod tests {
         ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID,
     };
     use crate::kafka::error::KafkaError;
-    use crate::kafka::messages::{JoinGroupProtocol, SyncGroupAssignment};
+    use crate::kafka::messages::{JoinGroupProtocol, LeavingMembers, SyncGroupAssignment};
     use crate::kafka::{BrokerMetadata, GroupCoordinator};
     use crate::testing::mocks::MockKafkaStore;
     use crate::testing::TestEnv;
@@ -1138,11 +1141,10 @@ mod tests {
         let leave = handle_leave_group(
             &f.ctx(),
             "g",
-            "",
-            vec![crate::kafka::messages::MemberIdentity {
+            LeavingMembers::Batch(vec![crate::kafka::messages::MemberIdentity {
                 member_id: leader.clone(),
                 group_instance_id: None,
-            }],
+            }]),
         )
         .unwrap();
         assert_eq!(leave.members[0].error_code, ERROR_NONE);
@@ -1296,9 +1298,18 @@ mod tests {
     fn test_handle_leave_group_v0_and_unknown_member() {
         let f = Fixture::new();
         let member_id = f.join_now("test-group", "").member_id.to_string();
-        let unknown = handle_leave_group(&f.ctx(), "test-group", "unknown-member-id", vec![]);
+        let unknown = handle_leave_group(
+            &f.ctx(),
+            "test-group",
+            LeavingMembers::Single("unknown-member-id".to_string()),
+        );
         assert!(matches!(unknown, Err(KafkaError::UnknownMemberId { .. })));
-        let leave = handle_leave_group(&f.ctx(), "test-group", &member_id, vec![]).unwrap();
+        let leave = handle_leave_group(
+            &f.ctx(),
+            "test-group",
+            LeavingMembers::Single(member_id.clone()),
+        )
+        .unwrap();
         assert_eq!(leave.error_code, ERROR_NONE);
         assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_err());
     }
@@ -1312,8 +1323,7 @@ mod tests {
         let leave = handle_leave_group(
             &f.ctx(),
             "test-group",
-            "",
-            vec![
+            LeavingMembers::Batch(vec![
                 crate::kafka::messages::MemberIdentity {
                     member_id: member_id.clone(),
                     group_instance_id: None,
@@ -1322,7 +1332,7 @@ mod tests {
                     member_id: "unknown-member".to_string(),
                     group_instance_id: None,
                 },
-            ],
+            ]),
         )
         .unwrap();
         assert_eq!(leave.error_code, ERROR_NONE);
@@ -1333,12 +1343,31 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_leave_group_v3_without_members_is_none() {
+        // An empty v3+ batch is NONE with no member results, for a known group (whose
+        // member stays) and an unknown one, as in Kafka 3.7; it is not a v0 leave of the
+        // member "".
+        let f = Fixture::new();
+        let member_id = f.join_now("test-group", "").member_id.to_string();
+        for group in ["test-group", "no-such-group"] {
+            let leave = handle_leave_group(&f.ctx(), group, LeavingMembers::Batch(vec![]))
+                .expect("answered");
+            assert_eq!(
+                (leave.error_code, leave.members.len()),
+                (ERROR_NONE, 0),
+                "{group}"
+            );
+        }
+        assert!(handle_heartbeat(&f.ctx(), "test-group", &member_id, 1).is_ok());
+    }
+
+    #[test]
     fn test_handle_leave_group_releases_held_join() {
         let f = Fixture::new();
         let leader = f.join_now("test-group", "").member_id.to_string();
         let second = f.join("test-group", "", 30_000);
         assert!(take(&second).is_none());
-        handle_leave_group(&f.ctx(), "test-group", &leader, vec![]).unwrap();
+        handle_leave_group(&f.ctx(), "test-group", LeavingMembers::Single(leader)).unwrap();
         let second = take(&second).expect("answered by the LeaveGroup");
         assert_eq!(second.error_code, ERROR_NONE);
         assert_eq!(second.leader, second.member_id);

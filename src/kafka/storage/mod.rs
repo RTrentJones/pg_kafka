@@ -551,7 +551,8 @@ pub trait OffsetStore {
         partitions: &[(i32, i32)],
     ) -> Result<Vec<(i32, i32, CommittedOffset)>>;
 
-    /// Delete all committed offsets for a consumer group
+    /// Delete a consumer group's offsets: the committed ones and those pending in open
+    /// transactions (a transaction's commit then stores none for the group).
     ///
     /// # Arguments
     /// * `group_id` - Consumer group ID
@@ -560,12 +561,15 @@ pub trait OffsetStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    /// The ids of every group that has at least one committed offset (sorted). These groups
-    /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
-    /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
+    /// The ids of every group that has at least one committed offset or pending
+    /// transactional offset (sorted). These groups exist for DescribeGroups / ListGroups /
+    /// DeleteGroups even when the in-memory coordinator does not know them (e.g. after a
+    /// worker restart, or a group only a TxnOffsetCommit named), as Kafka reports them as
+    /// Empty groups.
     fn list_offset_groups(&self) -> Result<Vec<String>>;
 
-    /// Which of `group_ids` have at least one committed offset, in one statement.
+    /// Which of `group_ids` have at least one committed offset or pending transactional
+    /// offset, in one statement.
     fn groups_with_offsets(&self, group_ids: &[String]) -> Result<HashSet<String>>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
     /// offset commit (TxnOffsetCommit) whose transaction has not ended yet: among

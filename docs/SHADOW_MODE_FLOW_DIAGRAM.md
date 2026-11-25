@@ -192,18 +192,37 @@ the skipped ones in `kafka.shadow_metrics.messages_skipped`, and inserts one pen
 `external_only` marks a topic as **external-primary**. Its writes are forwarded as above, but local
 reads are suppressed so consumers cut over to the external broker: fetches return no records and the
 offset bounds report an empty partition. Suppression depends only on the global GUC plus the
-per-topic config, so a standby suppresses these reads too. If any forward of the topic is
-dead-lettered (`external_offset IS NULL` and `retry_count >= pg_kafka.shadow_max_retries`),
-suppression is lifted and the topic is served locally again, so a record is never readable nowhere;
+per-topic config. If any forward of the topic is dead-lettered (`external_offset IS NULL` and
+`retry_count >= pg_kafka.shadow_max_retries`), suppression is lifted and the topic is served
+locally again, so a dead-lettered record is not readable nowhere;
 `pg_kafka.shadow_external_primary_strict = true` keeps full suppression.
+
+Suppression does not check that every local record of the topic was forwarded, so some records
+are readable nowhere (suppressed locally, never sent) until they are replayed:
+
+- records produced while `pg_kafka.shadow_mode_enabled` was off (the topic is read locally then,
+  and nothing is queued; once the GUC is back on, its reads are suppressed again);
+- records produced before the topic became `external_only`: while it was `local_only`, or
+  `dual_write` with `forward_percentage` below 100 (the records routing sampled out then);
+- a dead-lettered record under `pg_kafka.shadow_external_primary_strict`.
+
+The remedy is `kafka.replay_shadow_messages(topic_id, from_offset, to_offset)` over the affected
+offset range (or the whole topic) before or right after switching a topic to `external_only`, and
+after a period with `shadow_mode_enabled` off; a record already delivered is sent again
+(at-least-once).
 
 ### Transactional Produce
 
-`insert_transactional_records()` writes locally and, if the topic forwards, buffers the records'
-keys in RAM. `commit_transaction()` reads the transaction's records from `kafka.messages` (falling
-back to the RAM buffer), commits, re-checks the topic config, routes them and inserts their outbox
-rows in the commit transaction. An abort discards them. Transactional records are forwarded by the
-outbox tick (they are never held as sync).
+`insert_transactional_records()` only writes locally; nothing is kept in worker memory for an
+open transaction. `commit_transaction()`, before the inner commit and in the same transaction,
+enqueues the producer's pending records of every forwarding topic, routed by the topic config at
+commit time: for a topic at 100% one `INSERT INTO kafka.shadow_tracking ... SELECT ... FROM
+kafka.messages` (no record passes through the worker), for a sampled topic a cursor read
+`TXN_ENQUEUE_CHUNK` rows at a time, routed by `make_forward_decision` as a plain produce is. An
+existing outbox row is left alone (`ON CONFLICT DO NOTHING`), so a retried EndTxn or a worker
+restart neither loses nor duplicates a record; a failed enqueue fails the EndTxn, whose request
+rolls back whole. An abort enqueues nothing. Transactional records are forwarded by the outbox tick
+(they are never held as sync).
 
 ## Sync vs Async Forwarding
 

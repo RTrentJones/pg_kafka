@@ -1,9 +1,9 @@
 //! InitProducerId: producer ids and epochs for idempotent and transactional producers.
 
-use crate::kafka::constants::{ERROR_NONE, ERROR_PRODUCER_FENCED};
+use crate::kafka::constants::{ERROR_CONCURRENT_TRANSACTIONS, ERROR_NONE, ERROR_PRODUCER_FENCED};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::storage::TransactionalProducer;
+use crate::kafka::storage::{TransactionState, TransactionalProducer};
 use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::ProducerId;
 use pgrx::GucSetting;
@@ -70,7 +70,9 @@ pub(crate) fn decide_txn_init(
 /// a new transactional id gets a new producer id; an existing one gets its next epoch
 /// (fencing the previous producer) unless the request presents a producer id and epoch
 /// that are not the current producer's (PRODUCER_FENCED) or that a bump already moved
-/// past (the current epoch, without another bump).
+/// past (the current epoch, without another bump). While the transactional id has a
+/// transaction Ongoing, a request that is not fenced aborts it, fences its epoch and is
+/// answered CONCURRENT_TRANSACTIONS (the client retries), as in Kafka 3.7.
 ///
 /// For idempotent-only producers (transactional_id is None) a new producer ID is
 /// allocated; the producer id and epoch the request presents are ignored, as in Kafka 3.7.
@@ -143,7 +145,24 @@ pub(crate) fn init_producer_id_bounded(
         } else {
             None
         };
-        let (producer_id, epoch) = match decide_txn_init(presented, current.as_ref()) {
+        let decision = decide_txn_init(presented, current.as_ref());
+        if decision != TxnInit::Fenced
+            && store.get_transaction_state(txn_id)? == Some(TransactionState::Ongoing)
+        {
+            // Kafka 3.7 (TransactionCoordinator.prepareInitProducerIdTransit, state Ongoing)
+            // aborts the open transaction under a fenced epoch and answers
+            // CONCURRENT_TRANSACTIONS, never handing out that epoch: a retry presenting the
+            // same epoch is then fenced, and one presenting none gets the next epoch. The
+            // abort and the fence are the bump below; the bump is not remembered as asked
+            // for by the producer, so no presented epoch counts as a retry of it.
+            store.get_or_create_transactional_producer(
+                txn_id,
+                transaction_timeout_ms,
+                client_id,
+            )?;
+            return Ok(init_error(ERROR_CONCURRENT_TRANSACTIONS));
+        }
+        let (producer_id, epoch) = match decision {
             TxnInit::Fenced => return Ok(init_error(ERROR_PRODUCER_FENCED)),
             TxnInit::Current { producer_id, epoch } => (producer_id, epoch),
             TxnInit::Bump { requested_by } => {
@@ -227,6 +246,7 @@ mod tests {
         }
         // The default bound (15 minutes) itself is accepted.
         let mut store = MockKafkaStore::new();
+        store.expect_get_transaction_state().returning(|_| Ok(None));
         store
             .expect_get_or_create_transactional_producer()
             .times(1)
@@ -318,6 +338,9 @@ mod tests {
         store
             .expect_transactional_producer()
             .returning(|_| Ok(Some(OWNER)));
+        store
+            .expect_get_transaction_state()
+            .returning(|_| Ok(Some(TransactionState::CompleteCommit)));
         let r = run_presented(&store, (7, 2));
         assert_eq!(
             (r.error_code, r.producer_id.0, r.producer_epoch),
@@ -337,6 +360,56 @@ mod tests {
         assert_eq!(
             (r.error_code, r.producer_id.0, r.producer_epoch),
             (ERROR_NONE, 7, 4)
+        );
+    }
+
+    #[test]
+    fn an_ongoing_transaction_is_aborted_and_answered_concurrent_transactions() {
+        // Kafka 3.7 aborts the open transaction under a fenced epoch and answers
+        // CONCURRENT_TRANSACTIONS, whether the request presents the owner's epoch, the one
+        // before its last bump or none; the fenced epoch is not handed out nor remembered
+        // as asked for, so a retry presenting the same epoch is fenced.
+        for presented in [Some((7, 3)), Some((7, 2)), None] {
+            let mut store = MockKafkaStore::new();
+            store
+                .expect_transactional_producer()
+                .returning(|_| Ok(Some(OWNER)));
+            store
+                .expect_get_transaction_state()
+                .withf(|id| id == "tx")
+                .returning(|_| Ok(Some(TransactionState::Ongoing)));
+            store
+                .expect_get_or_create_transactional_producer()
+                .times(1)
+                .returning(|_, _, _| Ok((7, 4)));
+            store.expect_remember_previous_epoch().never();
+            let env = TestEnv::new();
+            let ctx = env.ctx(&store);
+            let r = init_producer_id_bounded(
+                &ctx,
+                Some("tx"),
+                60_000,
+                presented,
+                None,
+                crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
+            )
+            .unwrap();
+            assert_eq!(
+                (r.error_code, r.producer_id.0, r.producer_epoch),
+                (ERROR_CONCURRENT_TRANSACTIONS, -1, -1),
+                "{presented:?}"
+            );
+        }
+        // A fenced request does not touch the open transaction.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_transactional_producer()
+            .returning(|_| Ok(Some(OWNER)));
+        store.expect_get_transaction_state().never();
+        store.expect_get_or_create_transactional_producer().never();
+        assert_eq!(
+            run_presented(&store, (7, 1)).error_code,
+            ERROR_PRODUCER_FENCED
         );
     }
 }

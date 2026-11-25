@@ -259,3 +259,53 @@ pub async fn test_offsets_only_group_is_listed_after_restart() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// LeaveGroup v3+ with an empty `members` array, as Kafka 3.7 answers it: NONE at the top
+/// level and no member results, for a group it does not know and for one with a member
+/// (who stays). The version decides the framing: v3+ never reads the top-level member id.
+pub async fn test_leave_group_v3_with_no_members_is_none() -> TestResult {
+    use kafka_protocol::messages::leave_group_request::LeaveGroupRequest;
+    use kafka_protocol::messages::leave_group_response::LeaveGroupResponse;
+    use kafka_protocol::messages::GroupId;
+    use kafka_protocol::protocol::StrBytes;
+    println!("=== Test: LeaveGroup v3+ with no members is NONE ===\n");
+    let ctx = TestContext::new().await?;
+    let unknown = ctx.unique_group("leave-empty-unknown").await;
+    let group = ctx.unique_group("leave-empty").await;
+    let mut a = conn().await?;
+    let (e, generation, member, _) =
+        join_now(&mut a, &join_req(&group, "", "consumer", &["range"])).await?;
+    assert_eq!(e, error_codes::NONE);
+    assert_eq!(
+        sync_leader(&mut a, &group, generation, &member).await?,
+        error_codes::NONE
+    );
+    let mut w = crate::wire::Wire::connect().await?;
+    for (g, what) in [(&unknown, "unknown group"), (&group, "group with a member")] {
+        for version in [3, 4] {
+            let mut req = LeaveGroupRequest::default();
+            req.group_id = GroupId(StrBytes::from_string(g.clone()));
+            let left: LeaveGroupResponse = w.call(version, &req).await?;
+            println!(
+                "{what} v{version}: error {} members {}",
+                left.error_code,
+                left.members.len()
+            );
+            assert_eq!(
+                (left.error_code, left.members.len()),
+                (error_codes::NONE, 0),
+                "{what}, v{version}"
+            );
+        }
+    }
+    let (e, state, _, members) = describe(&group).await?;
+    assert_eq!(
+        (e, state.as_str(), members),
+        (error_codes::NONE, "Stable", 1),
+        "the member stays"
+    );
+    assert_eq!(leave(&mut a, &group, &member).await?, error_codes::NONE);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

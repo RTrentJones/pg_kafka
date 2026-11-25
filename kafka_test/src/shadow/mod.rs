@@ -64,6 +64,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         transaction_integration::test_aborted_transaction_not_forwarded: sequential,
         transaction_integration::test_committed_transaction_uses_durable_outbox: sequential,
         transaction_integration::test_committed_txn_leaves_no_orphan_outbox_rows: sequential,
+        transaction_integration::test_large_committed_transaction_is_enqueued_exactly_once: sequential, // measures the worker's memory
         // Error handling tests
         error_handling::test_dual_write_external_down: sequential, // Pauses the external broker
         error_handling::test_external_only_fallback: sequential, // Mutates shadow_max_retries, shadow_retry_backoff_ms
@@ -86,7 +87,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_backlog_does_not_starve_other_topics: sequential,
         outbox_robustness::test_shadow_full_producer_queue_does_not_block_sync_timeouts: sequential,
         outbox_robustness::test_shadow_backlogged_records_are_answered_before_their_in_flight_entry_expires: sequential, // Mutates shadow_bootstrap_servers, test_shadow_delivery_timeout_ms
-        outbox_robustness::test_shadow_timed_out_transaction_buffer_is_dropped: sequential,
+        outbox_robustness::test_shadow_timed_out_transaction_is_not_forwarded: sequential,
         outbox_robustness::test_shadow_ack_application_error_loses_no_ack: sequential,
         outbox_robustness::test_shadow_failed_tick_commit_loses_no_ack: sequential,
         outbox_robustness::test_shadow_stuck_partitions_do_not_throttle_a_backlog: sequential,

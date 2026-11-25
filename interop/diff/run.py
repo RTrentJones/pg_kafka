@@ -701,6 +701,60 @@ def sc_txn_parity(t, obs):
     obs("commit", normalise(t, body(t.req(26, 3, dict(end, committed=True)))))
 
 
+def sc_txn_group_delete(t, obs):
+    """DeleteGroups of a group with a pending TxnOffsetCommit, without (a) and with (b) a
+    committed offset: the group exists (Empty), is deleted, and the commit stores nothing for
+    it. Then InitProducerId while a transaction is Ongoing: CONCURRENT_TRANSACTIONS, and a
+    retry presenting the same epoch is fenced."""
+    topic, txn, group = f"diff-tgd-{RUN}", f"diff-tgd-{RUN}", f"diff-tgdg-{RUN}"
+    create_topics(t, [topic_spec(topic, 2)])
+    for variant in ("a", "b"):
+        g, tid = f"{group}-{variant}", f"{txn}-{variant}"
+        if variant == "b":
+            offset_commit(t, g, topic, [(1, 1, "", {})])
+        b, pid, ep = init_pid(t, tid)
+        end = {"transactionalId": tid, "producerId": pid, "producerEpoch": ep}
+        t.req(25, 3, dict(end, groupId=g))
+        toc = body(t.req(28, 3, {"transactionalId": tid, "groupId": g, "producerId": pid,
+                                 "producerEpoch": ep, "generationId": -1, "memberId": "",
+                                 "groupInstanceId": None, "topics": [{"name": topic, "partitions": [
+                                     {"partitionIndex": 0, "committedOffset": 5}]}]}))
+        obs(f"{variant}.txn_offset_commit", normalise(t, toc))
+        listed = body(t.req(16, 4, {"statesFilter": []}))
+        obs(f"{variant}.listed_state", [x.get("groupState") for x in listed.get("groups", [])
+                                        if x.get("groupId") == g])
+        described = body(t.req(15, 5, {"groups": [g], "includeAuthorizedOperations": False}))
+        obs(f"{variant}.described_state", [(errname(x.get("errorCode")), x.get("groupState"))
+                                           for x in described.get("groups", [])])
+        obs(f"{variant}.delete", normalise(t, body(t.req(42, 2, {"groupsNames": [g]}))))
+        obs(f"{variant}.commit", normalise(t, body(t.req(26, 3, dict(end, committed=True)))))
+        # Kafka writes the commit markers after EndTxn; wait out UNSTABLE_OFFSET_COMMIT.
+        for _ in range(40):
+            of = body(t.req(9, 7, {"groupId": g, "requireStable": True,
+                                   "topics": [{"name": topic, "partitionIndexes": [0, 1]}]}))
+            if not has_code(of, 88):
+                break
+            time.sleep(0.25)
+        obs(f"{variant}.offset_fetch_after", normalise(t, of))
+    b, pid, ep = init_pid(t, f"{txn}-ongoing")
+    tid = f"{txn}-ongoing"
+    t.req(24, 3, {"v3AndBelowTransactionalId": tid, "v3AndBelowProducerId": pid,
+                  "v3AndBelowProducerEpoch": ep,
+                  "v3AndBelowTopics": [{"name": topic, "partitions": [0]}]})
+    produce(t, topic, ["o"], txn=tid, producerId=pid, producerEpoch=ep, baseSequence=0,
+            transactional=True)
+    init = {"transactionalId": tid, "transactionTimeoutMs": 60000, "producerId": pid,
+            "producerEpoch": ep}
+    obs("init_ongoing", errname(body(t.req(22, 4, init, retry=False)).get("errorCode")))
+    # Kafka aborts the transaction asynchronously; its retry is fenced once that is done.
+    for _ in range(40):
+        r = body(t.req(22, 4, init, retry=False))
+        if r.get("errorCode") != 51:
+            break
+        time.sleep(0.25)
+    obs("init_ongoing_retry", errname(r.get("errorCode")))
+
+
 def sc_groups_parity(t, obs):
     """DescribeGroups outside Stable, ListGroups' states filter, FindCoordinator key types,
     and the removal of a member that never syncs."""
@@ -785,6 +839,7 @@ SCENARIOS = [
     ("admin", sc_admin),
     ("offsets_parity", sc_offsets_parity),
     ("txn_parity", sc_txn_parity),
+    ("txn_group_delete", sc_txn_group_delete),
     ("groups_parity", sc_groups_parity),
     ("configs_parity", sc_configs_parity),
 ]

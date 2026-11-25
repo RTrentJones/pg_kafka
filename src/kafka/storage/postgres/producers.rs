@@ -170,12 +170,6 @@ fn forget_producer_sequences(
     Ok(())
 }
 
-/// An advisory-lock key for one producer on one partition: serializes the sequence
-/// check of concurrent batches against out-of-band writers.
-fn sequence_lock_key(producer_id: i64, topic_id: i32, partition_id: i32) -> i64 {
-    producer_id ^ (i64::from(topic_id) << 20) ^ (i64::from(partition_id) << 40)
-}
-
 /// Advance a partition's last sequence (upsert into `kafka.producer_sequences`).
 fn upsert_last_sequence(
     client: &mut SpiClient<'_>,
@@ -409,11 +403,8 @@ impl PostgresStore {
                 ));
             }
 
-            client.select(
-                "SELECT pg_advisory_xact_lock($1)",
-                None,
-                &[sequence_lock_key(producer_id, topic_id, partition_id).into()],
-            )?;
+            // No lock: producer state is read and written only by the worker's single
+            // DB thread, so nothing else can change it between this read and the write.
             let partition = read_partition_sequence_state(client, &batch)?;
 
             // RV-8: nothing is advanced here; record_producer_batch persists the batch

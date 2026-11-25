@@ -37,6 +37,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         coordinator_state::test_group_state_transitions,
         protocol_rules::test_join_group_protocol_and_member_id_rules,
         protocol_rules::test_join_with_no_common_assignor_is_refused,
+        protocol_rules::test_leave_group_v3_with_no_members_is_none,
         protocol_rules::test_offsets_only_group_is_listed_after_restart: sequential, // restarts the listener worker
         sync_liveness::test_slow_leader_sync_keeps_silent_follower: sequential, // Has sleep delays
         group_cap::test_lowered_group_cap_still_admits_new_groups: sequential, // changes a GUC

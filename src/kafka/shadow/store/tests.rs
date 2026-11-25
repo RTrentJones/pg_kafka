@@ -14,32 +14,18 @@ use super::*;
 use crate::kafka::shadow::outbox::fake::InMemoryShadowDb;
 use crate::testing::mocks::MockKafkaStore;
 
-fn buffered_record(topic_id: i32) -> PendingForwardRecord {
-    PendingForwardRecord {
-        row: RowKey::new(topic_id, 0, -1),
-        key: None,
-    }
-}
-
 #[test]
-fn test_abort_finalizes_inner_txn_whatever_was_buffered() {
-    // The inner abort always runs, or the transaction stays Ongoing.
+fn test_abort_finalizes_inner_txn_and_enqueues_nothing() {
+    // The inner abort always runs, or the transaction stays Ongoing; nothing was
+    // enqueued for the open transaction, so there is nothing to undo.
     let mut mock = MockKafkaStore::new();
     mock.expect_abort_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
 
-    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        pending
-            .entry((100, 0))
-            .or_default()
-            .records
-            .push(buffered_record(1));
-    }
-
+    let store = ShadowStore::with_db(mock, InMemoryShadowDb::enabled());
     store.abort_transaction("txn-1", 100, 0).unwrap();
+    assert!(store.db().state().tracking.is_empty());
 }
 
 #[test]
@@ -52,16 +38,71 @@ fn test_commit_finalizes_inner_txn() {
         .returning(|_, _, _| Ok(()));
 
     let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        pending
-            .entry((100, 0))
-            .or_default()
-            .records
-            .push(buffered_record(1));
-    }
-
     store.commit_transaction("txn-1", 100, 0).unwrap();
+}
+
+#[test]
+fn test_transactional_writes_and_reinit_are_delegated_without_state() {
+    // A transactional produce and a re-init reach the wrapped store unchanged and
+    // keep nothing in the shadow store: the commit finds the records in
+    // kafka.messages.
+    let mut mock = MockKafkaStore::new();
+    mock.expect_get_or_create_transactional_producer()
+        .times(1)
+        .returning(|_, _, _| Ok((100, 1)));
+    mock.expect_insert_transactional_records()
+        .withf(|t, p, records, pid, epoch| {
+            (*t, *p, records.len(), *pid, *epoch) == (1, 0, 1, 100, 1)
+        })
+        .times(1)
+        .returning(|_, _, _, _, _| Ok(7));
+
+    let store = ShadowStore::with_db(mock, InMemoryShadowDb::enabled());
+    assert_eq!(
+        store
+            .get_or_create_transactional_producer("txn-1", 60_000, None)
+            .unwrap(),
+        (100, 1)
+    );
+    let record = Record {
+        key: None,
+        value: Some(b"v".to_vec()),
+        headers: vec![],
+        timestamp: None,
+    };
+    assert_eq!(
+        store
+            .insert_transactional_records(1, 0, &[record], 100, 1)
+            .unwrap(),
+        7
+    );
+    assert!(store.db().state().tracking.is_empty());
+}
+
+#[test]
+fn test_maintenance_is_delegated_to_the_inner_store() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_abort_timed_out_transactions()
+        .withf(|t| *t == Duration::from_secs(60))
+        .times(1)
+        .returning(|_| Ok(vec!["abandoned".to_string()]));
+    mock.expect_cleanup_aborted_messages()
+        .times(1)
+        .returning(|_| Ok(3));
+
+    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
+    assert_eq!(
+        store
+            .abort_timed_out_transactions(Duration::from_secs(60))
+            .unwrap(),
+        vec!["abandoned".to_string()]
+    );
+    assert_eq!(
+        store
+            .cleanup_aborted_messages(Duration::from_secs(1))
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -100,176 +141,6 @@ fn test_unchanged_roles_are_delegated_to_the_inner_store() {
     store.delete_consumer_group_offsets("g").unwrap();
     assert_eq!(store.allocate_producer_id(None, None).unwrap(), (5, 0));
     store.record_producer_sequence(5, 7, 1, 9).unwrap();
-}
-
-/// A buffer created `age` ago.
-fn aged_buffer(age: Duration) -> PendingTxnBuffer {
-    let mut buf = PendingTxnBuffer::from(vec![buffered_record(1)]);
-    buf.first_buffered = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-    buf
-}
-
-#[test]
-fn test_abort_timed_out_drops_the_buffers_of_ended_transactions() {
-    // The storage sweeper force-aborts timed-out transactions without routing
-    // through abort_transaction(): the buffer of a transaction that is no longer
-    // Ongoing must go (it can never be committed), whatever its age, and the
-    // buffer of an open transaction stays, even one older than the default
-    // timeout (its own transaction.timeout.ms may be longer).
-    let mut mock = MockKafkaStore::new();
-    mock.expect_abort_timed_out_transactions()
-        .times(1)
-        .returning(|_| Ok(vec!["abandoned".to_string()]));
-
-    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    store.db().state().ongoing_txns.insert((1, 0));
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        pending.insert((1, 0), aged_buffer(Duration::from_secs(120)));
-        pending.insert((2, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
-    }
-
-    store
-        .abort_timed_out_transactions(Duration::from_secs(60))
-        .unwrap();
-
-    let pending = store.pending_txn_messages.read().unwrap();
-    assert!(
-        pending.contains_key(&(1, 0)),
-        "the open transaction's buffer stays"
-    );
-    assert!(
-        !pending.contains_key(&(2, 0)),
-        "the ended transaction's buffer goes"
-    );
-}
-
-#[test]
-fn test_abort_timed_out_falls_back_to_age_when_the_lookup_fails() {
-    let mut mock = MockKafkaStore::new();
-    mock.expect_abort_timed_out_transactions()
-        .times(1)
-        .returning(|_| Ok(vec![]));
-
-    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    store.db().state().fail_ongoing_lookup = true;
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        pending.insert((1, 0), aged_buffer(Duration::from_secs(120)));
-        pending.insert((2, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
-    }
-
-    store
-        .abort_timed_out_transactions(Duration::from_secs(60))
-        .unwrap();
-
-    let pending = store.pending_txn_messages.read().unwrap();
-    assert!(!pending.contains_key(&(1, 0)), "stale buffer evicted");
-    assert!(pending.contains_key(&(2, 0)), "fresh buffer retained");
-}
-
-#[test]
-fn test_reinit_drops_stale_epoch_pending_buffer() {
-    // A producer re-init bumps the epoch; the old-epoch in-RAM
-    // forward buffer must be dropped on re-init (commit/abort look it up by the
-    // NEW epoch and would otherwise never free it). A different producer's
-    // buffer must be left untouched.
-    let mut mock = MockKafkaStore::new();
-    mock.expect_get_or_create_transactional_producer()
-        .times(1)
-        .returning(|_, _, _| Ok((100, 1)));
-
-    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        // Stale: producer 100 at the OLD epoch 0.
-        pending.insert((100, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
-        // Unrelated producer 200 — must be kept.
-        pending.insert((200, 0), PendingTxnBuffer::from(vec![buffered_record(1)]));
-    }
-
-    let (pid, epoch) = store
-        .get_or_create_transactional_producer("txn-1", 60_000, None)
-        .unwrap();
-    assert_eq!((pid, epoch), (100, 1));
-
-    let pending = store.pending_txn_messages.read().unwrap();
-    assert!(
-        !pending.contains_key(&(100, 0)),
-        "stale old-epoch buffer should be dropped on re-init"
-    );
-    assert!(
-        pending.contains_key(&(200, 0)),
-        "a different producer's buffer must be retained"
-    );
-}
-
-/// Producer keys at the edges of both halves of the `(producer_id, epoch)`
-/// buffer key: distinct ids, distinct epochs of one id, and the extremes.
-const BOUNDARY_TXN_KEYS: [TxnKey; 8] = [
-    (1000, 0),
-    (1000, 1),
-    (1001, 0),
-    (1000, i16::MAX),
-    (1000, i16::MIN),
-    (i64::MAX, 0),
-    (i64::MIN, 0),
-    (0, 0),
-];
-
-fn store_with_buffers(mock: MockKafkaStore) -> ShadowStore<MockKafkaStore, InMemoryShadowDb> {
-    let store = ShadowStore::with_db(mock, InMemoryShadowDb::default());
-    {
-        let mut pending = store.pending_txn_messages.write().unwrap();
-        for key in BOUNDARY_TXN_KEYS {
-            pending.insert(key, PendingTxnBuffer::from(vec![buffered_record(1)]));
-        }
-    }
-    store
-}
-
-#[test]
-fn test_commit_removes_only_its_own_pending_buffer() {
-    let mut mock = MockKafkaStore::new();
-    mock.expect_commit_transaction()
-        .times(BOUNDARY_TXN_KEYS.len())
-        .returning(|_, _, _| Ok(()));
-    let store = store_with_buffers(mock);
-
-    for (done, &(producer_id, epoch)) in BOUNDARY_TXN_KEYS.iter().enumerate() {
-        store.commit_transaction("txn", producer_id, epoch).unwrap();
-        let pending = store.pending_txn_messages.read().unwrap();
-        assert!(
-            !pending.contains_key(&(producer_id, epoch)),
-            "{producer_id}/{epoch}"
-        );
-        for later in &BOUNDARY_TXN_KEYS[done + 1..] {
-            assert!(
-                pending.contains_key(later),
-                "{later:?} dropped by {producer_id}/{epoch}"
-            );
-        }
-    }
-    assert!(store.pending_txn_messages.read().unwrap().is_empty());
-}
-
-#[test]
-fn test_abort_discards_only_its_own_pending_buffer() {
-    let mut mock = MockKafkaStore::new();
-    mock.expect_abort_transaction()
-        .times(BOUNDARY_TXN_KEYS.len())
-        .returning(|_, _, _| Ok(()));
-    let store = store_with_buffers(mock);
-
-    for (done, &(producer_id, epoch)) in BOUNDARY_TXN_KEYS.iter().enumerate() {
-        store.abort_transaction("txn", producer_id, epoch).unwrap();
-        let pending = store.pending_txn_messages.read().unwrap();
-        assert!(
-            !pending.contains_key(&(producer_id, epoch)),
-            "{producer_id}/{epoch}"
-        );
-        assert_eq!(pending.len(), BOUNDARY_TXN_KEYS.len() - done - 1);
-    }
 }
 
 #[test]

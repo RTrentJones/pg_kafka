@@ -66,12 +66,8 @@ pub struct State {
     pub metrics: HashMap<(i32, i32), FakeMetrics>,
     /// `None` makes `load_topic_configs` fail.
     pub configs: Option<Vec<TopicShadowConfig>>,
-    /// Make `pending_txn_records` fail (None).
-    pub fail_pending_txn_lookup: bool,
-    /// `(producer_id, producer_epoch)` of the Ongoing transactions.
-    pub ongoing_txns: std::collections::HashSet<(i64, i16)>,
-    /// Make `ongoing_transactions` fail (None).
-    pub fail_ongoing_lookup: bool,
+    /// Make `enqueue_pending_txn_records` fail (`Err`).
+    pub fail_txn_enqueue: bool,
     /// Make `apply_delivered` fail (`Err`).
     pub fail_apply_delivered: bool,
     /// Make `apply_delivered` raise (panic, as a Postgres ERROR unwinds).
@@ -315,38 +311,41 @@ impl ShadowDb for InMemoryShadowDb {
         Ok(())
     }
 
-    fn pending_txn_records(
+    fn enqueue_pending_txn_records(
         &self,
         producer_id: i64,
         producer_epoch: i16,
-    ) -> Option<Vec<PendingForwardRecord>> {
-        let s = self.state();
-        if s.fail_pending_txn_lookup {
-            return None;
+        forward_all: &[i32],
+        sampled: &[(i32, u8)],
+    ) -> Result<HashMap<(i32, i32), u64>> {
+        use crate::kafka::shadow::routing::{make_forward_decision, ForwardDecision};
+        let mut s = self.state();
+        if s.fail_txn_enqueue {
+            return Err(KafkaError::Internal("txn enqueue failed".to_string()));
         }
-        Some(
-            s.messages
-                .iter()
-                .filter(|(_, m)| m.txn == Some((producer_id, producer_epoch)) && m.txn_pending)
-                .map(|(&row, m)| PendingForwardRecord {
-                    row,
-                    key: m.key.clone(),
-                })
-                .collect(),
-        )
-    }
-
-    fn ongoing_transactions(&self, keys: &[(i64, i16)]) -> Option<Vec<(i64, i16)>> {
-        let s = self.state();
-        if s.fail_ongoing_lookup {
-            return None;
+        let pending: Vec<(RowKey, Option<Vec<u8>>)> = s
+            .messages
+            .iter()
+            .filter(|(_, m)| m.txn == Some((producer_id, producer_epoch)) && m.txn_pending)
+            .map(|(&row, m)| (row, m.key.clone()))
+            .collect();
+        let mut skipped: HashMap<(i32, i32), u64> = HashMap::new();
+        for (row, key) in pending {
+            let forward = if forward_all.contains(&row.topic_id) {
+                true
+            } else if let Some(&(_, pct)) = sampled.iter().find(|(t, _)| *t == row.topic_id) {
+                make_forward_decision(key.as_deref(), row.local_offset, pct)
+                    == ForwardDecision::Forward
+            } else {
+                continue;
+            };
+            if forward {
+                s.tracking.entry(row).or_default();
+            } else {
+                *skipped.entry(row.partition()).or_default() += 1;
+            }
         }
-        Some(
-            keys.iter()
-                .copied()
-                .filter(|k| s.ongoing_txns.contains(k))
-                .collect(),
-        )
+        Ok(skipped)
     }
 
     fn claim_due_outbox_rows(&self, claim: &OutboxClaim) -> Result<ClaimedRows> {

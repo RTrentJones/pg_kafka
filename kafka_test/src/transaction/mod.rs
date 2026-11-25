@@ -57,8 +57,10 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         timeouts::test_second_transaction_gets_its_own_timeout,
         timeouts::test_timeout_abort_fences_an_exhausted_epoch,
         producer_epochs::test_init_producer_id_checks_the_presented_epoch,
+        producer_epochs::test_init_producer_id_during_an_ongoing_transaction,
         kafka_parity::test_end_txn_of_an_empty_transaction_is_invalid_txn_state,
         kafka_parity::test_txn_offset_commit_metadata_longer_than_4096_is_refused,
         kafka_parity::test_read_uncommitted_fetch_reports_the_last_stable_offset,
+        kafka_parity::test_delete_groups_drops_pending_txn_offsets,
     ]
 }

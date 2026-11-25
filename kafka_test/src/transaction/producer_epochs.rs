@@ -16,6 +16,9 @@ use uuid::Uuid;
 
 /// PRODUCER_FENCED (Kafka 3.7's answer to a fenced InitProducerId).
 const PRODUCER_FENCED: i16 = 90;
+/// CONCURRENT_TRANSACTIONS (Kafka 3.7's answer to an InitProducerId that had to abort an
+/// open transaction first).
+const CONCURRENT_TRANSACTIONS: i16 = 51;
 
 /// InitProducerId v4 presenting `(producer_id, epoch)`: `(error, producer_id, epoch)`.
 async fn init(
@@ -117,6 +120,94 @@ pub async fn test_init_producer_id_checks_the_presented_epoch() -> TestResult {
     let (err, fresh, epoch) = init(&mut w, None, pid, e2).await?;
     assert_eq!((err, epoch), (error_codes::NONE, 0));
     assert_ne!(fresh, pid, "an idempotent producer always gets a new id");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// The `txn_state` of every record of `topic`, in offset order.
+async fn record_states(
+    ctx: &TestContext,
+    topic: &str,
+) -> Result<Vec<Option<String>>, Box<dyn std::error::Error>> {
+    Ok(ctx
+        .db()
+        .query(
+            "SELECT m.txn_state FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1 ORDER BY m.partition_offset",
+            &[&topic],
+        )
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// InitProducerId while the transactional id's transaction is Ongoing, as Kafka 3.7
+/// answers it (TransactionCoordinator.prepareInitProducerIdTransit): whatever epoch of the
+/// current producer id is presented (its current one, the one before its last bump) or
+/// none, the open transaction is aborted under a fenced epoch and the answer is
+/// CONCURRENT_TRANSACTIONS, never that epoch. A retry presenting the same epoch is then
+/// PRODUCER_FENCED; a retry presenting none gets the next epoch.
+pub async fn test_init_producer_id_during_an_ongoing_transaction() -> TestResult {
+    println!("=== Test: InitProducerId During an Ongoing Transaction ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-init-ongoing", 1).await?;
+    let mut w = Wire::connect().await?;
+
+    for case in ["current", "previous", "none"] {
+        let txn = format!("txn-init-ongoing-{case}-{}", Uuid::new_v4());
+        let (err, pid, e0) = init(&mut w, Some(&txn), -1, -1).await?;
+        assert_eq!(err, error_codes::NONE);
+        // A bump the owner asked for itself, so e0 is the epoch a retry of it presents.
+        let (err, _, e1) = init(&mut w, Some(&txn), pid, e0).await?;
+        assert_eq!((err, e1), (error_codes::NONE, e0 + 1));
+        let added = w.add_partitions(&txn, pid, e1, &[(&t, &[0])]).await?;
+        assert_eq!(added[0].2, error_codes::NONE);
+        let (err, _) = w
+            .produce(&t, 0, batch(&[case], pid, e1, 0, true, None), Some(&txn))
+            .await?;
+        assert_eq!(err, error_codes::NONE);
+        let presented = match case {
+            "current" => (pid, e1),
+            "previous" => (pid, e0),
+            _ => (-1, -1),
+        };
+        println!(
+            "Step: {case}: InitProducerId presenting {presented:?} while Ongoing at {pid}/{e1}..."
+        );
+        assert_eq!(
+            init(&mut w, Some(&txn), presented.0, presented.1).await?,
+            (CONCURRENT_TRANSACTIONS, -1, -1),
+            "{case}: the open transaction is aborted first, as in Kafka 3.7"
+        );
+        let states = record_states(&ctx, &t).await?;
+        assert_eq!(
+            states.last().cloned().flatten().as_deref(),
+            Some("aborted"),
+            "{case}: the open transaction's record is aborted"
+        );
+        assert_ne!(
+            w.end_txn(&txn, pid, e1, true).await?,
+            error_codes::NONE,
+            "{case}: the fenced owner can no longer commit"
+        );
+        let retry = init(&mut w, Some(&txn), presented.0, presented.1).await?;
+        if case == "none" {
+            assert_eq!(
+                retry,
+                (error_codes::NONE, pid, e1 + 2),
+                "a new producer's retry gets the epoch after the fenced one"
+            );
+        } else {
+            assert_eq!(
+                retry,
+                (PRODUCER_FENCED, -1, -1),
+                "{case}: the retry presents an epoch the fence moved past"
+            );
+        }
+        println!("✅ {case}: CONCURRENT_TRANSACTIONS, transaction aborted, retry {retry:?}\n");
+    }
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

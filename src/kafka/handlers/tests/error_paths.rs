@@ -483,7 +483,12 @@ fn make_empty_group(ctx: &HandlerContext, group: &str) {
         .unwrap()
         .take()
         .expect("lone join answered immediately");
-    handle_leave_group(ctx, group, &join.member_id, vec![]).unwrap();
+    handle_leave_group(
+        ctx,
+        group,
+        crate::kafka::messages::LeavingMembers::Single(join.member_id.to_string()),
+    )
+    .unwrap();
     let state = ctx.coordinator.get_group_state(group).expect("group kept");
     assert!(state.members.is_empty());
 }
