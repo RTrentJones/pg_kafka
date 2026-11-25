@@ -308,8 +308,9 @@ deduplicate on an application id.
 `DROP EXTENSION` takes the outbox with it. A re-created extension starts `kafka.topics.id` again,
 so its first rows reuse the keys of rows the old outbox had dispatched: when the worker finds the
 schema again it forgets every forward still in flight, moves to a new schema epoch and tells the
-forwarder first, which drops the old forwards' fences, queued records and held responses and stamps
-its acks with the epoch. A late ack of an old forward is then ignored instead of finalizing (or
+forwarder first, which drops the old forwards' fences and queued records, releases the produce
+responses it holds for them (`sync` mode: they are sent without waiting any longer for the external
+ack; their records are committed locally) and stamps its acks with the epoch. A late ack of an old forward is then ignored instead of finalizing (or
 charging an attempt to) the new row that shares its key; the old records may still reach the
 external broker.
 
