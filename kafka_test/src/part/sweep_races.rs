@@ -111,8 +111,9 @@ async fn release(sweeper: &Client) -> SendResult<()> {
 ///
 /// Asserts: a producer idle for 20 years with a sequence row, revived (epoch bump,
 /// last_active_at = NOW(), sequences reset, as `bump_producer_epoch` and
-/// `reset_producer_sequences` do) by a transaction that commits while an on-demand
-/// sweep waits for it, keeps its row at the new epoch and its sequence row.
+/// `reset_producer_sequences` do) by a transaction held open while an on-demand sweep
+/// runs (the prune skips the row it holds, or, waiting for it, re-checks the committed
+/// version), keeps its row at the new epoch and its sequence row.
 pub async fn test_sweep_prune_keeps_a_producer_revived_during_its_wait() -> TestResult {
     into_test_result(revived_producer().await)
 }
@@ -165,9 +166,6 @@ async fn revived_producer() -> SendResult<()> {
         println!(
             "Step 3: the sweep pruned {pruned} producer(s); it waited for the writer: {waited}"
         );
-        if !waited {
-            return Err("the sweep never waited for the reviving transaction".into());
-        }
         let epoch: Option<i16> = sweeper
             .query_opt(
                 "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
@@ -502,8 +500,8 @@ async fn drop_prune_produce_fixture(db: &Client, topic: i32, pid: i64) -> SendRe
 /// Asserts: an idempotent producer idle past the 7-day window with sequence 0 on topic
 /// A; one real Produce of sequence 1 to A and of sequence 0 to a new topic B, held by
 /// the worker after it wrote A's batch (the test holds B's append lock); an on-demand
-/// sweep run meanwhile waits for the Produce; after both finish, the retry of A's acked
-/// batch answers its original offset and stores nothing.
+/// sweep run meanwhile (the prune skips the producer row the Produce holds); after both
+/// finish, the retry of A's acked batch answers its original offset and stores nothing.
 pub async fn test_sweep_prune_keeps_a_producer_whose_produce_is_open() -> TestResult {
     into_test_result(prune_during_produce().await)
 }
@@ -605,9 +603,6 @@ async fn prune_during_produce() -> SendResult<()> {
             "Step 4: the sweep pruned {pruned} producer(s) (it waited for the Produce: \
              {waited}); the Produce answered {produced:?}"
         );
-        if !waited {
-            return Err("the sweep never waited for the open Produce".into());
-        }
         let acked = |topic: &str| {
             produced
                 .iter()
@@ -700,5 +695,208 @@ async fn produce_after_prune() -> SendResult<()> {
     release(&sweeper).await?;
     result?;
     println!("✅ the producer keeps deduplicating after a prune it outlived");
+    Ok(())
+}
+
+/// Run an on-demand sweep on `sweeper` (autocommit) against `writer`, which holds an
+/// open transaction that has run `hold`: if the sweep waits for one of the writer's
+/// rows, the writer then runs `then`, a write of a row the sweep already deleted (the
+/// order of two requests in one group-commit batch). Returns the sweep's and the
+/// writer's outcomes (an error text, or None) and whether the sweep waited; the
+/// writer's transaction ends either way.
+async fn sweep_against_two_writes(
+    sweeper: &Client,
+    observer: &Client,
+    writer: &Client,
+    hold: &str,
+    then: &str,
+) -> SendResult<(Option<String>, Option<String>, bool)> {
+    let pid: i32 = sweeper
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    writer
+        .batch_execute(&format!("BEGIN; {hold}"))
+        .await
+        .map_err(boxed)?;
+    let sweep = async {
+        sweeper
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
+            .await
+            .err()
+            .map(|e| format!("{e:?}"))
+    };
+    let write = async {
+        let waited =
+            wait_until_waiting(observer, pid, "transactionid", Duration::from_secs(3)).await?;
+        let failed = writer
+            .batch_execute(then)
+            .await
+            .err()
+            .map(|e| format!("{e:?}"));
+        // COMMIT after a failed statement rolls back; either way the transaction ends.
+        writer.batch_execute("COMMIT").await.map_err(boxed)?;
+        Ok::<(Option<String>, bool), Box<dyn std::error::Error + Send + Sync>>((failed, waited))
+    };
+    let (swept, written) = tokio::join!(sweep, write);
+    let (written, waited) = written?;
+    Ok((swept, written, waited))
+}
+
+/// An on-demand sweep runs beside the worker, whose group commit holds the rows of
+/// every request in a batch until one commit: a batch of two Produce (or
+/// InitProducerId) requests updates two idle producers' rows (last_active_at) in
+/// request order, as a batch of two InitProducerId requests updates two terminal
+/// transactions' rows. The sweep's producer prune and terminal-transaction delete
+/// took their rows in index order and waited for a row the batch held while holding
+/// one the batch needed next: a deadlock, which aborted one side (the CI run of the
+/// prune's index test against the worker's own sweep).
+///
+/// Asserts, for two producers idle 30 years (the lower id the older) and then for two
+/// terminal transactions idle 30 years (the first-stored the older): a writer updates
+/// the second one and holds its transaction; a sweep runs; the writer then updates the
+/// first one and commits. Neither the sweep nor the writer fails, the sweep does not
+/// wait for the writer, the first row is gone and the second (revived) one kept.
+pub async fn test_sweep_never_deadlocks_with_a_batch_writing_two_rows() -> TestResult {
+    into_test_result(two_row_batch().await)
+}
+
+async fn two_row_batch() -> SendResult<()> {
+    println!("=== Test: the sweep never deadlocks with a batch writing two rows ===\n");
+    let sweeper = sweeper_session().await?;
+    let observer = session().await?;
+    let writer = session().await?;
+    writer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    // Explicit negative ids, never issued by the sequence; the lower one inserted
+    // first (so the lower id comes first in index and physical order).
+    let base: i64 = sweeper
+        .query_one(
+            "SELECT -(floor(random() * 1000000)::bigint + 1) * 1000000",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let (lo, hi, owner) = (base - 3, base - 2, base - 1);
+    let prefix = unique("two-row-batch");
+    let (txn_lo, txn_hi) = (format!("{prefix}-lo"), format!("{prefix}-hi"));
+    let result: SendResult<()> = async {
+        sweeper
+            .execute(
+                "INSERT INTO kafka.producer_ids (producer_id, created_at, last_active_at)
+                 VALUES ($1, now() - INTERVAL '31 years', now() - INTERVAL '31 years'),
+                        ($2, now() - INTERVAL '30 years', now() - INTERVAL '30 years'),
+                        ($3, now(), now())",
+                &[&lo, &hi, &owner],
+            )
+            .await
+            .map_err(boxed)?;
+        println!("Step 1: producers {lo} and {hi} idle for 30 years");
+        let (swept, written, waited) = sweep_against_two_writes(
+            &sweeper,
+            &observer,
+            &writer,
+            &format!(
+                "UPDATE kafka.producer_ids SET last_active_at = now() WHERE producer_id = {hi}"
+            ),
+            &format!(
+                "UPDATE kafka.producer_ids SET last_active_at = now() WHERE producer_id = {lo}"
+            ),
+        )
+        .await?;
+        let left: Vec<i64> = sweeper
+            .query(
+                "SELECT producer_id FROM kafka.producer_ids WHERE producer_id IN ($1, $2)
+                 ORDER BY 1",
+                &[&lo, &hi],
+            )
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        println!(
+            "Step 2: sweep error {swept:?}, writer error {written:?}, the sweep waited: \
+             {waited}; producers left {left:?}"
+        );
+        if swept.is_some() || written.is_some() || waited || left != [hi] {
+            return Err("the producer prune waited for a batch's row (deadlock)".into());
+        }
+
+        sweeper
+            .execute(
+                "INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch,
+                                                 state, last_updated_at)
+                 VALUES ($1, $2, 0, 'CompleteCommit', now() - INTERVAL '31 years')",
+                &[&txn_lo, &owner],
+            )
+            .await
+            .map_err(boxed)?;
+        sweeper
+            .execute(
+                "INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch,
+                                                 state, last_updated_at)
+                 VALUES ($1, $2, 0, 'CompleteCommit', now() - INTERVAL '30 years')",
+                &[&txn_hi, &owner],
+            )
+            .await
+            .map_err(boxed)?;
+        println!("Step 3: terminal transactions {txn_lo} and {txn_hi} idle for 30 years");
+        let (swept, written, waited) = sweep_against_two_writes(
+            &sweeper,
+            &observer,
+            &writer,
+            &format!(
+                "UPDATE kafka.transactions SET last_updated_at = now()
+                 WHERE transactional_id = '{txn_hi}'"
+            ),
+            &format!(
+                "UPDATE kafka.transactions SET last_updated_at = now()
+                 WHERE transactional_id = '{txn_lo}'"
+            ),
+        )
+        .await?;
+        let left: Vec<String> = sweeper
+            .query(
+                "SELECT transactional_id FROM kafka.transactions
+                 WHERE transactional_id IN ($1, $2) ORDER BY 1",
+                &[&txn_lo, &txn_hi],
+            )
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        println!(
+            "Step 4: sweep error {swept:?}, writer error {written:?}, the sweep waited: \
+             {waited}; transactions left {left:?}"
+        );
+        if swept.is_some() || written.is_some() || waited || left != [txn_hi.clone()] {
+            return Err("the terminal-transaction delete waited for a batch's row".into());
+        }
+        Ok(())
+    }
+    .await;
+    sweeper
+        .execute(
+            "DELETE FROM kafka.transactions WHERE transactional_id IN ($1, $2)",
+            &[&txn_lo, &txn_hi],
+        )
+        .await
+        .map_err(boxed)?;
+    sweeper
+        .execute(
+            "DELETE FROM kafka.producer_ids WHERE producer_id IN ($1, $2, $3)",
+            &[&lo, &hi, &owner],
+        )
+        .await
+        .map_err(boxed)?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ the sweep skipped the batch's rows and neither side failed");
     Ok(())
 }
