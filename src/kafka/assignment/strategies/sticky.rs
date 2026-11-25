@@ -20,7 +20,10 @@
 //! 5. Move partitions from members at least two heavier than the lightest subscriber of
 //!    their topic to that subscriber
 //!
-//! Every step is counted against a budget ([`StickyStrategy::assign_within`]).
+//! This is not the general assign algorithm of Kafka's StickyAssignor (which places the
+//! partitions with the fewest possible consumers first), so for the same input the two can
+//! choose different, equally balanced assignments (docs/PROTOCOL_DEVIATIONS.md). Every step
+//! is counted against a budget ([`StickyStrategy::assign_within`]).
 //!
 //! # Example
 //!

@@ -10,7 +10,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 |----------|--------|
 | **Producer APIs** | ✅ Full support (idempotent + transactional) |
 | **Consumer APIs** | ✅ Full support (with automatic rebalancing) |
-| **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies) |
+| **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies; server-side Sticky is not Kafka's StickyAssignor algorithm, see §5) |
 | **Admin APIs** | ✅ Supported (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups; see §13) |
 | **Config & Log APIs** | ✅ Minimal support (DescribeConfigs, IncrementalAlterConfigs for `retention.ms` only, DeleteRecords) |
 | **Transaction APIs** | ✅ Full support (EOS with read-committed isolation) |
@@ -360,7 +360,9 @@ pg_kafka.compression_type = 'gzip'
 
 **Status:** Full support with automatic partition assignment and rebalancing
 **Kafka Behavior:** Automatic partition assignment with rebalancing
-**pg_kafka Behavior:** Same, with Range, RoundRobin, and Sticky strategies
+**pg_kafka Behavior:** Same, with Range, RoundRobin, and Sticky strategies (the server-side
+Sticky assignor balances and keeps previous assignments but is not Kafka's StickyAssignor
+algorithm; see "Server-side sticky assignment" below)
 
 **What Works:**
 - ✅ FindCoordinator API
@@ -414,6 +416,19 @@ pg_kafka.compression_type = 'gzip'
   way; 999 members subscribed to 999 different, nested sets of topics, rebalancing from one
   owner of everything, fit up to about 40 partitions per topic. Kafka assigns on the client
   and has no such limits.
+- ⚠️ **Deviation: server-side sticky assignment.** When the group's protocol is "sticky" and
+  the leader sends empty assignments, the server's Sticky assignor keeps each remaining
+  member's previous partitions that it still subscribes to, gives the other partitions (by
+  topic name, then partition) to the lightest subscriber, and then moves partitions until no
+  partition sits on a member two partitions heavier than the lightest subscriber of its
+  topic. It is not the general assign algorithm of Kafka 3.7's StickyAssignor, which places
+  the partitions with the fewest possible consumers first and balances by a different
+  search, so the two can choose differently: for a fresh group over topics a (3 partitions),
+  b (3) and c (2) with m1 subscribed to {a}, m2 to {a, b} and m3 to {a, b, c}, Kafka gives
+  m1 [a0, a1, a2], m2 [b0, b1, b2], m3 [c0, c1], and pg_kafka m1 [a0, a2], m2 [a1, b0, b2],
+  m3 [b1, c0, c1]; after a member joins, the two can also move different partitions. It only applies to leaders that send empty assignments: the Java
+  client and librdkafka run their sticky assignors on the client, and the server only
+  passes those assignments on.
 - ✅ As in Kafka 3.0+ (`pendingSyncMembers`, checked against a 3.7 broker): every member of
   a new generation must send its SyncGroup within the group's rebalance timeout of the
   join's completion. The sweep removes those that have not, though they heartbeat and
