@@ -52,11 +52,29 @@ pub const MAX_MEMBER_PROTOCOLS: usize = 64;
 
 /// Most entries one server-side group assignment may take: the topics in the members'
 /// subscriptions (repeats included), the partitions of the sticky assignor's previous
-/// assignments and the partitions of the subscribed topics. The assignment runs on the
-/// single DB thread in about that many steps; a leader SyncGroup over it is answered
-/// POLICY_VIOLATION instead of stalling every other client while it runs. A thousand
-/// members subscribed to a thousand topics each stay well within it.
+/// assignments and the partitions of the subscribed topics. A leader SyncGroup over it is
+/// answered POLICY_VIOLATION before anything is computed, instead of stalling every other
+/// client on the single DB thread while it runs. Range and round-robin run in about one step
+/// per entry; the sticky assignor's balancing also depends on how the subscriptions overlap
+/// and how far the previous assignment is from balanced, so it is bounded by
+/// [`MAX_ASSIGNMENT_STEPS`] as well. A thousand members subscribed to a thousand topics
+/// each stay well within it.
 pub const MAX_ASSIGNMENT_WORK: usize = 2_000_000;
+
+/// Most steps one server-side sticky assignment may take (a step is about one ordered-set or
+/// map operation, some 50 to 150 ns; a partition move counts 16). An ordinary rebalance (the
+/// members share a few distinct subscriptions) takes about the subscription entries plus the
+/// partitions plus 16 per move, and moves each partition at most about once, so an assignment
+/// within [`MAX_ASSIGNMENT_WORK`] and the default `max_total_partitions` fits; with
+/// `max_total_partitions` raised past about 500,000, a rebalance moving most of a group's
+/// partitions can exceed it. Many distinct, overlapping subscriptions cost more per move (up
+/// to a look at every subscription class): the heaviest shape measured, 999 members each
+/// subscribed to a different suffix of 999 topics, rebalancing from one owner of everything,
+/// takes about 5,500,000 steps at 200 partitions per topic when member ids follow the
+/// subscriptions, and fits up to about 40 partitions per topic with random member ids. Past
+/// the budget the assignment is answered POLICY_VIOLATION, after about a second on the DB
+/// thread, and the group stays in its sync phase.
+pub const MAX_ASSIGNMENT_STEPS: usize = 10_000_000;
 
 /// Default for `pg_kafka.max_group_memory`, in kB: 128 MB. The per-member and per-group caps
 /// above still let the coordinator hold `max_consumer_groups * group_max_size` members of up

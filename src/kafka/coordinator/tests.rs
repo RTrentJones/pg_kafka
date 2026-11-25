@@ -1623,6 +1623,48 @@ fn test_assignment_over_the_work_limit_is_refused() {
     assert_eq!(c.compute_assignments("g", &partitions).unwrap().len(), 1);
 }
 
+/// A sticky assignment that spends its step budget is refused with POLICY_VIOLATION;
+/// range and round-robin have no step budget.
+#[test]
+fn test_sticky_assignment_over_its_step_budget_is_refused() {
+    let input = AssignmentInput::new(
+        HashMap::from([
+            (
+                "a".to_string(),
+                MemberSubscription::new(vec!["t".to_string()]),
+            ),
+            (
+                "b".to_string(),
+                MemberSubscription::new(vec!["t".to_string()]),
+            ),
+        ]),
+        HashMap::from([("t".to_string(), 100)]),
+    );
+    let owned = HashMap::from([(
+        "a".to_string(),
+        MemberAssignment::with_partitions(HashMap::from([("t".to_string(), (0..100).collect())])),
+    )]);
+    let refused = run_assignor("g", owned.clone(), &input, "sticky", 100).unwrap_err();
+    assert_eq!(
+        refused.to_kafka_error_code(),
+        crate::kafka::constants::ERROR_POLICY_VIOLATION
+    );
+    let computed = run_assignor(
+        "g",
+        owned,
+        &input,
+        "sticky",
+        crate::kafka::limits::MAX_ASSIGNMENT_STEPS,
+    )
+    .unwrap();
+    assert_eq!(computed["a"].partition_count(), 50);
+    assert_eq!(computed["a"].partitions("t"), (0..50).collect::<Vec<_>>());
+    for strategy in ["range", "roundrobin"] {
+        let computed = run_assignor("g", HashMap::new(), &input, strategy, 0).unwrap();
+        assert_eq!(computed["b"].partition_count(), 50);
+    }
+}
+
 #[test]
 fn test_late_leader_sync_answers_count_as_liveness() {
     // Neither member heartbeats while the sync phase lasts longer than their session

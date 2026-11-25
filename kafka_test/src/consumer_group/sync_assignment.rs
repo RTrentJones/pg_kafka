@@ -1,13 +1,18 @@
 //! Server-side assignment (a leader SyncGroup with empty assignments) on the single DB
 //! thread: computed only for the SyncGroup the coordinator takes assignments from, and in
-//! time about linear in the subscriptions plus the partitions assigned.
+//! time about linear in the subscriptions plus the partitions assigned, also for a sticky
+//! rebalance whose donor holds many differently subscribed topics.
 
 use crate::common::{DynResult, TestResult};
 use crate::error_codes;
 use crate::setup::TestContext;
-use crate::wire::requests::{conn, creatable, create_topics_raw, join_now, join_req, leave, s};
+use crate::wire::requests::{
+    conn, creatable, create_topics_raw, describe, join_now, join_req, leave, s,
+};
 use crate::wire::{recv, send};
 use bytes::{BufMut, Bytes, BytesMut};
+use kafka_protocol::messages::join_group_request::JoinGroupRequest;
+use kafka_protocol::messages::leave_group_request::{LeaveGroupRequest, MemberIdentity};
 use kafka_protocol::messages::sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment};
 use kafka_protocol::messages::GroupId;
 use std::time::{Duration, Instant};
@@ -164,6 +169,167 @@ pub async fn test_server_side_assignment_is_bounded() -> TestResult {
     );
 
     assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Topics (and members) of the nested-subscription group.
+const NESTED_TOPICS: usize = 999;
+/// Partitions of each of its topics.
+const NESTED_PARTITIONS: i32 = 8;
+/// JoinGroups pipelined per connection: the listener reads no further request while 8
+/// requests other than Fetch and Heartbeat wait for their responses, and a JoinGroup waits
+/// until the join phase completes. 143 connections stay within `max_connections_per_ip`.
+const JOINS_PER_CONNECTION: usize = 7;
+
+/// A JoinGroup of `group` on "sticky" subscribing to `topics`.
+fn sticky_join(group: &str, member: &str, topics: &[String]) -> JoinGroupRequest {
+    let mut join = join_req(group, member, "consumer", &["sticky"]);
+    join.session_timeout_ms = 120_000;
+    join.rebalance_timeout_ms = 120_000;
+    join.protocols[0].metadata = subscription(topics.iter().cloned());
+    join
+}
+
+/// The review's reproduction of a sticky rebalance that held the DB thread for minutes (at
+/// more partitions per topic), within the default `group_max_size`: 999 topics of 8
+/// partitions, all owned by a lone first member subscribed to all of them; then member i (for
+/// i in 1..999) joins subscribed to the topics from the i-th on, and the leader asks the
+/// server to assign. Every topic is subscribed to by a different set of members, and the
+/// member that gives up partitions holds all of them: each of its 7,984 moves compared every
+/// topic's subscribers (seconds in all, about cubic in the members). Now a move costs a few
+/// ordered-set operations, and every step counts against a budget.
+pub async fn test_sticky_rebalance_of_nested_subscriptions_is_bounded() -> TestResult {
+    println!("=== Test: sticky rebalance of nested subscriptions is bounded ===\n");
+    let ctx = TestContext::new().await?;
+    let group = ctx.unique_group("sticky-nested").await;
+    let mut topics = Vec::with_capacity(NESTED_TOPICS);
+    for _ in 0..NESTED_TOPICS {
+        topics.push(ctx.unique_topic("nested").await);
+    }
+
+    println!("Step 1: {NESTED_TOPICS} topics of {NESTED_PARTITIONS} partitions...");
+    for chunk in topics.chunks(100) {
+        let created = create_topics_raw(
+            chunk
+                .iter()
+                .map(|t| creatable(t, NESTED_PARTITIONS, 1))
+                .collect(),
+        )
+        .await?;
+        assert!(
+            created.iter().all(|t| t.error_code == error_codes::NONE),
+            "{created:?}"
+        );
+    }
+
+    println!("Step 2: the first member joins alone and is assigned everything...");
+    let mut first = conn().await?;
+    let (e, generation, owner, _) = join_now(&mut first, &sticky_join(&group, "", &topics)).await?;
+    assert_eq!(e, error_codes::NONE);
+    let (codes, assignment, _) =
+        pipelined(&mut first, &empty_sync(&group, generation, &owner), 1).await?;
+    assert_eq!(codes, [error_codes::NONE]);
+    let owned: usize = topics
+        .iter()
+        .map(|t| assigned_partitions(&assignment, t))
+        .sum();
+    assert_eq!(owned, NESTED_TOPICS * usize::try_from(NESTED_PARTITIONS)?);
+
+    println!(
+        "Step 3: {} more members join, member i subscribed to the topics from the i-th on...",
+        NESTED_TOPICS - 1
+    );
+    let mut joiners = Vec::new();
+    let others: Vec<usize> = (1..NESTED_TOPICS).collect();
+    for chunk in others.chunks(JOINS_PER_CONNECTION) {
+        let mut c = conn().await?;
+        for (n, &i) in chunk.iter().enumerate() {
+            send(
+                &mut c,
+                5,
+                i32::try_from(n)?,
+                &sticky_join(&group, "", &topics[i..]),
+            )
+            .await?;
+        }
+        joiners.push((c, chunk.len()));
+    }
+    // Every joiner is a member (its JoinGroup is held) before the first member rejoins, so
+    // the rejoin completes the join phase with all of them.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (e, _, _, members) = describe(&group).await?;
+        assert_eq!(e, error_codes::NONE);
+        if members == NESTED_TOPICS {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{members} members after 60 s");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let rejoin = tokio::time::timeout(
+        Duration::from_secs(60),
+        crate::wire::roundtrip(&mut first, 5, 50, &sticky_join(&group, &owner, &topics)),
+    )
+    .await??;
+    assert_eq!(rejoin.error_code, error_codes::NONE);
+    let generation = rejoin.generation_id;
+    let mut members = vec![owner.clone()];
+    let mut leader = rejoin.leader.to_string();
+    for (c, count) in &mut joiners {
+        for n in 0..*count {
+            let r = tokio::time::timeout(
+                Duration::from_secs(60),
+                recv::<JoinGroupRequest>(c, 5, i32::try_from(n)?),
+            )
+            .await??;
+            assert_eq!(r.error_code, error_codes::NONE);
+            assert_eq!(r.generation_id, generation);
+            leader = r.leader.to_string();
+            members.push(r.member_id.to_string());
+        }
+    }
+    println!("  generation {generation}, leader {leader}");
+
+    println!("Step 4: the leader's empty SyncGroup is assigned within the time bound...");
+    // A SyncGroup names its member, so it may travel on any connection.
+    let mut leader_conn = first;
+    let (codes, assignment, took) = pipelined(
+        &mut leader_conn,
+        &empty_sync(&group, generation, &leader),
+        1,
+    )
+    .await?;
+    println!("  answered in {took:?}");
+    assert_eq!(codes, [error_codes::NONE]);
+    let kept: usize = topics
+        .iter()
+        .map(|t| assigned_partitions(&assignment, t))
+        .sum();
+    // 7,992 partitions over 999 members (how many the leader gets depends on the random
+    // member ids, which break the assignor's ties).
+    println!("  the leader holds {kept} partitions");
+    assert!(kept > 0, "the leader holds nothing");
+    assert!(
+        took < Duration::from_secs(2),
+        "the sticky assignment took {took:?}"
+    );
+
+    println!("Step 5: every member leaves...");
+    let mut leave_all = LeaveGroupRequest::default();
+    leave_all.group_id = GroupId(s(&group));
+    leave_all.members = members
+        .iter()
+        .map(|m| {
+            let mut member = MemberIdentity::default();
+            member.member_id = s(m);
+            member
+        })
+        .collect();
+    let left = crate::wire::roundtrip(&mut leader_conn, 3, 60, &leave_all).await?;
+    assert_eq!(left.error_code, error_codes::NONE);
+
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
