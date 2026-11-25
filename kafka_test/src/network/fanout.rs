@@ -771,6 +771,41 @@ pub async fn test_create_partitions_of_many_missing_names_is_answered_quickly() 
     Ok(())
 }
 
+/// DescribeConfigs v1 of 6,000 distinct existing topics (about 100 KB): every topic's
+/// retention is read in one statement; one statement per topic held the DB thread for each.
+pub async fn test_describe_configs_of_many_topics_is_answered_quickly() -> TestResult {
+    println!("=== Test: DescribeConfigs of 6,000 distinct existing topics ===\n");
+    let (ctx, probe) = setup("dcm").await?;
+    let prefix = short_name("dm");
+    let names = numbered(&prefix, 6_000);
+    let created = create_topics_raw(names.iter().map(|n| creatable(n, 1, 1)).collect()).await?;
+    assert_eq!(
+        tally(created.iter().map(|t| t.error_code)),
+        BTreeMap::from([(0, 6_000)])
+    );
+    let mut req = DescribeConfigsRequest::default();
+    req.resources = names
+        .iter()
+        .map(|name| {
+            let mut r = DescribeConfigsResource::default();
+            r.resource_type = 2;
+            r.resource_name = s(name);
+            r.configuration_keys = Some(vec![s("retention.ms")]);
+            r
+        })
+        .collect();
+    let m = measure(&probe, 1, &req).await?;
+    let codes = tally(m.response.results.iter().map(|r| r.error_code));
+    println!("  {} results, codes {codes:?}", m.response.results.len());
+    drop_topics(&ctx, &prefix).await?;
+    assert_not_stalled(&m);
+    assert_eq!(codes, BTreeMap::from([(0, 6_000)]));
+    assert!(m.response.results.iter().all(|r| r.configs.len() == 1));
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// DescribeConfigs v1 of one existing topic 7,000 times (196 KB): Kafka answers every
 /// entry.
 pub async fn test_describe_configs_of_a_repeated_topic_is_answered_quickly() -> TestResult {

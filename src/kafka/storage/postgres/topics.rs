@@ -333,21 +333,29 @@ impl PostgresStore {
         .map_err(internal("colliding_topics"))
     }
 
-    pub(super) fn get_topic_retention_ms(topic_id: i32) -> Result<Option<i64>> {
+    /// One statement for every id: a DescribeConfigs may name thousands of topics, and a
+    /// statement per topic held the DB thread, which serves every client, for each of them.
+    pub(super) fn get_topics_retention_ms(
+        topic_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Option<i64>>> {
+        let mut retention = std::collections::HashMap::new();
+        if topic_ids.is_empty() {
+            return Ok(retention);
+        }
         Spi::connect(|client| {
             let table = client.select(
-                "SELECT retention_ms FROM kafka.topics WHERE id = $1",
-                Some(1),
-                &[topic_id.into()],
+                "SELECT id, retention_ms FROM kafka.topics WHERE id = ANY($1::int4[])",
+                None,
+                &[topic_ids.to_vec().into()],
             )?;
-            if table.is_empty() {
-                return Err(KafkaError::Internal(format!(
-                    "topic id {topic_id} not found"
-                )));
+            for row in table {
+                if let Some(id) = row.get_by_name::<i32, _>("id")? {
+                    retention.insert(id, row.get_by_name::<i64, _>("retention_ms")?);
+                }
             }
-            Ok(table.first().get_by_name::<i64, _>("retention_ms")?)
+            Ok(retention)
         })
-        .map_err(internal("get_topic_retention_ms"))
+        .map_err(internal("get_topics_retention_ms"))
     }
 
     pub(super) fn set_topic_retention_ms(topic_id: i32, retention_ms: Option<i64>) -> Result<()> {

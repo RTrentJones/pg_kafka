@@ -61,11 +61,11 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_partition_count(name, partition_count)
         }
-        fn get_topic_retention_ms(
+        fn get_topics_retention_ms(
             &self,
-            topic_id: i32,
-        ) -> $crate::kafka::error::Result<Option<i64>> {
-            $via::get_topic_retention_ms(topic_id)
+            topic_ids: &[i32],
+        ) -> $crate::kafka::error::Result<::std::collections::HashMap<i32, Option<i64>>> {
+            $via::get_topics_retention_ms(topic_ids)
         }
         fn set_topic_retention_ms(
             &self,
@@ -131,11 +131,11 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_partition_count(&self.$field, name, partition_count)
         }
-        fn get_topic_retention_ms(
+        fn get_topics_retention_ms(
             &self,
-            topic_id: i32,
-        ) -> $crate::kafka::error::Result<Option<i64>> {
-            $via::get_topic_retention_ms(&self.$field, topic_id)
+            topic_ids: &[i32],
+        ) -> $crate::kafka::error::Result<::std::collections::HashMap<i32, Option<i64>>> {
+            $via::get_topics_retention_ms(&self.$field, topic_ids)
         }
         fn set_topic_retention_ms(
             &self,

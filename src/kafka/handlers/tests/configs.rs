@@ -34,8 +34,12 @@ fn test_handle_describe_configs_retention_sources() {
             (2, 1)
         }))
     });
-    mock.expect_get_topic_retention_ms()
-        .returning(|topic_id| Ok(if topic_id == 1 { Some(60_000) } else { None }));
+    mock.expect_get_topics_retention_ms().returning(|ids| {
+        Ok(ids
+            .iter()
+            .map(|&id| (id, if id == 1 { Some(60_000) } else { None }))
+            .collect())
+    });
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -69,7 +73,8 @@ fn test_handle_describe_configs_retention_sources() {
 fn test_handle_describe_configs_key_filter() {
     let mut mock = MockKafkaStore::new();
     expect_topics(&mut mock, |_| Ok(Some((1, 1))));
-    mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
+    mock.expect_get_topics_retention_ms()
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -382,13 +387,49 @@ fn test_handle_delete_records_repeated_partition_is_deleted_once() {
 }
 
 /// DescribeConfigs answers every entry of a repeated topic but reads its configs once.
+/// Distinct topics share one retention lookup: a statement per topic held the DB thread for
+/// every topic the request names.
+#[test]
+fn test_handle_describe_configs_of_many_topics_reads_retention_once() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |name| {
+        Ok(name
+            .strip_prefix('t')
+            .and_then(|n| n.parse().ok())
+            .map(|id| (id, 1)))
+    });
+    mock.expect_get_topics_retention_ms()
+        .times(1)
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, Some(i64::from(id)))).collect()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let resources = (0..1000)
+        .map(|i| {
+            (
+                RESOURCE_TYPE_TOPIC,
+                format!("t{i}"),
+                Some(vec!["retention.ms".to_string()]),
+            )
+        })
+        .collect();
+    let response = configs::handle_describe_configs(&ctx, resources, 0).unwrap();
+    assert_eq!(response.results.len(), 1000);
+    for (i, result) in response.results.iter().enumerate() {
+        assert_eq!(result.error_code, ERROR_NONE);
+        assert_eq!(
+            result.configs[0].value.as_deref(),
+            Some(i.to_string().as_str())
+        );
+    }
+}
+
 #[test]
 fn test_handle_describe_configs_repeated_topic_is_read_once() {
     let mut mock = MockKafkaStore::new();
     expect_topics(&mut mock, |_| Ok(Some((1, 1))));
-    mock.expect_get_topic_retention_ms()
+    mock.expect_get_topics_retention_ms()
         .times(1)
-        .returning(|_| Ok(None));
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
     let response = configs::handle_describe_configs(
@@ -569,7 +610,8 @@ fn test_handle_incremental_alter_configs_malformed_before_topic_lookup() {
 fn test_handle_describe_configs_reports_kafka_config_types() {
     let mut mock = MockKafkaStore::new();
     expect_topics(&mut mock, |_| Ok(Some((1, 1))));
-    mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
+    mock.expect_get_topics_retention_ms()
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
     let response = configs::handle_describe_configs(
