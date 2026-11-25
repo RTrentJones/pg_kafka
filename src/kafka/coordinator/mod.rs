@@ -1290,7 +1290,7 @@ impl GroupCoordinator {
                 .iter()
                 .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
             {
-                if let Ok(sub) = MemberSubscription::parse(metadata) {
+                if let Ok(sub) = MemberSubscription::parse_topics(metadata) {
                     for topic in sub.topics {
                         topics.insert(topic);
                     }
@@ -1353,7 +1353,8 @@ impl Default for GroupCoordinator {
 
 /// Every member's subscription, parsed from its metadata for the group's selected
 /// protocol. A member without that protocol, or whose metadata does not parse, is
-/// assigned as if it subscribed to nothing.
+/// assigned as if it subscribed to nothing. Only the topics are kept
+/// ([`MemberSubscription::parse_topics`]): no assignor reads the user data.
 fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscription> {
     group
         .members
@@ -1364,7 +1365,7 @@ fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscrip
                 .iter()
                 .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
                 .map_or_else(MemberSubscription::default, |(_, metadata)| {
-                    MemberSubscription::parse(metadata).unwrap_or_else(|e| {
+                    MemberSubscription::parse_topics(metadata).unwrap_or_else(|e| {
                         pg_log!(
                             "Failed to parse subscription for member {}: {}",
                             member_id,

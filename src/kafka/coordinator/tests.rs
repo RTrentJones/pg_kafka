@@ -2299,3 +2299,27 @@ fn test_refused_assignment_is_remembered_for_its_generation() {
         "the group stays in its sync phase"
     );
 }
+
+/// The subscriptions a server-side assignment reads keep no member's user data: no assignor
+/// reads it, and each member's metadata may carry up to about a megabyte of it, which was
+/// copied into the assignor's input (and once more for the subscribed topics) on every
+/// computation.
+#[test]
+fn test_assignment_input_keeps_no_user_data() {
+    let c = GroupCoordinator::new();
+    let metadata = MemberSubscription {
+        version: 0,
+        topics: vec!["t".to_string()],
+        user_data: Some(vec![7; 512 * 1024]),
+    }
+    .encode()
+    .unwrap();
+    joined(&join_with(&c, &params("g", None, &[("range", &metadata)])));
+    let groups = c.groups.read().unwrap();
+    let subscriptions = member_subscriptions(&groups["g"]);
+    assert_eq!(subscriptions.len(), 1);
+    for subscription in subscriptions.values() {
+        assert_eq!(subscription.topics, ["t"]);
+        assert!(subscription.user_data.is_none(), "user data copied");
+    }
+}
