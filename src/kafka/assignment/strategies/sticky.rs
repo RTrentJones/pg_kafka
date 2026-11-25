@@ -71,17 +71,22 @@ impl StickyStrategy {
 
     /// Keep each remaining member's previous partitions that still exist, that it still
     /// subscribes to and that no other member kept first; returns the kept partitions.
+    ///
+    /// Cost: a binary search of each previous member's id among the members (about
+    /// `log m` id comparisons), a map lookup of each previous topic name, and one set
+    /// insertion per previous partition; the member is then its index, so no id is hashed
+    /// or compared per topic or partition.
     fn keep_previous_assignments<'a>(
         &self,
         input: &'a AssignmentInput,
-        result: &mut AssignmentOutput,
+        result: &mut [MemberAssignment],
     ) -> HashSet<(&'a str, i32)> {
         let mut assigned = HashSet::new();
         for (member_id, prev_assignment) in &self.previous_assignments {
             // Departed members keep nothing.
-            if !input.subscriptions.contains_key(member_id) {
+            let Some(member) = input.member_index(member_id) else {
                 continue;
-            }
+            };
             for (topic, prev_partitions) in &prev_assignment.topic_partitions {
                 // The previous assignment is the leader's, whatever names it carries: the
                 // topic is looked up once, and only a topic that exists is keyed per
@@ -90,16 +95,14 @@ impl StickyStrategy {
                 let Some((topic, &count)) = input.topic_partitions.get_key_value(topic) else {
                     continue;
                 };
-                if !input.is_subscribed(member_id, topic) {
+                if !input.is_subscribed(member, topic) {
                     continue;
                 }
                 for &partition in prev_partitions {
                     if (0..count).contains(&partition)
                         && assigned.insert((topic.as_str(), partition))
                     {
-                        let partitions = result
-                            .get_mut(member_id)
-                            .expect("every member is initialised in `result` before this step")
+                        let partitions = result[member]
                             .topic_partitions
                             .entry(topic.clone())
                             .or_default();
@@ -129,12 +132,8 @@ impl StickyStrategy {
         budget: usize,
     ) -> Result<AssignmentOutput, StepBudgetExceeded> {
         let mut steps = Steps::new(budget);
-        let mut result: AssignmentOutput = HashMap::new();
-
-        // Initialize empty assignments for all current members
-        for member_id in input.subscriptions.keys() {
-            result.insert(member_id.clone(), MemberAssignment::new());
-        }
+        // Every member's assignment, by member index.
+        let mut result = input.empty_assignments();
 
         // Calculate total partitions for balancing
         let total_partitions: usize = input
@@ -143,11 +142,11 @@ impl StickyStrategy {
             .map(|&count| usize::try_from(count).unwrap_or(0))
             .sum();
 
-        let num_members = input.subscriptions.len();
+        let num_members = input.member_count();
 
         // If no members or partitions, return empty
         if num_members == 0 || total_partitions == 0 {
-            return Ok(result);
+            return Ok(input.output(result));
         }
 
         // Step 1: Preserve valid assignments from previous state
@@ -181,13 +180,13 @@ impl StickyStrategy {
         balance_assignments(&mut members, &mut result, &mut steps)?;
 
         // Sort partition lists for consistent output
-        for assignment in result.values_mut() {
+        for assignment in &mut result {
             for partitions in assignment.topic_partitions.values_mut() {
                 partitions.sort_unstable();
             }
         }
 
-        Ok(result)
+        Ok(input.output(result))
     }
 }
 
@@ -259,10 +258,10 @@ impl Steps {
 /// and the rebalance runs on the single DB thread, where a slow assignment stalls every other
 /// request. Topics subscribed to by the same classes form a topic group, which shares its
 /// lightest subscriber.
+///
+/// A member is its index in the input ([`AssignmentInput::member_id`]), so index order is
+/// id order and ties broken by index are broken by member id, without comparing ids.
 struct Members<'a> {
-    /// Member ids in ascending order. A member is its index here, so index order is id
-    /// order and ties broken by index are broken by member id.
-    ids: Vec<&'a str>,
     /// Partitions held, per member.
     loads: Vec<usize>,
     /// Subscription class, per member.
@@ -279,22 +278,23 @@ struct Members<'a> {
 }
 
 impl<'a> Members<'a> {
-    fn new(input: &'a AssignmentInput, result: &AssignmentOutput) -> Self {
-        let mut ids: Vec<&str> = input.subscriptions.keys().map(String::as_str).collect();
-        ids.sort_unstable();
+    /// Cost: hashing each member's topic list once (about its subscription's bytes), plus
+    /// one ordered-set insertion per member.
+    fn new(input: &'a AssignmentInput, result: &[MemberAssignment]) -> Self {
+        let count = input.member_count();
         let mut class_index: HashMap<Vec<&str>, usize> = HashMap::new();
         let mut topic_classes: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut classes = Vec::new();
-        let mut class_of = Vec::with_capacity(ids.len());
-        let mut loads = Vec::with_capacity(ids.len());
-        for (index, id) in ids.iter().enumerate() {
-            let mut topics: Vec<&str> = input.subscriptions[*id]
+        let mut class_of = Vec::with_capacity(count);
+        let mut loads = Vec::with_capacity(count);
+        for (index, assignment) in result.iter().enumerate() {
+            // Sorted and without repeats (`AssignmentInput::new`).
+            let topics: Vec<&str> = input
+                .subscription(index)
                 .topics
                 .iter()
                 .map(String::as_str)
                 .collect();
-            topics.sort_unstable();
-            topics.dedup();
             let class = match class_index.entry(topics) {
                 Entry::Occupied(entry) => *entry.get(),
                 Entry::Vacant(entry) => {
@@ -306,7 +306,7 @@ impl<'a> Members<'a> {
                     *entry.insert(class)
                 }
             };
-            let load = result[*id].partition_count();
+            let load = assignment.partition_count();
             classes[class].insert((load, index));
             class_of.push(class);
             loads.push(load);
@@ -333,7 +333,6 @@ impl<'a> Members<'a> {
             })
             .collect();
         Members {
-            ids,
             loads,
             class_of,
             classes,
@@ -373,7 +372,7 @@ impl<'a> Members<'a> {
 fn distribute_orphans(
     members: &mut Members<'_>,
     orphaned: Vec<(&String, Vec<i32>)>,
-    result: &mut AssignmentOutput,
+    result: &mut [MemberAssignment],
     steps: &mut Steps,
 ) -> Result<(), StepBudgetExceeded> {
     for (topic, partitions) in orphaned {
@@ -398,9 +397,7 @@ fn distribute_orphans(
             let Some(Reverse((load, member, class))) = lightest.pop() else {
                 break;
             };
-            result
-                .get_mut(members.ids[member])
-                .expect("`members` holds only members of `result`")
+            result[member]
                 .topic_partitions
                 .entry(topic.clone())
                 .or_default()
@@ -631,13 +628,13 @@ fn receiver<'a>(
 /// move.
 fn balance_assignments(
     members: &mut Members<'_>,
-    result: &mut AssignmentOutput,
+    result: &mut [MemberAssignment],
     steps: &mut Steps,
 ) -> Result<(), StepBudgetExceeded> {
-    let count = members.ids.len();
+    let count = members.loads.len();
     let mut held: Vec<Held<'_>> = Vec::with_capacity(count);
-    for id in &members.ids {
-        let topics = &result[*id].topic_partitions;
+    for assignment in result.iter() {
+        let topics = &assignment.topic_partitions;
         steps.spend(topics.len() + 1)?;
         held.push(
             topics
@@ -696,9 +693,7 @@ fn balance_assignments(
         };
 
         steps.spend(MOVE_STEPS)?;
-        let donor = result
-            .get_mut(members.ids[from])
-            .expect("`from` is a member of `result`")
+        let donor = result[from]
             .topic_partitions
             .get_mut(topic)
             .expect("the donor topic was chosen for holding a partition");
@@ -715,9 +710,7 @@ fn balance_assignments(
                 steps,
             )?;
         }
-        result
-            .get_mut(members.ids[to])
-            .expect("`to` is a member of `result`")
+        result[to]
             .topic_partitions
             .entry(topic.to_string())
             .or_default()
@@ -1218,11 +1211,7 @@ mod tests {
             previous: &super::StickyStrategy,
             input: &AssignmentInput,
         ) -> AssignmentOutput {
-            let mut result: AssignmentOutput = input
-                .subscriptions
-                .keys()
-                .map(|id| (id.clone(), super::MemberAssignment::new()))
-                .collect();
+            let mut kept = input.empty_assignments();
             let mut all_partitions = std::collections::HashSet::new();
             for (topic, count) in &input.topic_partitions {
                 for partition in 0..*count {
@@ -1230,9 +1219,10 @@ mod tests {
                 }
             }
             if all_partitions.is_empty() {
-                return result;
+                return input.output(kept);
             }
-            let assigned = previous.keep_previous_assignments(input, &mut result);
+            let assigned = previous.keep_previous_assignments(input, &mut kept);
+            let mut result = input.output(kept);
             let mut orphaned: Vec<(String, i32)> = all_partitions
                 .into_iter()
                 .filter(|(topic, partition)| !assigned.contains(&(topic.as_str(), *partition)))
@@ -1265,12 +1255,12 @@ mod tests {
 
         fn topic_queues(input: &AssignmentInput, loads: &Loads) -> TopicQueues {
             let mut queues = TopicQueues::new();
-            for (member_id, subscription) in &input.subscriptions {
+            for (member_id, subscription) in input.subscriptions() {
                 for topic in &subscription.topics {
                     queues
                         .entry(topic.clone())
                         .or_default()
-                        .insert((loads[member_id], member_id.clone()));
+                        .insert((loads[member_id], member_id.to_string()));
                 }
             }
             queues
@@ -1284,7 +1274,8 @@ mod tests {
             old: usize,
             new: usize,
         ) {
-            for topic in &input.subscriptions[member_id].topics {
+            let member = input.member_index(member_id).expect("a member");
+            for topic in &input.subscription(member).topics {
                 if let Some(queue) = queues.get_mut(topic) {
                     queue.remove(&(old, member_id.to_string()));
                     queue.insert((new, member_id.to_string()));
@@ -1535,7 +1526,7 @@ mod tests {
         for (member, assignment) in result {
             for (topic, parts) in &assignment.topic_partitions {
                 assert!(
-                    input.subscriptions[member].topics.contains(topic),
+                    input.is_subscribed(input.member_index(member).expect("a member"), topic),
                     "{member} holds unsubscribed {topic}"
                 );
                 for &p in parts {
@@ -1704,7 +1695,7 @@ mod tests {
                 let lightest = input
                     .members_for_topic(topic)
                     .iter()
-                    .map(|m| loads[m.as_str()])
+                    .map(|&m| loads[input.member_id(m)])
                     .min()
                     .unwrap_or(0);
                 assert!(
@@ -1827,6 +1818,26 @@ mod tests {
                 .assign_within(&input, crate::kafka::limits::MAX_ASSIGNMENT_STEPS / 2)
                 .expect("within half the budget");
             assert_balanced(&input, &result);
+        }
+    }
+
+    #[test]
+    fn test_nested_prefix_shape_against_the_step_budget() {
+        // 999 members over 999 topics, member i subscribed to the first i + 1 (ids in
+        // subscription order), from a fresh group: 10 partitions per topic fit, 12 are
+        // refused (as limits::MAX_ASSIGNMENT_STEPS documents).
+        let names = topic_names("t", 999);
+        let all: Vec<(String, Vec<String>)> = (0..999)
+            .map(|i| (format!("m{i:05}"), names[..=i].to_vec()))
+            .collect();
+        for (parts, fits) in [(10, true), (12, false)] {
+            let input = input_of(
+                &all,
+                &names.iter().map(|t| (t.clone(), parts)).collect::<Vec<_>>(),
+            );
+            let result = StickyStrategy::new()
+                .assign_within(&input, crate::kafka::limits::MAX_ASSIGNMENT_STEPS);
+            assert_eq!(result.is_ok(), fits, "{parts} partitions per topic");
         }
     }
 }

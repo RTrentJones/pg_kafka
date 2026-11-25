@@ -2189,3 +2189,104 @@ fn test_a_stale_generation_sync_forgets_no_empty_group() {
     .unwrap();
     assert!(c.get_group_state(&e).is_none());
 }
+
+/// A one-member "sticky" group "g" subscribed to topic "t", whose member's stored previous
+/// assignment is `previous`; returns the member id.
+fn sticky_member_with_previous(c: &GroupCoordinator, previous: Vec<u8>) -> String {
+    let member = joined(&join_with(
+        c,
+        &params("g", None, &[("sticky", &subscription(&["t"]))]),
+    ))
+    .member_id;
+    let mut groups = c.groups.write().unwrap();
+    groups
+        .get_mut("g")
+        .unwrap()
+        .previous_assignments
+        .insert(member.clone(), previous);
+    member
+}
+
+/// An encoded MemberAssignment (v0) of `entries` entries named by `name` with an empty
+/// partition list, after one entry of topic "t" holding partition 0.
+fn padded_previous(entries: usize, name: impl Fn(usize) -> Option<String>) -> Vec<u8> {
+    let mut b = vec![0, 0];
+    b.extend_from_slice(&i32::try_from(entries + 1).unwrap().to_be_bytes());
+    b.extend_from_slice(&1_i16.to_be_bytes());
+    b.push(b't');
+    b.extend_from_slice(&1_i32.to_be_bytes());
+    b.extend_from_slice(&0_i32.to_be_bytes());
+    for i in 0..entries {
+        match name(i) {
+            Some(name) => {
+                b.extend_from_slice(&i16::try_from(name.len()).unwrap().to_be_bytes());
+                b.extend_from_slice(name.as_bytes());
+                b.extend_from_slice(&0_i32.to_be_bytes());
+            }
+            None => b.extend_from_slice(&(-1_i16).to_be_bytes()),
+        }
+    }
+    b.extend_from_slice(&(-1_i32).to_be_bytes());
+    b
+}
+
+/// Previous-assignment entries count toward the work limit whatever they hold: an entry
+/// with a null name, a name of no existing topic or no partitions costs a parse and a
+/// lookup, so a leader storing millions of them (2 bytes each, within max_group_memory)
+/// must not make the sticky assignor parse them all.
+#[test]
+fn test_previous_assignment_entries_count_toward_the_work_limit() {
+    let max = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    let topics = HashMap::from([("t".to_string(), 2)]);
+    let c = GroupCoordinator::new();
+    sticky_member_with_previous(&c, padded_previous(max, |_| None));
+    assert_eq!(
+        c.compute_assignments("g", &topics)
+            .unwrap_err()
+            .to_kafka_error_code(),
+        crate::kafka::constants::ERROR_POLICY_VIOLATION
+    );
+
+    // Within the limit it is computed, and the member keeps its previous partition.
+    let c = GroupCoordinator::new();
+    let member = sticky_member_with_previous(&c, padded_previous(1000, |_| None));
+    let computed = c.compute_assignments("g", &topics).unwrap();
+    let assignment = MemberAssignment::parse(&computed[&member]).unwrap();
+    assert_eq!(assignment.partitions("t"), vec![0, 1]);
+}
+
+/// The previous assignment is parsed keeping only entries for existing topics with
+/// partitions: 200,000 entries naming topics that do not exist (about 2 MB stored) take
+/// no memory beyond the kept entry, where parsing them all held a name and a map slot each
+/// (about 15 MB here, 584 MB for the 6,000,000 entries max_group_memory allows).
+#[test]
+fn test_previous_assignment_parse_keeps_only_existing_topics() {
+    let topics = HashMap::from([("t".to_string(), 1)]);
+    let c = GroupCoordinator::new();
+    let member =
+        sticky_member_with_previous(&c, padded_previous(200_000, |i| Some(format!("{i:x}"))));
+    let (computed, peak) = crate::testing::heap_peak(|| c.compute_assignments("g", &topics));
+    let assignment = MemberAssignment::parse(&computed.unwrap()[&member]).unwrap();
+    assert_eq!(assignment.partitions("t"), vec![0]);
+    assert!(peak < 1 << 20, "computing the assignment held {peak} bytes");
+}
+
+/// A refused server-side assignment is remembered for its generation, so the leader's
+/// retries are answered without computing; the next generation computes again.
+#[test]
+fn test_refused_assignment_is_remembered_for_its_generation() {
+    let c = GroupCoordinator::new();
+    let (leader, _, gen) = completing_pair(&c, "g");
+    assert!(!c.assignment_refused("g", gen));
+    c.refuse_assignment("g", gen);
+    assert!(c.assignment_refused("g", gen));
+    assert!(!c.assignment_refused("g", gen + 1), "another generation");
+    assert!(!c.assignment_refused("other", gen), "another group");
+    // A refusal for a generation the group is no longer at is not recorded.
+    c.refuse_assignment("g", gen - 1);
+    assert!(c.assignment_refused("g", gen));
+    assert!(
+        c.awaits_leader_sync("g", &leader, gen),
+        "the group stays in its sync phase"
+    );
+}

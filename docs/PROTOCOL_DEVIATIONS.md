@@ -406,19 +406,32 @@ algorithm; see "Server-side sticky assignment" below)
   group is in its sync phase (a stale generation or a Stable group's SyncGroup ignores its
   assignments, so nothing is computed for it). A member's repeated subscriptions count once.
   An assignment over 2,000,000 entries (subscribed topics per member, repeats included, the
-  sticky assignor's previous partitions and the partitions of the subscribed topics) is
-  refused with POLICY_VIOLATION (44) before it is computed, and the group stays in its sync
-  phase (the rebalance timeout evicts the leader), since it would hold the DB thread that
-  serves every client. Range and RoundRobin take about one step per entry. Sticky
-  distributes in about the entries plus the partitions and moves a partition for balance in
-  a few ordered-set operations plus at most a look at each distinct subscription, so a
-  rebalance of members sharing a few subscriptions also takes about as many steps as
-  entries. How much balancing an input needs depends on how the subscriptions overlap and
-  how far the previous assignment is from balanced, so every step is counted, and a sticky
-  assignment that would take more than 10,000,000 steps (about a second) is refused the same
-  way; 999 members subscribed to 999 different, nested sets of topics, rebalancing from one
-  owner of everything, fit up to about 40 partitions per topic. Kafka assigns on the client
-  and has no such limits.
+  topic entries of the sticky assignor's previous assignments, also those naming no existing
+  topic or listing no partitions, the partitions they list, and the partitions of the
+  subscribed topics) is refused with POLICY_VIOLATION (44) before it is computed, and the
+  group stays in its sync phase (the rebalance timeout evicts the leader), since it would
+  hold the DB thread that serves every client. Of a previous assignment only the entries for
+  existing topics with partitions are kept in memory. The assignors work on member indexes,
+  so a member id (up to 32 KB of client id) costs its length only when the ids are sorted and
+  copied into the result, once per assignment, never per subscribed topic, partition or
+  move. Range and RoundRobin take about one step per entry. Sticky distributes in about the
+  entries plus the partitions and moves a partition for balance in a few ordered-set
+  operations plus at most a look at each distinct subscription, so a rebalance of members
+  sharing a few subscriptions also takes about as many steps as entries. How much balancing
+  an input needs depends on how the subscriptions overlap and how far the previous
+  assignment is from balanced, so every step is counted, and a sticky assignment that would
+  take more than 10,000,000 steps (about a second at most) is refused the same way. Measured
+  with 999 members over 999 topics: member i subscribed to the topics from the i-th on,
+  rebalancing from one owner of everything, fits up to about 430 partitions per topic
+  (beyond the default `pg_kafka.max_total_partitions`; 5,419,770 steps at 200), with
+  ordered or random member ids; member i subscribed to the first i + 1 topics fits up to 10
+  to 24 partitions per topic, depending on the member ids and the previous assignment
+  (up to 11 from a fresh group with member ids in subscription order, refused at 12). The
+  leader's retries of a refused assignment in the same generation are answered
+  POLICY_VIOLATION without computing it again; the refusal holds until the generation moves
+  (a member joins, leaves or is evicted, or the leader rejoins, as a client does when its
+  subscribed topics change), not when partitions are added within the generation. Kafka
+  assigns on the client and has no such limits.
 - ⚠️ **Deviation: server-side sticky assignment.** When the group's protocol is "sticky" and
   the leader sends empty assignments, the server's Sticky assignor keeps each remaining
   member's previous partitions that it still subscribes to, gives the other partitions (by

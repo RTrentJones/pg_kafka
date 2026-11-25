@@ -276,6 +276,12 @@ pub struct ConsumerGroup {
     /// the same one (INCONSISTENT_GROUP_PROTOCOL otherwise) while the group has members.
     pub protocol_type: Option<String>,
 
+    /// The generation whose server-side assignment (the leader's SyncGroup with empty
+    /// assignments) was refused as too large: the leader's retries in that generation are
+    /// answered with the refusal without computing again (see
+    /// `GroupCoordinator::refuse_assignment`).
+    pub(super) refused_assignment: Option<i32>,
+
     /// What the group held in coordinator memory when last counted ([`Self::recount`]): the
     /// coordinator recounts a group after every operation that changes it, and bounds the
     /// sum over all groups by `pg_kafka.max_group_memory`.
@@ -297,6 +303,7 @@ impl ConsumerGroup {
             rebalance_started_at: None,
             sync_started_at: None,
             protocol_type: None,
+            refused_assignment: None,
             held_bytes: 0,
         }
         .recounted()

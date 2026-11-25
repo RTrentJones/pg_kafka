@@ -321,6 +321,38 @@ impl GroupCoordinator {
         })
     }
 
+    /// Remember that the server-side assignment of `group_id` at `generation_id` was refused
+    /// (POLICY_VIOLATION: over `limits::MAX_ASSIGNMENT_WORK` or `MAX_ASSIGNMENT_STEPS`), so
+    /// that [`Self::assignment_refused`] answers the leader's retries in that generation.
+    ///
+    /// A refusal leaves the group in its sync phase with the same leader and generation, and
+    /// the rebalance timeout that ends the phase is the client's (up to `i32::MAX` ms): without
+    /// this, one connection pipelining empty SyncGroups would recompute a refused assignment
+    /// (up to about a second each) for as long as it liked. The refusal holds until the
+    /// generation moves (a member joins, leaves or is evicted, or the leader rejoins, as a
+    /// client does when its subscribed topics change); a change of the topics' partitions
+    /// within the generation does not lift it.
+    pub fn refuse_assignment(&self, group_id: &str, generation_id: i32) {
+        if let Ok(mut groups) = self.groups.write() {
+            if let Some(group) = groups
+                .get_mut(group_id)
+                .filter(|g| g.generation_id == generation_id)
+            {
+                group.refused_assignment = Some(generation_id);
+            }
+        }
+    }
+
+    /// Whether the server-side assignment of `group_id` at `generation_id`, its current
+    /// generation, was refused ([`Self::refuse_assignment`]).
+    pub fn assignment_refused(&self, group_id: &str, generation_id: i32) -> bool {
+        self.groups.read().is_ok_and(|groups| {
+            groups.get(group_id).is_some_and(|g| {
+                g.generation_id == generation_id && g.refused_assignment == Some(generation_id)
+            })
+        })
+    }
+
     /// Handle a JoinGroup request.
     ///
     /// `responder` is called exactly once with the outcome: before this returns when
@@ -1116,24 +1148,20 @@ impl GroupCoordinator {
         let subscriptions = member_subscriptions(group);
         // The group's selected assignor, "range" if none was selected.
         let strategy_name = group.protocol_name.as_deref().unwrap_or("range");
-        let previous = previous_assignments(group, strategy_name);
+        let work = subscriptions
+            .values()
+            .map(|s| s.topics.len())
+            .sum::<usize>()
+            + topic_partitions
+                .values()
+                .filter_map(|&count| crate::kafka::limits::sane_partition_count(count))
+                .map(|count| usize::try_from(count).unwrap_or(0))
+                .sum::<usize>();
         check_assignment_work(
             group_id,
-            subscriptions
-                .values()
-                .map(|s| s.topics.len())
-                .sum::<usize>()
-                + previous
-                    .values()
-                    .flat_map(|a| a.topic_partitions.values())
-                    .map(Vec::len)
-                    .sum::<usize>()
-                + topic_partitions
-                    .values()
-                    .filter_map(|&count| crate::kafka::limits::sane_partition_count(count))
-                    .map(|count| usize::try_from(count).unwrap_or(0))
-                    .sum::<usize>(),
+            work + previous_assignments_work(group, strategy_name),
         )?;
+        let previous = previous_assignments(group, strategy_name, topic_partitions);
         let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
         let assignments = run_assignor(
             group_id,
@@ -1288,10 +1316,16 @@ fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscrip
         .collect()
 }
 
-/// The group's previous assignments, for the sticky assignor (none for the others).
+/// The group's previous assignments, for the sticky assignor (none for the others): those
+/// of its current members (a departed member keeps nothing), each with only the entries the
+/// assignor can keep, for topics in `topic_partitions` ([`MemberAssignment::parse_kept`]).
+///
+/// Cost: time linear in the stored bytes of the current members' previous assignments
+/// (bounded beforehand by [`previous_assignments_work`]); memory: the kept entries only.
 fn previous_assignments(
     group: &ConsumerGroup,
     strategy_name: &str,
+    topic_partitions: &HashMap<String, i32>,
 ) -> HashMap<String, MemberAssignment> {
     if !strategy_name.contains("sticky") {
         return HashMap::new();
@@ -1299,16 +1333,40 @@ fn previous_assignments(
     group
         .previous_assignments
         .iter()
+        .filter(|(member_id, _)| group.members.contains_key(*member_id))
         .filter_map(|(member_id, bytes)| {
-            MemberAssignment::parse(bytes)
+            MemberAssignment::parse_kept(bytes, topic_partitions)
                 .ok()
                 .map(|assignment| (member_id.clone(), assignment))
         })
         .collect()
 }
 
+/// The entries [`previous_assignments`] parses: every topic entry of the current members'
+/// previous assignments (also those naming no existing topic or listing no partitions,
+/// which cost a parse and a lookup each), plus the partitions they list, counted from the
+/// stored lengths ([`MemberAssignment::work_hint`]) and only up to just over
+/// `limits::MAX_ASSIGNMENT_WORK`. Zero for an assignor other than sticky.
+fn previous_assignments_work(group: &ConsumerGroup, strategy_name: &str) -> usize {
+    if !strategy_name.contains("sticky") {
+        return 0;
+    }
+    let limit = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    let mut work = 0_usize;
+    for (member_id, bytes) in &group.previous_assignments {
+        if work > limit {
+            break;
+        }
+        if group.members.contains_key(member_id) {
+            work = work.saturating_add(MemberAssignment::work_hint(bytes, limit - work));
+        }
+    }
+    work
+}
+
 /// Refuse a server-side assignment over [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`]
-/// entries (subscribed topics per member, previous assignments, partitions to assign)
+/// entries (subscribed topics per member, previous assignments' entries and partitions,
+/// partitions to assign)
 /// with POLICY_VIOLATION: it would hold the single DB thread, and every other client
 /// with it, for as long as it ran.
 fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {

@@ -251,4 +251,112 @@ mod integration_tests {
             assert_eq!(out["m2"].partition_count(), 3, "{strategy}");
         }
     }
+
+    /// Members whose ids are a 32 KB client id plus a uuid-length suffix, as
+    /// `{client_id}-{uuid}` ids are when a client sends the longest client id the request
+    /// header allows; all `members` subscribe to `topics` topics named t0, t1, ...
+    fn long_id_members(
+        members: usize,
+        topics: usize,
+        id_len: usize,
+    ) -> HashMap<String, MemberSubscription> {
+        let client = "c".repeat(id_len);
+        let names: Vec<String> = (0..topics).map(|t| format!("t{t}")).collect();
+        (0..members)
+            .map(|m| {
+                (
+                    format!("{client}-{m:036}"),
+                    MemberSubscription::new(names.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Building the input and assigning copy each member id at most a couple of times,
+    /// whatever the members' subscriptions: 32 members of 32 KB ids subscribed to the same
+    /// 64 topics (1 MB of ids) allocate about the ids once more plus a little per entry,
+    /// where copying an id per (member, topic) allocated 64 MB here, and about 32 GB for
+    /// 1,000 such members over 1,000 topics (within the work limit and max_group_memory).
+    #[test]
+    fn test_long_member_ids_are_not_copied_per_subscription() {
+        const MEMBERS: usize = 32;
+        const TOPICS: usize = 64;
+        const ID_LEN: usize = 32 * 1024;
+        let ids_bytes = MEMBERS * ID_LEN;
+        for strategy in ["range", "roundrobin", "sticky"] {
+            let subscriptions = long_id_members(MEMBERS, TOPICS, ID_LEN);
+            let topic_partitions: HashMap<String, i32> =
+                (0..TOPICS).map(|t| (format!("t{t}"), 4)).collect();
+            let (out, allocated) = crate::testing::heap_allocated(|| {
+                let input = AssignmentInput::new(subscriptions, topic_partitions);
+                create_strategy(strategy).unwrap().assign(&input)
+            });
+            assert_eq!(out.len(), MEMBERS);
+            assert_eq!(
+                out.values()
+                    .map(MemberAssignment::partition_count)
+                    .sum::<usize>(),
+                TOPICS * 4
+            );
+            assert!(
+                allocated < ids_bytes + (1 << 20),
+                "{strategy} allocated {allocated} bytes for {ids_bytes} bytes of ids"
+            );
+        }
+    }
+
+    /// Per-partition and per-move work never touches member id bytes: assigning 40,000
+    /// partitions to 50 members (with sticky, rebalancing them all from one owner) takes
+    /// about as long with 32 KB ids as with 40-byte ones, where hashing an id per
+    /// partition and per move took about a hundred times longer.
+    #[test]
+    fn test_long_member_ids_cost_no_time_per_partition() {
+        const MEMBERS: usize = 50;
+        const TOPICS: usize = 10;
+        const PARTITIONS: i32 = 4_000;
+        let topic_partitions: HashMap<String, i32> =
+            (0..TOPICS).map(|t| (format!("t{t}"), PARTITIONS)).collect();
+        let run = |strategy: &str, id_len: usize| {
+            let input = AssignmentInput::new(
+                long_id_members(MEMBERS, TOPICS, id_len),
+                topic_partitions.clone(),
+            );
+            // The member with the lowest id.
+            let owner = format!("{}-{:036}", "c".repeat(id_len), 0);
+            let previous = HashMap::from([(
+                owner,
+                MemberAssignment::with_partitions(
+                    topic_partitions
+                        .iter()
+                        .map(|(t, &n)| (t.clone(), (0..n).collect()))
+                        .collect(),
+                ),
+            )]);
+            (0..3)
+                .map(|_| {
+                    let (out, spent) = crate::testing::cpu_time(|| {
+                        if strategy == "sticky" {
+                            crate::kafka::assignment::strategies::StickyStrategy::with_previous(
+                                previous.clone(),
+                            )
+                            .assign(&input)
+                        } else {
+                            create_strategy(strategy).unwrap().assign(&input)
+                        }
+                    });
+                    assert_eq!(out.len(), MEMBERS);
+                    spent
+                })
+                .min()
+                .unwrap()
+        };
+        for strategy in ["range", "roundrobin", "sticky"] {
+            let short = run(strategy, 0);
+            let long = run(strategy, 32 * 1024);
+            assert!(
+                long < short * 4 + std::time::Duration::from_millis(20),
+                "{strategy}: {long:?} with 32 KB ids, {short:?} with short ones"
+            );
+        }
+    }
 }

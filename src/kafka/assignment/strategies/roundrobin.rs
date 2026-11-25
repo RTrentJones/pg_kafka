@@ -22,10 +22,7 @@
 //! - **Pros**: Better balance than Range when partition counts vary across topics
 //! - **Cons**: Partitions scattered across topics (not co-located)
 
-use std::collections::HashMap;
-
 use super::{AssignmentInput, AssignmentOutput, AssignmentStrategy};
-use crate::kafka::assignment::MemberAssignment;
 
 /// RoundRobin partition assignment strategy
 #[derive(Debug, Clone, Default)]
@@ -43,34 +40,25 @@ impl AssignmentStrategy for RoundRobinStrategy {
         "roundrobin"
     }
 
+    /// Cost: one step per (topic, subscriber) plus a binary search over the topic's
+    /// subscribers per partition, and a lookup of the topic name (at most 249 bytes) in the
+    /// receiving member's assignment per partition; members are indexes, so no member id is
+    /// hashed or copied besides once into the output.
     fn assign(&self, input: &AssignmentInput) -> AssignmentOutput {
-        let mut result: AssignmentOutput = HashMap::new();
-
-        // Initialize empty assignments for all members
-        for member_id in input.subscriptions.keys() {
-            result.insert(member_id.clone(), MemberAssignment::new());
-        }
-
-        // Get sorted member IDs; a member is its index here.
-        let mut member_ids: Vec<&str> = input.subscriptions.keys().map(String::as_str).collect();
-        member_ids.sort_unstable();
-        let member_count = member_ids.len();
+        let mut assignments = input.empty_assignments();
+        let member_count = input.member_count();
         if member_count == 0 {
-            return result;
+            return input.output(assignments);
         }
 
-        // Per topic with at least one subscriber, the indexes of its subscribers in
-        // ascending order (the index lists ids in ascending order too).
-        let mut topics: Vec<(&str, i32, Vec<usize>)> = input
+        // Per topic with at least one subscriber, its subscribers' indexes in ascending
+        // order (index order is member id order).
+        let mut topics: Vec<(&str, i32, &[usize])> = input
             .topic_partitions
             .iter()
             .filter(|(_, count)| **count > 0)
             .filter_map(|(topic, &count)| {
-                let subscribers: Vec<usize> = input
-                    .members_for_topic(topic)
-                    .iter()
-                    .filter_map(|m| member_ids.binary_search(&m.as_str()).ok())
-                    .collect();
+                let subscribers = input.members_for_topic(topic);
                 (!subscribers.is_empty()).then_some((topic.as_str(), count, subscribers))
             })
             .collect();
@@ -90,9 +78,7 @@ impl AssignmentStrategy for RoundRobinStrategy {
                 let next = subscribers.partition_point(|&m| m < at);
                 let member = subscribers.get(next).copied().unwrap_or(subscribers[0]);
                 position = member + 1;
-                let assignment = result
-                    .get_mut(member_ids[member])
-                    .expect("every member is initialised in `result`");
+                let assignment = &mut assignments[member];
                 match assignment.topic_partitions.get_mut(topic) {
                     Some(partitions) => partitions.push(partition),
                     None => {
@@ -104,14 +90,15 @@ impl AssignmentStrategy for RoundRobinStrategy {
             }
         }
 
-        result
+        input.output(assignments)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::assignment::MemberSubscription;
+    use crate::kafka::assignment::{MemberAssignment, MemberSubscription};
+    use std::collections::HashMap;
 
     fn make_input(members: Vec<(&str, Vec<&str>)>, topics: Vec<(&str, i32)>) -> AssignmentInput {
         let subscriptions: HashMap<String, MemberSubscription> = members
@@ -323,12 +310,11 @@ mod tests {
     /// a subscriber of the partition's topic.
     fn walk_reference(input: &AssignmentInput) -> AssignmentOutput {
         let mut result: AssignmentOutput = input
-            .subscriptions
-            .keys()
-            .map(|m| (m.clone(), MemberAssignment::new()))
+            .subscriptions()
+            .map(|(m, _)| (m.to_string(), MemberAssignment::new()))
             .collect();
-        let mut members: Vec<&String> = input.subscriptions.keys().collect();
-        members.sort();
+        let mut members: Vec<(&str, &MemberSubscription)> = input.subscriptions().collect();
+        members.sort_by_key(|&(m, _)| m);
         let mut partitions: Vec<(String, i32)> = input
             .topic_partitions
             .iter()
@@ -339,9 +325,9 @@ mod tests {
         let mut position = 0;
         for (topic, partition) in partitions {
             loop {
-                let candidate = members[position % members.len()];
+                let (candidate, subscription) = members[position % members.len()];
                 position += 1;
-                if input.subscriptions[candidate].topics.contains(&topic) {
+                if subscription.topics.contains(&topic) {
                     result
                         .get_mut(candidate)
                         .unwrap()

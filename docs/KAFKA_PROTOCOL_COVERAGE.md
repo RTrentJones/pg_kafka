@@ -433,7 +433,10 @@ Consumer Flow (Current):
 ```
 
 **Implemented Features (Phase 4-5):**
-- ✅ **Automatic Partition Assignment**: Range, RoundRobin, Sticky (KIP-54) strategies
+- ✅ **Automatic Partition Assignment**: Range, RoundRobin, Sticky (KIP-54) strategies; the
+  server-side Sticky assignor can choose differently from Kafka's StickyAssignor
+  ([PROTOCOL_DEVIATIONS.md §5](PROTOCOL_DEVIATIONS.md#5-consumer-groups--fully-implemented),
+  "Deviation: server-side sticky assignment")
 - ✅ **Automatic Rebalancing**: Trigger on member join/leave
 - ✅ **Member Timeout Detection**: Background scanner removes dead members
 - ✅ **REBALANCE_IN_PROGRESS**: Error code 27 forces client rejoin
@@ -500,7 +503,7 @@ Consumer Flow (Current):
 | Member tracking | Yes | Yes | ✅ In-memory |
 | Generation IDs | Yes | Yes | ✅ Implemented |
 | Heartbeats | Yes | Yes | ✅ Implemented |
-| Assignment strategies | Range, RR, Sticky | Range, RR, Sticky | ✅ Phase 4 |
+| Assignment strategies | Range, RR, Sticky | Range, RR, Sticky | ✅ Phase 4; ⚠️ server-side Sticky deviates ([PROTOCOL_DEVIATIONS.md §5](PROTOCOL_DEVIATIONS.md#5-consumer-groups--fully-implemented)) |
 | Auto-rebalance | Yes | Yes | ✅ Phase 5 |
 | Timeout detection | Yes | Yes | ✅ Phase 5 |
 | Group visibility | DescribeGroups, ListGroups | DescribeGroups, ListGroups | ✅ Phase 5 |
