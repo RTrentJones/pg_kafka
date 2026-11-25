@@ -6,8 +6,9 @@
 -- with scripts/check-upgrade.sh.
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
--- leaf, not copied) under an ACCESS EXCLUSIVE lock and reads the table three times
--- (see step 1); run it in a quiet period on a large table.
+-- leaf, not copied) under an ACCESS EXCLUSIVE lock and reads the table five times
+-- (see step 1; once more, and rewrites it, for an install whose created_at is a naive
+-- TIMESTAMP); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
