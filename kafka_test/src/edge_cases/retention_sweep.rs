@@ -125,10 +125,22 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
     }
     println!("  ✅ 3 messages produced\n");
 
-    // 2. Default sweep (GUC message_retention_hours = 0) must delete nothing.
-    println!("Step 2: Sweep with retention disabled (default) keeps everything...");
+    // 2. A sweep without a window argument reads pg_kafka.message_retention_hours,
+    //    whose default (0) disables message retention: it must delete nothing.
+    println!("Step 2: Sweep with the GUC's window (default 0, disabled) keeps everything...");
+    let guc: String = client
+        .query_one("SHOW pg_kafka.message_retention_hours", &[])
+        .await?
+        .get(0);
+    assert_eq!(
+        guc, "0",
+        "pg_kafka.message_retention_hours must be at its default"
+    );
     client
-        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+        .query(
+            "SELECT * FROM pg_kafka_run_retention_sweep(aborted_grace_seconds => 3600)",
+            &[],
+        )
         .await?;
     let count: i64 = client
         .query_one(
@@ -165,6 +177,25 @@ pub async fn test_retention_sweep_expires_old_messages() -> TestResult {
         )
         .await?;
     println!("  ✅ Rows aged\n");
+
+    // 3b. Without a window argument the sweep reads the GUC (0): the aged rows stay.
+    println!("Step 3b: Sweep with the GUC's window (0) keeps the aged rows...");
+    client
+        .query(
+            "SELECT * FROM pg_kafka_run_retention_sweep(aborted_grace_seconds => 3600)",
+            &[],
+        )
+        .await?;
+    let count: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages m
+             JOIN kafka.topics t ON m.topic_id = t.id WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(count, 4, "The GUC's window (0) keeps aged rows too");
+    println!("  ✅ All 4 rows survive\n");
 
     // 4. Sweep with 1-hour retention: the 2 aged committed rows go, the fresh row
     //    and the aged pending row stay.
