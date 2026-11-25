@@ -27,8 +27,9 @@ use tokio::net::TcpStream;
 /// The shipped default of `pg_kafka.fetch_poll_interval_ms` (the long-poll safety net).
 const DEFAULT_SAFETY_NET_MS: u64 = 1000;
 
-/// When the wake-up test produces, after the fetch started: 0.2 s past a safety-net re-run.
-const PRODUCE_AT: Duration = Duration::from_millis(2_200);
+/// When the wake-up test produces, after the fetch was sent: half-way to its first
+/// safety-net re-run, which is at least `DEFAULT_SAFETY_NET_MS` after the fetch was sent.
+const PRODUCE_AT: Duration = Duration::from_millis(500);
 /// How soon after the produce's ack a woken fetch must answer.
 const PROMPT: Duration = Duration::from_millis(300);
 /// Wake-up attempts before an inconclusive test fails.
@@ -165,11 +166,14 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
 
 /// A produce must wake a waiting long poll at once, not at the next safety-net tick.
 ///
-/// The fetch waits at the log end (max_wait_ms = 10 s); the produce is sent 2.2 s later,
-/// i.e. 0.2 s after a safety-net tick (ticks at ~1 s, ~2 s, ~3 s). The response must come
-/// within 300 ms of the produce's ack (both follow the same commit, so a slow fsync delays
-/// them alike); the safety net alone would deliver at the ~3 s tick. An ack landing within
-/// 300 ms of that tick cannot be told apart from it, and the attempt is repeated.
+/// The fetch waits at the log end (max_wait_ms = 10 s); the produce is sent 0.5 s later.
+/// The fetch's first safety-net re-run is at least 1 s after it was sent (the re-run
+/// interval starts once its first attempt has run, and restarts after every attempt), so a
+/// response that arrives within 1 s of sending the fetch was woken by the produce; one that
+/// arrives later cannot be told from the safety net (a slow runner, or no wake-up), and the
+/// attempt is repeated (3 attempts: a produce that wakes nothing fails them all). The
+/// response must come within 300 ms of the produce's ack (both follow the same commit, so a
+/// slow fsync delays them alike).
 pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
     // Metadata for the test topic too.
     use rdkafka::producer::Producer;
@@ -196,15 +200,12 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
 
     // The fetch is woken by the produce's commit, so its response is measured from the
     // produce's ack (sent after that same commit), which leaves the produce's own commit
-    // and fsync time out. The safety net re-runs the fetch about every
-    // DEFAULT_SAFETY_NET_MS from its start; an ack that lands so close to the next
-    // re-run that the two cannot be told apart makes the attempt inconclusive, and the
-    // test tries again.
-    let next_safety_net = Duration::from_millis(3 * DEFAULT_SAFETY_NET_MS);
+    // and fsync time out. A response later than the fetch's first possible safety-net
+    // re-run cannot be told from it: the attempt is inconclusive, and the test tries again.
+    let first_safety_net = Duration::from_millis(DEFAULT_SAFETY_NET_MS);
     for attempt in 1..=ATTEMPTS {
         let hwm = high_watermark(&ctx, &topic).await?;
         println!("Step 1 (attempt {attempt}/{ATTEMPTS}): long poll at offset {hwm} (max_wait_ms=10000)...");
-        let started = Instant::now();
         let fetch = spawn_long_poll(topic.clone(), hwm, 10_000, 0);
 
         tokio::time::sleep(PRODUCE_AT).await;
@@ -237,8 +238,11 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
             received >= produce_started,
             "the fetch must have waited for the produce"
         );
-        if acked.duration_since(started) + PROMPT >= next_safety_net {
-            println!("   the ack landed too close to the next safety-net re-run; retrying");
+        if elapsed >= first_safety_net {
+            println!(
+                "   answered {elapsed:?} after the fetch was sent, not before its first possible \
+                 safety-net re-run; retrying"
+            );
             continue;
         }
         assert!(
@@ -250,7 +254,9 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
         return Ok(());
     }
     Err(format!(
-        "every attempt's ack landed within {PROMPT:?} of a safety-net re-run; the wake-up could not be measured"
+        "no attempt's fetch was answered within {first_safety_net:?} of being sent, before its \
+         first possible safety-net re-run: the produce woke no waiting fetch (or every \
+         attempt was stalled that long)"
     )
     .into())
 }

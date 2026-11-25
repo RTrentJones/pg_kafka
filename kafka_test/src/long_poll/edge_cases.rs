@@ -240,9 +240,11 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
 /// (`pg_kafka.fetch_poll_interval_ms`, 1 s). Measured at the wire level, as
 /// `error_paths::listener_tests::test_listener_produce_wakes_long_poll_promptly` measures
 /// one waiter: the three Fetches (max_wait_ms 10 000) are sent together and the record is
-/// produced 2.2 s later, 0.2 s after their second re-check; an ack that lands within
-/// 300 ms of the third re-check cannot be told apart from it, and the attempt is repeated
-/// (3 attempts).
+/// produced 0.5 s later. A Fetch's first safety-net re-check is at least 1 s after it was
+/// sent (the interval starts once its first attempt has run and restarts after every
+/// attempt), so Fetches all answered within 1 s of being sent were woken by the Produce;
+/// an attempt with any later answer cannot be told from the safety net (a slow runner, or
+/// no wake-up) and is repeated (3 attempts: a Produce that wakes nothing fails them all).
 ///
 /// Asserts: each of the three Fetches is answered with the produced record within 300 ms
 /// of the Produce's ack.
@@ -253,7 +255,6 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
     let mut producer = Wire::connect().await?;
     for attempt in 1..=WAKE_ATTEMPTS {
         let offset = i64::try_from(attempt - 1)?;
-        let started = Instant::now();
         let waiters: Vec<_> = (0..WAITERS)
             .map(|_| park_fetch(topic.clone(), offset))
             .collect();
@@ -269,15 +270,18 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
         let acked = Instant::now();
         assert_eq!((code, stored), (0, offset));
         let mut after_ack = Vec::new();
+        let mut waited = Vec::new();
         for waiter in waiters {
-            let (received, offsets) = waiter.await??;
+            let (sent, received, offsets) = waiter.await??;
             assert_eq!(offsets, vec![offset], "each waiter gets the record");
             after_ack.push(received.saturating_duration_since(acked));
+            waited.push(received.duration_since(sent));
         }
-        println!("  attempt {attempt}: answered {after_ack:?} after the ack");
-        // Their third re-check is at least 3 s after `started`.
-        if acked.duration_since(started) + PROMPT >= 3 * SAFETY_NET {
-            println!("  the ack landed too close to the next safety-net re-check; retrying");
+        println!(
+            "  attempt {attempt}: answered {after_ack:?} after the ack, {waited:?} after sending"
+        );
+        if waited.iter().any(|&w| w >= SAFETY_NET) {
+            println!("  a Fetch was answered no earlier than its first possible safety-net re-check; retrying");
             continue;
         }
         assert!(
@@ -289,8 +293,9 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
         return Ok(());
     }
     Err(format!(
-        "every attempt's ack landed within {PROMPT:?} of a safety-net re-check; the wake-up \
-         could not be measured"
+        "in no attempt were all Fetches answered within {SAFETY_NET:?} of being sent, before \
+         their first possible safety-net re-check: the Produce did not wake every waiting \
+         Fetch (or every attempt was stalled that long)"
     )
     .into())
 }
@@ -299,23 +304,24 @@ pub async fn test_long_poll_multiple_consumers_same_partition() -> TestResult {
 const WAITERS: usize = 3;
 /// Its attempts before an inconclusive test fails.
 const WAKE_ATTEMPTS: usize = 3;
-/// When it produces after sending the Fetches: 0.2 s past their second safety-net re-check.
-const PRODUCE_AT: Duration = Duration::from_millis(2_200);
+/// When it produces after sending the Fetches: half-way to their first safety-net re-check.
+const PRODUCE_AT: Duration = Duration::from_millis(500);
 /// The long poll's safety-net interval (`pg_kafka.fetch_poll_interval_ms`, default).
 const SAFETY_NET: Duration = Duration::from_millis(1_000);
 /// How soon after the Produce's ack a woken Fetch must be answered.
 const PROMPT: Duration = Duration::from_millis(300);
 
+/// When a parked Fetch was sent, when its answer arrived and the offsets it holds.
+type Parked = (Instant, Instant, Vec<i64>);
+
 /// A Fetch (v4, max_wait_ms 10 000, min_bytes 1) of partition 0 of `topic` from `offset` on
-/// a connection of its own: when its answer arrived and the offsets it holds.
-fn park_fetch(
-    topic: String,
-    offset: i64,
-) -> tokio::task::JoinHandle<Result<(Instant, Vec<i64>), String>> {
+/// a connection of its own.
+fn park_fetch(topic: String, offset: i64) -> tokio::task::JoinHandle<Result<Parked, String>> {
     tokio::spawn(async move {
         let mut s = TcpStream::connect(get_bootstrap_servers())
             .await
             .map_err(|e| format!("connect: {e}"))?;
+        let sent = Instant::now();
         let resp = roundtrip(&mut s, 4, 1, &fetch_request(&topic, 0, offset, 10_000))
             .await
             .map_err(|e| format!("fetch: {e}"))?;
@@ -326,7 +332,7 @@ fn park_fetch(
             .into_iter()
             .map(|(o, _)| o)
             .collect();
-        Ok((received, offsets))
+        Ok((sent, received, offsets))
     })
 }
 
