@@ -292,9 +292,19 @@ pg_kafka.compression_type = 'gzip'
   fenced (PRODUCER_FENCED, INVALID_PRODUCER_EPOCH before v4) and changes nothing. A presented id without an epoch, or the
   reverse, is INVALID_REQUEST (42). An InitProducerId presenting none (-1/-1) fences
   the previous producer, after which its retry is fenced too. An idempotent producer
-  always gets a new producer id. **Deviation:** a retry of a re-init that moved the
+  always gets a new producer id. While the transactional id has a transaction Ongoing, an
+  InitProducerId that would bump it (the current epoch presented, the epoch before the last
+  bump, or none) aborts that transaction under the next epoch and is answered
+  CONCURRENT_TRANSACTIONS (51), as in Kafka 3.7; the client retries, and a retry presenting
+  the same epoch is then fenced while one presenting none gets the epoch after the fenced one.
+  (The Java client and librdkafka end a transaction with EndTxn before they bump its epoch,
+  and retry CONCURRENT_TRANSACTIONS.) **Deviation:** a retry of a re-init that moved the
   producer to a new id (epoch 32767 exhausted) is PRODUCER_FENCED; Kafka also
-  remembers the previous producer id.
+  remembers the previous producer id. **Deviation:** an InitProducerId presenting the
+  current producer id with any other epoch (older than the one before the last bump, or
+  newer than the current one) while a transaction is Ongoing is PRODUCER_FENCED and leaves
+  that transaction open; Kafka 3.7 checks only the producer id there and aborts the
+  owner's transaction (CONCURRENT_TRANSACTIONS) on behalf of such a zombie.
 - ✅ The transaction timeout (`transaction.timeout.ms`) runs from the start of each
   transaction, as Kafka's does; the timeout sweep aborts an expired one and fences its
   producer with the next epoch (a new producer id when the epoch is exhausted)

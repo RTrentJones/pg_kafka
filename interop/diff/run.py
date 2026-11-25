@@ -704,7 +704,8 @@ def sc_txn_parity(t, obs):
 def sc_txn_group_delete(t, obs):
     """DeleteGroups of a group with a pending TxnOffsetCommit, without (a) and with (b) a
     committed offset: the group exists (Empty), is deleted, and the commit stores nothing for
-    it."""
+    it. Then InitProducerId while a transaction is Ongoing: CONCURRENT_TRANSACTIONS, and a
+    retry presenting the same epoch is fenced."""
     topic, txn, group = f"diff-tgd-{RUN}", f"diff-tgd-{RUN}", f"diff-tgdg-{RUN}"
     create_topics(t, [topic_spec(topic, 2)])
     for variant in ("a", "b"):
@@ -735,6 +736,23 @@ def sc_txn_group_delete(t, obs):
                 break
             time.sleep(0.25)
         obs(f"{variant}.offset_fetch_after", normalise(t, of))
+    b, pid, ep = init_pid(t, f"{txn}-ongoing")
+    tid = f"{txn}-ongoing"
+    t.req(24, 3, {"v3AndBelowTransactionalId": tid, "v3AndBelowProducerId": pid,
+                  "v3AndBelowProducerEpoch": ep,
+                  "v3AndBelowTopics": [{"name": topic, "partitions": [0]}]})
+    produce(t, topic, ["o"], txn=tid, producerId=pid, producerEpoch=ep, baseSequence=0,
+            transactional=True)
+    init = {"transactionalId": tid, "transactionTimeoutMs": 60000, "producerId": pid,
+            "producerEpoch": ep}
+    obs("init_ongoing", errname(body(t.req(22, 4, init, retry=False)).get("errorCode")))
+    # Kafka aborts the transaction asynchronously; its retry is fenced once that is done.
+    for _ in range(40):
+        r = body(t.req(22, 4, init, retry=False))
+        if r.get("errorCode") != 51:
+            break
+        time.sleep(0.25)
+    obs("init_ongoing_retry", errname(r.get("errorCode")))
 
 
 def sc_groups_parity(t, obs):
