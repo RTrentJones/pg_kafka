@@ -342,7 +342,10 @@ the startup role check verifies them with `has_function_privilege`.
 (renaming its primary key / unique index / constraints to the per-leaf names), creates the
 partitioned parent (same `global_offset` sequence, now owned by the parent) with the DEFAULT leaf,
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied into
-a new table. Under ACCESS EXCLUSIVE it rewrites the old table once (filling `record_bytes`, the
+a new table. The bound is `GREATEST(now(), MAX(created_at)) + 1 µs`: a 0.0.0 row dated after the
+upgrade extends the legacy leaf to that time, maintenance creates no leaf before it (it fills only
+gaps), every Produce until then lands in the legacy leaf, and leaf-granular retention of what it
+holds waits until that bound is past (docs/UPGRADING.md says how to check for such rows first). Under ACCESS EXCLUSIVE it rewrites the old table once (filling `record_bytes`, the
 size a fetch sums, for every row: a full read with each row's headers detoasted, a full write and
 the rebuild of its three indexes, the two unique ones and the 0.0.0 pending-row index adopted at
 ATTACH as a leaf of `idx_messages_txn_pending`, each a full read of the new copy) and reads it six more times (MAX(created_at) for the bound,

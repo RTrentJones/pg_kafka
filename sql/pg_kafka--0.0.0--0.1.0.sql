@@ -59,11 +59,13 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 --
 -- The populated 0.0.0 table is not copied into a new one: it is renamed to
 -- kafka.messages_legacy and attached to the new partitioned kafka.messages as one leaf covering
--- [MINVALUE, the upgrade time). It keeps its primary key and unique index (renamed to
+-- [MINVALUE, the upgrade time), or up to just past its latest created_at if a row is dated
+-- later than that (see the ATTACH below). It keeps its primary key and unique index (renamed to
 -- the per-leaf names), its rows, offsets and global_offset sequence. The retention
 -- sweep treats it like any other past leaf: it is dropped whole once every row in it
 -- is expired under its topic's retention (row deletes until then only for topics with
--- a window shorter than one partition width). New rows go to the new time leaves.
+-- a window shorter than one partition width). New rows go to the new time leaves from the
+-- leaf's upper bound on.
 --
 -- Cost: ACCESS EXCLUSIVE on the old table for the whole script; one rewrite of it (the
 -- record_bytes fill: a full read and write, then the rebuild of its three indexes, the two
@@ -736,7 +738,14 @@ DECLARE
     v_upper TIMESTAMPTZ;
 BEGIN
     -- Every existing row sorts below the bound, including any written with a future
-    -- created_at; rows written after this transaction go to the new time leaves.
+    -- created_at. Rows written after this transaction go to the new time leaves only from
+    -- the bound on: with a 0.0.0 row dated after the upgrade (a clock set ahead, an
+    -- out-of-band INSERT) the bound is that row's time, partition maintenance creates no
+    -- leaf before it (it fills only gaps), so every Produce until then lands in this leaf,
+    -- and the leaf (all of it) is dropped, or a topic's rows trimmed, only once that bound
+    -- is past and its rows' windows have run from it. The bound is not clamped to now():
+    -- the later rows would have to be moved out of the leaf under this lock, and an
+    -- operator can correct their created_at before upgrading (docs/UPGRADING.md).
     SELECT GREATEST(now(), MAX(created_at)) + INTERVAL '1 microsecond'
     INTO v_upper FROM kafka.messages_legacy;
     -- The bound as ISO 8601 text in UTC with a numeric offset: the session's DateStyle

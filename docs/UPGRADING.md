@@ -91,7 +91,7 @@ EXTENSION pg_kafka` has run, without a restart.
 
 - converts `kafka.messages` to a table partitioned by `created_at` (ADR-001): the
   populated 0.0.0 table becomes the leaf `kafka.messages_legacy` covering
-  `[MINVALUE, upgrade time)` without copying rows (it keeps its primary key and unique
+  `[MINVALUE, upgrade time)` (see below for a row dated later) without copying rows (it keeps its primary key and unique
   index as the per-leaf unique indexes and its `global_offset` sequence, now owned by
   the new parent), a DEFAULT leaf `kafka.messages_default` is added, the views
   `kafka.shadow_status` and `kafka.metrics` are recreated on the new parent, and the
@@ -103,6 +103,15 @@ EXTENSION pg_kafka` has run, without a restart.
   pending-row index, each a full read of the new copy, so it needs free disk for a second
   copy of the table) and reads it six more times (bound, attach check, BRIN, aborted-row,
   pending-producer and timestamp index builds): ten full reads in all;
+  A 0.0.0 row whose `created_at` is later than the upgrade time (a clock set ahead, an
+  out-of-band INSERT) extends the legacy leaf to just past that time: partition maintenance
+  creates no leaf for the span before it, so every Produce until then is written to
+  `kafka.messages_legacy`, and that leaf, with everything written to it, is dropped (or a
+  topic's rows in it trimmed) only once its upper bound is past and the topics' windows have
+  run from it; until then only windows shorter than one partition width expire its rows
+  (row by row). Check `SELECT max(created_at) FROM kafka.messages` before the upgrade and
+  correct such rows (on 0.0.0 the table is not partitioned, so an UPDATE of `created_at` is
+  safe there);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
