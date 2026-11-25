@@ -329,8 +329,8 @@ the startup role check verifies them with `has_function_privilege`.
 (renaming its primary key / unique index / constraints to the per-leaf names), creates the
 partitioned parent (same `global_offset` sequence, now owned by the parent) with the DEFAULT leaf,
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied. It
-reads the old table four times (MAX(created_at) for the bound, the attach's bound check, the BRIN
-and `idx_messages_txn_aborted` builds) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
+reads the old table five times (MAX(created_at) for the bound, the attach's bound check, the BRIN,
+`idx_messages_txn_aborted` and `idx_messages_txn_pending_producer` builds) under ACCESS EXCLUSIVE. The legacy leaf is then retained and dropped like any past leaf.
 The views that read the table are recreated on the parent. A new binary
 running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
 skips partition maintenance; its retention sweep expires rows row by row on the

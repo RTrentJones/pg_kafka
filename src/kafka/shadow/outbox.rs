@@ -796,9 +796,10 @@ impl ShadowDb for SpiShadowDb {
     ) -> Result<HashMap<(i32, i32), u64>> {
         use super::routing::{make_forward_decision, ForwardDecision};
         use pgrx::prelude::*;
-        // Both statements lead with the topic on idx_messages_txn_pending (the
-        // pending rows only), then keep the producer's: no other topic's rows and no
-        // committed row are read. No ORDER BY: the outbox claim orders the rows.
+        // Both statements read the producer's pending rows through
+        // idx_messages_txn_pending_producer, then keep the listed topics': no other
+        // producer's rows and no committed row are read. No ORDER BY: the outbox claim
+        // orders the rows.
         if !forward_all.is_empty() {
             Spi::connect_mut(|client| {
                 client.update(
