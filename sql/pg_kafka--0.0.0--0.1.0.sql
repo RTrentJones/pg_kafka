@@ -36,6 +36,17 @@ SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
                                   (SELECT last_value FROM kafka.producer_ids_producer_id_seq),
                                   (SELECT COALESCE(MAX(producer_id), 0) FROM kafka.producer_ids)));
 
+-- Producer ids by idleness, for the retention sweep's prune (see bootstrap.sql).
+CREATE INDEX idx_producer_ids_last_active
+ON kafka.producer_ids(last_active_at, producer_id);
+
+-- Rows by topic, for the foreign keys on kafka.topics, whose ON DELETE CASCADE
+-- (DeleteTopics) would otherwise read each table whole once per deleted topic (see
+-- bootstrap.sql). kafka.txn_partitions gets its index where it is created.
+CREATE INDEX idx_consumer_offsets_topic ON kafka.consumer_offsets(topic_id);
+CREATE INDEX idx_producer_sequences_topic ON kafka.producer_sequences(topic_id);
+CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id);
+
 -- 1. Time-partition kafka.messages (ADR-001).
 --
 -- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy
@@ -1078,12 +1089,28 @@ CREATE TABLE kafka.txn_partitions (
     PRIMARY KEY (transactional_id, topic_id, partition_id)
 );
 
+-- Rows by topic, for the foreign key on kafka.topics (see bootstrap.sql).
+CREATE INDEX idx_txn_partitions_topic ON kafka.txn_partitions(topic_id);
+
 -- Ongoing transactions by producer id: every non-transactional idempotent batch asks
 -- whether its producer has an open transaction (open_txn_epoch_on_partition), and a plain
 -- idempotent producer has none, so the lookup must not scan every open transaction.
 CREATE INDEX idx_transactions_ongoing_producer
 ON kafka.transactions(producer_id)
 WHERE state = 'Ongoing';
+
+-- Every transaction row by producer id, for the foreign key on producer_ids: the
+-- retention sweep deletes idle producer ids, and each delete checks that no transaction
+-- row references the id. Without an index on the referencing column that check reads
+-- the whole table once per deleted id.
+CREATE INDEX idx_transactions_producer
+ON kafka.transactions(producer_id);
+
+-- Terminal transactions oldest first: the retention sweep deletes the ones idle past
+-- the transactional-id expiration through it, reading only those.
+CREATE INDEX idx_transactions_terminal
+ON kafka.transactions(last_updated_at)
+WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
 
 -- Pending offsets by group: OffsetFetch with require_stable (KIP-447, the Java consumer
 -- under read_committed) asks for the group's pending partitions, and the primary key leads

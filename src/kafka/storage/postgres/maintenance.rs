@@ -119,12 +119,20 @@ impl BatchFilter {
 }
 
 /// One unit of row-level expiry: delete `topic_id`'s rows older than `window_ms` in
-/// the leaf `leaf_oid`.
+/// the leaf `leaf_oid`, whose [`retention::leaf_key`] is `leaf_key`.
 #[derive(Debug, Clone, Copy)]
 struct ExpiryWork {
     topic_id: i32,
     window_ms: i64,
     leaf_oid: u32,
+    leaf_key: i64,
+}
+
+impl ExpiryWork {
+    /// The item's identity for [`retention::EXPIRY_ROTATION`].
+    fn key(&self) -> (i32, i64) {
+        (self.topic_id, self.leaf_key)
+    }
 }
 
 /// What one sweep pass does with the messages: whole-leaf drops and row deletes.
@@ -133,7 +141,7 @@ struct ExpiryPlan {
     /// Leaves to drop, with the topics found wholly expired in each (the drop function
     /// re-checks them under its lock).
     drops: Vec<(u32, Vec<i32>)>,
-    /// Row deletes, in the order they run.
+    /// Row deletes, sorted by [`ExpiryWork::key`] (one item per key).
     work: Vec<ExpiryWork>,
 }
 
@@ -141,8 +149,7 @@ struct ExpiryPlan {
 struct TopicWindows {
     /// `None`: kept forever.
     by_topic: HashMap<i32, Option<i64>>,
-    /// The topics with a window, rotated so a pass that runs out of budget does not
-    /// starve the topics after the one it stopped at.
+    /// The topics with a window.
     finite: Vec<(i32, i64)>,
 }
 
@@ -209,10 +216,13 @@ impl PostgresStore {
     /// with the stored data when there is little to do. Every step is index-driven
     /// (the aborted rows through the partial index idx_messages_txn_aborted, the
     /// delivered and orphaned outbox rows through idx_shadow_tracking_delivered and the
-    /// primary key), runs bounded statements ([`RETENTION_DELETE_BATCH`] rows, one
-    /// leaf), and stops between statements once the pass has spent
-    /// [`retention::RETENTION_PASS_BUDGET`] (after at least one statement per step, so no step
-    /// starves). The full contents probe of a leaf runs only where some topic can be
+    /// primary key, the producer and transaction prunes through indexes on
+    /// last_active_at, last_updated_at and transactions.producer_id), runs bounded
+    /// statements ([`RETENTION_DELETE_BATCH`] rows, one leaf), and stops between
+    /// statements once the pass has spent [`retention::RETENTION_PASS_BUDGET`] (after at
+    /// least one statement per step, so no step starves; the steps before row expiry
+    /// get at most a third of it each, so their backlogs cannot crowd expiry out), each
+    /// step resuming at the next pass where this one left it. The full contents probe of a leaf runs only where some topic can be
     /// wholly expired, at most [`MAX_CONTENTS_PROBES_PER_PASS`] per pass; the other
     /// past leaves get one emptiness check (a single statement for all of them).
     ///
@@ -266,6 +276,7 @@ impl PostgresStore {
             let now_ms = database_now_ms(client)?;
             let partitioned = has_time_partitions(client)?;
             let leaves = list_leaves(client, partitioned)?;
+            let default_has_rows = default_leaf_has_rows(client, partitioned)?;
             let mut stats = RetentionSweepStats {
                 aborted_messages: delete_aborted_rows(
                     client,
@@ -277,7 +288,17 @@ impl PostgresStore {
                 )?,
                 ..Default::default()
             };
-            let plan = plan_expiry(client, &leaves, &windows, now_ms, width_ms, pass_start)?;
+            let plan = plan_expiry(
+                client,
+                &leaves,
+                &windows,
+                ExpiryClock {
+                    now_ms,
+                    width_ms,
+                    pass_start,
+                },
+                default_has_rows,
+            )?;
 
             let mut affected = AffectedPartitions::default();
             stats.expired_messages = delete_expired_rows(
@@ -293,8 +314,8 @@ impl PostgresStore {
             stats.dropped_partitions = drop_leaves(client, plan.drops, &mut affected, pass_start)?;
             advance_log_start(client, affected)?;
 
-            stats.terminal_transactions = delete_terminal_transactions(client)?;
-            stats.stale_producers = delete_stale_producers(client)?;
+            stats.terminal_transactions = delete_terminal_transactions(client, pass_start)?;
+            stats.stale_producers = delete_stale_producers(client, pass_start)?;
             // After advance_log_start, so the outbox rows of the messages this pass
             // removed go in the same pass.
             stats.shadow_orphaned_rows = delete_orphaned_shadow_rows(client, pass_start)?;
@@ -457,7 +478,6 @@ fn load_topic_windows(
             finite.push((id, window_ms));
         }
     }
-    let finite = retention::rotated(&finite, retention::next_start_index(finite.len()));
     Ok(TopicWindows { by_topic, finite })
 }
 
@@ -488,6 +508,25 @@ fn has_time_partitions(client: &SpiClient<'_>) -> Result<bool> {
         .first()
         .get_by_name("p")?
         .unwrap_or(false))
+}
+
+/// Whether the DEFAULT leaf holds any row (one probe; an unpartitioned table counts as
+/// non-empty). Row expiry has a work item in the DEFAULT leaf for every topic with a
+/// window, so when it is empty (the usual case: partition maintenance moves its rows
+/// out) those items are left out instead of each costing a statement.
+fn default_leaf_has_rows(client: &SpiClient<'_>, partitioned: bool) -> Result<bool> {
+    if !partitioned {
+        return Ok(true);
+    }
+    Ok(client
+        .select(
+            "SELECT EXISTS (SELECT 1 FROM kafka.messages_default) AS e",
+            None,
+            &[],
+        )?
+        .first()
+        .get_by_name("e")?
+        .unwrap_or(true))
 }
 
 /// The leaves, oldest first (DEFAULT and the upgrade's MINVALUE leaf first).
@@ -539,9 +578,11 @@ fn delete_target(leaf: &Leaf, partitioned: bool) -> DeleteTarget<'_> {
 /// start after the cutoff cannot hold any), in [`RETENTION_DELETE_BATCH`] batches
 /// within the pass budget. Each batch is confined to one leaf and found through that
 /// leaf's partial index idx_messages_txn_aborted, so the cost follows the aborted rows,
-/// not the leaf's size: a leaf without any costs one probe of an empty index. A pass
-/// whose budget runs out leaves the rest for the next ones, which start at the first
-/// leaf it did not finish ([`retention::ABORTED_ROTATION`]): starting from the oldest
+/// not the leaf's size: a leaf without any costs one probe of an empty index. The
+/// step stops at its share of the pass ([`retention::share_may_continue`]): aborted
+/// rows are client-driven, and the row expiry after it must keep part of every pass.
+/// A pass that stops early leaves the rest for the next ones, which start after the
+/// last leaf it worked on ([`retention::ABORTED_ROTATION`]): starting from the oldest
 /// every time, passes on many retained leaves (or with the budget spent by earlier
 /// steps) would never reach the newest. Aborted rows are invisible to every reader, so
 /// their removal moves no log start.
@@ -557,21 +598,33 @@ fn delete_aborted_rows(
         .unwrap_or(i64::MAX)
         .min(MAX_RETENTION_WINDOW_MS);
     let filter = BatchFilter::Aborted { grace_ms };
-    let eligible: Vec<&Leaf> = leaves
+    let step_start = Instant::now();
+    let mut eligible: Vec<&Leaf> = leaves
         .iter()
         .filter(|l| retention::may_hold_expired(&l.partition, now_ms, grace_ms))
         .collect();
-    let start = retention::ABORTED_ROTATION.start(eligible.len());
+    eligible.sort_by_key(|l| retention::leaf_key(&l.partition));
+    let keys: Vec<i64> = eligible
+        .iter()
+        .map(|l| retention::leaf_key(&l.partition))
+        .collect();
+    let start = retention::ABORTED_ROTATION.start(&keys);
     let mut statements = 0usize;
-    let mut finished = 0usize;
+    let mut last_served = None;
     let mut deleted = 0u64;
     'leaves: for leaf in retention::rotated(&eligible, start) {
         loop {
-            if !retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
+            if !retention::share_may_continue(
+                statements,
+                step_start.elapsed(),
+                pass_start.elapsed(),
+                pass_budget(),
+            ) {
                 break 'leaves;
             }
             let n = delete_batch(client, filter, delete_target(leaf, partitioned), None)?;
             statements += 1;
+            last_served = Some(retention::leaf_key(&leaf.partition));
             deleted += n;
             // A short batch: this leaf is caught up.
             if !retention::should_run_another_batch(
@@ -583,9 +636,8 @@ fn delete_aborted_rows(
                 break;
             }
         }
-        finished += 1;
     }
-    retention::ABORTED_ROTATION.record(start, finished);
+    retention::ABORTED_ROTATION.record(last_served);
     crate::pg_debug!("Deleted {deleted} aborted messages");
     Ok(deleted)
 }
@@ -636,17 +688,25 @@ fn empty_leaves(client: &SpiClient<'_>, candidates: &[&Leaf]) -> Result<Vec<u32>
 /// Only a leaf where some topic can be wholly expired
 /// ([`retention::needs_contents_probe`]) gets the full contents probe (one btree
 /// descent per (topic, partition) it holds), at most [`MAX_CONTENTS_PROBES_PER_PASS`]
-/// per pass and within the pass budget, rotating over the candidates. Every other past
+/// per pass and within the step's share of the pass budget, rotating over the
+/// candidates ([`retention::PROBE_ROTATION`]). Once the pass has planned
+/// [`retention::MAX_PARTITION_DROPS_PER_PASS`] drops the probes stop at the first leaf
+/// that would be one more, and the next pass resumes at that leaf. Every other past
 /// leaf can only be dropped if it is empty: one statement checks them all. With no
-/// finite window anywhere (the default), no leaf is probed.
+/// finite window anywhere (the default), no leaf is probed. The DEFAULT leaf gets no
+/// row-expiry items when it is empty (`default_has_rows`).
 fn plan_expiry(
     client: &SpiClient<'_>,
     leaves: &[Leaf],
     windows: &TopicWindows,
-    now_ms: i64,
-    width_ms: i64,
-    pass_start: Instant,
+    clock: ExpiryClock,
+    default_has_rows: bool,
 ) -> Result<ExpiryPlan> {
+    let ExpiryClock {
+        now_ms,
+        width_ms,
+        pass_start,
+    } = clock;
     let partitions: Vec<TimePartition> = leaves.iter().map(|l| l.partition.clone()).collect();
     let mut plan = ExpiryPlan::default();
     let shortest = windows.finite.iter().map(|&(_, w)| w).min();
@@ -665,15 +725,24 @@ fn plan_expiry(
             plan.drops.push((oid, Vec::new()));
         }
     }
-    let probe_start = retention::PROBE_ROTATION.start(probe.len());
-    let mut probes = 0usize;
-    for leaf in retention::rotated(&probe, probe_start) {
+    let keys: Vec<i64> = probe.iter().map(|l| retention::leaf_key(l)).collect();
+    let probe_start = retention::PROBE_ROTATION.start(&keys);
+    let step_start = Instant::now();
+    let mut last_probed = None;
+    for (probes, leaf) in retention::rotated(&probe, probe_start)
+        .into_iter()
+        .enumerate()
+    {
         if probes >= MAX_CONTENTS_PROBES_PER_PASS
-            || !retention::step_may_continue(probes, pass_start.elapsed(), pass_budget())
+            || !retention::share_may_continue(
+                probes,
+                step_start.elapsed(),
+                pass_start.elapsed(),
+                pass_budget(),
+            )
         {
             break;
         }
-        probes += 1;
         let row = client.select(
             "SELECT topic_ids, has_pending
              FROM kafka.message_partition_contents($1::bigint::oid::regclass)",
@@ -689,9 +758,11 @@ fn plan_expiry(
             windows.window(t)
         }) {
             LeafAction::Drop { expired_topics } => {
-                if plan.drops.len() < retention::MAX_PARTITION_DROPS_PER_PASS {
-                    plan.drops.push((leaf.oid, expired_topics));
+                if plan.drops.len() >= retention::MAX_PARTITION_DROPS_PER_PASS {
+                    // No room for the drop this pass: the next pass resumes at this leaf.
+                    break;
                 }
+                plan.drops.push((leaf.oid, expired_topics));
             }
             LeafAction::Trim { topics } => {
                 plan.work.extend(topics.into_iter().filter_map(|topic_id| {
@@ -699,16 +770,20 @@ fn plan_expiry(
                         topic_id,
                         window_ms,
                         leaf_oid: leaf.oid,
+                        leaf_key: retention::leaf_key(leaf),
                     })
                 }));
             }
             LeafAction::Keep => {}
         }
+        last_probed = Some(retention::leaf_key(leaf));
     }
-    retention::PROBE_ROTATION.record(probe_start, probes);
+    retention::PROBE_ROTATION.record(last_probed);
     for &(topic_id, window_ms) in &windows.finite {
         for leaf in &partitions {
-            if plan.drops.iter().any(|(oid, _)| *oid == leaf.oid) {
+            if plan.drops.iter().any(|(oid, _)| *oid == leaf.oid)
+                || (leaf.is_default && !default_has_rows)
+            {
                 continue;
             }
             let in_scope = leaf.is_default || retention::row_level_expiry(window_ms, width_ms);
@@ -717,16 +792,35 @@ fn plan_expiry(
                     topic_id,
                     window_ms,
                     leaf_oid: leaf.oid,
+                    leaf_key: retention::leaf_key(leaf),
                 });
             }
         }
     }
+    // One stable key space for the trims and the row-level items, so the expiry's
+    // cursor means the same item from pass to pass; a trim and a row-level item of the
+    // same (topic, leaf) are the same delete.
+    plan.work.sort_by_key(ExpiryWork::key);
+    plan.work.dedup_by_key(|w| w.key());
     Ok(plan)
 }
 
+/// The clocks [`plan_expiry`] decides by: the database time and the partition width
+/// (epoch ms, ms) and when the pass started.
+#[derive(Clone, Copy)]
+struct ExpiryClock {
+    now_ms: i64,
+    width_ms: i64,
+    pass_start: Instant,
+}
+
 /// Run the row deletes in [`RETENTION_DELETE_BATCH`] batches per work item, until
-/// caught up (a short batch) or the pass has spent [`retention::RETENTION_PASS_BUDGET`]. Returns
-/// the number of rows deleted and records the partitions they came from.
+/// caught up (a short batch) or the pass has spent [`retention::RETENTION_PASS_BUDGET`]
+/// (after at least one statement). Each pass starts after the last item the previous
+/// one worked on ([`retention::EXPIRY_ROTATION`], keyed by (topic, leaf)), so a pass
+/// with little budget left still moves on through the items, and an item with a large
+/// backlog takes a turn per rotation instead of every pass. Returns the number of rows
+/// deleted and records the partitions they came from.
 ///
 /// Each statement is confined to one leaf: through the parent with the leaf's bounds
 /// (so the planner prunes to it) and its tableoid (ctid is only unique within one
@@ -749,7 +843,10 @@ fn delete_expired_rows(
         .map(|l| l.partition.oid);
     let mut expired = 0u64;
     let mut statements = 0usize;
-    'work: for item in work {
+    let keys: Vec<(i32, i64)> = work.iter().map(ExpiryWork::key).collect();
+    let start = retention::EXPIRY_ROTATION.start(&keys);
+    let mut last_served = None;
+    'work: for item in retention::rotated(work, start) {
         loop {
             if !retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
                 break 'work;
@@ -767,6 +864,7 @@ fn delete_expired_rows(
             };
             let deleted = delete_batch(client, filter, target, Some(affected))?;
             statements += 1;
+            last_served = Some(item.key());
             expired += deleted;
             if !retention::should_run_another_batch(
                 deleted,
@@ -778,6 +876,7 @@ fn delete_expired_rows(
             }
         }
     }
+    retention::EXPIRY_ROTATION.record(last_served);
     Ok(expired)
 }
 
@@ -969,26 +1068,70 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
 /// producer that resumes a terminal transactional id within the window keeps its row;
 /// one that resumes after the prune re-creates it with InitProducerId, matching Kafka's
 /// transactional.id expiration.
-fn delete_terminal_transactions(client: &mut SpiClient<'_>) -> Result<u64> {
-    let table = client.update(
-        "DELETE FROM kafka.transactions
-         WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
-           AND last_updated_at < NOW() - ($1 || ' seconds')::interval
-         RETURNING 1",
-        None,
-        &[whole_seconds(TERMINAL_TXN_RETENTION).into()],
-    )?;
-    Ok(row_count(table.len()))
+///
+/// Index-driven and bounded: the partial index idx_transactions_terminal
+/// (last_updated_at) WHERE the state is terminal holds exactly the rows this deletes,
+/// oldest first, so a pass with none due costs one descent; batches of
+/// [`RETENTION_DELETE_BATCH`] rows within the pass budget (the transactional ids are
+/// client-chosen, so their number is too).
+fn delete_terminal_transactions(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
+    let mut deleted = 0u64;
+    let mut statements = 0usize;
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
+        let table = client.update(
+            "DELETE FROM kafka.transactions
+             WHERE ctid = ANY (ARRAY(
+                 SELECT t.ctid FROM kafka.transactions t
+                 WHERE t.state IN ('CompleteCommit', 'CompleteAbort', 'Empty')
+                   AND t.last_updated_at < NOW() - ($1 || ' seconds')::interval
+                 LIMIT $2))
+             RETURNING 1",
+            None,
+            &[
+                whole_seconds(TERMINAL_TXN_RETENTION).into(),
+                RETENTION_DELETE_BATCH.into(),
+            ],
+        )?;
+        statements += 1;
+        let n = row_count(table.len());
+        deleted += n;
+        if !retention::should_run_another_batch(
+            n,
+            RETENTION_DELETE_BATCH,
+            Duration::ZERO,
+            pass_budget(),
+        ) {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
-/// Producers idle past [`PRODUCER_ID_RETENTION`] and not referenced by any remaining
-/// transaction row. Their sequences go with them (no foreign key between the two
-/// tables, so one statement keeps it atomic).
-fn delete_stale_producers(client: &mut SpiClient<'_>) -> Result<u64> {
-    let table = client.update(
-        "WITH doomed AS (
-             DELETE FROM kafka.producer_ids p
+/// The stale-producer prune's statement: examine the next [`RETENTION_DELETE_BATCH`]
+/// producer ids idle past the window in (last_active_at, producer_id) order through
+/// idx_producer_ids_last_active, after the cursor (`$3`, `$4`: last_active_at in epoch
+/// microseconds and the id) when there is one, and delete those not referenced by a
+/// transaction row and without recent sequence activity, with their sequences. Returns
+/// the rows deleted, the candidates examined and the key of the last one.
+fn producer_prune_sql(with_cursor: bool) -> String {
+    let after = if with_cursor {
+        "AND (p.last_active_at, p.producer_id)
+             > (TIMESTAMP 'epoch' + $3::bigint * INTERVAL '1 microsecond', $4::bigint)"
+    } else {
+        ""
+    };
+    format!(
+        "WITH candidates AS (
+             SELECT p.producer_id, p.last_active_at FROM kafka.producer_ids p
              WHERE p.last_active_at < NOW() - ($1 || ' seconds')::interval
+               {after}
+             ORDER BY p.last_active_at, p.producer_id
+             LIMIT $2
+         ),
+         doomed AS (
+             DELETE FROM kafka.producer_ids p
+             USING candidates c
+             WHERE p.producer_id = c.producer_id
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
@@ -1007,12 +1150,76 @@ fn delete_stale_producers(client: &mut SpiClient<'_>) -> Result<u64> {
              USING doomed d
              WHERE s.producer_id = d.producer_id
          )
-         SELECT COUNT(*)::BIGINT AS n FROM doomed",
-        None,
-        &[whole_seconds(PRODUCER_ID_RETENTION).into()],
-    )?;
-    let deleted = table.first().get_by_name::<i64, _>("n")?.unwrap_or(0);
-    Ok(u64::try_from(deleted).unwrap_or(0))
+         SELECT (SELECT count(*) FROM doomed)::bigint AS deleted,
+                (SELECT count(*) FROM candidates)::bigint AS examined,
+                last.at_us, last.producer_id
+         FROM (SELECT 1) AS one
+         LEFT JOIN LATERAL (
+             SELECT (EXTRACT(EPOCH FROM c.last_active_at) * 1000000)::bigint AS at_us,
+                    c.producer_id
+             FROM candidates c
+             ORDER BY c.last_active_at DESC, c.producer_id DESC
+             LIMIT 1) AS last ON true"
+    )
+}
+
+/// Producers idle past [`PRODUCER_ID_RETENTION`] and not referenced by any remaining
+/// transaction row. Their sequences go with them (no foreign key between the two
+/// tables, so one statement keeps it atomic).
+///
+/// Index-driven and bounded: producer ids are client-driven (every InitProducerId
+/// without a transactional id makes one), so each statement examines at most
+/// [`RETENTION_DELETE_BATCH`] candidates through idx_producer_ids_last_active (a pass
+/// with none idle costs one descent), the foreign key of kafka.transactions on each
+/// deleted id is checked through idx_transactions_producer, and the step runs within
+/// the pass budget. Candidates it keeps (still referenced, or active through their
+/// sequences) stay idle by last_active_at, so the step resumes after the last one it
+/// examined ([`retention::PRODUCER_PRUNE_CURSOR`]) and starts from the oldest again
+/// once it reaches the end.
+fn delete_stale_producers(client: &mut SpiClient<'_>, pass_start: Instant) -> Result<u64> {
+    let mut deleted = 0u64;
+    let mut statements = 0usize;
+    while retention::step_may_continue(statements, pass_start.elapsed(), pass_budget()) {
+        let cursor = retention::PRODUCER_PRUNE_CURSOR.get();
+        let window = whole_seconds(PRODUCER_ID_RETENTION);
+        let table = match cursor {
+            None => client.update(
+                &producer_prune_sql(false),
+                None,
+                &[window.into(), RETENTION_DELETE_BATCH.into()],
+            )?,
+            Some((at_us, producer_id)) => client.update(
+                &producer_prune_sql(true),
+                None,
+                &[
+                    window.into(),
+                    RETENTION_DELETE_BATCH.into(),
+                    at_us.into(),
+                    producer_id.into(),
+                ],
+            )?,
+        };
+        statements += 1;
+        let row = table.first();
+        let n: i64 = row.get_by_name("deleted")?.unwrap_or(0);
+        let examined: i64 = row.get_by_name("examined")?.unwrap_or(0);
+        let last = match (
+            row.get_by_name::<i64, _>("at_us")?,
+            row.get_by_name::<i64, _>("producer_id")?,
+        ) {
+            (Some(at_us), Some(producer_id)) => Some((at_us, producer_id)),
+            _ => None,
+        };
+        deleted += u64::try_from(n).unwrap_or(0);
+        let examined = u64::try_from(examined).unwrap_or(0);
+        let next = retention::next_prune_cursor(examined, RETENTION_DELETE_BATCH, last);
+        retention::PRODUCER_PRUNE_CURSOR.set(next);
+        // A short batch reached the end of the candidates.
+        if next.is_none() {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Shadow-outbox rows forwarded (external_offset set) more than

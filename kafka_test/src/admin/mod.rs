@@ -8,6 +8,7 @@
 
 pub(crate) mod configs;
 mod create_validation;
+mod delete_cost;
 
 use crate::common::create_admin_client;
 use crate::common::{create_db_client, DynResult, TestResult};
@@ -690,5 +691,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_create_topic_invalid_partitions,
         create_validation::test_partition_count_above_cap_is_rejected,
         create_validation::test_create_topics_rejects_duplicates_collisions_and_bad_replication,
+        // Sequential: it seeds 2,000,000 rows and times one request on the DB thread.
+        delete_cost::test_delete_topics_cascade_is_indexed: sequential,
     ]
 }

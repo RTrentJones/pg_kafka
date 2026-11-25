@@ -636,6 +636,10 @@ CREATE TABLE kafka.consumer_offsets (
 
 CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
 CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_consumer_offsets_topic ON kafka.consumer_offsets(topic_id);
 
 GRANT SELECT ON kafka.topics TO pgkafka_reader;
 GRANT SELECT ON kafka.messages TO pgkafka_reader;
@@ -708,6 +712,12 @@ CREATE TABLE kafka.producer_ids (
 CREATE INDEX idx_producer_ids_txn_id
 ON kafka.producer_ids(transactional_id) WHERE transactional_id IS NOT NULL;
 
+-- Producer ids by idleness: the retention sweep prunes the ones idle past the
+-- expiration window through it, resuming at (last_active_at, producer_id) from pass to
+-- pass, so a pass with none idle costs one descent.
+CREATE INDEX idx_producer_ids_last_active
+ON kafka.producer_ids(last_active_at, producer_id);
+
 -- Producer sequences table: Tracks sequence numbers for idempotent deduplication
 CREATE TABLE kafka.producer_sequences (
     producer_id BIGINT NOT NULL,
@@ -719,6 +729,11 @@ CREATE TABLE kafka.producer_sequences (
     PRIMARY KEY (producer_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_producer_sequences_topic ON kafka.producer_sequences(topic_id);
 
 GRANT SELECT ON kafka.producer_ids TO pgkafka_reader;
 GRANT SELECT ON kafka.producer_sequences TO pgkafka_reader;
@@ -805,6 +820,19 @@ CREATE INDEX idx_transactions_ongoing_producer
 ON kafka.transactions(producer_id)
 WHERE state = 'Ongoing';
 
+-- Every transaction row by producer id, for the foreign key on producer_ids: the
+-- retention sweep deletes idle producer ids, and each delete checks that no transaction
+-- row references the id. Without an index on the referencing column that check reads
+-- the whole table once per deleted id.
+CREATE INDEX idx_transactions_producer
+ON kafka.transactions(producer_id);
+
+-- Terminal transactions oldest first: the retention sweep deletes the ones idle past
+-- the transactional-id expiration through it, reading only those.
+CREATE INDEX idx_transactions_terminal
+ON kafka.transactions(last_updated_at)
+WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
+
 -- Pending transactional offsets table: Stores offset commits within an active transaction
 -- These offsets are moved to consumer_offsets on commit, deleted on abort
 CREATE TABLE kafka.txn_pending_offsets (
@@ -824,6 +852,11 @@ CREATE TABLE kafka.txn_pending_offsets (
 -- with the transactional id, so without this every group's pending rows would be scanned.
 CREATE INDEX idx_txn_pending_offsets_group
 ON kafka.txn_pending_offsets(group_id, topic_id, partition_id);
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id);
 
 -- Unique index for transactional_id lookup (fencing - one producer per transactional_id)
 CREATE UNIQUE INDEX idx_producer_ids_txn_id_unique
@@ -860,6 +893,11 @@ CREATE TABLE kafka.txn_partitions (
     partition_id INT NOT NULL CHECK (partition_id >= 0),
     PRIMARY KEY (transactional_id, topic_id, partition_id)
 );
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_txn_partitions_topic ON kafka.txn_partitions(topic_id);
 
 GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
 GRANT SELECT, INSERT, DELETE ON kafka.txn_partitions TO pgkafka_worker;

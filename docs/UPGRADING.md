@@ -67,9 +67,12 @@ the worker's current transaction and the worker's next transactions wait (up to
 `pg_kafka.worker_lock_timeout_ms`, default 5 s, then their requests get a retriable
 error) until the upgrade commits. The script's wait is usually short, a request batch
 (up to 50 ms of handlers plus its commit), but the worker's maintenance runs in
-transactions too and can hold the lock for seconds: a retention sweep spends up to
-1.5 s on row deletes and then up to 2 s waiting for the locks of each leaf it drops,
-and partition maintenance moves rows out of the DEFAULT leaf in one transaction. The
+transactions too and can hold the lock for seconds: a retention sweep stops its steps
+once the pass has used its 1.5 s budget, each step after at least one bounded statement
+(10,000 rows or one leaf), and of its leaf drops, each of which can wait up to 2 s for
+its lock, it stops after the first that times out, so a pass holds the lock for about
+1.5 s plus one statement per step plus one 2 s drop wait at worst; partition
+maintenance moves rows out of the DEFAULT leaf in one transaction. The
 upgrade itself holds the lock for as long as it runs (see step 1 of 0.0.0 -> 0.1.0), so
 on a large `kafka.messages` requests fail retriably for most of it.
 
@@ -119,7 +122,15 @@ EXTENSION pg_kafka` has run, without a restart.
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
   differs). Converting `kafka.messages.created_at` rewrites the table, one more full
   read and write under the same lock. Layouts older than these are not supported;
-- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
+- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
+- adds indexes on the referencing columns of foreign keys whose parent rows are deleted
+  or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,
+  `idx_txn_pending_offsets_topic` and `idx_txn_partitions_topic` (`topic_id`, for the
+  cascade of DeleteTopics) and `idx_transactions_producer` (`kafka.transactions.producer_id`,
+  for the retention sweep's producer prune and the RV-13 producer-id reallocation);
+- adds `idx_producer_ids_last_active` (`last_active_at`, `producer_id`) and
+  `idx_transactions_terminal` (partial, `last_updated_at` of terminal transactions) for
+  the retention sweep's producer and transaction prunes.
 
 After the upgrade:
 

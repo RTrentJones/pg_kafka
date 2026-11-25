@@ -87,15 +87,19 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
 
 0. Aborted transactional rows past the grace (60 s) are deleted first, leaf by leaf, through
    the partial index `idx_messages_txn_aborted` (created_at) WHERE txn_state = 'aborted' (every
-   leaf has it: it is a partitioned index), in 10,000-row batches. Each leaf costs at least one
-   probe of that index, so a pass that runs out of budget part way leaves the rest to the next
-   passes, which start at the first leaf it did not finish (not at the oldest again).
+   leaf has it: it is a partitioned index), in 10,000-row batches, for at most a third of the
+   pass budget (aborted rows are client-driven, and the row expiry after this step must keep a
+   share of every pass). Each leaf costs at least one probe of that index, so a pass that stops
+   part way leaves the rest to the next passes, which start after the last leaf it worked on
+   (not at the oldest again).
 1. For every past leaf (upper bound <= now) where some topic can be wholly expired (upper bound
    + the shortest finite window <= now) it asks `kafka.message_partition_contents(leaf)` for
    the (topic, partition) pairs present (a loose index scan, one descent per pair) and whether a
-   pending transactional row is there, at most 64 leaves per pass (rotating over the
-   candidates: each pass starts at the first candidate the previous pass's probes did not
-   reach, so passes cut short by the cap or the budget still cover every leaf), then `retention::classify_leaf` decides:
+   pending transactional row is there, at most 64 leaves per pass and at most a third of the pass
+   budget (rotating over the candidates: each pass starts after the last candidate the previous
+   pass probed, so passes cut short by the cap or the budget still cover every leaf; once the pass
+   has 64 drops planned the probes stop at the leaf that would be one more, and the next pass
+   starts there), then `retention::classify_leaf` decides:
    **Drop** when every topic present is wholly expired (`upper + window <= now`) and nothing is
    pending; **Trim** when some topics are wholly expired but the leaf must stay (a longer or
    infinite window, or a pending row): those topics' rows in that leaf get the existing bounded
@@ -103,10 +107,14 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
    which one statement checks for all of them (a LIMIT 1 probe per leaf, pruned to it at run
    time); empty past leaves are dropped. With no finite window anywhere (the default), no leaf
    is probed.
-2. Row-level expiry for short windows (and for the DEFAULT leaf), per (topic, leaf), with the
-   same 10,000-row batches and 1.5 s pass budget as before. Each statement is confined to one
-   leaf (the leaf's bounds make the planner prune to it, and `tableoid` keeps `ctid`
-   unambiguous; the DEFAULT leaf is addressed directly).
+2. Row-level expiry for short windows (and for the DEFAULT leaf, unless it is empty), per
+   (topic, leaf), in 10,000-row batches within the 1.5 s pass budget. Each statement is
+   confined to one leaf (the leaf's bounds make the planner prune to it, and `tableoid` keeps
+   `ctid` unambiguous; the DEFAULT leaf is addressed directly). The work items (the Trims of
+   step 1 and the row-level items) are sorted by (topic, leaf upper bound), and each pass starts
+   after the last item the previous pass worked on, wrapping: a pass with little budget left
+   still moves on through the items, and an item with a large backlog takes one turn per
+   rotation (plus whatever budget the others leave) instead of every pass.
 3. Drops last (at most 64 per pass), through `kafka.drop_message_partition(leaf, expired_topics)`,
    which re-checks under `ACCESS EXCLUSIVE` on `kafka.messages` that the leaf holds only listed
    topics and no pending row, so a concurrent writer cannot lose a row. The drops are a bounded
@@ -122,10 +130,14 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
    `created_at` order, so a dropped leaf is an offset prefix of each partition it held; the only
    transient exception is a topic whose older rows sit in a non-droppable leaf awaiting the Trim
    delete of the same pass, and those rows are expired too.
-5. Then the auxiliary tables: terminal transactions and stale producers, shadow-outbox rows
-   below their partition's log start (their message is gone: one primary-key range per
-   partition, so the rows of the messages this pass removed go in the same pass, and
-   DeleteRecords' at the next), and outbox rows delivered more than a day ago (walked per
+5. Then the auxiliary tables: terminal transactions (through a partial index on
+   `last_updated_at` of the terminal rows) and stale producers (through an index on
+   `(last_active_at, producer_id)`, resuming after the last candidate the previous pass
+   examined, since the ones it keeps stay idle by that column; each deleted id's foreign-key
+   check reads `kafka.transactions` through an index on `producer_id`), in 10,000-row batches
+   within the pass budget; shadow-outbox rows below their partition's log start (their message
+   is gone: one primary-key range per partition, so the rows of the messages this pass removed
+   go in the same pass, and DeleteRecords' at the next), and outbox rows delivered more than a day ago (walked per
    partition in offset order through `idx_shadow_tracking_delivered`, one index step per due
    row; a partition with none due costs one descent).
 
@@ -133,10 +145,18 @@ high watermark (caught by `test_fetch_bounds_from_single_statement`).
 settings, and nothing else is served while it runs. So every step is index-driven, runs
 bounded statements (10,000 rows, one leaf), and stops between statements once the pass has
 used `RETENTION_PASS_BUDGET` (1.5 s), after at least one statement per step so no step
-starves behind another's backlog: a pass costs at most the budget plus one statement per
-step, and with nothing to do it reads a few index pages. (Before, the aborted-row DELETE read
-every block of every leaf, outside the budget: a 20 ms Metadata probe saw a 200-300 ms stall
-every minute with 3,000,000 stored rows; PERFORMANCE.md "The sweep's cost" has the numbers.)
+starves behind another's backlog. The two steps before row expiry (the aborted-row cleanup
+and the contents probes) stop at a third of the budget each, so a client-driven backlog there
+leaves row expiry at least a third of every pass, not only its one statement. Each step
+resumes where the last pass left it, by the identity of its items (a leaf's upper bound, a
+(topic, leaf) pair, a producer's `(last_active_at, producer_id)`), not their position, so
+leaves dropped or created between passes do not shift it. A pass costs at most the budget plus
+one statement per step, one of them a leaf drop that can wait 2 s for its lock (the drops stop
+after the first that times out), and with nothing to do it reads a few index pages. (Before,
+the aborted-row DELETE read every block of every leaf, outside the budget: a 20 ms Metadata
+probe saw a 200-300 ms stall every minute with 3,000,000 stored rows; and every stale
+producer id deleted read all of `kafka.transactions` for its foreign key, 18.6 s for 40,000
+ids. PERFORMANCE.md "The sweep's cost" has the numbers.)
 
 A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
 timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.
