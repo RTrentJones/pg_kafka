@@ -11,7 +11,9 @@ use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{
     ListOffsetsPartitionData, ListOffsetsTopicData, PartitionFetchData, TopicFetchData,
 };
-use crate::kafka::storage::{FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds};
+use crate::kafka::storage::{
+    record_fetch_bytes, FetchedMessage, IsolationLevel, KafkaStore, PartitionBounds,
+};
 use bytes::BufMut;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::fetch_response::{
@@ -49,34 +51,16 @@ pub fn handle_fetch(
 /// The bytes one record adds to a Fetch response, the size both byte limits
 /// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
 /// value and header keys and values, 84 bytes per record and 10 per header for its framing
-/// (what a record alone in its RecordBatch adds at most, see [`RECORD_OVERHEAD`]).
-/// Matches the storage layer's own accounting (`record_bytes_sql!` in
-/// `storage/postgres/log.rs`), so storage and this handler cut a partition at the same
-/// record.
+/// (what a record alone in its RecordBatch adds at most, see [`crate::kafka::storage::RECORD_OVERHEAD`]).
+/// [`record_fetch_bytes`] is also what Produce stores with each row for the storage layer's
+/// own accounting, so storage and this handler cut a partition at the same record.
 pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
-    let len = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
-    let headers = msg.headers.iter().fold(0i64, |sum, (k, v)| {
-        sum.saturating_add(len(k.len()))
-            .saturating_add(len(v.len()))
-            .saturating_add(HEADER_OVERHEAD)
-    });
-    len(msg.key.as_ref().map_or(0, Vec::len))
-        .saturating_add(len(msg.value.as_ref().map_or(0, Vec::len)))
-        .saturating_add(RECORD_OVERHEAD)
-        .saturating_add(headers)
+    record_fetch_bytes(
+        msg.key.as_ref().map_or(0, Vec::len),
+        msg.value.as_ref().map_or(0, Vec::len),
+        msg.headers.iter().map(|(k, v)| (k.len(), v.len())),
+    )
 }
-
-/// The framing bytes [`message_size_estimate`] counts per record and per header, upper
-/// bounds of what an uncompressed RecordBatch v2 spends on them. A record alone in its batch
-/// (each run of one producer's consecutive offsets is a batch: read_committed skipping
-/// aborted offsets, or alternating producers, leave records alone) carries the whole 61-byte
-/// batch header ([`BATCH_HEADER_LEN`]) and at most 23 bytes of its own: its length, key and
-/// value length and header count varints (at most 5 bytes each), attributes, and timestamp
-/// and offset deltas of 0 (1 byte each). A record sharing its batch takes at most 31 bytes of
-/// its own (both deltas up to 5) and at most half the header. A header's key and value
-/// lengths are two varints of at most 5 bytes.
-const RECORD_OVERHEAD: i64 = 61 + 23;
-const HEADER_OVERHEAD: i64 = 10;
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
 /// records for it. `remaining` is what is left of the request-level `max_bytes`;

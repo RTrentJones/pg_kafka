@@ -43,9 +43,10 @@ const REQUIRED_TABLES: [&str; 11] = [
 /// 0.0.0 schema has none of them: every idempotent Produce reads kafka.producer_batches,
 /// transactions use kafka.txn_partitions and kafka.txn_groups, SASL logins read kafka.sasl_credentials and
 /// kafka.sasl_server_secret, the shadow outbox claims through
-/// kafka.shadow_tracking.attempt_open, and partition maintenance and the metrics flush
-/// need the time partitions and the broker metrics tables.
-const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 9] = [
+/// kafka.shadow_tracking.attempt_open, every Produce writes kafka.messages.record_bytes,
+/// and partition maintenance and the metrics flush need the time partitions and the broker
+/// metrics tables.
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 10] = [
     (
         "kafka.producer_batches",
         "to_regclass('kafka.producer_batches') IS NOT NULL",
@@ -71,6 +72,12 @@ const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 9] = [
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
                  WHERE attrelid = to_regclass('kafka.shadow_tracking')
                    AND attname = 'attempt_open' AND NOT attisdropped)",
+    ),
+    (
+        "kafka.messages.record_bytes",
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = to_regclass('kafka.messages')
+                   AND attname = 'record_bytes' AND NOT attisdropped)",
     ),
     (
         "time partitions of kafka.messages",
@@ -367,6 +374,7 @@ mod tests {
             "kafka.sasl_credentials",
             "kafka.sasl_server_secret",
             "kafka.shadow_tracking.attempt_open",
+            "kafka.messages.record_bytes",
         ] {
             assert!(
                 old.missing.contains(&name),

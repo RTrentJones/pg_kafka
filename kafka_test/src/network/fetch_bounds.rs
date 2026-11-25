@@ -495,25 +495,62 @@ async fn timed_fetch(
 /// their consumers past the records they did not get).
 pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> TestResult {
     println!("=== Test: Fetch reads no first record a partition cannot return ===\n");
+    fanout_skips_first_records("net-fetch-first", LargePart::Value).await
+}
+
+/// [`test_fetch_reads_no_first_record_a_partition_cannot_return`] with the size of each first
+/// record in one header value instead of its value. The fetch query computed every row's size
+/// from its headers JSONB (up to the query's row limit, and past the budget), which reads the
+/// whole headers value from TOAST and parses it: a later partition still read its 2 MB of
+/// stored hex just to leave the record out. Now Produce stores each record's size
+/// (`kafka.messages.record_bytes`), the fetch sums that, and reads headers only of the records
+/// it returns.
+pub async fn test_fetch_reads_no_first_record_header_a_partition_cannot_return() -> TestResult {
+    println!("=== Test: Fetch reads no first record header a partition cannot return ===\n");
+    fanout_skips_first_records("net-fetch-first-hdr", LargePart::Header).await
+}
+
+/// Where the size of the large first records of [`fanout_skips_first_records`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LargePart {
+    /// A value of [`FANOUT_LARGE`] bytes.
+    Value,
+    /// A one-byte value and one header `h` of [`FANOUT_LARGE`] bytes.
+    Header,
+}
+
+/// [`FANOUT_PARTITIONS`] partitions of a new topic named after `prefix`, each a large record
+/// (`large`) at offset 0 and one of 100 bytes at offset 1: a Fetch from offset 0 of every
+/// partition, 1000 bytes each, returns the first partition's large record whole and nothing of
+/// the others, and takes about as long as the Fetch of the small records from offset 1.
+async fn fanout_skips_first_records(prefix: &str, large: LargePart) -> TestResult {
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("net-fetch-first").await;
+    let topic = ctx.unique_topic(prefix).await;
     let created = create_topics_raw(vec![creatable(&topic, FANOUT_PARTITIONS, 1)]).await?;
     assert_eq!(created[0].error_code, 0, "{created:?}");
     let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
-    let large = Bytes::from(b"abcdefgh".repeat(FANOUT_LARGE / 8));
+    let pattern = Bytes::from(b"abcdefgh".repeat(FANOUT_LARGE / 8));
     let small = Bytes::from(vec![b's'; 100]);
+    let first = match large {
+        LargePart::Value => pattern.clone(),
+        LargePart::Header => Bytes::from_static(b"x"),
+    };
     let partitions: Vec<i32> = (0..FANOUT_PARTITIONS).collect();
     for (corr, chunk) in (0..).zip(partitions.chunks(10)) {
         let parts = chunk
             .iter()
             .map(|&p| {
-                let records: Vec<_> = [&large, &small]
+                let records: Vec<_> = [&first, &small]
                     .into_iter()
                     .zip(0..)
                     .map(|(value, offset)| {
                         let mut r = plain_record(offset, None, value);
                         // One batch: offset - sequence is the same for every record.
                         r.sequence = i32::try_from(offset).unwrap_or(0) - 1;
+                        if offset == 0 && large == LargePart::Header {
+                            r.headers
+                                .insert(StrBytes::from_static_str("h"), Some(pattern.clone()));
+                        }
                         r
                     })
                     .collect();
@@ -534,13 +571,14 @@ pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> Tes
         assert!(codes.iter().all(|&c| c == 0), "produce answered {codes:?}");
     }
     println!(
-        "Step 1: {FANOUT_PARTITIONS} partitions, each a record of {FANOUT_LARGE} bytes at offset \
-         0 and one of 100 bytes at offset 1"
+        "Step 1: {FANOUT_PARTITIONS} partitions, each a record of {FANOUT_LARGE} bytes ({large:?}) \
+         at offset 0 and one of 100 bytes at offset 1"
     );
 
     // Each Fetch three times; the fastest of each is compared.
     let mut large_first = Duration::MAX;
     let mut small_first = Duration::MAX;
+    let mut answers = (Vec::new(), Vec::new());
     for attempt in 0..3 {
         let (took, answer) = timed_fetch(
             &mut s,
@@ -560,6 +598,7 @@ pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> Tes
             "the later partitions return no records, nor a gap batch: {later:?}"
         );
         large_first = large_first.min(took);
+        answers.0 = answer;
 
         let (took, answer) = timed_fetch(
             &mut s,
@@ -572,6 +611,7 @@ pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> Tes
             "every partition returns its small record: {answer:?}"
         );
         small_first = small_first.min(took);
+        answers.1 = answer;
         println!(
             "  attempt {attempt}: from the large records {large_first:?}, from the small ones \
              {small_first:?} (fastest so far)"
@@ -587,6 +627,42 @@ pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> Tes
          {small_first:?}: the later partitions read their first records although they cannot \
          return them"
     );
+    // Produce stored each record's size as a Fetch counts it: key, value, each header's key
+    // and value, 84 bytes a record and 10 a header.
+    let large_bytes = match large {
+        LargePart::Value => i32::try_from(FANOUT_LARGE)? + 84,
+        LargePart::Header => 1 + 84 + 1 + i32::try_from(FANOUT_LARGE)? + 10,
+    };
+    let wrong: i64 = ctx
+        .db()
+        .query_one(
+            "SELECT count(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id \
+             WHERE t.name = $1 AND m.record_bytes IS DISTINCT FROM \
+                   CASE m.partition_offset WHEN 0 THEN $2 ELSE 100 + 84 END",
+            &[&topic, &large_bytes],
+        )
+        .await?
+        .get(0);
+    assert_eq!(wrong, 0, "records stored without their fetch size");
+    // Rows without a stored size (written by SQL outside the extension) are sized from their
+    // columns, and the Fetches cut them at the same records.
+    ctx.db()
+        .execute(
+            "UPDATE kafka.messages m SET record_bytes = NULL FROM kafka.topics t \
+             WHERE t.id = m.topic_id AND t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    for (corr, offset, expected) in [(300, 0, &answers.0), (301, 1, &answers.1)] {
+        let (_, answer) = timed_fetch(
+            &mut s,
+            corr,
+            &fetch_partitions(&topic, FANOUT_PARTITIONS, offset, 1000),
+        )
+        .await?;
+        assert_eq!(&answer, expected, "unsized rows from offset {offset}");
+    }
+    println!("Step 3: stored sizes as counted; rows without one are cut at the same records");
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

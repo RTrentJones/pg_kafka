@@ -12,8 +12,8 @@ use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, IN
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    decode_headers_json, encode_headers_json, FetchedMessage, FetchedRecords, IsolationLevel,
-    PartitionBounds, MAX_TIMESTAMP,
+    decode_headers_json, encode_headers_json, record_fetch_bytes, FetchedMessage, FetchedRecords,
+    IsolationLevel, PartitionBounds, MAX_TIMESTAMP,
 };
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
@@ -29,12 +29,14 @@ const LOG_END_OFFSET_SQL: &str = "SELECT GREATEST(
 
 /// A fetch query: the rows of one partition from `$3` in offset order, at most `$4` of
 /// them, each with the running total of the bytes it adds to a Fetch response
-/// (`cumulative_bytes`, see `record_bytes_sql!`); of those, only the rows whose running
+/// (`cumulative_bytes`: the `record_bytes` Produce stored with the row, see
+/// `record_bytes_sql!` for rows without it); of those, only the rows whose running
 /// total is within `$5` bytes, and the first row whatever its size. The cut is made here so
 /// that the result set, which SPI holds whole, never holds the rows a byte budget leaves
-/// out. The first row past the budget carries its key, value and headers only when `$6` is
-/// true (`whole`); otherwise they are NULL, so it is never read from TOAST, and it only
-/// tells the caller that a record is there. `$filter` is the isolation level's extra
+/// out. The running total reads no key, value or headers: a row's are read (from TOAST, when
+/// stored there) only when it is returned whole. The first row past the budget carries its
+/// key, value and headers only when `$6` is true (`whole`); otherwise they are NULL, so they
+/// are never read, and it only tells the caller that a record is there. `$filter` is the isolation level's extra
 /// condition.
 ///
 /// `headers` is cast to text in the outer query, for the rows returned whole only.
@@ -51,9 +53,9 @@ macro_rules! fetch_sql {
    SELECT partition_offset, key, value, headers, producer_id, producer_epoch,
           CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
                ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
-          (SUM(",
+          (SUM(COALESCE(record_bytes, ",
             record_bytes_sql!(),
-            ") OVER w)::bigint AS cumulative_bytes,
+            ")) OVER w)::bigint AS cumulative_bytes,
           ROW_NUMBER() OVER w AS row_number
    FROM kafka.messages
    WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3",
@@ -69,7 +71,9 @@ macro_rules! fetch_sql {
     };
 }
 
-/// The bytes one stored row adds to a Fetch response, as SQL over its columns: the
+/// The bytes one stored row adds to a Fetch response, as SQL over its key, value and
+/// headers, for rows stored without `record_bytes` (written by SQL outside the extension;
+/// the 0.0.0 -> 0.1.0 upgrade fills it for older rows with this expression): the
 /// uncompressed lengths of its key, value and header keys and values (`octet_length`
 /// reads a bytea's raw length from its TOAST header without decompressing it; the stored
 /// header value is hex, two characters a byte), plus 84 bytes per record and 10 per header
@@ -83,7 +87,9 @@ macro_rules! fetch_sql {
 /// would let a highly compressible record count as a small fraction of what the response
 /// and the DB thread hold of it, and headers would not count at all. Rows written before
 /// headers were stored as an ordered array hold a `{key: hex}` object; `{}` is a record
-/// without headers. The Fetch handler's `message_size_estimate` counts the same.
+/// without headers. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
+/// `message_size_estimate` uses, counts the same. COALESCE evaluates it only for a row whose
+/// `record_bytes` is NULL; it reads the whole headers value, from TOAST when stored there.
 macro_rules! record_bytes_sql {
     () => {
         "COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 84
@@ -142,6 +148,7 @@ struct MessageColumns<'a> {
     keys: Vec<Option<Vec<u8>>>,
     values: Vec<Option<Vec<u8>>>,
     headers: Vec<String>,
+    record_bytes: Vec<i32>,
     timestamps: Vec<i64>,
     producer_ids: Vec<Option<i64>>,
     producer_epochs: Vec<Option<i16>>,
@@ -168,6 +175,7 @@ impl MessageColumns<'_> {
                     )
                 })
                 .collect(),
+            record_bytes: records.iter().map(stored_record_bytes).collect(),
             // BUG-7: the producer's record timestamp is stored verbatim.
             timestamps: records
                 .iter()
@@ -178,6 +186,17 @@ impl MessageColumns<'_> {
             txn_states: vec![txn.map(|_| "pending"); n],
         }
     }
+}
+
+/// The `kafka.messages.record_bytes` of `record`: [`record_fetch_bytes`], saturated to the
+/// column's INT (no record a Produce frame can carry comes near it).
+fn stored_record_bytes(record: &Record) -> i32 {
+    let bytes = record_fetch_bytes(
+        record.key.as_ref().map_or(0, Vec::len),
+        record.value.as_ref().map_or(0, Vec::len),
+        record.headers.iter().map(|h| (h.key.len(), h.value.len())),
+    );
+    i32::try_from(bytes).unwrap_or(i32::MAX)
 }
 
 /// Take the partition's append lock and read its log-end offset, the base offset of
@@ -214,13 +233,13 @@ fn insert_message_rows(
         .update(
             "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value,
                                          headers, producer_id, producer_epoch, txn_state,
-                                         timestamp_ms)
+                                         timestamp_ms, record_bytes)
              SELECT $1, $2, u.partition_offset, u.key, u.value, u.headers, u.producer_id,
-                    u.producer_epoch, u.txn_state, u.timestamp_ms
+                    u.producer_epoch, u.txn_state, u.timestamp_ms, u.record_bytes
              FROM unnest($3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[],
-                         $8::smallint[], $9::text[], $10::bigint[])
+                         $8::smallint[], $9::text[], $10::bigint[], $11::int[])
                   AS u(partition_offset, key, value, headers, producer_id, producer_epoch,
-                       txn_state, timestamp_ms)",
+                       txn_state, timestamp_ms, record_bytes)",
             None,
             &[
                 topic_id.into(),
@@ -233,6 +252,7 @@ fn insert_message_rows(
                 columns.producer_epochs.into(),
                 columns.txn_states.into(),
                 columns.timestamps.into(),
+                columns.record_bytes.into(),
             ],
         )
         .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {e}")))?;
@@ -305,8 +325,8 @@ impl PostgresStore {
     /// and returns only the rows within what is left of the budget, so neither a pass nor its
     /// result set holds more than the budget (and the one first record); the loop runs until
     /// the budget is spent or the partition has no more rows (DR-9). Sizes are the
-    /// uncompressed key, value and header lengths, summed by a window function
-    /// (`record_bytes_sql!`, ADR-002).
+    /// uncompressed key, value and header lengths plus their framing, as Produce stored them
+    /// (`record_bytes`), summed by a window function (ADR-002).
     fn fetch_records_filtered(
         topic_id: i32,
         partition_id: i32,
@@ -734,6 +754,35 @@ mod tests {
         assert_eq!(columns.producer_ids, [None, None]);
         assert_eq!(columns.producer_epochs, [None, None]);
         assert_eq!(columns.txn_states, [None, None]);
+        // Key, value, header key and value, 84 per record and 10 per header.
+        assert_eq!(columns.record_bytes, [1 + 1 + 1 + 1 + 84 + 10, 84]);
+    }
+
+    /// Every header adds its key, value and 10 bytes of framing.
+    #[test]
+    fn stored_record_bytes_count_every_header() {
+        let mut record = records().remove(1);
+        record.headers = (0..3)
+            .map(|_| RecordHeader {
+                key: "k".into(),
+                value: vec![0; 3],
+            })
+            .collect();
+        assert_eq!(super::stored_record_bytes(&record), 84 + 3 * 14);
+    }
+
+    /// The upgrade fills `record_bytes` for 0.0.0 rows with the expression fetches use for
+    /// rows without it, so both count what Produce stores.
+    #[test]
+    fn upgrade_fills_record_bytes_with_the_fetch_expression() {
+        const UPGRADE_SQL: &str = include_str!("../../../../sql/pg_kafka--0.0.0--0.1.0.sql");
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words(UPGRADE_SQL).contains(&words(record_bytes_sql!())),
+            "the upgrade's record_bytes expression differs from record_bytes_sql!"
+        );
+        assert!(super::FETCH_ALL_SQL.contains("COALESCE(record_bytes, "));
+        assert!(super::FETCH_COMMITTED_SQL.contains("COALESCE(record_bytes, "));
     }
 
     #[test]

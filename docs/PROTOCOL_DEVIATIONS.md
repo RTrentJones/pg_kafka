@@ -544,7 +544,8 @@ pg_kafka.compression_type = 'gzip'
   the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
   within both limits, but for the first one above; the database reads (and holds) no more than
   that of a partition, and a later partition whose first record is larger than its limit does
-  not read that record. Kafka counts
+  not read that record (sizes are stored with each record at Produce, so a fetch reads the key,
+  value and headers only of the records it returns). Kafka counts
   the bytes of the record batches as stored, compressed when the producer compressed them,
   so a compressible topic returns fewer records per Fetch than Kafka would, never more
   than the limits

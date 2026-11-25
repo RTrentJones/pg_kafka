@@ -6,8 +6,8 @@
 -- with scripts/check-upgrade.sh.
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
--- leaf, not copied) under an ACCESS EXCLUSIVE lock and reads the table three times
--- (see step 1); run it in a quiet period on a large table.
+-- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes and reads it
+-- five more times (see step 1); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
@@ -55,18 +55,18 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 
 -- 1. Time-partition kafka.messages (ADR-001).
 --
--- The populated 0.0.0 table is not rewritten: it is renamed to kafka.messages_legacy
--- and attached to the new partitioned kafka.messages as one leaf covering
+-- The populated 0.0.0 table is not copied into a new one: it is renamed to
+-- kafka.messages_legacy and attached to the new partitioned kafka.messages as one leaf covering
 -- [MINVALUE, the upgrade time). It keeps its primary key and unique index (renamed to
 -- the per-leaf names), its rows, offsets and global_offset sequence. The retention
 -- sweep treats it like any other past leaf: it is dropped whole once every row in it
 -- is expired under its topic's retention (row deletes until then only for topics with
 -- a window shorter than one partition width). New rows go to the new time leaves.
 --
--- Cost: ACCESS EXCLUSIVE on the old table for the whole script; five sequential
--- reads of it (MAX(created_at) for the leaf bound, the attach's bound check, and the
--- BRIN, idx_messages_txn_aborted and idx_messages_txn_pending_producer builds). The
--- rows themselves are not copied.
+-- Cost: ACCESS EXCLUSIVE on the old table for the whole script; one rewrite of it (the
+-- record_bytes fill, which also rebuilds its two unique indexes) and five sequential
+-- reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
+-- idx_messages_txn_aborted and idx_messages_txn_pending_producer builds).
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
 ALTER INDEX kafka.messages_pkey RENAME TO messages_legacy_offset_key;
 ALTER INDEX kafka.messages_global_offset_key RENAME TO messages_legacy_global_offset_key;
@@ -137,6 +137,11 @@ CREATE TABLE kafka.messages (
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
+    -- What the record adds to a Fetch response (uncompressed key, value and headers plus
+    -- their framing), stored by Produce so a fetch sums the sizes of the rows it scans
+    -- without reading their keys, values or headers (from TOAST, when stored there). NULL
+    -- for a row written by SQL outside the extension: fetches then compute it.
+    record_bytes INT,
     -- DR-7 (DEEP-REVIEW-2026-07): reject negative partition ids at the storage layer too
     -- (handlers validate range against topics.partitions; this is the schema backstop).
     CHECK (partition_id >= 0),
@@ -668,6 +673,32 @@ BEGIN
     END LOOP;
 END
 $$;
+-- Fetches sum the record_bytes of the rows they scan (bootstrap.sql): the 0.0.0 rows get
+-- theirs here, computed as fetches compute it for a row without one (record_bytes_sql! in
+-- src/kafka/storage/postgres/log.rs). ALTER COLUMN TYPE ... USING rewrites the legacy
+-- table (one more full read and write, the headers of every row detoasted); its USING
+-- expression cannot hold the subqueries itself, so a function computes it for the rewrite
+-- only.
+ALTER TABLE kafka.messages_legacy ADD COLUMN record_bytes INT;
+CREATE FUNCTION kafka.upgrade_record_bytes(key BYTEA, value BYTEA, headers JSONB)
+RETURNS INT
+LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 84
+            + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
+                   WHEN jsonb_typeof(headers) = 'array' THEN
+                     (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                          + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
+                      FROM jsonb_array_elements(headers) h)
+                   ELSE
+                     (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
+                      FROM jsonb_each_text(headers) e(k, v))
+              END
+$$;
+ALTER TABLE kafka.messages_legacy
+    ALTER COLUMN record_bytes TYPE INT USING kafka.upgrade_record_bytes(key, value, headers);
+DROP FUNCTION kafka.upgrade_record_bytes(BYTEA, BYTEA, JSONB);
 DO $$
 DECLARE
     v_upper TIMESTAMPTZ;
@@ -692,6 +723,7 @@ COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. 
 COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional messages. NULL for non-transactional messages. (Phase 10)';
 COMMENT ON COLUMN kafka.messages.producer_epoch IS 'Producer epoch for fencing. Used with producer_id to identify unique producer instance. (Phase 10)';
 COMMENT ON COLUMN kafka.messages.txn_state IS 'Transaction state: NULL (committed or non-transactional), ''pending'' (uncommitted), ''aborted'' (rolled back). (Phase 10)';
+COMMENT ON COLUMN kafka.messages.record_bytes IS 'Bytes the record adds to a Fetch response: uncompressed key, value and header lengths, 84 per record and 10 per header. NULL for rows written outside the extension (fetches compute it).';
 
 -- 2. The views over kafka.messages, recreated on the partitioned parent (same
 --    definitions as bootstrap.sql).

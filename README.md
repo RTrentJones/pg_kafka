@@ -191,6 +191,7 @@ CREATE TABLE kafka.messages (
     producer_id BIGINT,             -- Transactional messages only
     producer_epoch SMALLINT,
     txn_state TEXT,                 -- NULL (committed), 'pending', 'aborted'
+    record_bytes INT,               -- What the record adds to a Fetch (stored by Produce)
     CHECK (partition_id >= 0),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 ) PARTITION BY RANGE (created_at);

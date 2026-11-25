@@ -108,6 +108,11 @@ CREATE TABLE kafka.messages (
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
+    -- What the record adds to a Fetch response (uncompressed key, value and headers plus
+    -- their framing), stored by Produce so a fetch sums the sizes of the rows it scans
+    -- without reading their keys, values or headers (from TOAST, when stored there). NULL
+    -- for a row written by SQL outside the extension: fetches then compute it.
+    record_bytes INT,
     -- DR-7 (DEEP-REVIEW-2026-07): reject negative partition ids at the storage layer too
     -- (handlers validate range against topics.partitions; this is the schema backstop).
     CHECK (partition_id >= 0),
@@ -696,6 +701,7 @@ COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional m
 COMMENT ON COLUMN kafka.messages.producer_epoch IS 'Producer epoch for fencing. Used with producer_id to identify unique producer instance. (Phase 10)';
 
 COMMENT ON COLUMN kafka.messages.txn_state IS 'Transaction state: NULL (committed or non-transactional), ''pending'' (uncommitted), ''aborted'' (rolled back). (Phase 10)';
+COMMENT ON COLUMN kafka.messages.record_bytes IS 'Bytes the record adds to a Fetch response: uncompressed key, value and header lengths, 84 per record and 10 per header. NULL for rows written outside the extension (fetches compute it).';
 
 COMMENT ON TABLE kafka.consumer_offsets IS 'Consumer offset tracking per group/topic/partition. Stores committed offsets for Kafka consumers (Phase 3).';
 
