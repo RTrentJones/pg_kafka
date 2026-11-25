@@ -596,7 +596,12 @@ the log:
   like the marker Kafka writes when a transaction ends. Clients skip control records
   and move their position past it (the Java client to the batch's last offset + 1,
   librdkafka to the marker's offset + 1), so their position and committed offset reach
-  the end and the lag goes to 0. An open transaction still blocks at the LSO.
+  the end and the lag goes to 0. An open transaction still blocks at the LSO. The
+  control batch counts against `partition_max_bytes` and `max_bytes` at its encoded size
+  (about 80 bytes), as Kafka counts the abort markers it returns: the first partition of a
+  response with data or such a batch returns it whatever its size, a later partition only
+  when it fits what is left of both limits (otherwise nothing, and its consumer fetches
+  the same offset again).
 - Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
   offsets written by the same producer id/epoch. Batches of transactional rows carry their producer
   id/epoch and the transactional flag; other batches `producer_id = -1`. The base

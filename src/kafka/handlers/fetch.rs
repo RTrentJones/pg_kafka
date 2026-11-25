@@ -520,11 +520,27 @@ fn read_partition(
             IsolationLevel::ReadCommitted => bounds.last_stable_offset,
             IsolationLevel::ReadUncommitted => bounds.high_watermark,
         };
-        Ok(gap_batch(fetch_offset, readable_end).unwrap_or_default())
+        Ok(gap_batch(fetch_offset, readable_end)
+            .and_then(|gap| take_gap_batch(gap, i64::from(limit), budget))
+            .unwrap_or_default())
     } else {
         Ok(bytes::Bytes::new())
     };
     fetched_partition_data(topic_id, partition_id, bounds, records)
+}
+
+/// `gap` if it fits the partition's `limit`, counted against the response budget as records
+/// are: Kafka 3.7 counts the abort marker batches it returns in the fetch size, and a
+/// partition with only them still stops the later ones returning anything past their limits.
+/// As the first record of the response, it is returned whatever its size.
+fn take_gap_batch(gap: bytes::Bytes, limit: i64, budget: &mut FetchBudget) -> Option<bytes::Bytes> {
+    let len = i64::try_from(gap.len()).unwrap_or(i64::MAX);
+    if budget.returned_any && len > limit {
+        return None;
+    }
+    budget.remaining -= len;
+    budget.returned_any = true;
+    Some(gap)
 }
 
 /// A partition entry for an error that leaves its bounds unknown.
@@ -1046,9 +1062,13 @@ mod tests {
                 });
             let env = TestEnv::new();
             let ctx = env.ctx(&mock);
+            // Partition 0 reads from its end (3): returning no record, it has no gap batch
+            // either (one would count as data, see gap_batches_count_against_the_byte_limits).
+            let mut request = two_partition_request();
+            request[0].partitions[0].fetch_offset = if returned == 0 { 3 } else { 0 };
             handle_fetch_with_max_bytes(
                 &ctx,
-                two_partition_request(),
+                request,
                 IsolationLevel::ReadUncommitted,
                 1 << 20,
                 whole_first_record,
@@ -1338,6 +1358,60 @@ mod tests {
             gap_batch(1, 3).unwrap()
         );
         assert!(fetch_one(&mock, 3, IsolationLevel::ReadCommitted).is_empty());
+    }
+
+    /// A gap batch counts against the byte limits as records do (Kafka 3.7 counts the abort
+    /// markers it returns): the first one of a response is returned whatever its size, a later
+    /// one only if it fits what is left of `max_bytes` and its `partition_max_bytes`, and after
+    /// one no later partition reads an oversized first record.
+    #[test]
+    fn gap_batches_count_against_the_byte_limits() {
+        let gap_len = i32::try_from(gap_batch(0, 3).unwrap().len()).unwrap();
+        // (max_bytes, partition 1's partition_max_bytes) -> whether partition 1 has a gap.
+        let cases = [
+            (1 << 20, 1 << 20, true),
+            (2 * gap_len, 1 << 20, true),
+            (2 * gap_len - 1, 1 << 20, false),
+            (1, 1 << 20, false),
+            (1 << 20, gap_len - 1, false),
+            (1 << 20, gap_len, true),
+        ];
+        for (max_bytes, partition_max, second_gap) in cases {
+            let mut mock = mock_with_two_partitions();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = std::sync::Arc::clone(&asked);
+            mock.expect_fetch_records_with_isolation().returning(
+                move |_, partition, _, _, whole, _| {
+                    seen.lock().unwrap().push((partition, whole));
+                    Ok(Vec::new().into())
+                },
+            );
+            let env = TestEnv::new();
+            let ctx = env.ctx(&mock);
+            let mut request = two_partition_request();
+            request[0].partitions[1].partition_max_bytes = partition_max;
+            let response = handle_fetch_with_max_bytes(
+                &ctx,
+                request,
+                IsolationLevel::ReadCommitted,
+                max_bytes,
+                true,
+            )
+            .unwrap();
+            let parts = &response.responses[0].partitions;
+            let case = format!("max_bytes {max_bytes}, partition_max_bytes {partition_max}");
+            assert_eq!(parts[0].records, gap_batch(0, 3), "{case}");
+            assert_eq!(parts[1].error_code, ERROR_NONE, "{case}");
+            if second_gap {
+                assert_eq!(parts[1].records, gap_batch(0, 3), "{case}");
+            } else {
+                assert!(parts[1].records.as_ref().unwrap().is_empty(), "{case}");
+            }
+            // Partition 1 is not the first with data: it reads no oversized first record.
+            for &(partition, whole) in asked.lock().unwrap().iter() {
+                assert_eq!(whole, partition == 0, "{case}: partition {partition}");
+            }
+        }
     }
 
     /// The default get_partition_bounds reports the last stable offset to a

@@ -668,6 +668,76 @@ async fn fanout_skips_first_records(prefix: &str, large: LargePart) -> TestResul
     Ok(())
 }
 
+/// A partition with no visible records before its readable end returns a control batch that
+/// moves its consumer past them (a gap batch, PROTOCOL_DEVIATIONS §7). Those batches counted
+/// against neither byte limit, so every partition of a Fetch returned one, whatever was left
+/// of its `max_bytes`. Kafka 3.7 counts the abort marker batches it returns in the fetch size
+/// like any other: now a gap batch is returned only by the first partition of a response or
+/// within what is left of the limits.
+pub async fn test_gap_batches_count_against_max_bytes() -> TestResult {
+    println!("=== Test: Gap batches count against max_bytes ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-fetch-gap").await;
+    let created = create_topics_raw(vec![creatable(&topic, 3, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    for partition in 0..3 {
+        let records = batch(&["value"; 3], -1, -1, -1, false, None);
+        let req = produce_request(&topic, vec![(partition, records)], 1);
+        s.write_all(&request_frame(3, partition, &req)).await?;
+        let frame = read_frame_within(&mut s, Duration::from_secs(30))
+            .await?
+            .ok_or("closed on produce")?;
+        let (_, resp) = decode_response::<ProduceRequest>(3, &frame)?;
+        assert_eq!(resp.responses[0].partition_responses[0].error_code, 0);
+    }
+    // Aborted: invisible to read_committed, with nothing pending (the readable end is 3).
+    let aborted = ctx
+        .db()
+        .execute(
+            "UPDATE kafka.messages m SET txn_state = 'aborted' FROM kafka.topics t \
+             WHERE t.id = m.topic_id AND t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    assert_eq!(aborted, 9);
+    println!("Step 1: 3 partitions of 3 aborted records each");
+
+    let fetch = |max_bytes: i32| {
+        let mut req = fetch_partitions(&topic, 3, 0, 1 << 20);
+        req.isolation_level = 1;
+        req.max_bytes = max_bytes;
+        req
+    };
+    let (_, unlimited) = timed_fetch(&mut s, 10, &fetch(i32::MAX)).await?;
+    let gap = unlimited[0].2;
+    assert!(
+        unlimited
+            .iter()
+            .all(|&(_, code, len)| code == 0 && len == gap && gap > 0),
+        "every partition returns a gap batch: {unlimited:?}"
+    );
+    println!("Step 2: without a limit each partition returns a gap batch of {gap} bytes");
+    let gap = i32::try_from(gap)?;
+    for (corr, max_bytes, gaps) in [(11, gap + gap / 2, 1), (12, 2 * gap, 2), (13, 1, 1)] {
+        let (_, answer) = timed_fetch(&mut s, corr, &fetch(max_bytes)).await?;
+        let returned: Vec<i32> = answer
+            .iter()
+            .filter(|&&(_, code, len)| code == 0 && len > 0)
+            .map(|&(p, _, _)| p)
+            .collect();
+        assert_eq!(
+            returned,
+            (0..gaps).collect::<Vec<_>>(),
+            "max_bytes {max_bytes}: the partitions with a gap batch, {answer:?}"
+        );
+        println!("  max_bytes {max_bytes}: gap batches from partitions {returned:?}");
+    }
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// Records of [`test_fetch_limits_count_records_alone_in_their_batch`].
 const LONE_RECORDS: i64 = 400;
 /// The value of each of them.
