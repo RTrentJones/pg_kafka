@@ -33,9 +33,11 @@ pub use sticky::StickyStrategy;
 /// The subscriptions come from the members' JoinGroup metadata, so a member may list a
 /// topic many times: [`AssignmentInput::new`] drops the repeats and indexes the members
 /// of every subscribed topic once, and the assignors look subscribers up in that index.
-/// Assignment then costs about the subscription entries plus the partitions assigned,
-/// never their product (it runs on the single DB thread, where a slow assignment stalls
-/// every other request).
+/// Range and round-robin then cost about the subscription entries plus the partitions
+/// assigned, never their product (assignment runs on the single DB thread, where a slow
+/// assignment stalls every other request). Sticky also does in an ordinary rebalance; how
+/// much its balancing takes depends on the input's shape, so the coordinator runs it with a
+/// step budget ([`StickyStrategy::assign_within`]).
 #[derive(Debug, Clone)]
 pub struct AssignmentInput {
     /// Map of member_id -> parsed subscription, each member's topics sorted and

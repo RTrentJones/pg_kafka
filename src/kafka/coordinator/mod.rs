@@ -76,8 +76,7 @@
 
 use crate::kafka::assignment::strategies::StickyStrategy;
 use crate::kafka::assignment::{
-    create_strategy, AssignmentInput, AssignmentOutput, AssignmentStrategy, MemberAssignment,
-    MemberSubscription,
+    create_strategy, AssignmentInput, AssignmentOutput, MemberAssignment, MemberSubscription,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1136,7 +1135,13 @@ impl GroupCoordinator {
                     .sum::<usize>(),
         )?;
         let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
-        let assignments = run_assignor(previous, &input, strategy_name)?;
+        let assignments = run_assignor(
+            group_id,
+            previous,
+            &input,
+            strategy_name,
+            crate::kafka::limits::MAX_ASSIGNMENT_STEPS,
+        )?;
 
         // Encode assignments to bytes
         let encoded = assignments
@@ -1324,15 +1329,34 @@ fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {
     Ok(())
 }
 
-/// Run the assignor `strategy_name` over `input`. The sticky assignor starts from
-/// `previous`, the group's previous assignments.
+/// Run the assignor `strategy_name` over `input` for `group_id`. The sticky assignor starts
+/// from `previous`, the group's previous assignments, and is refused with POLICY_VIOLATION
+/// once it has spent `sticky_steps` steps: how long its balancing runs depends on how the
+/// subscriptions overlap, not only on the entries `check_assignment_work` counts. Range and
+/// round-robin take about one step per entry.
 fn run_assignor(
+    group_id: &str,
     previous: HashMap<String, MemberAssignment>,
     input: &AssignmentInput,
     strategy_name: &str,
+    sticky_steps: usize,
 ) -> Result<AssignmentOutput> {
     if strategy_name.contains("sticky") {
-        return Ok(StickyStrategy::with_previous(previous).assign(input));
+        return StickyStrategy::with_previous(previous)
+            .assign_within(input, sticky_steps)
+            .map_err(|exceeded| {
+                crate::pg_warning!(
+                    "SyncGroup for group '{}' refused: its sticky assignment takes more than {} steps",
+                    group_id,
+                    exceeded.budget
+                );
+                KafkaError::PolicyViolation {
+                    message: format!(
+                        "the server-side sticky assignment of group '{group_id}' takes more than {} steps",
+                        exceeded.budget
+                    ),
+                }
+            });
     }
     let strategy = create_strategy(strategy_name).ok_or_else(|| {
         KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
