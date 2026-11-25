@@ -153,12 +153,9 @@ pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult
 pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestResult {
     println!("=== Test: >100 MB fetch response ===\n");
     let db = crate::common::create_db_client().await?;
-    super::fetch_limits::set_fetch_max_bytes(&db, Some(120_000_000)).await?;
-    let outcome = response_larger_than_the_request_limit()
-        .await
-        .map_err(|e| e.to_string());
-    super::fetch_limits::set_fetch_max_bytes(&db, None).await?;
-    Ok(outcome?)
+    let guc = super::fetch_limits::set_fetch_max_bytes(&db, 120_000_000).await?;
+    response_larger_than_the_request_limit().await?;
+    super::fetch_limits::restore_fetch_max_bytes(guc).await
 }
 
 async fn response_larger_than_the_request_limit() -> TestResult {

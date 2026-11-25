@@ -4,7 +4,7 @@
 //! (Kafka's broker `fetch.max.bytes`); the tests lower it so a few hundred KB show the cap.
 
 use crate::common::{create_db_client, DynResult, TestResult};
-use crate::setup::TestContext;
+use crate::setup::{GucError, SystemGucGuard, TestContext};
 use crate::wire::records::{fetched_values, plain_batch};
 use crate::wire::requests::{creatable, create_topics_raw, fetch_request, produce_request};
 use crate::wire::{decode_response, read_frame_within, request_frame};
@@ -22,18 +22,26 @@ const GUC: &str = "pg_kafka.fetch_max_bytes";
 /// What `test_fetch_responses_are_capped_by_fetch_max_bytes` lowers it to.
 const CAP: i32 = 64 * 1024;
 
-/// ALTER SYSTEM SET (or RESET for `None`) `pg_kafka.fetch_max_bytes`, then reload. The
-/// worker reloads its configuration on SIGHUP at its next loop iteration; the network thread
-/// reads the new value for the next Fetch it reads.
-pub async fn set_fetch_max_bytes(db: &Client, value: Option<i32>) -> DynResult<()> {
-    let sql = match value {
-        Some(v) => format!("ALTER SYSTEM SET {GUC} = {v}"),
-        None => format!("ALTER SYSTEM RESET {GUC}"),
-    };
-    db.batch_execute(&sql).await?;
-    db.batch_execute("SELECT pg_reload_conf()").await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    Ok(())
+/// Set `pg_kafka.fetch_max_bytes` for a test with `ALTER SYSTEM`, then reload. The returned
+/// guard puts the earlier setting back: the test calls `restore` on success, and the guard's
+/// drop restores it when an assert panics, an error returns early or the runner aborts the
+/// test at its timeout. The network thread reads the new value for the next Fetch it reads;
+/// a connection's response budget is read when it opens.
+pub async fn set_fetch_max_bytes(db: &Client, value: i32) -> DynResult<SystemGucGuard> {
+    SystemGucGuard::set(db, GUC, &value.to_string())
+        .await
+        .map_err(widen)?
+        .ok_or_else(|| format!("the server refused {GUC} = {value}").into())
+}
+
+/// Put `pg_kafka.fetch_max_bytes` back (see [`set_fetch_max_bytes`]).
+pub async fn restore_fetch_max_bytes(guard: SystemGucGuard) -> DynResult<()> {
+    guard.restore().await.map_err(widen)
+}
+
+/// The guard's errors are `Send + Sync`; this file's results are not.
+fn widen(e: GucError) -> Box<dyn std::error::Error> {
+    e
 }
 
 /// Produce `values` to partition 0 of `topic` (one batch, acks=1) on `s`: one value, or
@@ -95,8 +103,8 @@ pub async fn test_fetch_responses_are_capped_by_fetch_max_bytes() -> TestResult 
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-fetch-cap").await;
     let db = create_db_client().await?;
-    set_fetch_max_bytes(&db, Some(CAP)).await?;
-    let outcome = async {
+    let guc = set_fetch_max_bytes(&db, CAP).await?;
+    {
         let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
         assert_eq!(created[0].error_code, 0, "{created:?}");
         let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
@@ -143,12 +151,8 @@ pub async fn test_fetch_responses_are_capped_by_fetch_max_bytes() -> TestResult 
         );
         assert_eq!(records[0].0, 30);
         assert_eq!(records[0].1.len(), 100_000);
-        DynResult::Ok(())
     }
-    .await
-    .map_err(|e| e.to_string());
-    set_fetch_max_bytes(&db, None).await?;
-    outcome?;
+    restore_fetch_max_bytes(guc).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -172,8 +176,8 @@ pub async fn non_reading_client_behind_a_long_poll_closes_after(idle: Duration) 
     let data = ctx.unique_topic("net-nr-data").await;
     let quiet = ctx.unique_topic("net-nr-lp").await;
     let db = create_db_client().await?;
-    set_fetch_max_bytes(&db, Some(1 << 20)).await?;
-    let outcome = async {
+    let guc = set_fetch_max_bytes(&db, 1 << 20).await?;
+    {
         let created =
             create_topics_raw(vec![creatable(&data, 1, 1), creatable(&quiet, 1, 1)]).await?;
         assert!(created.iter().all(|t| t.error_code == 0), "{created:?}");
@@ -229,12 +233,8 @@ pub async fn non_reading_client_behind_a_long_poll_closes_after(idle: Duration) 
         );
         let mut ok = TcpStream::connect(("127.0.0.1", super::port())).await?;
         assert!(super::answers(&mut ok, 1).await, "other clients unaffected");
-        DynResult::Ok(())
     }
-    .await
-    .map_err(|e| e.to_string());
-    set_fetch_max_bytes(&db, None).await?;
-    outcome?;
+    restore_fetch_max_bytes(guc).await?;
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
