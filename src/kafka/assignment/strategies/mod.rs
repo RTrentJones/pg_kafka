@@ -29,14 +29,24 @@ pub use roundrobin::RoundRobinStrategy;
 pub use sticky::StickyStrategy;
 
 /// Input for partition assignment computation
+///
+/// The subscriptions come from the members' JoinGroup metadata, so a member may list a
+/// topic many times: [`AssignmentInput::new`] drops the repeats and indexes the members
+/// of every subscribed topic once, and the assignors look subscribers up in that index.
+/// Assignment then costs about the subscription entries plus the partitions assigned,
+/// never their product (it runs on the single DB thread, where a slow assignment stalls
+/// every other request).
 #[derive(Debug, Clone)]
 pub struct AssignmentInput {
-    /// Map of member_id -> parsed subscription
-    /// Contains each consumer's subscribed topics
+    /// Map of member_id -> parsed subscription, each member's topics sorted and
+    /// without repeats
     pub subscriptions: HashMap<String, MemberSubscription>,
 
     /// Available partitions per topic: topic_name -> partition_count
     pub topic_partitions: HashMap<String, i32>,
+
+    /// Per subscribed topic, its subscribers in ascending member id order.
+    topic_members: HashMap<String, Vec<String>>,
 }
 
 impl AssignmentInput {
@@ -50,34 +60,49 @@ impl AssignmentInput {
         let mut topic_partitions = topic_partitions;
         topic_partitions
             .retain(|_, count| crate::kafka::limits::sane_partition_count(*count).is_some());
+        let mut subscriptions = subscriptions;
+        for subscription in subscriptions.values_mut() {
+            subscription.topics.sort_unstable();
+            subscription.topics.dedup();
+        }
+        let mut topic_members: HashMap<String, Vec<String>> = HashMap::new();
+        for (member_id, subscription) in &subscriptions {
+            for topic in &subscription.topics {
+                match topic_members.get_mut(topic) {
+                    Some(members) => members.push(member_id.clone()),
+                    None => {
+                        topic_members.insert(topic.clone(), vec![member_id.clone()]);
+                    }
+                }
+            }
+        }
+        for members in topic_members.values_mut() {
+            members.sort_unstable();
+        }
         Self {
             subscriptions,
             topic_partitions,
+            topic_members,
         }
     }
 
     /// Get all unique topics that any member is subscribed to
     pub fn all_subscribed_topics(&self) -> Vec<String> {
-        let mut topics: Vec<String> = self
-            .subscriptions
-            .values()
-            .flat_map(|sub| sub.topics.iter().cloned())
-            .collect();
-        topics.sort();
-        topics.dedup();
+        let mut topics: Vec<String> = self.topic_members.keys().cloned().collect();
+        topics.sort_unstable();
         topics
     }
 
-    /// Get member IDs subscribed to a specific topic
-    pub fn members_for_topic(&self, topic: &str) -> Vec<String> {
-        let mut members: Vec<String> = self
-            .subscriptions
-            .iter()
-            .filter(|(_, sub)| sub.topics.contains(&topic.to_string()))
-            .map(|(id, _)| id.clone())
-            .collect();
-        members.sort(); // Deterministic order
-        members
+    /// Member IDs subscribed to a specific topic, in ascending order
+    pub fn members_for_topic(&self, topic: &str) -> &[String] {
+        self.topic_members.get(topic).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `member_id` subscribes to `topic`.
+    pub fn is_subscribed(&self, member_id: &str, topic: &str) -> bool {
+        self.members_for_topic(topic)
+            .binary_search_by(|m| m.as_str().cmp(member_id))
+            .is_ok()
     }
 }
 

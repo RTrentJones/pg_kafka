@@ -1539,13 +1539,88 @@ fn test_remove_group_answers_parked_syncs() {
     assert_eq!(c.pending_sync_count(), 0);
 }
 
+/// Server-side assignments are computed only for the SyncGroup `sync_group` takes
+/// assignments from: the leader's, at the current generation, in the sync phase.
 #[test]
-fn test_is_group_leader() {
+fn test_awaits_leader_sync_only_in_the_sync_phase() {
     let c = GroupCoordinator::new();
-    let (leader, follower, _) = stable_pair(&c, "g");
-    assert!(c.is_group_leader("g", &leader));
-    assert!(!c.is_group_leader("g", &follower));
-    assert!(!c.is_group_leader("nope", &leader));
+    let (leader, follower, gen) = completing_pair(&c, "g");
+    assert!(c.awaits_leader_sync("g", &leader, gen));
+    assert!(
+        !c.awaits_leader_sync("g", &leader, gen - 1),
+        "stale generation"
+    );
+    assert!(
+        !c.awaits_leader_sync("g", &leader, gen + 1),
+        "future generation"
+    );
+    assert!(!c.awaits_leader_sync("g", &follower, gen), "follower");
+    assert!(!c.awaits_leader_sync("nope", &leader, gen), "unknown group");
+    assert!(
+        !c.awaits_leader_sync("g", "stranger", gen),
+        "unknown member"
+    );
+    c.sync_now(
+        "g".to_string(),
+        leader.clone(),
+        gen,
+        vec![(leader.clone(), b"A".to_vec())],
+    )
+    .unwrap();
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+    assert!(!c.awaits_leader_sync("g", &leader, gen), "Stable group");
+    // A rejoin by the leader starts a join phase: still no SyncGroup is awaited.
+    let _ = join(&c, "g", Some(&leader));
+    assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
+    assert!(!c.awaits_leader_sync("g", &leader, gen));
+}
+
+/// Encoded subscription metadata of `topics`.
+fn subscription(topics: &[&str]) -> Vec<u8> {
+    MemberSubscription::new(topics.iter().map(|t| (*t).to_string()).collect())
+        .encode()
+        .unwrap()
+}
+
+/// A server-side assignment over `limits::MAX_ASSIGNMENT_WORK` entries is refused with
+/// POLICY_VIOLATION before it is computed: subscriptions are counted from the array length
+/// the metadata claims, before parsing, and the partitions to assign before assigning.
+#[test]
+fn test_assignment_over_the_work_limit_is_refused() {
+    let max = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    let policy = crate::kafka::constants::ERROR_POLICY_VIOLATION;
+
+    // Metadata claiming more topics than the limit.
+    let c = GroupCoordinator::new();
+    let mut claimed = vec![0, 0];
+    claimed.extend_from_slice(&i32::try_from(max + 1).unwrap().to_be_bytes());
+    joined(&join_with(&c, &params("g", None, &[("range", &claimed)])));
+    assert_eq!(
+        c.get_subscribed_topics("g")
+            .unwrap_err()
+            .to_kafka_error_code(),
+        policy
+    );
+
+    // A small subscription over more partitions than the limit.
+    let c = GroupCoordinator::new();
+    let names: Vec<String> = (0..=max / 100_000).map(|i| format!("t{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    joined(&join_with(
+        &c,
+        &params("g", None, &[("range", &subscription(&refs))]),
+    ));
+    assert_eq!(c.get_subscribed_topics("g").unwrap().len(), names.len());
+    let partitions: HashMap<String, i32> = names.iter().map(|n| (n.clone(), 100_000)).collect();
+    assert_eq!(
+        c.compute_assignments("g", &partitions)
+            .unwrap_err()
+            .to_kafka_error_code(),
+        policy
+    );
+    // Within the limit it is computed.
+    let partitions: HashMap<String, i32> = names.iter().map(|n| (n.clone(), 10)).collect();
+    assert_eq!(c.compute_assignments("g", &partitions).unwrap().len(), 1);
 }
 
 #[test]

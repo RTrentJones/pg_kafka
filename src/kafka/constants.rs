@@ -278,6 +278,9 @@ pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 /// INVALID_REPLICATION_FACTOR: a replication factor other than 1 or -1 on this
 /// single-broker cluster.
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+/// POLICY_VIOLATION: the request exceeds a broker-wide limit (Kafka's answer when a
+/// broker policy refuses a request).
+pub const ERROR_POLICY_VIOLATION: i16 = 44;
 /// OFFSET_METADATA_TOO_LARGE: committed offset metadata longer than
 /// [`OFFSET_METADATA_MAX_LENGTH`].
 pub const ERROR_OFFSET_METADATA_TOO_LARGE: i16 = 12;
@@ -460,6 +463,7 @@ mod tests {
         assert_eq!(ERROR_INVALID_TIMESTAMP, 32);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
         assert_eq!(ERROR_INVALID_PARTITIONS, 37);
+        assert_eq!(ERROR_POLICY_VIOLATION, 44);
 
         // Idempotent-producer and transaction codes, as in Apache Kafka's
         // org.apache.kafka.common.protocol.Errors.

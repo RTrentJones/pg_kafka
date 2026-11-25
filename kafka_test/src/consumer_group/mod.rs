@@ -15,6 +15,7 @@ mod protocol_rules;
 mod rebalance;
 mod rebalance_edge_cases;
 mod state_reporting;
+mod sync_assignment;
 mod sync_liveness;
 
 /// The `consumer_group` tests, in run order.
@@ -48,5 +49,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         state_reporting::test_describe_groups_reports_metadata_only_when_stable,
         state_reporting::test_list_groups_state_filter_is_case_sensitive,
         state_reporting::test_find_coordinator_unknown_key_type_is_invalid_request,
+        sync_assignment::test_server_side_assignment_is_bounded: sequential, // timed; stalls the DB thread when it fails
     ]
 }

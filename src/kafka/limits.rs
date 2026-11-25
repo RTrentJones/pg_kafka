@@ -41,6 +41,14 @@ pub const MAX_MEMBER_PROTOCOL_BYTES: usize = 1024 * 1024;
 /// Largest number of protocols (assignors) one member may advertise.
 pub const MAX_MEMBER_PROTOCOLS: usize = 64;
 
+/// Most entries one server-side group assignment may take: the topics in the members'
+/// subscriptions (repeats included), the partitions of the sticky assignor's previous
+/// assignments and the partitions of the subscribed topics. The assignment runs on the
+/// single DB thread in about that many steps; a leader SyncGroup over it is answered
+/// POLICY_VIOLATION instead of stalling every other client while it runs. A thousand
+/// members subscribed to a thousand topics each stay well within it.
+pub const MAX_ASSIGNMENT_WORK: usize = 2_000_000;
+
 /// Default for `pg_kafka.max_group_memory`, in kB: 128 MB. The per-member and per-group caps
 /// above still let the coordinator hold `max_consumer_groups * group_max_size` members of up
 /// to 1 MiB each (about 1e14 bytes); members of groups that never sync stay in memory until

@@ -395,7 +395,16 @@ pg_kafka.compression_type = 'gzip'
   leaves, or the sweep evicts the members that did not sync, below), and
   UNKNOWN_MEMBER_ID if the member itself is removed. Like a waiting joiner, a member
   whose SyncGroup is held is exempt from its session timeout. Server-side
-  assignment (a leader sending empty assignments) is computed only for the leader.
+  assignment (a leader sending empty assignments) is computed only for the SyncGroup the
+  coordinator takes assignments from: the leader's, at the current generation, while the
+  group is in its sync phase (a stale generation or a Stable group's SyncGroup ignores its
+  assignments, so nothing is computed for it). A member's repeated subscriptions count once,
+  and the assignment takes about as many steps as there are subscription entries plus
+  partitions; one over 2,000,000 entries (subscribed topics per member, repeats included, the
+  sticky assignor's previous partitions and the partitions of the subscribed topics) is
+  refused with POLICY_VIOLATION (44) and the group stays in its sync phase (the rebalance
+  timeout evicts the leader), since it would hold the DB thread that serves every client.
+  Kafka assigns on the client and has no such limit.
 - ✅ As in Kafka 3.0+ (`pendingSyncMembers`, checked against a 3.7 broker): every member of
   a new generation must send its SyncGroup within the group's rebalance timeout of the
   join's completion. The sweep removes those that have not, though they heartbeat and

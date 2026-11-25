@@ -306,14 +306,20 @@ impl GroupCoordinator {
         self.lock_pending_syncs().len()
     }
 
-    /// Whether `member_id` is the leader of `group_id` (false for an unknown group).
-    /// The SyncGroup handler computes server-side assignments only for the leader.
-    pub fn is_group_leader(&self, group_id: &str, member_id: &str) -> bool {
-        self.groups
-            .read()
-            .ok()
-            .and_then(|groups| groups.get(group_id).and_then(|g| g.leader.clone()))
-            .is_some_and(|leader| leader == member_id)
+    /// Whether a SyncGroup from `member_id` at `generation_id` is the one [`Self::sync_group`]
+    /// takes the group's assignments from: the leader's, at the current generation, while
+    /// the group is in its sync phase (CompletingRebalance). The SyncGroup handler computes
+    /// server-side assignments only for it; any other SyncGroup ignores its assignments, so
+    /// computing them for a stale generation or a Stable group would be work for nothing.
+    pub fn awaits_leader_sync(&self, group_id: &str, member_id: &str, generation_id: i32) -> bool {
+        self.groups.read().is_ok_and(|groups| {
+            groups.get(group_id).is_some_and(|g| {
+                g.state == GroupState::CompletingRebalance
+                    && g.generation_id == generation_id
+                    && g.members.contains_key(member_id)
+                    && g.leader.as_deref() == Some(member_id)
+            })
+        })
     }
 
     /// Handle a JoinGroup request.
@@ -1108,10 +1114,29 @@ impl GroupCoordinator {
                 group_id: group_id.to_string(),
             })?;
 
-        let input = AssignmentInput::new(member_subscriptions(group), topic_partitions.clone());
+        let subscriptions = member_subscriptions(group);
         // The group's selected assignor, "range" if none was selected.
         let strategy_name = group.protocol_name.as_deref().unwrap_or("range");
-        let assignments = run_assignor(group, &input, strategy_name)?;
+        let previous = previous_assignments(group, strategy_name);
+        check_assignment_work(
+            group_id,
+            subscriptions
+                .values()
+                .map(|s| s.topics.len())
+                .sum::<usize>()
+                + previous
+                    .values()
+                    .flat_map(|a| a.topic_partitions.values())
+                    .map(Vec::len)
+                    .sum::<usize>()
+                + topic_partitions
+                    .values()
+                    .filter_map(|&count| crate::kafka::limits::sane_partition_count(count))
+                    .map(|count| usize::try_from(count).unwrap_or(0))
+                    .sum::<usize>(),
+        )?;
+        let input = AssignmentInput::new(subscriptions, topic_partitions.clone());
+        let assignments = run_assignor(previous, &input, strategy_name)?;
 
         // Encode assignments to bytes
         let encoded = assignments
@@ -1134,8 +1159,6 @@ impl GroupCoordinator {
     /// Parses subscription metadata from all members to determine
     /// which topics need partition information.
     pub fn get_subscribed_topics(&self, group_id: &str) -> Result<Vec<String>> {
-        use crate::kafka::assignment::MemberSubscription;
-
         let groups = self.groups.read().map_err(|e| {
             KafkaError::Internal(format!("Failed to acquire groups read lock: {e}"))
         })?;
@@ -1145,6 +1168,23 @@ impl GroupCoordinator {
             .ok_or_else(|| KafkaError::CoordinatorNotAvailable {
                 group_id: group_id.to_string(),
             })?;
+
+        // Counted from the metadata's array lengths before anything is parsed: a member's
+        // metadata may list up to about half a million names.
+        check_assignment_work(
+            group_id,
+            group
+                .members
+                .values()
+                .filter_map(|member| {
+                    member
+                        .protocols
+                        .iter()
+                        .find(|(name, _)| Some(name) == group.protocol_name.as_ref())
+                })
+                .map(|(_, metadata)| MemberSubscription::topic_count_hint(metadata))
+                .sum(),
+        )?;
 
         let mut topics = std::collections::HashSet::new();
 
@@ -1243,23 +1283,55 @@ fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscrip
         .collect()
 }
 
-/// Run the assignor `strategy_name` over `input`. The sticky assignor starts from the
-/// group's previous assignments.
-fn run_assignor(
+/// The group's previous assignments, for the sticky assignor (none for the others).
+fn previous_assignments(
     group: &ConsumerGroup,
+    strategy_name: &str,
+) -> HashMap<String, MemberAssignment> {
+    if !strategy_name.contains("sticky") {
+        return HashMap::new();
+    }
+    group
+        .previous_assignments
+        .iter()
+        .filter_map(|(member_id, bytes)| {
+            MemberAssignment::parse(bytes)
+                .ok()
+                .map(|assignment| (member_id.clone(), assignment))
+        })
+        .collect()
+}
+
+/// Refuse a server-side assignment over [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`]
+/// entries (subscribed topics per member, previous assignments, partitions to assign)
+/// with POLICY_VIOLATION: it would hold the single DB thread, and every other client
+/// with it, for as long as it ran.
+fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {
+    let max = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    if entries > max {
+        crate::pg_warning!(
+            "SyncGroup for group '{}' refused: computing its assignments takes {} entries (subscriptions, previous assignments and partitions), above the limit of {}",
+            group_id,
+            entries,
+            max
+        );
+        return Err(KafkaError::PolicyViolation {
+            message: format!(
+                "the server-side assignment of group '{group_id}' takes {entries} entries, above the limit of {max}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Run the assignor `strategy_name` over `input`. The sticky assignor starts from
+/// `previous`, the group's previous assignments.
+fn run_assignor(
+    previous: HashMap<String, MemberAssignment>,
     input: &AssignmentInput,
     strategy_name: &str,
 ) -> Result<AssignmentOutput> {
     if strategy_name.contains("sticky") {
-        let previous = group
-            .previous_assignments
-            .iter()
-            .filter_map(|(member_id, bytes)| {
-                MemberAssignment::parse(bytes)
-                    .ok()
-                    .map(|assignment| (member_id.clone(), assignment))
-            })
-            .collect();
         return Ok(StickyStrategy::with_previous(previous).assign(input));
     }
     let strategy = create_strategy(strategy_name).ok_or_else(|| {

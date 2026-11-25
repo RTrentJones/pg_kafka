@@ -422,7 +422,6 @@ pub fn handle_sync_group<F>(
     F: FnOnce(SyncGroupResponse) + Send + 'static,
 {
     let coordinator = ctx.coordinator;
-    let store = ctx.store;
     coordinator.set_memory_limit(crate::kafka::limits::max_group_memory_bytes());
 
     crate::pg_debug!(
@@ -439,36 +438,22 @@ pub fn handle_sync_group<F>(
         .map(|a| (a.member_id, a.assignment))
         .collect();
 
-    // A leader that sent empty assignments asks the server to compute them. (Only the
-    // leader's assignments are used, so a follower's SyncGroup computes nothing.)
+    // A leader that sent empty assignments asks the server to compute them. Only the
+    // SyncGroup the coordinator takes assignments from (the leader's, at the current
+    // generation, in the sync phase) computes them: every other SyncGroup ignores its
+    // assignments, and the computation runs on the single DB thread.
     let assignments_empty =
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
-    if assignments_empty && coordinator.is_group_leader(group_id, member_id) {
-        // Get subscribed topics from group members
-        if let Ok(topics) = coordinator.get_subscribed_topics(group_id) {
-            if !topics.is_empty() {
-                // Get partition counts for all topics in a single query (avoid N+1)
-                let mut topic_partitions: HashMap<String, i32> = HashMap::new();
-                if let Ok(metadata) = store.get_topic_metadata(Some(&topics)) {
-                    for tm in metadata {
-                        topic_partitions.insert(tm.name.clone(), tm.partition_count);
-                    }
-                }
-
-                // Compute assignments server-side
-                if !topic_partitions.is_empty() {
-                    if let Ok(computed) =
-                        coordinator.compute_assignments(group_id, &topic_partitions)
-                    {
-                        crate::pg_debug!(
-                            "SyncGroup: computed {} assignments server-side for group {}",
-                            computed.len(),
-                            group_id
-                        );
-                        coord_assignments = computed.into_iter().collect();
-                    }
-                }
+    if assignments_empty && coordinator.awaits_leader_sync(group_id, member_id, generation_id) {
+        match server_side_assignments(ctx, group_id) {
+            Ok(Some(computed)) => coord_assignments = computed,
+            Ok(None) => {}
+            Err(e) => {
+                // Too large to compute: nothing is stored and the group stays in its sync
+                // phase (the rebalance timeout evicts a leader that cannot sync).
+                respond(build_sync_group_response(Err(e)));
+                return;
             }
         }
     }
@@ -482,6 +467,51 @@ pub fn handle_sync_group<F>(
         coord_assignments,
         Box::new(move |outcome| respond(build_sync_group_response(outcome))),
     );
+}
+
+/// A member id and its encoded MemberAssignment.
+type MemberAssignmentBytes = (String, Vec<u8>);
+
+/// The assignments the server computes for `group_id` with the group's assignor over the
+/// topics its members subscribe to, `None` when there is nothing to assign (no subscribed
+/// topic exists) or the topics cannot be read, and a `PolicyViolation` when the
+/// computation would exceed [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`].
+fn server_side_assignments(
+    ctx: &HandlerContext,
+    group_id: &str,
+) -> Result<Option<Vec<MemberAssignmentBytes>>> {
+    let coordinator = ctx.coordinator;
+    let topics = match coordinator.get_subscribed_topics(group_id) {
+        Ok(topics) => topics,
+        Err(e @ crate::kafka::error::KafkaError::PolicyViolation { .. }) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    if topics.is_empty() {
+        return Ok(None);
+    }
+    // Partition counts for all topics in a single query (avoid N+1)
+    let Ok(metadata) = ctx.store.get_topic_metadata(Some(&topics)) else {
+        return Ok(None);
+    };
+    let topic_partitions: HashMap<String, i32> = metadata
+        .into_iter()
+        .map(|tm| (tm.name, tm.partition_count))
+        .collect();
+    if topic_partitions.is_empty() {
+        return Ok(None);
+    }
+    match coordinator.compute_assignments(group_id, &topic_partitions) {
+        Ok(computed) => {
+            crate::pg_debug!(
+                "SyncGroup: computed {} assignments server-side for group {}",
+                computed.len(),
+                group_id
+            );
+            Ok(Some(computed.into_iter().collect()))
+        }
+        Err(e @ crate::kafka::error::KafkaError::PolicyViolation { .. }) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Build the SyncGroup response for a coordinator outcome.
@@ -838,6 +868,24 @@ mod tests {
 
         /// Send a JoinGroup and return the slot its response lands in.
         fn join(&self, group: &str, member_id: &str, session_timeout_ms: i32) -> ResponseSlot {
+            self.join_protocol(
+                group,
+                member_id,
+                session_timeout_ms,
+                "range",
+                vec![0, 1, 2, 3],
+            )
+        }
+
+        /// Send a JoinGroup with one protocol and return the slot its response lands in.
+        fn join_protocol(
+            &self,
+            group: &str,
+            member_id: &str,
+            session_timeout_ms: i32,
+            protocol: &str,
+            metadata: Vec<u8>,
+        ) -> ResponseSlot {
             let slot: ResponseSlot = Arc::new(Mutex::new(None));
             let writer = slot.clone();
             handle_join_group(
@@ -851,8 +899,8 @@ mod tests {
                     rebalance_timeout_ms: 60_000,
                     protocol_type: "consumer".to_string(),
                     protocols: vec![JoinGroupProtocol {
-                        name: "range".to_string(),
-                        metadata: vec![0, 1, 2, 3],
+                        name: protocol.to_string(),
+                        metadata,
                     }],
                 },
                 move |response| {
@@ -1191,6 +1239,78 @@ mod tests {
         // A disconnected client is ignored.
         drop(rx);
         JoinGroupReply::new(9, 5, tx).send(JoinGroupResponse::default());
+    }
+
+    /// The server computes assignments (reading the subscribed topics' partition counts)
+    /// only for the SyncGroup the coordinator takes assignments from: the leader's, at the
+    /// current generation, in the sync phase. A leader's SyncGroup with empty assignments
+    /// for a stale generation, or once the group is Stable, computes nothing: the
+    /// computation runs on the single DB thread and its result would be ignored.
+    #[test]
+    fn test_sync_group_computes_assignments_only_in_the_sync_phase() {
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 4,
+            }])
+        });
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "roundrobin", metadata))
+            .expect("a lone member's JoinGroup is answered at once");
+        let member = join.member_id.to_string();
+        let generation = join.generation_id;
+        let empty = || {
+            vec![SyncGroupAssignment {
+                member_id: member.clone(),
+                assignment: vec![],
+            }]
+        };
+
+        let stale = f.sync("g", &member, generation - 1, empty());
+        assert_eq!(
+            take_sync(&stale).unwrap().error_code,
+            crate::kafka::constants::ERROR_ILLEGAL_GENERATION
+        );
+
+        let synced = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
+        assert_eq!(synced.error_code, ERROR_NONE);
+        let assignment =
+            crate::kafka::assignment::MemberAssignment::parse(&synced.assignment).unwrap();
+        assert_eq!(assignment.partitions("t"), vec![0, 1, 2, 3]);
+
+        // Stable: the stored assignment, nothing computed.
+        let again = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
+        assert_eq!(again.error_code, ERROR_NONE);
+        assert_eq!(again.assignment, synced.assignment);
+    }
+
+    /// A server-side assignment over the work limit is refused with POLICY_VIOLATION
+    /// before anything is read or computed; the group stays in its sync phase.
+    #[test]
+    fn test_sync_group_refuses_an_assignment_over_the_work_limit() {
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(0);
+        let mut metadata = vec![0, 0];
+        metadata.extend_from_slice(
+            &i32::try_from(crate::kafka::limits::MAX_ASSIGNMENT_WORK + 1)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let refused = f.sync("g", &member, join.generation_id, vec![]);
+        assert_eq!(
+            take_sync(&refused).unwrap().error_code,
+            crate::kafka::constants::ERROR_POLICY_VIOLATION
+        );
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
     }
 
     #[test]
