@@ -163,7 +163,8 @@ pg_kafka.compression_type = 'gzip'
   - Data after the batch too short to hold another batch is ignored, as Kafka trims it.
   - As in Kafka, a negative key, value or header value length is null (a null header
     value is stored empty) and duplicate header keys are stored, in order (see §7 for
-    what a fetch returns). A UTF-8 header key is stored as sent, U+0000 included. A header
+    what a fetch returns). A UTF-8 header key is stored as sent, U+0000 included (and shadow
+    mode forwards it so). A header
     key that is not UTF-8 is accepted and stored with replacement characters, what a Java
     client reads it as; Kafka stores its bytes.
 

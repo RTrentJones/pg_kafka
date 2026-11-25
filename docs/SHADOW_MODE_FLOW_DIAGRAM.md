@@ -101,6 +101,21 @@ previous delivery); a full librdkafka queue pauses intake briefly, keeping order
 headers and the timestamp are forwarded (`kafka.messages.timestamp_ms`, or the insert time when the
 producer sent none, which is what local consumers see). `partition` is left to the partitioner
 (`murmur2_random`, the Java client's), so the external cluster re-partitions by key.
+Header keys go to librdkafka with their length (`rd_kafka_header_add`), so a key holding U+0000,
+which Kafka allows and pg_kafka stores, is forwarded byte for byte (rdkafka's `OwnedHeaders::insert`
+would pass it as a C string and panic on it).
+
+### Panics
+
+The forwarder runs detached on the network thread, so a panic in it would stop forwarding for
+every shadow topic with nothing to notice. Sending one record runs under `catch_unwind`: a panic
+there fails that record (a counted attempt, so a record that always panics is dead-lettered after
+`shadow_max_retries`) and fences its partition. The loop itself is supervised: after a panic
+anywhere else, the records it held (on a producer or waiting in its backlog) are answered
+`NotAttempted` and fence their partitions, its producers are dropped (which purges them), and it
+runs again after 1 s, keeping its fences, held sync responses and queued acks. A record whose
+answer is lost with the panic (the one whose delivery report was being handled) is claimed again
+after the DB thread's in-flight eviction, as for any lost ack.
 
 ### Ordering
 

@@ -121,6 +121,17 @@
 //! serving delivery reports, held-response timeouts, the ack flush and the
 //! settings check meanwhile, so a full queue delays only the records behind it.
 //!
+//! ## Panics
+//!
+//! The task runs detached on the network thread, so a panic in it would end
+//! forwarding for every shadow topic with nothing to notice. Sending a record
+//! (the work that handles what a client put into it) runs under `catch_unwind`:
+//! a panic there fails that record, a counted attempt, and fences its
+//! partition. The loop itself runs supervised: after a panic anywhere else the
+//! records it held are answered `NotAttempted` and fence their partitions (see
+//! [`ForwarderCore::recover_from_panic`]), its producers are dropped (which
+//! purges them), and it runs again after [`RESTART_BACKOFF`].
+//!
 //! ## Held sync-mode responses
 //!
 //! A [`SyncHold`] carries the buffered response of a committed sync-mode
@@ -129,13 +140,14 @@
 //! only those responses, never the DB thread.
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::producer::{EnqueueError, DELIVERY_TIMEOUT};
 use super::{
@@ -160,6 +172,9 @@ const SETTINGS_CHECK_TICKS: u64 = 25;
 /// Producer generations timed out per hold tick at most (more than one at
 /// once is rare: a producer replaced while it still holds records).
 const MAX_TIMEOUTS_PER_TICK: usize = 8;
+/// Pause before the forwarder loop runs again after a panic, so a panic that
+/// repeats does not spin the network thread.
+const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 
 /// What to do with an incoming record.
 #[derive(Debug, PartialEq)]
@@ -392,10 +407,55 @@ impl ForwarderCore {
     ) {
         self.expire_backlog(backlog, now, timeout);
         while let Some(queued) = backlog.pop_front() {
-            if let Some(queued) = send(self, queued) {
-                backlog.push_front(queued);
-                return;
+            let key = queued.record.row;
+            // A panic while sending one record (a bug reached by what a client
+            // put into it) fails that record and leaves the forwarder running.
+            match catch_unwind(AssertUnwindSafe(|| send(self, queued))) {
+                Ok(Some(queued)) => {
+                    backlog.push_front(queued);
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => self.send_panicked(key),
             }
+        }
+    }
+
+    /// Sending `key` panicked. If it reached a producer first, its delivery
+    /// report is lost with the panic: it is no longer tracked. It is answered as
+    /// a failed attempt (retried and eventually dead-lettered like any other
+    /// failure, so a record that always panics does not block its partition for
+    /// good) and fences its partition, so no later record overtakes its retry.
+    pub(crate) fn send_panicked(&mut self, key: RowKey) {
+        error!("Shadow forwarder panicked while sending {key:?}; failing the record");
+        self.resolved(key);
+        self.fence(key);
+        self.acks.push_back(ForwardAck::new(
+            key,
+            ForwardOutcome::Failed("the shadow forwarder panicked while sending it".to_string()),
+        ));
+    }
+
+    /// The forwarder loop panicked and is about to run again with new producers:
+    /// the old ones (dropped with the loop, which purges them) and their delivery
+    /// reports are gone. Every record the loop held, on a producer or in the
+    /// `backlog`, is answered `NotAttempted` (its row becomes due again, without
+    /// a counted attempt) and fences its partition, so a later record of the
+    /// partition still on its way does not overtake the re-send. The producer
+    /// generations are forgotten (the new loop numbers its producers from the
+    /// start). Fences, held responses and queued acks stay: the DB thread still
+    /// waits for them.
+    pub(crate) fn recover_from_panic(&mut self, backlog: &mut VecDeque<Queued>) {
+        let mut lost: Vec<RowKey> = self.outstanding.keys().copied().collect();
+        lost.extend(backlog.drain(..).map(|queued| queued.record.row));
+        lost.sort_unstable();
+        self.outstanding.clear();
+        self.by_age.clear();
+        self.timed_out.clear();
+        self.collateral_generations.clear();
+        for key in lost {
+            self.fence(key);
+            self.not_attempted(key, "the shadow forwarder restarted");
         }
     }
 
@@ -851,6 +911,11 @@ type Deliveries = FuturesUnordered<BoxFuture<'static, Delivery>>;
 /// Reads the configuration through the `RuntimeContext` on every record, so
 /// shadow mode and every producer setting can change at runtime
 /// (ALTER SYSTEM + pg_reload_conf()).
+///
+/// The loop runs supervised: a panic in it (it runs detached, so nothing else
+/// would notice) is caught, the records it held are answered
+/// ([`ForwarderCore::recover_from_panic`]) and the loop runs again, so one bad
+/// record or bug cannot stop forwarding for every shadow topic.
 pub(crate) async fn run_shadow_forwarder(
     forward_rx: Receiver<ForwardRequest>,
     ack_tx: Sender<ForwardAck>,
@@ -860,20 +925,88 @@ pub(crate) async fn run_shadow_forwarder(
 
     // Bridge the DB thread's crossbeam channel into the runtime in batches, on
     // one blocking-pool thread, so the async loop below can wait for new records,
-    // delivery reports and hold timeouts at once.
-    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<ForwardRequest>>(4);
+    // delivery reports and hold timeouts at once. The bridge outlives a restart of
+    // the loop: it ends when either channel end is gone.
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<ForwardRequest>>(4);
     tokio::task::spawn_blocking(move || bridge_requests(&forward_rx, &batch_tx));
 
-    let mut core = ForwarderCore::default();
+    supervise(Forwarder::new(batch_rx, ack_tx, runtime_context)).await;
+
+    info!("Shadow forwarder task stopped");
+}
+
+/// What the forwarder loop keeps across a restart after a panic: its inputs and
+/// outputs, the bookkeeping the DB thread's view depends on, and the backlog
+/// (records received and not answered yet). Producers and pending delivery
+/// reports belong to one run of the loop.
+struct Forwarder {
+    batch_rx: tokio::sync::mpsc::Receiver<Vec<ForwardRequest>>,
+    ack_tx: Sender<ForwardAck>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
+    core: ForwarderCore,
+    backlog: VecDeque<Queued>,
+    /// Test hook: panic once after taking the next batch.
+    #[cfg(test)]
+    panic_on_next_batch: bool,
+}
+
+impl Forwarder {
+    fn new(
+        batch_rx: tokio::sync::mpsc::Receiver<Vec<ForwardRequest>>,
+        ack_tx: Sender<ForwardAck>,
+        runtime_context: Arc<crate::kafka::RuntimeContext>,
+    ) -> Self {
+        Self {
+            batch_rx,
+            ack_tx,
+            runtime_context,
+            core: ForwarderCore::default(),
+            backlog: VecDeque::new(),
+            #[cfg(test)]
+            panic_on_next_batch: false,
+        }
+    }
+}
+
+/// Run the forwarder loop until it stops, running it again after a panic.
+async fn supervise(mut forwarder: Forwarder) {
+    loop {
+        let run = AssertUnwindSafe(forward(&mut forwarder))
+            .catch_unwind()
+            .await;
+        if run.is_ok() {
+            return;
+        }
+        error!(
+            "Shadow forwarder panicked; answering the records it held as not attempted \
+             and restarting it"
+        );
+        forwarder.core.recover_from_panic(&mut forwarder.backlog);
+        tokio::time::sleep(RESTART_BACKOFF).await;
+    }
+}
+
+/// The forwarder loop (see the module docs). Returns when the DB thread is gone.
+async fn forward(forwarder: &mut Forwarder) {
+    let Forwarder {
+        batch_rx,
+        ack_tx,
+        runtime_context,
+        core,
+        backlog,
+        ..
+    } = forwarder;
+    #[cfg(test)]
+    let panic_on_next_batch = &mut forwarder.panic_on_next_batch;
+    let runtime_context: &crate::kafka::RuntimeContext = runtime_context;
     let mut slot = ProducerSlot::default();
     let mut deliveries = Deliveries::new();
     let mut ticks: u64 = 0;
     let mut tick = tokio::time::interval(HOLD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut backlog: VecDeque<Queued> = VecDeque::new();
     loop {
-        if !core.flush_acks(&ack_tx) {
+        if !core.flush_acks(ack_tx) {
             info!("Forward ack channel closed, stopping shadow forwarder");
             break;
         }
@@ -898,7 +1031,9 @@ pub(crate) async fn run_shadow_forwarder(
                         }
                     }
                 }
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                #[cfg(test)]
+                assert!(!std::mem::take(panic_on_next_batch), "injected forwarder panic");
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             Some(delivery) = deliveries.next(), if !deliveries.is_empty() => {
                 if let Err(e) = &delivery.result {
@@ -910,10 +1045,10 @@ pub(crate) async fn run_shadow_forwarder(
                     core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
                 }
                 // A delivery frees room in librdkafka's queue.
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             () = tokio::time::sleep(QUEUE_FULL_BACKOFF), if !backlog.is_empty() => {
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             _ = tick.tick() => {
                 let now = Instant::now();
@@ -925,12 +1060,12 @@ pub(crate) async fn run_shadow_forwarder(
                     let Some(generation) = core.expired_generation(now, timeout) else {
                         break;
                     };
-                    slot.time_out(&mut core, generation, now, timeout);
+                    slot.time_out(core, generation, now, timeout);
                 }
                 // After the generations (`pump` expires the backlog first),
                 // so a record behind a timed-out one of its partition is
                 // collateral, not a second failure.
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
                 // A settings change rebuilds the producer (and purges its
                 // outstanding records) even when no new record arrives to
                 // notice it.
@@ -940,14 +1075,12 @@ pub(crate) async fn run_shadow_forwarder(
                     if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
                         // A failed rebuild is logged by `current` and retried on the
                         // next record or check.
-                        let _ = slot.current(&mut core, &config);
+                        let _ = slot.current(core, &config);
                     }
                 }
             }
         }
     }
-
-    info!("Shadow forwarder task stopped");
 }
 
 /// Move requests from the DB thread's channel to the async task, up to
@@ -2140,5 +2273,122 @@ mod tests {
         ] {
             assert_ne!(producer_fingerprint(&changed), f);
         }
+    }
+
+    /// A panic while sending one record fails that record (a counted attempt, so
+    /// a record that always panics is dead-lettered in the end) and fences its
+    /// partition; the records after it are still sent.
+    #[test]
+    fn a_panic_while_sending_fails_only_that_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let mut backlog: VecDeque<Queued> = [rec(0, 1, true), rec(0, 2, false), rec(1, 1, true)]
+            .into_iter()
+            .map(|record| Queued {
+                record,
+                received_at: now,
+            })
+            .collect();
+        core.pump_backlog(&mut backlog, now, TIMEOUT, |core, q| {
+            core.sent(q.record.row, 1, q.received_at);
+            assert_ne!(q.record.row, RowKey::new(1, 0, 1), "injected panic");
+            None
+        });
+        assert!(backlog.is_empty());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, RowKey::new(1, 0, 1));
+        assert!(matches!(&got[0].1, ForwardOutcome::Failed(e) if e.contains("panicked")));
+        assert!(!core.outstanding.contains_key(&RowKey::new(1, 0, 1)));
+        assert_eq!(core.outstanding.len(), 2, "the later records were sent");
+        assert_eq!(core.admit(&rec(0, 3, false)), Admit::Fenced);
+        assert_eq!(
+            core.admit(&rec(0, 1, false)),
+            Admit::Send,
+            "its retry lifts the fence"
+        );
+    }
+
+    /// After a panic of the loop, every record it held (on a producer or in the
+    /// backlog) is answered NotAttempted and fences its partition; acks already
+    /// queued, fences and held responses are kept; producer generations are
+    /// forgotten.
+    #[test]
+    fn recovering_from_a_panic_answers_every_held_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let released = Arc::new(AtomicUsize::new(0));
+        core.add_hold(
+            counting_hold(vec![RowKey::new(1, 0, 4)], TIMEOUT, &released),
+            now,
+        );
+        core.on_result(RowKey::new(1, 2, 7), 1, Err("boom".into()), false);
+        core.sent(RowKey::new(1, 0, 4), 3, now);
+        core.retire_generation(3);
+        let mut backlog: VecDeque<Queued> = VecDeque::from([Queued {
+            record: rec(1, 9, true),
+            received_at: now,
+        }]);
+        core.recover_from_panic(&mut backlog);
+        assert!(backlog.is_empty());
+        assert!(core.outstanding.is_empty() && core.by_age.is_empty());
+        assert!(core.collateral_generations.is_empty());
+        let got = outcomes(&mut core);
+        assert!(matches!(got[0], (k, ForwardOutcome::Failed(_)) if k == RowKey::new(1, 2, 7)));
+        let lost: Vec<RowKey> = got[1..].iter().map(|(k, _)| *k).collect();
+        assert_eq!(lost, vec![RowKey::new(1, 0, 4), RowKey::new(1, 1, 9)]);
+        assert!(got[1..]
+            .iter()
+            .all(|(_, o)| matches!(o, ForwardOutcome::NotAttempted(e) if e.contains("restarted"))));
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(2, 8, false)), Admit::Fenced);
+        assert_eq!(core.held(), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+    }
+
+    /// A panic of the forwarder loop does not end forwarding: the records it held
+    /// are answered, and the loop runs again and answers the records after them.
+    /// It stops only when the DB thread's channel is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_forwarder_runs_again_after_a_panic() {
+        let mut config = crate::config::Config::load();
+        config.shadow_mode_enabled = false;
+        let context = Arc::new(crate::kafka::RuntimeContext::new(config));
+        let (forward_tx, forward_rx) = crossbeam_channel::bounded(16);
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(16);
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || bridge_requests(&forward_rx, &batch_tx));
+        let mut forwarder = Forwarder::new(batch_rx, ack_tx, context);
+        forwarder.panic_on_next_batch = true;
+        let task = tokio::spawn(supervise(forwarder));
+
+        let next_ack = || {
+            ack_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("an ack within 10 s")
+        };
+        forward_tx
+            .send(ForwardRequest::Record(rec(0, 1, true)))
+            .expect("the forwarder takes requests");
+        let first = next_ack();
+        assert_eq!(first.row, RowKey::new(1, 0, 1));
+        assert!(
+            matches!(&first.outcome, ForwardOutcome::NotAttempted(e) if e.contains("restarted")),
+            "{first:?}"
+        );
+        forward_tx
+            .send(ForwardRequest::Record(rec(1, 1, true)))
+            .expect("the restarted forwarder takes requests");
+        let second = next_ack();
+        assert_eq!(second.row, RowKey::new(1, 1, 1));
+        assert!(
+            matches!(&second.outcome, ForwardOutcome::NotAttempted(e) if e.contains("not enabled")),
+            "{second:?}"
+        );
+        drop(forward_tx);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the forwarder stops once its channel is gone")
+            .expect("the forwarder task ends without a panic");
     }
 }
