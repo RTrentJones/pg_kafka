@@ -343,6 +343,7 @@ fn create_topics_storage_failures_are_reported_on_the_topics_they_affect() {
     // The existing topics are looked up once for the request: a failed lookup refuses
     // every topic it would have checked; a failed create refuses only its topic.
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     store.expect_colliding_topics().returning(|_| Err(boom()));
     store.expect_create_topic().times(0);
     let resp = with_ctx(&store, |ctx| {
@@ -356,6 +357,7 @@ fn create_topics_storage_failures_are_reported_on_the_topics_they_affect() {
     }
 
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     store.expect_colliding_topics().returning(|_| Ok(vec![]));
     store.expect_create_topic().returning(|name, _| {
         if name == "create-fails" {
@@ -385,6 +387,7 @@ fn create_topics_storage_failures_are_reported_on_the_topics_they_affect() {
 fn delete_topics_storage_failures_are_reported_on_the_topics_they_affect() {
     // The topics are looked up once for the request: a failed lookup errors every topic.
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     expect_topics(&mut store, |_| Err(boom()));
     store.expect_delete_topic().times(0);
     let resp = with_ctx(&store, |ctx| {
@@ -396,6 +399,7 @@ fn delete_topics_storage_failures_are_reported_on_the_topics_they_affect() {
 
     // A failed delete errors only its topic.
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     expect_topics(&mut store, |name| {
         Ok(Some(if name == "delete-fails" {
             (1, 1)
@@ -424,6 +428,7 @@ fn create_partitions_storage_failures_are_reported_on_the_topics_they_affect() {
     };
     // The topics are looked up once for the request: a failed lookup errors every topic.
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     expect_topics(&mut store, |_| Err(boom()));
     store.expect_set_topic_partition_count().times(0);
     let resp = with_ctx(&store, |ctx| {
@@ -435,6 +440,7 @@ fn create_partitions_storage_failures_are_reported_on_the_topics_they_affect() {
 
     // A failed change errors only its topic.
     let mut store = MockKafkaStore::new();
+    store.expect_total_partition_count().returning(|| Ok(0));
     expect_topics(&mut store, |_| Ok(Some((1, 1))));
     store
         .expect_set_topic_partition_count()

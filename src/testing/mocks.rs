@@ -35,6 +35,7 @@ mod store {
             fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
             fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
                 fn colliding_topics<'a>(&self, names: &'a [String]) -> Result<Vec<String>>;
+            fn total_partition_count(&self) -> Result<i64>;
         }
 
         impl LogStore for KafkaStore {

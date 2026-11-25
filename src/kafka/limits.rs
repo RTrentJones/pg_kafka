@@ -1,10 +1,13 @@
 //! Bounds on client-controlled state.
 //!
 //! Every count a client can choose and the broker then materialises in memory is capped here:
-//! partitions per topic (Metadata and the assignors allocate one entry per partition, so an
-//! unbounded count could abort the worker with an allocation failure and send Postgres into crash
-//! recovery on every Metadata request), members per consumer group, the number of groups the
-//! in-memory coordinator holds, and the memory all groups' member state may take together.
+//! partitions per topic and partitions of all topics together (Metadata and the assignors
+//! allocate one entry per partition; partitions cost nothing to create, so without the total
+//! cap one CreateTopics of 10,000 topics of 10,000 partitions each would make every all-topics
+//! Metadata request allocate about 17 GB, abort the worker with an allocation failure and send
+//! Postgres into crash recovery, again after every restart), members per consumer group, the
+//! number of groups the in-memory coordinator holds, the memory all groups' member state may
+//! take together, and the work of one server-side assignment.
 //!
 //! The GUCs are `Sighup`: the worker re-reads them on its config reload. Code reads them through
 //! the accessors below, which also work in unit tests (they return the boot values there).
@@ -20,6 +23,12 @@ pub const HARD_MAX_PARTITIONS: i32 = 100_000;
 /// Default for `pg_kafka.max_partitions_per_topic` (the upper bound of
 /// `pg_kafka.default_partitions`).
 pub const DEFAULT_MAX_PARTITIONS_PER_TOPIC: i32 = 10_000;
+
+/// Default for `pg_kafka.max_total_partitions`: twenty topics at the default per-topic cap. An
+/// all-topics Metadata response at that size takes about 35 MB in the worker.
+pub const DEFAULT_MAX_TOTAL_PARTITIONS: i32 = 200_000;
+/// Upper bound of `pg_kafka.max_total_partitions` (about 1.75 GB per all-topics Metadata).
+pub const MAX_MAX_TOTAL_PARTITIONS: i32 = 10_000_000;
 
 /// Default for `pg_kafka.group_max_size` (Kafka's `group.max.size` defaults to unlimited; a bound
 /// keeps one group's member table, which lives in worker memory, finite).
@@ -65,6 +74,7 @@ pub const DEFAULT_MAX_GROUP_MEMORY_BYTES: usize = DEFAULT_MAX_GROUP_MEMORY_KB as
 
 static MAX_PARTITIONS_PER_TOPIC: GucSetting<i32> =
     GucSetting::<i32>::new(DEFAULT_MAX_PARTITIONS_PER_TOPIC);
+static MAX_TOTAL_PARTITIONS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_TOTAL_PARTITIONS);
 static GROUP_MAX_SIZE: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_GROUP_MAX_SIZE);
 static MAX_CONSUMER_GROUPS: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_CONSUMER_GROUPS);
 static MAX_GROUP_MEMORY_KB: GucSetting<i32> = GucSetting::<i32>::new(DEFAULT_MAX_GROUP_MEMORY_KB);
@@ -78,6 +88,16 @@ pub fn register_gucs() {
         &MAX_PARTITIONS_PER_TOPIC,
         1,
         HARD_MAX_PARTITIONS,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_kafka.max_total_partitions",
+        c"Maximum number of partitions of all topics together",
+        c"A CreateTopics, CreatePartitions or auto-created topic (Metadata, Produce) that would take the total above it fails with POLICY_VIOLATION; topics already above it stay. Default 200000. Reloadable.",
+        &MAX_TOTAL_PARTITIONS,
+        1,
+        MAX_MAX_TOTAL_PARTITIONS,
         GucContext::Sighup,
         GucFlags::default(),
     );
@@ -128,6 +148,26 @@ fn read(_setting: &GucSetting<i32>, boot: i32) -> i32 {
 /// The configured per-topic partition cap (`pg_kafka.max_partitions_per_topic`).
 pub fn max_partitions_per_topic() -> i32 {
     read(&MAX_PARTITIONS_PER_TOPIC, DEFAULT_MAX_PARTITIONS_PER_TOPIC).clamp(1, HARD_MAX_PARTITIONS)
+}
+
+/// The configured cap on the partitions of all topics (`pg_kafka.max_total_partitions`).
+pub fn max_total_partitions() -> i64 {
+    i64::from(
+        read(&MAX_TOTAL_PARTITIONS, DEFAULT_MAX_TOTAL_PARTITIONS)
+            .clamp(1, MAX_MAX_TOTAL_PARTITIONS),
+    )
+}
+
+/// Why adding `adding` partitions to the `current` total is refused, or `Ok` if the total
+/// stays within `max` (adding nothing is always accepted).
+pub fn check_total_partitions(current: i64, adding: i64, max: i64) -> Result<(), String> {
+    if adding <= 0 || current.saturating_add(adding) <= max {
+        Ok(())
+    } else {
+        Err(format!(
+            "Adding {adding} partitions to the {current} of all topics exceeds the maximum of {max} (pg_kafka.max_total_partitions)"
+        ))
+    }
 }
 
 /// The configured member cap per group (`pg_kafka.group_max_size`).
@@ -194,6 +234,22 @@ mod tests {
     }
 
     #[test]
+    fn test_check_total_partitions() {
+        assert!(check_total_partitions(0, 10, 10).is_ok());
+        assert!(check_total_partitions(5, 5, 10).is_ok());
+        assert!(check_total_partitions(5, 6, 10).is_err());
+        // Topics already above the cap stay; only growth is refused.
+        assert!(check_total_partitions(20, 0, 10).is_ok());
+        assert!(check_total_partitions(20, 1, 10).is_err());
+        // 10,000 topics of 10,000 partitions.
+        assert!(
+            check_total_partitions(0, 100_000_000, DEFAULT_MAX_TOTAL_PARTITIONS.into()).is_err()
+        );
+        assert!(check_total_partitions(i64::MAX, i64::MAX, i64::MAX).is_ok());
+        assert!(check_total_partitions(i64::MAX, 1, 10).is_err());
+    }
+
+    #[test]
     fn test_sane_partition_count() {
         assert_eq!(sane_partition_count(1), Some(1));
         assert_eq!(
@@ -209,6 +265,11 @@ mod tests {
     #[test]
     fn test_defaults() {
         assert_eq!(max_partitions_per_topic(), DEFAULT_MAX_PARTITIONS_PER_TOPIC);
+        assert_eq!(
+            max_total_partitions(),
+            i64::from(DEFAULT_MAX_TOTAL_PARTITIONS)
+        );
+        const { assert!(DEFAULT_MAX_TOTAL_PARTITIONS >= HARD_MAX_PARTITIONS) };
         assert_eq!(group_max_size(), DEFAULT_GROUP_MAX_SIZE as usize);
         assert_eq!(max_consumer_groups(), DEFAULT_MAX_CONSUMER_GROUPS as usize);
         assert_eq!(max_group_memory_bytes(), DEFAULT_MAX_GROUP_MEMORY_BYTES);

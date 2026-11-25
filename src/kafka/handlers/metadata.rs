@@ -21,7 +21,9 @@ pub fn handle_api_versions() -> kafka_protocol::messages::api_versions_response:
 /// Returns metadata for all topics or specific requested topics, each distinct requested
 /// name once. A specifically-requested topic that doesn't exist is auto-created only when
 /// `allow_auto_topic_creation` is true; otherwise it is reported as
-/// UNKNOWN_TOPIC_OR_PARTITION and left uncreated.
+/// UNKNOWN_TOPIC_OR_PARTITION and left uncreated. The missing names of one request are
+/// created together or not at all: if they would take the partitions of all topics above
+/// `pg_kafka.max_total_partitions`, none is created and each is POLICY_VIOLATION.
 ///
 /// # Arguments
 /// * `ctx` - Handler context containing store, broker metadata, and default partitions

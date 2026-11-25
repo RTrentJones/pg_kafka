@@ -320,6 +320,7 @@ pg_kafka.message_retention_hours = 0  -- Time-based retention sweep (0 = keep fo
 pg_kafka.message_partition_minutes = 1440  -- Width of one time partition of kafka.messages
 -- Resource bounds
 pg_kafka.max_partitions_per_topic = 10000  -- CreateTopics/CreatePartitions cap (1-100000; INVALID_PARTITIONS above)
+pg_kafka.max_total_partitions = 200000     -- partitions of all topics together (POLICY_VIOLATION above)
 pg_kafka.group_max_size = 1000             -- members per consumer group (GROUP_MAX_SIZE_REACHED above)
 pg_kafka.max_consumer_groups = 100000      -- groups held in memory (oldest Empty group evicted when full)
 
