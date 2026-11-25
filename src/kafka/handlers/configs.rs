@@ -291,6 +291,7 @@ fn alter_topic_configs(
         name: resource_name,
         topic,
     } = resource;
+    malformed_alterations(configs).map_or(Ok(()), |msg| Err((ERROR_INVALID_REQUEST, msg)))?;
     if resource_type != RESOURCE_TYPE_TOPIC {
         return Err((
             ERROR_INVALID_REQUEST,
@@ -309,17 +310,6 @@ fn alter_topic_configs(
                 format!("Unknown topic '{resource_name}'"),
             )
         })?;
-    // Kafka 3.7 refuses a SET, APPEND or SUBTRACT without a value as a malformed request
-    // (INVALID_REQUEST), whatever the key, before it validates any config.
-    if let Some((name, _, _)) = configs
-        .iter()
-        .find(|(_, op, value)| *op != OP_DELETE && value.is_none())
-    {
-        return Err((
-            ERROR_INVALID_REQUEST,
-            format!("Null value not supported for : {name}"),
-        ));
-    }
     let planned = plan_retention_change(configs).map_err(|msg| (ERROR_INVALID_CONFIG, msg))?;
     if let (false, Some(change)) = (validate_only, planned) {
         let retention_ms = match change {
@@ -331,6 +321,27 @@ fn alter_topic_configs(
             .map_err(storage_error)?;
     }
     Ok(())
+}
+
+/// Why a resource's alterations are a malformed request, if they are. Kafka 3.7
+/// (`ConfigAdminManager.preprocess`) refuses, before it looks at the resource type or the
+/// topic and before it validates any config, a resource that names one key twice and then
+/// a SET, APPEND or SUBTRACT without a value, whatever the key, each INVALID_REQUEST.
+fn malformed_alterations(configs: &[(String, i8, Option<String>)]) -> Option<String> {
+    let mut names = HashSet::with_capacity(configs.len());
+    if !configs
+        .iter()
+        .all(|(name, _, _)| names.insert(name.as_str()))
+    {
+        return Some("Error due to duplicate config keys".to_string());
+    }
+    let null_updates: Vec<&str> = configs
+        .iter()
+        .filter(|(_, op, value)| *op != OP_DELETE && value.is_none())
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    (!null_updates.is_empty())
+        .then(|| format!("Null value not supported for : {}", null_updates.join(", ")))
 }
 
 /// An IncrementalAlterConfigs resource: its type, its name and, for a topic, the topic's
@@ -350,8 +361,8 @@ enum RetentionChange {
 }
 
 /// Validate a resource's alterations before any is applied (all-or-nothing per resource):
-/// the `retention.ms` change (`None` for no change), or why they are refused. Every supported alteration targets the same column, so applying them in
-/// order is the same as applying the last one, and the resource is applied with one write.
+/// the `retention.ms` change (`None` for no change), or why they are refused. A resource
+/// names each key at most once ([`malformed_alterations`]), so it has at most one change.
 fn plan_retention_change(
     configs: &[(String, i8, Option<String>)],
 ) -> std::result::Result<Option<RetentionChange>, String> {
