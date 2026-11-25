@@ -631,8 +631,14 @@ BEGIN
         SELECT * INTO v_contents FROM kafka.message_partition_contents(p_partition);
         topic_ids := v_contents.topic_ids;
         partition_ids := v_contents.partition_ids;
+        -- Some topic in the leaf that is not listed: a hashed EXCEPT, linear in both
+        -- arrays (one entry per (topic, partition) pair, one per expired topic, each
+        -- up to the partition cap), not the array operator <@, which compares every
+        -- element of one with every element of the other (40,000 of each: 1.5 s,
+        -- holding the locks taken above).
         IF v_contents.has_pending
-           OR NOT (v_contents.topic_ids <@ COALESCE(p_expired_topics, '{}'::INT[])) THEN
+           OR EXISTS (SELECT unnest(v_contents.topic_ids)
+                      EXCEPT SELECT unnest(p_expired_topics)) THEN
             RETURN;
         END IF;
         IF EXISTS (SELECT 1 FROM pg_depend
