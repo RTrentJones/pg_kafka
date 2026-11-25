@@ -99,9 +99,10 @@ EXTENSION pg_kafka` has run, without a restart.
   retention sweep once all its rows are expired. Under ACCESS EXCLUSIVE this rewrites
   the old table once (adding `kafka.messages.record_bytes`, the size of each record a
   Fetch sums, computed for every row: a full read with each row's headers detoasted, a
-  full write and the rebuild of its two unique indexes, so it needs free disk for a
-  second copy of the table) and reads it six more times (bound, attach check, BRIN,
-  aborted-row, pending-producer and timestamp index builds);
+  full write and the rebuild of its three indexes, the two unique ones and the 0.0.0
+  pending-row index, each a full read of the new copy, so it needs free disk for a second
+  copy of the table) and reads it six more times (bound, attach check, BRIN, aborted-row,
+  pending-producer and timestamp index builds): ten full reads in all;
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
@@ -130,7 +131,7 @@ EXTENSION pg_kafka` has run, without a restart.
   `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
   differs). Converting `kafka.messages.created_at` rewrites the table, one more full
-  read and write under the same lock. Layouts older than these are not supported;
+  read and write and three index rebuilds under the same lock. Layouts older than these are not supported;
 - adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
 - adds indexes on the referencing columns of foreign keys whose parent rows are deleted
   or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,

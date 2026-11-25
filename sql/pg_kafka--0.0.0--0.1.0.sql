@@ -6,9 +6,10 @@
 -- with scripts/check-upgrade.sh.
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
--- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes and reads it
--- six more times (see step 1; once more, and rewrites it again, for an install whose
--- created_at is a naive TIMESTAMP); run it in a quiet period on a large table.
+-- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes (reading it,
+-- writing a copy and reading that copy once per index rebuilt, three) and reads it six more
+-- times: ten full reads (see step 1; an install whose created_at is a naive TIMESTAMP gets
+-- one more rewrite with its three index rebuilds); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
@@ -65,8 +66,10 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 -- a window shorter than one partition width). New rows go to the new time leaves.
 --
 -- Cost: ACCESS EXCLUSIVE on the old table for the whole script; one rewrite of it (the
--- record_bytes fill, which also rebuilds its two unique indexes) and six sequential
--- reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
+-- record_bytes fill: a full read and write, then the rebuild of its three indexes, the two
+-- unique ones and the 0.0.0 pending-row index renamed messages_legacy_txn_pending_idx below,
+-- which ATTACH adopts as idx_messages_txn_pending's leaf, each rebuild a full read of the new
+-- copy) and six sequential reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
 -- idx_messages_txn_aborted, idx_messages_txn_pending_producer and idx_messages_timestamp
 -- builds).
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
@@ -678,7 +681,8 @@ $$;
 -- 0.0.0 installs from before BUG-7 (no kafka.messages.timestamp_ms) and RV-10 (naive
 -- TIMESTAMP columns compared with NOW()): ATTACH needs the leaf's columns to be the
 -- parent's, and the other two columns get the type a fresh install has. Converting
--- created_at rewrites the legacy table (one more full read and write); the naive
+-- created_at rewrites the legacy table (one more full read and write, and the rebuild of
+-- its three indexes, a full read each); the naive
 -- values are taken in the session's TimeZone, the zone NOW() was stored in.
 ALTER TABLE kafka.messages_legacy ADD COLUMN IF NOT EXISTS timestamp_ms BIGINT NOT NULL DEFAULT -1;
 DO $$
@@ -703,7 +707,8 @@ $$;
 -- Fetches sum the record_bytes of the rows they scan (bootstrap.sql): the 0.0.0 rows get
 -- theirs here, computed as fetches compute it for a row without one (record_bytes_sql! in
 -- src/kafka/storage/postgres/log.rs). ALTER COLUMN TYPE ... USING rewrites the legacy
--- table (one more full read and write, the headers of every row detoasted); its USING
+-- table (one more full read and write, the headers of every row detoasted, and the
+-- rebuild of its three indexes, a full read each); its USING
 -- expression cannot hold the subqueries itself, so a function computes it for the rewrite
 -- only.
 ALTER TABLE kafka.messages_legacy ADD COLUMN record_bytes INT;

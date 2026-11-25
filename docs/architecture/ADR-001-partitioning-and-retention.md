@@ -344,7 +344,8 @@ partitioned parent (same `global_offset` sequence, now owned by the parent) with
 and attaches the old table as one leaf `[MINVALUE, upgrade time)`; the rows are not copied into
 a new table. Under ACCESS EXCLUSIVE it rewrites the old table once (filling `record_bytes`, the
 size a fetch sums, for every row: a full read with each row's headers detoasted, a full write and
-the rebuild of its two unique indexes) and reads it six more times (MAX(created_at) for the bound,
+the rebuild of its three indexes, the two unique ones and the 0.0.0 pending-row index adopted at
+ATTACH as a leaf of `idx_messages_txn_pending`, each a full read of the new copy) and reads it six more times (MAX(created_at) for the bound,
 the attach's bound check, the BRIN, `idx_messages_txn_aborted`,
 `idx_messages_txn_pending_producer` and `idx_messages_timestamp` builds). The legacy leaf is then retained and dropped like any past leaf.
 The views that read the table are recreated on the parent. A new binary
