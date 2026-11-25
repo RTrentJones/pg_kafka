@@ -177,41 +177,57 @@ pub async fn enable_shadow_mode(
     Ok(())
 }
 
-/// Disable shadow mode for a topic and reset GUCs
-pub async fn disable_shadow_mode(db: &Client, topic_name: &str) -> TestResult {
-    println!("=== Disabling shadow mode ===");
+/// The server-wide settings [`enable_shadow_mode`] and [`shadow_test_setup`] leave in
+/// `postgresql.auto.conf` for the whole category (they are deliberately not reset
+/// between tests, see `TestContext::cleanup`).
+const SHADOW_CATEGORY_GUCS: [&str; 4] = [
+    "pg_kafka.shadow_mode_enabled",
+    "pg_kafka.shadow_bootstrap_servers",
+    "pg_kafka.shadow_security_protocol",
+    "pg_kafka.config_reload_interval_ms",
+];
 
-    // Disable shadow mode for topic
-    db.execute(
-        r"
-        UPDATE kafka.shadow_config sc
-        SET mode = 'local_only', updated_at = NOW()
-        FROM kafka.topics t
-        WHERE sc.topic_id = t.id AND t.name = $1
-        ",
-        &[&topic_name],
-    )
-    .await?;
+/// The shadow category's teardown, registered last: reset the settings its tests
+/// left (shadow mode on, pointed at the test broker, a 2 s reload interval), so the
+/// categories and runs after it (the performance step, with the broker stopped) do
+/// not run with shadow mode on. Fails unless the server reports every one at its
+/// default afterwards.
+pub async fn test_shadow_teardown_turns_shadow_mode_off() -> TestResult {
+    println!("=== Shadow Category Teardown ===\n");
+    let db = crate::common::create_db_client().await?;
+    for name in SHADOW_CATEGORY_GUCS {
+        db.batch_execute(&format!("ALTER SYSTEM RESET {name}"))
+            .await?;
+    }
+    db.batch_execute("SELECT pg_reload_conf()").await?;
+    // The worker reloads on SIGHUP at its next loop iteration (<= 100 ms idle).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    SHADOW_SETUP_DONE.store(false, Ordering::Release);
 
-    // Reset global GUCs
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_mode_enabled", &[])
-        .await?;
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_bootstrap_servers", &[])
-        .await?;
-    db.execute("ALTER SYSTEM RESET pg_kafka.shadow_security_protocol", &[])
-        .await?;
-    db.execute("ALTER SYSTEM RESET pg_kafka.config_reload_interval_ms", &[])
-        .await?;
-
-    // Reload config
-    db.execute("SELECT pg_reload_conf()", &[]).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-    // Wait for unified config reload cycle
-    println!("⏳ Waiting for config reload cycle (2 seconds)...");
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-
-    println!("✅ Shadow mode disabled");
+    // `pg_file_settings` reads the configuration files as they are now.
+    let left: Vec<String> = db
+        .query(
+            "SELECT DISTINCT name FROM pg_file_settings
+             WHERE sourcefile LIKE '%postgresql.auto.conf' AND name = ANY($1)",
+            &[&SHADOW_CATEGORY_GUCS.to_vec()],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    if !left.is_empty() {
+        return Err(format!("still set by ALTER SYSTEM after the reset: {left:?}").into());
+    }
+    // A new session reads the reloaded configuration at its start.
+    let check = crate::common::create_db_client().await?;
+    let enabled: String = check
+        .query_one("SHOW pg_kafka.shadow_mode_enabled", &[])
+        .await?
+        .get(0);
+    if enabled != "off" {
+        return Err(format!("pg_kafka.shadow_mode_enabled is {enabled} after the reset").into());
+    }
+    println!("✅ Shadow mode is off again\n");
     Ok(())
 }
 

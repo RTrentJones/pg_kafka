@@ -102,5 +102,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         outbox_robustness::test_shadow_dead_letters_follow_the_retry_cap: sequential, // Mutates shadow_bootstrap_servers, shadow_max_retries
         outbox_robustness::test_shadow_failure_acks_make_dead_letters: sequential, // Mutates shadow_max_retries, shadow_retry_backoff_ms
         schema_recreate::test_shadow_acks_from_a_dropped_schema_are_ignored: sequential, // DROP/CREATE EXTENSION; mutates test_forward_ack_delay_ms
+        // Teardown: stays last.
+        helpers::test_shadow_teardown_turns_shadow_mode_off: sequential,
     ]
 }
