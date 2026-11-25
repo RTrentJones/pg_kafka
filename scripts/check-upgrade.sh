@@ -29,6 +29,7 @@ EXT_DIR="$("$PG_CONFIG" --sharedir)/extension"
 OLD_SCRIPT="${OLD_SCRIPT:-$ROOT/sql/upgrade-test/pg_kafka--0.0.0.sql}"
 FRESH_DB="pgkafka_upgrade_fresh_$$"
 OLD_DB="pgkafka_upgrade_old_$$"
+ZONE_DB="pgkafka_upgrade_zone_$$"
 PSQL=(psql -X -q -v ON_ERROR_STOP=1 -At)
 
 NEW_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
@@ -45,6 +46,7 @@ cp "$OLD_SCRIPT" "$EXT_DIR/pg_kafka--0.0.0.sql"
 cleanup() {
   "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $FRESH_DB" || true
   "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $OLD_DB" || true
+  "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $ZONE_DB" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -260,6 +262,39 @@ if [ "${out//$'\n'/ }" != "t t t" ]; then
   echo "ERROR: dropping the legacy leaf failed: $out" >&2
   status=1
 fi
+
+# The legacy leaf's upper bound survives the session's DateStyle and TimeZone. Under a
+# non-ISO DateStyle a timestamptz prints with a zone abbreviation that is read back
+# through timezone_abbreviations, not TimeZone: Europe/Dublin's summer IST as Israel's
+# +02 (the bound lands an hour before the newest row: the ATTACH fails), Asia/Kolkata's
+# IST likewise (3 h 30 off). Each upgrade must succeed and the bound must be exactly
+# one microsecond past the newest row (here written in the future, so it is the max).
+for setting in "Postgres, MDY|Europe/Dublin" "SQL, DMY|Asia/Kolkata"; do
+  datestyle="${setting%%|*}"
+  timezone="${setting##*|}"
+  "${PSQL[@]}" -d postgres -c "CREATE DATABASE $ZONE_DB"
+  if ! out="$("${PSQL[@]}" -d "$ZONE_DB" 2>&1 <<SQL
+CREATE EXTENSION pg_kafka VERSION '0.0.0';
+INSERT INTO kafka.topics (name, partitions) VALUES ('upgrade-zone', 1);
+INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+SELECT id, 0, 0, 'v'::bytea, timestamptz '2099-07-01 12:00:00+00' FROM kafka.topics;
+SET datestyle = '$datestyle';
+SET timezone = '$timezone';
+ALTER EXTENSION pg_kafka UPDATE;
+RESET datestyle;
+RESET timezone;
+SELECT p.upper_bound = (SELECT max(created_at) FROM kafka.messages) + INTERVAL '1 microsecond'
+FROM kafka.message_partitions() p WHERE p.partition_name = 'messages_legacy';
+SQL
+)"; then
+    echo "ERROR: the upgrade under DateStyle '$datestyle', TimeZone $timezone failed: $out" >&2
+    status=1
+  elif [ "$out" != "t" ]; then
+    echo "ERROR: under DateStyle '$datestyle', TimeZone $timezone the legacy leaf's upper bound is not the newest row + 1 us: $out" >&2
+    status=1
+  fi
+  "${PSQL[@]}" -d postgres -c "DROP DATABASE $ZONE_DB"
+done
 
 # Leaves are extension members: pg_dump leaves them out exactly like kafka.messages
 # itself (a dump holds CREATE EXTENSION only), so a restore never meets an orphan leaf.

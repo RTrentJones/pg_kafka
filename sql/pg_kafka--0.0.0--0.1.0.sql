@@ -6,8 +6,9 @@
 -- with scripts/check-upgrade.sh.
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
--- leaf, not copied) under an ACCESS EXCLUSIVE lock and reads the table three times
--- (see step 1); run it in a quiet period on a large table.
+-- leaf, not copied) under an ACCESS EXCLUSIVE lock and reads the table five times
+-- (see step 1; once more, and rewrites it, for an install whose created_at is a naive
+-- TIMESTAMP); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
 
@@ -538,6 +539,10 @@ $$;
 -- says the leaf was kept because a lock wait ran out (the maintenance lock, or the
 -- locks the DROP needs, within the 2 s lock_timeout): a caller dropping several leaves
 -- stops there, since the session holding the lock blocks the next drop just as long.
+-- Only under READ COMMITTED: the re-check reads the snapshot, and a REPEATABLE READ or
+-- SERIALIZABLE one predates the lock wait, so rows committed during the wait would be
+-- invisible to it and dropped with the leaf. Under those levels the leaf is kept with a
+-- WARNING (dropped and lock_timed_out false) and a READ COMMITTED pass drops it.
 -- Dropping a leaf is equivalent to deleting its rows, which the worker may already do;
 -- the function grants no more.
 CREATE FUNCTION kafka.drop_message_partition(
@@ -560,6 +565,11 @@ BEGIN
     lock_timed_out := false;
     -- Already gone (a concurrent sweep dropped it): nothing to do, not an error.
     IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
+        RETURN;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE WARNING 'pg_kafka: did not drop time partition % (a % snapshot cannot see rows committed while the drop waits for its locks); a READ COMMITTED sweep drops it',
+            p_partition, upper(current_setting('transaction_isolation'));
         RETURN;
     END IF;
     -- The maintenance lock first, before this call locks any table (the leaf check
@@ -586,7 +596,9 @@ BEGIN
         -- the order inserts use) so the contents check below cannot race a writer.
         PERFORM kafka.lock_message_tables();
         -- Re-check under the locks: a concurrent drop of the same leaf may have
-        -- committed while this call waited for them.
+        -- committed while this call waited for them. Each statement here takes a new
+        -- snapshot (READ COMMITTED, checked above), so the contents check sees every
+        -- row committed during the wait.
         IF NOT EXISTS (SELECT 1 FROM pg_inherits
                        WHERE inhrelid = p_partition AND inhparent = 'kafka.messages'::regclass) THEN
             RETURN;
@@ -676,8 +688,11 @@ BEGIN
     -- created_at; rows written after this transaction go to the new time leaves.
     SELECT GREATEST(now(), MAX(created_at)) + INTERVAL '1 microsecond'
     INTO v_upper FROM kafka.messages_legacy;
+    -- The bound as ISO 8601 text in UTC with a numeric offset: the session's DateStyle
+    -- would print a zone abbreviation (Europe/Dublin's IST), which is read back through
+    -- timezone_abbreviations (as Israel's) and moves the bound.
     EXECUTE format('ALTER TABLE kafka.messages ATTACH PARTITION kafka.messages_legacy FOR VALUES FROM (MINVALUE) TO (%L)',
-                   v_upper);
+                   to_char(v_upper AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00');
 END
 $$;
 

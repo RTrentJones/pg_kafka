@@ -110,7 +110,9 @@ fn hello_pg_kafka() -> &'static str {
 /// partition-maintenance lock (bounded by the session's `lock_timeout`), so a
 /// concurrent pass (another session's, or the worker's) finishes first. Call it in a
 /// transaction of its own: a transaction that already locked kafka.messages could
-/// deadlock with the pass it waits for.
+/// deadlock with the pass it waits for. Only a READ COMMITTED call drops time
+/// partitions: under REPEATABLE READ or SERIALIZABLE the snapshot predates the drop's
+/// lock wait, so the pass skips its drops with a WARNING and does the rest.
 ///
 /// Superusers only: EXECUTE is revoked from PUBLIC (`sql/bootstrap.sql`), since a caller
 /// that waits here holds the extension lock, and any role can hold the maintenance lock.

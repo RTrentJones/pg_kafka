@@ -303,9 +303,17 @@ impl PostgresStore {
                 leaves: &leaves,
                 partitioned,
             };
+            let drops_allowed = read_committed(client)?;
+            if !drops_allowed {
+                crate::pg_warning!(
+                    "pg_kafka: this retention sweep drops no time partition: it runs outside \
+                     READ COMMITTED, and its snapshot cannot see rows committed while a drop \
+                     waits for its locks; a READ COMMITTED sweep drops them"
+                );
+            }
             let mut drops = DropStep {
                 lap: Lap::new(found.drops(), &state.drop, MAX_PARTITION_DROPS_PER_PASS),
-                blocked: false,
+                blocked: !drops_allowed,
             };
             let mut terminal = BatchStep::new(Batch::TerminalTransactions);
             let mut producers = BatchStep::new(Batch::StaleProducers);
@@ -703,6 +711,22 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for AbortedStep<'_> {
             .served(!retention::batch_was_full(n, RETENTION_DELETE_BATCH));
         Ok(())
     }
+}
+
+/// Whether this transaction runs at READ COMMITTED. Only there does
+/// `kafka.drop_message_partition` re-check a leaf with a snapshot taken after its lock
+/// wait; at REPEATABLE READ or SERIALIZABLE it refuses every drop, so the sweep skips
+/// its drop step and keeps the found leaves for a later pass.
+fn read_committed(client: &SpiClient<'_>) -> Result<bool> {
+    Ok(client
+        .select(
+            "SELECT current_setting('transaction_isolation') = 'read committed' AS rc",
+            Some(1),
+            &[],
+        )?
+        .first()
+        .get_by_name::<bool, _>("rc")?
+        .unwrap_or(false))
 }
 
 /// The past leaves among `candidates` that hold no row: one statement for all of

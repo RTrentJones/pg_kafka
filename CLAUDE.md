@@ -265,7 +265,9 @@ must keep:
   (`kafka.ensure_message_partitions`, `drop_message_partition`, `message_partition_contents`,
   internal `create_message_partition`, and the internal lock helpers `try_maintenance_lock`
   and `lock_message_tables`; `kafka.message_partitions()` lists the leaves), and the
-  drop/trim decisions are pure functions in `storage/retention.rs`. Retention for a window of at
+  drop/trim decisions are pure functions in `storage/retention.rs`. A leaf is dropped only at
+  READ COMMITTED (its re-check needs a snapshot taken after the drop's lock wait; the worker
+  pins its session to that level, and a sweep at another skips its drops). Retention for a window of at
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
   ctid-based statement to one leaf (`tableoid`; ctids repeat across leaves), and send hot
