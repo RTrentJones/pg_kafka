@@ -62,7 +62,9 @@ This document lists intentional deviations from the official Kafka protocol spec
 **Implementation:**
 - ✅ **Inbound (Producer → Server)**: pg_kafka reads the RecordBatch v2 itself, with Kafka 3.7's
   record grammar (varints of at most 5 bytes, the timestamp delta a varlong of at most 10)
-- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC
+- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC (the
+  last batch of a partition's Fetch records is sent uncompressed when only that fits the
+  Fetch's byte limits, §7)
 - ✅ **Supported codecs**: none, gzip, snappy, lz4, zstd
 
 **Configuration:**
