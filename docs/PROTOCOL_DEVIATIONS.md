@@ -215,7 +215,8 @@ pg_kafka.compression_type = 'gzip'
   answers it, and the request's other partitions are written (with acks=0 the refusal
   closes the connection); no producer state is taken from it, so the producer's next
   batch there is checked against its earlier batches only
-- ✅ PostgreSQL advisory locks for sequence serialization
+- ✅ Sequence checks are serialized by the worker's single database thread (every batch of
+  every producer is checked and recorded there, one at a time), not by a lock
 - ✅ A producer the broker holds no state for (a producer id with no `kafka.producer_ids`
   row: removed by the retention sweep after 7 idle days, lost with DROP EXTENSION, or never
   issued here) is accepted as Kafka 3.7 accepts it (KIP-360): its batch is written at
