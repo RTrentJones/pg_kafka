@@ -687,8 +687,11 @@ BEGIN
     -- created_at; rows written after this transaction go to the new time leaves.
     SELECT GREATEST(now(), MAX(created_at)) + INTERVAL '1 microsecond'
     INTO v_upper FROM kafka.messages_legacy;
+    -- The bound as ISO 8601 text in UTC with a numeric offset: the session's DateStyle
+    -- would print a zone abbreviation (Europe/Dublin's IST), which is read back through
+    -- timezone_abbreviations (as Israel's) and moves the bound.
     EXECUTE format('ALTER TABLE kafka.messages ATTACH PARTITION kafka.messages_legacy FOR VALUES FROM (MINVALUE) TO (%L)',
-                   v_upper);
+                   to_char(v_upper AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00');
 END
 $$;
 
