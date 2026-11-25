@@ -634,8 +634,12 @@ CREATE TABLE kafka.consumer_offsets (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
-CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
+-- Only the primary key (which leads with group_id, so it serves the lookups by group)
+-- and the topic index below: an offset commit updates committed_offset, metadata and
+-- commit_timestamp, none of them indexed, so the update can be HOT (no index entries at
+-- all); an index on commit_timestamp, which nothing reads, made every commit write an
+-- entry in every index.
+
 -- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
 -- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
 -- leading on topic_id reads the whole table once per deleted topic.

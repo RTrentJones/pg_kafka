@@ -45,7 +45,7 @@ async fn offset_fetch(w: &mut Wire, version: i16, group: &str, topic: &str) -> F
 
 /// OffsetCommit v8 of `(partition, offset, metadata)` with generation -1 (a simple
 /// consumer): each partition's error code.
-async fn commit(
+pub(super) async fn commit(
     w: &mut Wire,
     group: &str,
     topic: &str,

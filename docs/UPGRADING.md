@@ -130,7 +130,11 @@ EXTENSION pg_kafka` has run, without a restart.
   for the retention sweep's producer prune and the RV-13 producer-id reallocation);
 - adds `idx_producer_ids_last_active` (`last_active_at`, `producer_id`) and
   `idx_transactions_terminal` (partial, `last_updated_at` of terminal transactions) for
-  the retention sweep's producer and transaction prunes.
+  the retention sweep's producer and transaction prunes;
+- drops `idx_consumer_offsets_group` (its column leads the primary key) and
+  `idx_consumer_offsets_timestamp` (read by no query): an offset commit changes no
+  indexed column any more, so it can be a HOT update instead of writing four index
+  entries.
 
 After the upgrade:
 

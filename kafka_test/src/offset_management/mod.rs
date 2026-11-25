@@ -8,6 +8,7 @@
 mod boundaries;
 mod by_timestamp;
 mod commit_fetch;
+mod commit_indexes;
 mod commit_rules;
 mod edge_cases;
 mod fetch_parity;
@@ -33,5 +34,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         require_stable::test_offset_fetch_require_stable,
         fetch_parity::test_offset_fetch_of_a_missing_topic_is_no_offset,
         fetch_parity::test_offset_commit_metadata_longer_than_4096_is_refused,
+        commit_indexes::test_offset_commit_changes_no_indexed_column,
     ]
 }

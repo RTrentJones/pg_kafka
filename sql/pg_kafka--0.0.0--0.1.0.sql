@@ -40,6 +40,12 @@ SELECT pg_catalog.setval('kafka.producer_ids_producer_id_seq',
 CREATE INDEX idx_producer_ids_last_active
 ON kafka.producer_ids(last_active_at, producer_id);
 
+-- Offset commits maintain only the primary key and idx_consumer_offsets_topic (see
+-- bootstrap.sql): the primary key leads with group_id, and nothing reads
+-- commit_timestamp through an index.
+DROP INDEX IF EXISTS kafka.idx_consumer_offsets_group;
+DROP INDEX IF EXISTS kafka.idx_consumer_offsets_timestamp;
+
 -- Rows by topic, for the foreign keys on kafka.topics, whose ON DELETE CASCADE
 -- (DeleteTopics) would otherwise read each table whole once per deleted topic (see
 -- bootstrap.sql). kafka.txn_partitions gets its index where it is created.
