@@ -400,11 +400,32 @@ fn rss_anon_bytes(pid: i32) -> Option<u64> {
 /// the worker up (plan and relation caches, allocator arenas), then the measured rest.
 const LARGE_TXN_WARMUP_RECORDS: usize = 50_000;
 const LARGE_TXN_RECORDS: usize = 250_000;
+/// Records per topic between two samples of the worker's memory, each taken once every
+/// record sent so far is acknowledged.
+const LARGE_TXN_SAMPLE_EVERY: usize = 12_500;
 
-/// The worker's private memory may grow by at most this much while the measured
-/// 200,000 records of each topic go into the open transaction: holding a per-record
-/// forward buffer in RAM would grow it by about 50 MB there.
-const LARGE_TXN_GROWTH_BOUND: u64 = 8 * 1024 * 1024;
+/// The median sample of the measured records' second half may exceed the median of their
+/// first half by at most this much. One sample against another is noise: what the
+/// allocator keeps of the bursts of pipelined produce requests it has served moves a
+/// sample by up to ~12 MB either way from one sample to the next, with no trend. Holding
+/// a per-record forward buffer in RAM (about 50 MB over the measured 200,000 records of
+/// each topic) moves the median of the second half (taken ~112,000 records after that of
+/// the first) up by about 28 MB.
+const LARGE_TXN_GROWTH_BOUND: u64 = 12 * 1024 * 1024;
+
+/// How much the median of the last half of `samples` exceeds the median of the first half
+/// (0 if it does not); the middle sample of an odd count is in neither.
+fn median_growth(samples: &[u64]) -> Option<u64> {
+    let half = samples.len() / 2;
+    let median = |part: &[u64]| {
+        let mut part = part.to_vec();
+        part.sort_unstable();
+        part.get(part.len() / 2).copied()
+    };
+    let first = median(&samples[..half])?;
+    let last = median(&samples[samples.len() - half..])?;
+    Some(last.saturating_sub(first))
+}
 
 /// A large committed transaction on two shadowed topics, one forwarding everything and
 /// one half of its records (keyless records route by `offset % 100`, so the expected half
@@ -450,15 +471,21 @@ pub async fn test_large_committed_transaction_is_enqueued_exactly_once() -> Test
     producer.begin_transaction()?;
     println!("Step 1: {LARGE_TXN_RECORDS} keyed records to {full}, as many keyless to {half}...");
     let value = vec![b'v'; 32];
-    let mut before = None;
+    let mut samples: Option<Vec<u64>> = Some(Vec::new());
     let mut sent: Vec<rdkafka::producer::DeliveryFuture> =
-        Vec::with_capacity(2 * LARGE_TXN_RECORDS);
-    for i in 0..LARGE_TXN_RECORDS {
-        if i == LARGE_TXN_WARMUP_RECORDS {
+        Vec::with_capacity(2 * LARGE_TXN_SAMPLE_EVERY);
+    for i in 0..=LARGE_TXN_RECORDS {
+        if i >= LARGE_TXN_WARMUP_RECORDS && i % LARGE_TXN_SAMPLE_EVERY == 0 {
             for delivery in sent.drain(..) {
                 delivery.await?.map_err(|(e, _)| e)?;
             }
-            before = rss_anon_bytes(pid);
+            samples = samples.and_then(|mut s| {
+                s.push(rss_anon_bytes(pid)?);
+                Some(s)
+            });
+        }
+        if i == LARGE_TXN_RECORDS {
+            break;
         }
         let key = format!("{i:064}");
         sent.push(
@@ -472,10 +499,6 @@ pub async fn test_large_committed_transaction_is_enqueued_exactly_once() -> Test
                 .map_err(|(e, _)| e)?,
         );
     }
-    for delivery in sent {
-        delivery.await?.map_err(|(e, _)| e)?;
-    }
-    let after = rss_anon_bytes(pid);
     println!("Step 2: committing...");
     producer.commit_transaction(Duration::from_secs(120))?;
 
@@ -515,20 +538,58 @@ pub async fn test_large_committed_transaction_is_enqueued_exactly_once() -> Test
             "{topic}: exactly the records routing selects are enqueued, once each"
         );
     }
-    match (before, after) {
-        (Some(before), Some(after)) => {
-            let growth = after.saturating_sub(before);
+    match samples
+        .as_deref()
+        .and_then(|s| Some((s, median_growth(s)?)))
+    {
+        Some((samples, growth)) => {
             println!(
-                "Worker RssAnon while the transaction was open: {before} -> {after} (+{growth})"
+                "Worker RssAnon while the transaction was open, every \
+                 {LARGE_TXN_SAMPLE_EVERY} records: {samples:?} (median +{growth})"
             );
             assert!(
                 growth <= LARGE_TXN_GROWTH_BOUND,
-                "the worker grew by {growth} bytes while the transaction was open"
+                "the worker's median grew by {growth} bytes while the transaction was open \
+                 ({samples:?})"
             );
         }
-        _ => println!("/proc/{pid}/status is not readable here; memory not checked"),
+        None => println!("/proc/{pid}/status is not readable here; memory not checked"),
     }
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median_growth, LARGE_TXN_GROWTH_BOUND, LARGE_TXN_SAMPLE_EVERY};
+
+    const MB: u64 = 1_000_000;
+
+    /// The 17 samples of the measured records with `per_sample` bytes held per sample
+    /// and, at every other sample, `spike` bytes the allocator still keeps.
+    fn samples(per_sample: u64, spike: u64) -> Vec<u64> {
+        (0..17u64)
+            .map(|i| 40 * MB + i * per_sample + if i % 2 == 0 { spike } else { 0 })
+            .collect()
+    }
+
+    /// Noise of 12 MB at every other sample, with no trend, passes; a per-record buffer of
+    /// 50 MB over the measured 200,000 records fails, with or without that noise.
+    #[test]
+    fn the_median_growth_tells_a_per_record_buffer_from_noise() {
+        let leak_per_sample = 50 * MB * u64::try_from(LARGE_TXN_SAMPLE_EVERY).unwrap() / 200_000;
+        for spike in [0, 12 * MB] {
+            assert!(median_growth(&samples(0, spike)).unwrap() <= LARGE_TXN_GROWTH_BOUND);
+            assert!(
+                median_growth(&samples(leak_per_sample, spike)).unwrap() > LARGE_TXN_GROWTH_BOUND
+            );
+        }
+        // Noise that lowers the first half's samples instead.
+        let mut dips = samples(0, 0);
+        for s in dips.iter_mut().take(8).step_by(2) {
+            *s -= 12 * MB;
+        }
+        assert!(median_growth(&dips).unwrap() <= LARGE_TXN_GROWTH_BOUND);
+    }
 }

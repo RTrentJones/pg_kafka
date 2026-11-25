@@ -17,8 +17,13 @@ pub struct Wire {
 
 impl Wire {
     pub async fn connect() -> Result<Self> {
-        let addr = crate::common::get_bootstrap_servers();
-        let stream = TcpStream::connect(addr.as_str()).await?;
+        Self::connect_to(&crate::common::get_bootstrap_servers()).await
+    }
+
+    /// A connection to the broker at `addr` (`host:port`), for example the external
+    /// Kafka of the shadow tests.
+    pub async fn connect_to(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         Ok(Self {
             stream,

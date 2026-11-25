@@ -27,11 +27,14 @@
 use super::config::ShadowConfig;
 use super::error::{ShadowError, ShadowResult};
 use super::ForwardRecord;
+use rdkafka::bindings as rdsys;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::RDKafkaErrorCode;
-use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::message::{BorrowedHeaders, OwnedHeaders};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer, PurgeConfig};
+use rdkafka::types::RDKafkaRespErr;
 use rdkafka::util::Timeout;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -273,7 +276,18 @@ impl ShadowProducer {
     /// (the forwarder keeps many deliveries in flight). The record keeps its key,
     /// value, headers and timestamp; `partition` is left to the partitioner (the
     /// external cluster re-partitions by key).
+    ///
+    /// Every byte of the record comes from a client, so nothing here may panic on
+    /// it: rdkafka converts the topic name and header keys to C strings with an
+    /// `unwrap`, so a topic name holding U+0000 is refused here and header keys go
+    /// through [`owned_headers`], which passes each key's length.
     pub fn enqueue(&self, record: &ForwardRecord) -> Result<DeliveryFuture, EnqueueError> {
+        if record.topic_name.contains('\0') {
+            return Err(EnqueueError::Refused(format!(
+                "the external topic name {:?} holds U+0000",
+                record.topic_name
+            )));
+        }
         let mut future_record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&record.topic_name);
         if let Some(k) = record.key.as_deref() {
             future_record = future_record.key(k);
@@ -285,13 +299,7 @@ impl ShadowProducer {
             future_record = future_record.timestamp(ts);
         }
         if !record.headers.is_empty() {
-            let mut headers = OwnedHeaders::new_with_capacity(record.headers.len());
-            for (key, value) in &record.headers {
-                headers = headers.insert(Header {
-                    key,
-                    value: Some(value.as_slice()),
-                });
-            }
+            let headers = owned_headers(&record.headers).map_err(EnqueueError::Refused)?;
             future_record = future_record.headers(headers);
         }
         self.producer.send_result(future_record).map_err(|(e, _)| {
@@ -326,6 +334,90 @@ impl ShadowProducer {
     }
 }
 
+/// `headers` as librdkafka record headers, in order, each key and value byte for byte.
+///
+/// rdkafka's `OwnedHeaders::insert` passes the key as a C string and panics on a key
+/// holding U+0000, which Kafka allows (a header key is any UTF-8 string, and Kafka
+/// 3.7 stores and serves such keys). librdkafka itself takes the key's length
+/// (`rd_kafka_header_add`), stores that many bytes and writes them to the wire with
+/// that length, so the headers are built in a list of librdkafka's own and copied
+/// into an `OwnedHeaders` (`rd_kafka_headers_copy` re-adds each header with its
+/// stored length).
+pub(crate) fn owned_headers(headers: &[(String, Vec<u8>)]) -> Result<OwnedHeaders, String> {
+    let mut list = NativeHeaders::new(headers.len())?;
+    for (key, value) in headers {
+        list.add(key.as_bytes(), value)?;
+    }
+    Ok(list.to_owned_headers())
+}
+
+/// An `rd_kafka_headers_t` owned by this value and destroyed with it.
+struct NativeHeaders(NonNull<rdsys::rd_kafka_headers_t>);
+
+/// What an empty header value points at: librdkafka copies zero bytes from it, and a
+/// non-NULL pointer keeps the value empty rather than null.
+const EMPTY_VALUE: &[u8] = &[0];
+
+impl NativeHeaders {
+    fn new(capacity: usize) -> Result<Self, String> {
+        // SAFETY: `rd_kafka_headers_new` allocates a new, empty list and takes no
+        // pointers; a NULL result (allocation failure) is refused below.
+        let list = unsafe { rdsys::rd_kafka_headers_new(capacity) };
+        NonNull::new(list)
+            .map(Self)
+            .ok_or_else(|| "librdkafka could not allocate the record headers".to_string())
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let too_long = |_| "a record header is too long for librdkafka".to_string();
+        let key_len = isize::try_from(key.len()).map_err(too_long)?;
+        let value_len = isize::try_from(value.len()).map_err(too_long)?;
+        let value_ptr = if value.is_empty() {
+            EMPTY_VALUE.as_ptr()
+        } else {
+            value.as_ptr()
+        };
+        // SAFETY: `self.0` is a live, writable list owned by `self` (from
+        // `rd_kafka_headers_new`, destroyed only on drop). `key` and `value_ptr` are
+        // valid for reads of `key_len` and `value_len` bytes for the call;
+        // librdkafka copies exactly that many bytes of each (it calls `strlen` only
+        // for a size of -1) and keeps no pointer to them.
+        let err = unsafe {
+            rdsys::rd_kafka_header_add(
+                self.0.as_ptr(),
+                key.as_ptr().cast(),
+                key_len,
+                value_ptr.cast(),
+                value_len,
+            )
+        };
+        if err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+            Ok(())
+        } else {
+            Err(format!("librdkafka refused a record header: {err:?}"))
+        }
+    }
+
+    /// A copy of the list as rdkafka's `OwnedHeaders`.
+    fn to_owned_headers(&self) -> OwnedHeaders {
+        // SAFETY: `BorrowedHeaders` is rdkafka's zero-sized view of an
+        // `rd_kafka_headers_t`, made by casting the list's pointer (as rdkafka does
+        // for a message's headers). The list is live and not written while the view
+        // exists: `detach` only reads it, copying it with `rd_kafka_headers_copy`,
+        // and the view ends before `self` can be dropped.
+        let borrowed = unsafe { &*self.0.as_ptr().cast::<BorrowedHeaders>() };
+        borrowed.detach()
+    }
+}
+
+impl Drop for NativeHeaders {
+    fn drop(&mut self) {
+        // SAFETY: the list came from `rd_kafka_headers_new`, is owned by `self`
+        // alone (`to_owned_headers` hands out a copy) and is destroyed only here.
+        unsafe { rdsys::rd_kafka_headers_destroy(self.0.as_ptr()) };
+    }
+}
+
 impl std::fmt::Debug for ShadowProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShadowProducer")
@@ -338,6 +430,94 @@ impl std::fmt::Debug for ShadowProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The native list behind `headers` (rdkafka's `BorrowedHeaders` is a cast of it).
+    fn native(headers: &OwnedHeaders) -> *const rdsys::rd_kafka_headers_t {
+        std::ptr::from_ref(headers.as_borrowed()).cast()
+    }
+
+    /// Whether librdkafka finds a header named exactly `name` (it compares the stored
+    /// key length with `strlen(name)`, so `"a"` does not find a key `"a\0b"`), and the
+    /// value of the last one.
+    fn lookup(headers: &OwnedHeaders, name: &str) -> Option<Vec<u8>> {
+        let name = std::ffi::CString::new(name).expect("a test name without NUL");
+        let mut value: *const std::ffi::c_void = std::ptr::null();
+        let mut size = 0usize;
+        // SAFETY: `headers` is a live list; the out pointers are valid locals.
+        let err = unsafe {
+            rdsys::rd_kafka_header_get_last(
+                native(headers),
+                name.as_ptr(),
+                &raw mut value,
+                &raw mut size,
+            )
+        };
+        (err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR).then(|| {
+            // SAFETY: librdkafka returned a value of `size` bytes owned by `headers`.
+            unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) }.to_vec()
+        })
+    }
+
+    /// A header key holding U+0000 keeps all its bytes (rdkafka's `insert` panics on
+    /// it); values keep theirs, NUL bytes and empty values included, in order.
+    #[test]
+    fn owned_headers_keep_a_key_holding_nul() {
+        use rdkafka::message::Headers;
+        let headers = owned_headers(&[
+            ("a\0b".to_string(), b"\0v\0".to_vec()),
+            ("k".to_string(), b"plain".to_vec()),
+            ("e".to_string(), Vec::new()),
+        ])
+        .expect("headers build");
+        assert_eq!(headers.count(), 3);
+        // rdkafka reads a key as a C string, so it shows the key up to its NUL.
+        let first = headers.get(0);
+        assert_eq!((first.key, first.value), ("a", Some(&b"\0v\0"[..])));
+        assert_eq!(
+            lookup(&headers, "a"),
+            None,
+            "the key is stored with all 3 bytes"
+        );
+        assert_eq!(lookup(&headers, "k"), Some(b"plain".to_vec()));
+        assert_eq!(
+            lookup(&headers, "e"),
+            Some(Vec::new()),
+            "an empty value is not null"
+        );
+    }
+
+    fn record(topic: &str, headers: Vec<(String, Vec<u8>)>) -> ForwardRecord {
+        ForwardRecord {
+            row: super::super::RowKey::new(1, 0, 0),
+            topic_name: topic.to_string(),
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            headers,
+            timestamp_ms: None,
+            restart: true,
+        }
+    }
+
+    /// Nothing a client can put into a record panics in `enqueue`: a header key
+    /// holding U+0000 is queued, a topic name holding one is refused.
+    #[test]
+    fn enqueue_does_not_panic_on_nul_in_a_header_key_or_topic_name() {
+        let producer = ShadowProducer::new(Arc::new(ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        }))
+        .expect("a producer builds without connecting");
+        let nul_key = record("t", vec![("a\0b".to_string(), b"v".to_vec())]);
+        assert!(producer.enqueue(&nul_key).is_ok());
+        match producer.enqueue(&record("t\0x", Vec::new())) {
+            Err(EnqueueError::Refused(e)) => assert!(e.contains("U+0000"), "{e}"),
+            Ok(_) => panic!("a topic name holding U+0000 was queued"),
+            Err(EnqueueError::QueueFull) => panic!("expected a refusal, got QueueFull"),
+        }
+        producer.purge_outstanding();
+    }
 
     #[test]
     fn test_shadow_producer_not_enabled() {
