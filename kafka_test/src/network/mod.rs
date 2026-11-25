@@ -227,6 +227,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         fanout::test_delete_groups_of_many_groups_is_answered_quickly: sequential,
         fanout::test_describe_groups_of_many_groups_is_answered_quickly: sequential,
         fanout::test_fetch_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_long_poll_of_a_repeated_partition_is_answered_quickly: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,

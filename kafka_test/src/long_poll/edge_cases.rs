@@ -106,6 +106,7 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
     println!("Step 1: empty topic {topic}");
 
     for (corr, max_wait_ms) in (1..).zip([150, 700, 1_000, 1_300]) {
+        let slack = super::timeout::late_slack(&mut s, 100 + corr, &topic).await?;
         let took = super::timeout::timed_empty_fetch(&mut s, corr, &topic, max_wait_ms, 1).await?;
         let max_wait = Duration::from_millis(u64::try_from(max_wait_ms)?);
         println!("  max_wait_ms={max_wait_ms}: answered in {took:?}");
@@ -114,7 +115,7 @@ pub async fn test_long_poll_timeout_precision() -> TestResult {
             "an empty Fetch with max_wait_ms={max_wait_ms} was answered early, in {took:?}"
         );
         assert!(
-            took < max_wait + super::timeout::ANSWER_SLACK,
+            took < max_wait + slack,
             "an empty Fetch with max_wait_ms={max_wait_ms} was answered late, in {took:?}"
         );
     }

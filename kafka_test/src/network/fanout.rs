@@ -1097,3 +1097,101 @@ pub async fn test_fetch_of_a_repeated_partition_is_answered_quickly() -> TestRes
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A Fetch v4 of partition 0 of `topic` named `entries` times from `fetch_offset`.
+fn repeated_fetch(
+    topic: &str,
+    entries: usize,
+    fetch_offset: i64,
+    max_wait_ms: i32,
+) -> FetchRequest {
+    let mut t = FetchTopic::default();
+    t.topic = topic_name(topic);
+    t.partitions = (0..entries)
+        .map(|_| {
+            let mut p = FetchPartition::default();
+            p.fetch_offset = fetch_offset;
+            p.partition_max_bytes = 1_048_576;
+            p
+        })
+        .collect();
+    let mut req = FetchRequest::default();
+    req.replica_id = BrokerId(-1);
+    req.max_wait_ms = max_wait_ms;
+    req.min_bytes = 1;
+    req.max_bytes = 52_428_800;
+    req.topics = vec![t];
+    req
+}
+
+/// Long polls are registered on the network thread. One long poll naming a partition 60,000
+/// times (a 960 KB request, decoded inline) waits on it while a second such long poll, with a
+/// 1 ms wait, registers and unregisters: Kafka watches each partition of a Fetch once, and so
+/// does the registry, so the second is answered in milliseconds. Unregistering each of its
+/// 60,000 entries by scanning a list holding the first's 60,000 takes seconds on a network I/O
+/// thread, under the registry's write lock every long poll and Produce notification waits
+/// for. The first long poll is then woken by a produce and answers the partition once.
+pub async fn test_long_poll_of_a_repeated_partition_is_answered_quickly() -> TestResult {
+    const ENTRIES: usize = 60_000;
+    const BOUND: Duration = Duration::from_millis(500);
+    println!("=== Test: Long polls of one partition repeated {ENTRIES} times ===\n");
+    let (ctx, probe) = setup("lp").await?;
+    let target = short_topic("lp", 1).await?;
+    let mut w = Wire::connect().await?;
+    let (code, end, _) = w.list_offsets(&target, 0, -1, 0).await?;
+    assert_eq!((code, end), (0, 1), "the partition holds one record");
+
+    println!("Step 1: a long poll of the partition {ENTRIES} times, waiting 60 s...");
+    let waiting = repeated_fetch(&target, ENTRIES, end, 60_000);
+    let mut held = TcpStream::connect(crate::common::broker_addr()).await?;
+    held.write_all(&request_frame(4, 7, &waiting)).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    println!("Step 2: a second such long poll, waiting 1 ms...");
+    let quick = repeated_fetch(&target, ENTRIES, end, 1);
+    let m = measure(&probe, 4, &quick).await?;
+    let entries: Vec<(i32, i16)> = m
+        .response
+        .responses
+        .iter()
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(|p| (p.partition_index, p.error_code))
+        })
+        .collect();
+    println!("  answered after {:?} with {entries:?}", m.took);
+    assert_eq!(entries, vec![(0, 0)], "Kafka answers the partition once");
+    assert!(
+        m.took < BOUND,
+        "a 1 ms long poll took {:?} (best of {} attempts)",
+        m.took,
+        m.attempt + 1
+    );
+    assert_not_stalled(&m);
+
+    println!("Step 3: a produce wakes the first long poll...");
+    let value = plain_batch(&[Bytes::from_static(b"wake")], Compression::None);
+    assert_eq!(w.produce(&target, 0, value, None).await?.0, 0);
+    let answer = read_frame_within(&mut held, Duration::from_secs(10))
+        .await?
+        .ok_or("connection closed instead of an answer")?;
+    let (correlation, response) = decode_response::<FetchRequest>(4, &answer)?;
+    assert_eq!(correlation, 7);
+    let partitions: Vec<_> = response
+        .responses
+        .iter()
+        .flat_map(|t| t.partitions.iter())
+        .collect();
+    assert_eq!(partitions.len(), 1, "Kafka answers the partition once");
+    assert!(partitions[0]
+        .records
+        .as_ref()
+        .is_some_and(|r| !r.is_empty()));
+    println!("✅ the first long poll returned the record\n");
+
+    drop_topics(&ctx, &target).await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
