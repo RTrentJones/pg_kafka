@@ -175,6 +175,12 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// `commit_applied_acks` once its transaction committed (as the acks are), so
     /// no transaction's status is ever looked up after the fact.
     staged_dead_flags: Mutex<Option<i64>>,
+    /// The schema epoch: moved by [`forget_dropped_schema`](Self::forget_dropped_schema).
+    /// Acks of another epoch answer forwards of a dropped schema and are ignored.
+    epoch: AtomicU64,
+    /// The forwarder has not been told of the current epoch yet
+    /// ([`ForwardRequest::Reset`]): nothing else is sent before it.
+    reset_pending: AtomicBool,
 }
 
 /// The effects of one ack application that must wait for its transaction's
@@ -245,6 +251,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             staged_acks: Mutex::new(None),
             dead_flags: Mutex::new(None),
             staged_dead_flags: Mutex::new(None),
+            epoch: AtomicU64::new(0),
+            reset_pending: AtomicBool::new(false),
         }
     }
 
@@ -542,6 +550,10 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// not blocked: the forwarder releases the response. If the hold cannot be
     /// handed over (no forwarder, full channel) the response is released now.
     pub fn hold_response(&self, keys: Vec<RowKey>, release: HeldRelease) {
+        if !self.send_pending_reset() {
+            release.release();
+            return;
+        }
         let timeout = Duration::from_millis(self.db.settings().sync_timeout_ms);
         let hold = ForwardRequest::Hold(SyncHold {
             keys,
@@ -621,6 +633,11 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 return Ok(0);
             }
         }
+        // The forwarder must forget the dropped schema's forwards before it
+        // gets a record of the new one; the next tick tries again.
+        if !self.send_pending_reset() {
+            return Ok(0);
+        }
         // The forwarder answers every record NotAttempted without an external
         // broker, which leaves it due again: claiming it would only churn the
         // outbox. The rows wait, and go out once the broker is configured.
@@ -694,6 +711,43 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         Ok(dispatched)
     }
 
+    /// The extension was dropped (and possibly re-created) under the worker. Its
+    /// outbox is gone, and a re-created one reuses row keys (`kafka.topics.id`
+    /// starts again), so nothing kept for the old rows may touch the new ones:
+    /// forget the in-flight forwards (their keys would keep new rows from being
+    /// claimed), the acks not applied yet, the staged application and dead-flag
+    /// sync, and the sync rows of the batch; move to a new epoch, so the acks
+    /// still coming for the old forwards are ignored (a late delivery ack would
+    /// mark a new, never-sent row delivered; a failure would charge it an
+    /// attempt); and tell the forwarder, before anything else is sent, to drop
+    /// the old forwards' fences, records and holds.
+    pub fn forget_dropped_schema(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inflight.clear();
+        lock(&self.unapplied_acks).clear();
+        lock(&self.staged_acks).take();
+        lock(&self.sync_pending).clear();
+        self.forget_dead_flags_sync();
+        self.acks_only_not_attempted.store(false, Ordering::Relaxed);
+        self.reset_pending.store(true, Ordering::Relaxed);
+        tracing::debug!("Shadow: schema dropped, outbox state reset (epoch {epoch})");
+        self.send_pending_reset();
+    }
+
+    /// Tell the forwarder of the current epoch if it has not been told yet.
+    /// Returns whether it has been (false: no channel, or a full one).
+    fn send_pending_reset(&self) -> bool {
+        if !self.reset_pending.load(Ordering::Relaxed) {
+            return true;
+        }
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if self.try_send_forward(ForwardRequest::Reset(epoch)).is_err() {
+            return false;
+        }
+        self.reset_pending.store(false, Ordering::Relaxed);
+        true
+    }
+
     /// Whether `kafka.shadow_tracking.dead` agrees with `cap` on every pending row,
     /// so the claim can skip the full sync: the last committed sync used `cap` and
     /// no failure ack used another cap since. Every other change of `retry_count`
@@ -734,10 +788,13 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         let acks: Vec<ForwardAck> = {
             let mut unapplied = lock(&self.unapplied_acks);
             let guard = read_lock(&self.forward_ack_rx);
+            let epoch = self.epoch.load(Ordering::Relaxed);
             if let Some(rx) = guard.as_ref() {
                 while unapplied.len() < MAX_ACKS_PER_TICK {
                     match rx.try_recv() {
-                        Ok(ack) => unapplied.push(ack),
+                        Ok(ack) if ack.epoch == epoch => unapplied.push(ack),
+                        // A forward of a dropped schema (see `forget_dropped_schema`).
+                        Ok(_) => {}
                         Err(_) => break,
                     }
                 }

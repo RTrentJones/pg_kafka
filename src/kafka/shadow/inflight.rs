@@ -55,6 +55,11 @@ impl InflightTracker {
         self.lock().remove(key);
     }
 
+    /// Forget every entry: their forwards belong to a dropped schema.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
     /// Number of live forwards. Stale entries (older than `evict_after`: their
     /// ack was lost, and the claim treats their rows as claimable again) are
     /// dropped first, so lost acks never use up the in-flight room.

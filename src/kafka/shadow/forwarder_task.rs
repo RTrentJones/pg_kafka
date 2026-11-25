@@ -215,11 +215,34 @@ pub(crate) struct ForwarderCore {
     waiting: HashMap<RowKey, Vec<u64>>,
     next_hold: u64,
     /// Acks not yet accepted by the (bounded) ack channel. Never dropped: a lost
-    /// ack would leave the row in flight until the DB thread's eviction.
+    /// ack would leave the row in flight until the DB thread's eviction. (A
+    /// [`Self::reset`] drops them: the DB thread ignores them anyway.)
     pub(crate) acks: VecDeque<ForwardAck>,
+    /// The schema epoch of the last [`ForwardRequest::Reset`]: every ack sent is
+    /// stamped with it.
+    pub(crate) epoch: u64,
 }
 
 impl ForwarderCore {
+    /// The schema the forwards so far came from was dropped
+    /// ([`ForwardRequest::Reset`]): forget every fence, outstanding record,
+    /// timed-out or retired generation and queued ack of it, and release its held
+    /// responses (their records are gone with the schema). A re-created schema
+    /// reuses row keys, so none of this may apply to its rows. Acks sent from now
+    /// on carry `epoch`; the caller drops the backlog and the deliveries of
+    /// records sent before.
+    pub(crate) fn reset(&mut self, epoch: u64) {
+        let holds: Vec<u64> = self.holds.keys().copied().collect();
+        for id in holds {
+            self.finish_hold(id);
+        }
+        *self = Self {
+            next_hold: self.next_hold,
+            epoch,
+            ..Self::default()
+        };
+    }
+
     /// Ordering fence check for a record about to be sent. A record below the
     /// fence goes out ahead of the failed record, as it should, but leaves the
     /// fence in place. The fence is lifted by the failed record's retry, or by
@@ -604,7 +627,8 @@ impl ForwarderCore {
     /// Move queued acks onto the channel until it is full. Returns false when
     /// the DB thread is gone.
     pub(crate) fn flush_acks(&mut self, ack_tx: &Sender<ForwardAck>) -> bool {
-        while let Some(ack) = self.acks.pop_front() {
+        while let Some(mut ack) = self.acks.pop_front() {
+            ack.epoch = self.epoch;
             match ack_tx.try_send(ack) {
                 Ok(()) => {}
                 Err(TrySendError::Full(ack)) => {
@@ -738,6 +762,21 @@ impl ProducerSlot {
 }
 
 impl ProducerSlot {
+    /// The schema of every outstanding record was dropped: purge them from every
+    /// producer (their delivery reports are ignored, see [`Delivery::epoch`]), so
+    /// none waits on a producer forever with no delivery timeout watching it. The
+    /// live producer is dropped, so the next record builds a new generation.
+    fn reset(&mut self) {
+        if let Some(live) = self.live.take() {
+            live.producer.purge_outstanding();
+        }
+        for (_, producer) in self.replaced.drain(..) {
+            if let Some(producer) = producer.upgrade() {
+                producer.purge_outstanding();
+            }
+        }
+    }
+
     /// `generation` ran out of delivery time: fail every record outstanding on
     /// it now (see the module docs). The live producer is dropped, so the next
     /// record builds a new generation.
@@ -798,6 +837,9 @@ fn delivery_timeout(config: &crate::config::Config) -> Duration {
 struct Delivery {
     key: RowKey,
     generation: u64,
+    /// The schema epoch the record was sent in: a report of an earlier epoch
+    /// (the schema was dropped meanwhile) is ignored.
+    epoch: u64,
     result: Result<i64, String>,
     producer: Arc<ShadowProducer>,
 }
@@ -848,6 +890,12 @@ pub(crate) async fn run_shadow_forwarder(
                         ForwardRequest::Record(record) => {
                             backlog.push_back(Queued { record, received_at });
                         }
+                        ForwardRequest::Reset(epoch) => {
+                            info!("Shadow schema dropped; forgetting its forwards");
+                            backlog.clear();
+                            slot.reset();
+                            core.reset(epoch);
+                        }
                     }
                 }
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
@@ -856,8 +904,11 @@ pub(crate) async fn run_shadow_forwarder(
                 if let Err(e) = &delivery.result {
                     debug!("Forward FAILED {:?}: {e}", delivery.key);
                 }
-                let fatal = delivery.result.is_err() && delivery.producer.fatal_error().is_some();
-                core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
+                if delivery.epoch == core.epoch {
+                    let fatal =
+                        delivery.result.is_err() && delivery.producer.fatal_error().is_some();
+                    core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
+                }
                 // A delivery frees room in librdkafka's queue.
                 pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
             }
@@ -984,6 +1035,7 @@ fn forward_one(
             // keeps going.
             let ack_delay =
                 Duration::from_millis(u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0));
+            let epoch = core.epoch;
             deliveries.push(Box::pin(async move {
                 let result = match future.await {
                     Ok(Ok((_partition, offset))) => Ok(offset),
@@ -996,6 +1048,7 @@ fn forward_one(
                 Delivery {
                     key,
                     generation,
+                    epoch,
                     result,
                     producer,
                 }
@@ -1086,6 +1139,41 @@ mod tests {
         // Once a producer can be built, nothing of the partition overtakes 6.
         assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
         assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
+    }
+
+    #[test]
+    fn reset_forgets_the_dropped_schemas_state_and_stamps_acks() {
+        let mut core = ForwarderCore::default();
+        let released = Arc::new(AtomicUsize::new(0));
+        let r = released.clone();
+        core.add_hold(
+            SyncHold {
+                keys: vec![RowKey::new(1, 0, 5)],
+                timeout: Duration::from_secs(60),
+                release: HeldRelease::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }),
+            },
+            Instant::now(),
+        );
+        core.sent(RowKey::new(1, 0, 6), 1, Instant::now());
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("boom".into()), false);
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
+        core.reset(2);
+        // The old schema's hold is answered, its fence, outstanding record and
+        // queued acks are gone: offset 7 of the re-created schema goes out.
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(core.held(), 0);
+        assert!(core.acks.is_empty());
+        assert!(core
+            .expired_generation(Instant::now(), Duration::ZERO)
+            .is_none());
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Send);
+        // Acks sent from now on carry the new epoch.
+        core.on_result(RowKey::new(1, 0, 7), 3, Ok(1), false);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert!(core.flush_acks(&tx));
+        assert_eq!(rx.try_recv().map(|a| a.epoch), Ok(2));
     }
 
     #[test]
