@@ -307,15 +307,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// write_mode with forwarding active. Such a topic is written and
     /// forwarded exactly like DualWrite, but its local reads are suppressed so
     /// consumers must read from the external broker. The config loader forces
-    /// `forward_percentage = 100` for these topics, so every record is
-    /// guaranteed to be forwarded (a sampled-out record would be readable
-    /// nowhere).
+    /// `forward_percentage = 100` for these topics, so every record produced
+    /// while the topic is external-primary is enqueued (a sampled-out record
+    /// would be readable nowhere). Records written before (the topic local-only
+    /// or sampled) or while `pg_kafka.shadow_mode_enabled` was off have no outbox
+    /// row and are suppressed all the same until `kafka.replay_shadow_messages`
+    /// queues them (SHADOW_MODE_FLOW_DIAGRAM.md, "Read Path").
     ///
     /// Read suppression depends only on the global shadow GUC + the per-topic
-    /// config, not on primary/standby: a standby must suppress these reads
-    /// too, since the external broker — not the local copy — is the source of
-    /// truth for an external-primary topic. (Forwarding itself is still
-    /// primary-only; that gate lives on the write path.)
+    /// config.
     fn is_external_primary(&self, topic_id: i32) -> bool {
         if !self.is_enabled() {
             return false;
