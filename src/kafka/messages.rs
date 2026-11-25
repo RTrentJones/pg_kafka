@@ -285,6 +285,16 @@ pub struct SyncGroupAssignment {
     pub assignment: Vec<u8>,
 }
 
+/// The members a LeaveGroup request removes, framed by its version.
+#[derive(Debug, Clone)]
+pub enum LeavingMembers {
+    /// LeaveGroup v0-2: the top-level member id.
+    Single(String),
+    /// LeaveGroup v3+: the `members` array (possibly empty); the top-level member id is
+    /// not part of these versions.
+    Batch(Vec<MemberIdentity>),
+}
+
 /// Member identity for LeaveGroup request (v3+)
 #[derive(Debug, Clone)]
 pub struct MemberIdentity {

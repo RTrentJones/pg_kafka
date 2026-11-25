@@ -833,7 +833,10 @@ fn test_parse_leave_group_request() {
     request.member_id = str("leaving-member");
     let data = expect_body!(decode(&request, 2), LeaveGroup);
     assert_eq!(data.group_id, "leave-group");
-    assert_eq!(data.member_id, "leaving-member");
+    assert!(matches!(
+        data.leaving,
+        crate::kafka::messages::LeavingMembers::Single(ref m) if m == "leaving-member"
+    ));
 }
 
 #[test]
