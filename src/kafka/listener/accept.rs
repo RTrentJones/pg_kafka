@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
-use super::connection::{handle_connection, PRE_AUTH_TIMEOUT};
+use super::connection::{handle_connection, ActivityClock, Tracked, PRE_AUTH_TIMEOUT};
 use super::dispatch::Dispatcher;
 use super::sasl::{ConnectionAuth, LookupThrottle};
 use crate::kafka::auth::{ChannelLookup, ConnectionPrincipal, SaslMechanism, SecurityProtocol};
@@ -178,6 +178,10 @@ async fn serve_connection(
 ) {
     let peer = addr.to_string();
     let pre_auth_deadline = accepted_at + PRE_AUTH_TIMEOUT;
+    // Every byte written to the TCP socket is activity (the idle timeout): under the TLS
+    // stream, so the records rustls buffers count when they go out, on flush too.
+    let activity = Arc::new(ActivityClock::new());
+    let socket = Tracked::new(socket, Arc::clone(&activity));
     let throttle = Some(LookupThrottle {
         tracker: Arc::clone(&ctx.ip_tracker),
         ip: addr.ip(),
@@ -191,7 +195,7 @@ async fn serve_connection(
             ctx.log_connections,
             throttle,
         );
-        handle_connection(socket, ctx.dispatcher, auth, pre_auth_deadline).await;
+        handle_connection(socket, activity, ctx.dispatcher, auth, pre_auth_deadline).await;
         return;
     };
     let Some(tls) =
@@ -214,7 +218,7 @@ async fn serve_connection(
         ctx.log_connections,
         throttle,
     );
-    handle_connection(tls, ctx.dispatcher, auth, pre_auth_deadline).await;
+    handle_connection(tls, activity, ctx.dispatcher, auth, pre_auth_deadline).await;
 }
 
 #[cfg(test)]

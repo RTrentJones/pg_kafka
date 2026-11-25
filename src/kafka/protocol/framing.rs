@@ -17,15 +17,25 @@
 //! * [`FrameClock`] records when the incomplete frame started arriving so the connection
 //!   can enforce a per-frame read deadline (`pg_kafka.request_read_timeout_ms`).
 //!
-//! Outbound frames are bounded only by the wire format (`i32::MAX`), not by the inbound
-//! request limit: a response's size is bounded by the request's own `max_bytes`, as in
-//! Kafka.
+//! A connection's read buffer does not keep a large frame's memory: the frame takes the
+//! allocation it arrived in, and the buffer starts a new small one ([`READ_BUFFER_BYTES`]),
+//! as Kafka allocates each receive.
+//!
+//! [`FrameSink`] writes response frames. They are bounded only by the wire format
+//! (`i32::MAX`), not by the inbound request limit: a response's size is bounded by the
+//! request's `max_bytes` and `pg_kafka.fetch_max_bytes`, as in Kafka. A large response is
+//! written from its own buffer, never copied into a write buffer that would keep the largest
+//! response's memory for the connection's life.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::sink::Sink;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::{Duration, Instant};
-use tokio_util::codec::{Decoder, Encoder};
+use tokio::io::AsyncWrite;
+use tokio_util::codec::Decoder;
 
 use crate::kafka::constants::MAX_REQUEST_SIZE;
 
@@ -46,6 +56,14 @@ const LENGTH_PREFIX_BYTES: usize = 4;
 
 /// Smallest step the buffer of an incomplete large frame grows by.
 const MIN_BUFFER_GROWTH: usize = 64 * 1024;
+
+/// What a connection's read buffer starts with again after a frame larger than
+/// [`UNMETERED_FRAME_BYTES`] (tokio-util's own initial read buffer).
+pub const READ_BUFFER_BYTES: usize = 8 * 1024;
+
+/// Responses up to this size are copied behind their length prefix and written at once;
+/// larger ones are written from their own buffer.
+const COPIED_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Remaining global budget, in bytes.
 pub static FRAME_RESERVE_REMAINING: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
@@ -209,6 +227,14 @@ impl Decoder for FrameCodec {
             self.clock.clear();
             let mut frame = src.split_to(total);
             frame.advance(LENGTH_PREFIX_BYTES);
+            if total > UNMETERED_FRAME_BYTES {
+                // The frame keeps the large allocation it arrived in (freed with it); the
+                // buffer moves what follows it to a small new one instead of reusing that
+                // allocation for the connection's life.
+                let mut rest = BytesMut::with_capacity(src.len().max(READ_BUFFER_BYTES));
+                rest.extend_from_slice(src);
+                *src = rest;
+            }
             if !src.is_empty() {
                 // The next frame has started arriving.
                 self.clock.mark_started();
@@ -245,20 +271,103 @@ impl Drop for FrameCodec {
     }
 }
 
-impl Encoder<Bytes> for FrameCodec {
+/// Writes response frames (`[i32 length][response]`) to a connection's socket. A response
+/// up to [`COPIED_RESPONSE_BYTES`] is copied behind its prefix and written in one piece; a
+/// larger one is written from its own buffer (the prefix and the response in one vectored
+/// write where the socket supports it), so the sink holds nothing once a response is out.
+pub struct FrameSink<W> {
+    io: W,
+    prefix: [u8; LENGTH_PREFIX_BYTES],
+    /// Bytes of `prefix` still to write (0: none, or it went out with the response).
+    prefix_left: usize,
+    /// What is left to write of the current response.
+    body: Bytes,
+}
+
+impl<W> FrameSink<W> {
+    /// A sink writing to `io`.
+    pub fn new(io: W) -> Self {
+        FrameSink {
+            io,
+            prefix: [0; LENGTH_PREFIX_BYTES],
+            prefix_left: 0,
+            body: Bytes::new(),
+        }
+    }
+
+    /// Bytes the sink holds of responses not yet written (none once a response is out).
+    pub fn buffered(&self) -> usize {
+        self.prefix_left + self.body.len()
+    }
+}
+
+impl<W: AsyncWrite + Unpin> FrameSink<W> {
+    /// Write what is left of the current frame.
+    fn poll_write_frame(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.prefix_left > 0 || !self.body.is_empty() {
+            let written = if self.prefix_left > 0 {
+                let start = LENGTH_PREFIX_BYTES - self.prefix_left;
+                let parts = [
+                    std::io::IoSlice::new(&self.prefix[start..]),
+                    std::io::IoSlice::new(&self.body),
+                ];
+                ready!(Pin::new(&mut self.io).poll_write_vectored(cx, &parts))?
+            } else {
+                ready!(Pin::new(&mut self.io).poll_write(cx, &self.body))?
+            };
+            if written == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            let of_prefix = written.min(self.prefix_left);
+            self.prefix_left -= of_prefix;
+            self.body.advance(written - of_prefix);
+        }
+        // Let go of the response's buffer.
+        self.body = Bytes::new();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<W: AsyncWrite + Unpin> Sink<Bytes> for FrameSink<W> {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: Bytes, dst: &mut BytesMut) -> std::io::Result<()> {
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().poll_write_frame(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Bytes) -> std::io::Result<()> {
+        let this = self.get_mut();
         let len = i32::try_from(item.len()).map_err(|_| {
             std::io::Error::other(format!(
                 "response of {} bytes does not fit a Kafka frame",
                 item.len()
             ))
         })?;
-        dst.reserve(LENGTH_PREFIX_BYTES + item.len());
-        dst.put_i32(len);
-        dst.extend_from_slice(&item);
+        if item.len() <= COPIED_RESPONSE_BYTES {
+            let mut frame = BytesMut::with_capacity(LENGTH_PREFIX_BYTES + item.len());
+            frame.put_i32(len);
+            frame.extend_from_slice(&item);
+            this.prefix_left = 0;
+            this.body = frame.freeze();
+        } else {
+            this.prefix = len.to_be_bytes();
+            this.prefix_left = LENGTH_PREFIX_BYTES;
+            this.body = item;
+        }
         Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_write_frame(cx))?;
+        Pin::new(&mut this.io).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_write_frame(cx))?;
+        ready!(Pin::new(&mut this.io).poll_flush(cx))?;
+        Pin::new(&mut this.io).poll_shutdown(cx)
     }
 }
 
@@ -396,19 +505,96 @@ mod tests {
         assert_eq!(c.charged(), 0);
     }
 
+    /// Send `responses` through a [`FrameSink`] over an in-memory pipe whose reader keeps
+    /// everything; returns the bytes the reader got and the sink's buffered bytes after each.
+    fn sink_roundtrip(responses: Vec<Bytes>) -> (Vec<u8>, Vec<usize>) {
+        use futures::SinkExt;
+        use tokio::io::AsyncReadExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let reader = tokio::spawn(async move {
+                let mut client = client;
+                let mut out = Vec::new();
+                client.read_to_end(&mut out).await.unwrap();
+                out
+            });
+            let mut sink = FrameSink::new(server);
+            let mut buffered = Vec::new();
+            for response in responses {
+                sink.send(response).await.unwrap();
+                buffered.push(sink.buffered());
+            }
+            sink.close().await.unwrap();
+            drop(sink);
+            (reader.await.unwrap(), buffered)
+        })
+    }
+
     #[test]
-    fn encoder_has_no_request_size_cap() {
+    fn frame_sink_has_no_request_size_cap_and_frames_every_response() {
         // A response larger than the request limit must still be framed, or the
-        // connection would hang on it.
+        // connection would hang on it; small and large responses keep their order.
+        let big = Bytes::from(vec![7u8; MAX_REQUEST_SIZE + 10]);
+        let (out, buffered) = sink_roundtrip(vec![
+            Bytes::from_static(b"small"),
+            big,
+            Bytes::from_static(b"after"),
+        ]);
+        assert_eq!(
+            buffered,
+            vec![0, 0, 0],
+            "nothing held once a response is out"
+        );
+        assert_eq!(out.len(), 3 * 4 + 5 + MAX_REQUEST_SIZE + 10 + 5);
+        assert_eq!(&out[..9], b"\0\0\0\x05small");
+        let len = u32::from_be_bytes([out[9], out[10], out[11], out[12]]) as usize;
+        assert_eq!(len, MAX_REQUEST_SIZE + 10);
+        assert!(out[13..13 + len].iter().all(|&b| b == 7));
+        assert_eq!(&out[13 + len..], b"\0\0\0\x05after");
+    }
+
+    #[test]
+    fn frame_sink_does_not_copy_a_large_response() {
+        // The connection's write path does not copy a large response into a buffer of its
+        // own (which would take twice the response's memory while it is written, and keep
+        // the largest response's memory for the connection's life).
+        use futures::SinkExt;
+        let response = Bytes::from(vec![1u8; 8 << 20]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ((), copied) = crate::testing::heap_allocated(|| {
+            rt.block_on(async {
+                let mut sink = FrameSink::new(tokio::io::sink());
+                sink.send(response.clone()).await.unwrap();
+                sink.send(Bytes::from_static(b"small")).await.unwrap();
+            });
+        });
+        assert!(copied < 1 << 20, "{copied} bytes allocated to write 8 MiB");
+    }
+
+    #[test]
+    fn the_read_buffer_lets_go_of_a_large_frame() {
+        // After a 3 MiB frame the connection's buffer does not keep (and reuse) its
+        // allocation: once the frame is dropped and the next read reserves room, as
+        // tokio-util's FramedRead does, the buffer is small again.
         static B: AtomicUsize = AtomicUsize::new(FRAME_RESERVE_BUDGET_BYTES);
         let (mut c, _clock) = codec(&B);
-        let big = Bytes::from(vec![0u8; MAX_REQUEST_SIZE + 10]);
-        let mut dst = BytesMut::new();
-        c.encode(big, &mut dst).unwrap();
-        assert_eq!(dst.len(), MAX_REQUEST_SIZE + 14);
-        assert_eq!(
-            u32::from_be_bytes([dst[0], dst[1], dst[2], dst[3]]) as usize,
-            MAX_REQUEST_SIZE + 10
+        let mut src = BytesMut::new();
+        src.extend_from_slice(&frame(&vec![3u8; 3 << 20]));
+        src.extend_from_slice(&frame(b"next"));
+        let large = c.decode(&mut src).unwrap().unwrap();
+        assert_eq!(large.len(), 3 << 20);
+        drop(large);
+        assert_eq!(&c.decode(&mut src).unwrap().unwrap()[..], b"next");
+        src.reserve(1);
+        assert!(
+            src.capacity() < UNMETERED_FRAME_BYTES,
+            "the buffer kept {} bytes after a large frame",
+            src.capacity()
         );
     }
 

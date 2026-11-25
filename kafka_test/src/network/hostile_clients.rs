@@ -146,11 +146,22 @@ pub async fn test_partial_frames_cannot_exhaust_the_frame_budget() -> TestResult
     Ok(())
 }
 
-/// A response above the 100 MB inbound request limit is delivered (the outbound codec
+/// A response above the 100 MB inbound request limit is delivered (the outbound path
 /// does not apply the inbound cap; a refused encode would hang the connection). A
-/// response is bounded by the request's max_bytes, as in Kafka.
+/// response is bounded by the request's max_bytes and `pg_kafka.fetch_max_bytes` (55 MiB
+/// by default, as Kafka's `fetch.max.bytes`), raised here to 120 MB.
 pub async fn test_response_larger_than_the_request_limit_is_delivered() -> TestResult {
     println!("=== Test: >100 MB fetch response ===\n");
+    let db = crate::common::create_db_client().await?;
+    super::fetch_limits::set_fetch_max_bytes(&db, Some(120_000_000)).await?;
+    let outcome = response_larger_than_the_request_limit()
+        .await
+        .map_err(|e| e.to_string());
+    super::fetch_limits::set_fetch_max_bytes(&db, None).await?;
+    Ok(outcome?)
+}
+
+async fn response_larger_than_the_request_limit() -> TestResult {
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("net-big").await;
     let mut s = TcpStream::connect(("127.0.0.1", port())).await?;

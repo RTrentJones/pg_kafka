@@ -11,6 +11,7 @@
 //! * `tls`: the TLS handshake and the client-certificate principal.
 //! * `connection`: one connection's read loop and how it closes.
 //! * `writer`: the task that writes a connection's responses in request order.
+//! * `response_budget`: what a connection's unwritten responses may hold.
 //! * `sasl`: per-connection authentication state and the SASL frames.
 //! * `dispatch`: handing requests to the DB thread.
 //! * `long_poll`: Fetch long polling.
@@ -19,6 +20,7 @@ mod accept;
 mod connection;
 mod dispatch;
 mod long_poll;
+mod response_budget;
 mod sasl;
 mod thread;
 mod tls;
@@ -128,6 +130,7 @@ pub async fn run(
             long_poll_interval: config
                 .enable_long_polling
                 .then(|| long_poll::poll_interval(config.fetch_poll_interval_ms)),
+            runtime_context: Arc::clone(&runtime_context),
         },
         ip_tracker: IpTracker::new(max_per_ip),
         lookup: ChannelLookup(credential_tx),

@@ -376,6 +376,42 @@ fn test_a_decoded_request_waits_for_room_and_decodes_again() {
     });
 }
 
+#[test]
+fn test_a_produce_waits_for_room_no_longer_than_its_timeout_allows() {
+    use std::time::Duration;
+    // No room ever comes free.
+    static FULL: DecodePool = DecodePool::new(0);
+    let mut req = kafka_protocol::messages::ProduceRequest::default();
+    req.acks = 1;
+    // decode_wait(400 ms) = 200 ms, though the connection-wide wait is 10 s.
+    req.timeout_ms = 400;
+    let mut topic = kafka_protocol::messages::produce_request::TopicProduceData::default();
+    topic.name = super::topic("t");
+    let mut partition = kafka_protocol::messages::produce_request::PartitionProduceData::default();
+    partition.records = Some(
+        super::one_record_batch(vec![1; 10], kafka_protocol::records::Compression::None).freeze(),
+    );
+    topic.partition_data.push(partition);
+    req.topic_data = vec![topic];
+    let frame = super::frame(&req, 7, 3);
+    runtime().block_on(async {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        assert!(
+            decode_request_in(frame, tx, &budgets(&FULL), Duration::from_secs(10))
+                .await
+                .is_err(),
+            "no room came free"
+        );
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(
+            waited < Duration::from_secs(2),
+            "a Produce of timeout_ms = 400 waited {waited:?} for room"
+        );
+    });
+}
+
 /// The network thread's slots and frame budget, with `requests` for the decoded requests.
 fn budgets(requests: &'static DecodePool) -> Budgets {
     Budgets {

@@ -6,6 +6,7 @@
 //! as idle: `pg_kafka.connections_max_idle_ms` closes it, as Kafka's idle expiry closes a
 //! muted connection whose response never goes out.
 
+use super::fetch_limits::AbortOnDrop;
 use super::{client_config, port, rdkafka_roundtrip};
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
@@ -52,7 +53,7 @@ fn distinct(prefix: &str, n: usize) -> impl Iterator<Item = String> + '_ {
 
 /// A connection from `src` that reads nothing: its receive buffer is as small as the
 /// kernel allows, so a few responses fill it and the broker's writer stalls.
-async fn non_reading(src: Ipv4Addr) -> std::io::Result<TcpStream> {
+pub(super) async fn non_reading(src: Ipv4Addr) -> std::io::Result<TcpStream> {
     let socket = TcpSocket::new_v4()?;
     socket.set_recv_buffer_size(4096)?;
     socket.bind(SocketAddr::from((src, 0)))?;
@@ -120,12 +121,13 @@ pub async fn test_clients_that_stop_reading_do_not_lock_out_others() -> TestResu
         // requests held the budget until their responses were written, a connection whose
         // request found no room was closed after the 10 s decode wait and this write
         // failed: what counts is whether the fresh client below is served meanwhile.
-        hogs.push(tokio::spawn(async move {
+        // Aborted when `hogs` drops, whichever way the test ends.
+        hogs.push(AbortOnDrop(tokio::spawn(async move {
             let _ = s.write_all(&frames).await;
             // Kept open, reading nothing.
             tokio::time::sleep(Duration::from_secs(600)).await;
             drop(s);
-        }));
+        })));
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -140,9 +142,7 @@ pub async fn test_clients_that_stop_reading_do_not_lock_out_others() -> TestResu
     }
     rdkafka_roundtrip(client_config(port()), &ctx.unique_topic("net-nr").await, 10).await?;
     println!("✅ fresh clients served while the non-reading connections are open");
-    for hog in hogs {
-        hog.abort();
-    }
+    drop(hogs);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())
@@ -165,6 +165,29 @@ pub(super) fn broker_side_state(client: SocketAddr) -> DynResult<Option<u8>> {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() > 3 && cols[1] == local && cols[2] == remote {
             return Ok(Some(u8::from_str_radix(cols[3], 16)?));
+        }
+    }
+    Ok(None)
+}
+
+/// The bytes waiting in the broker's receive queue (`/proc/net/tcp` `rx_queue`) of the
+/// connection whose client end is `client`: what the client sent and the broker has not read.
+pub(super) fn broker_side_unread(client: SocketAddr) -> DynResult<Option<u64>> {
+    let SocketAddr::V4(client) = client else {
+        return Err("an IPv4 client address".into());
+    };
+    let hex = |a: Ipv4Addr, p: u16| format!("{:08X}:{p:04X}", u32::from_le_bytes(a.octets()));
+    let local = hex(Ipv4Addr::LOCALHOST, port());
+    let remote = hex(*client.ip(), client.port());
+    let table = std::fs::read_to_string("/proc/net/tcp")?;
+    for line in table.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() > 4 && cols[1] == local && cols[2] == remote {
+            let rx = cols[4]
+                .split(':')
+                .nth(1)
+                .ok_or("a tx_queue:rx_queue column")?;
+            return Ok(Some(u64::from_str_radix(rx, 16)?));
         }
     }
     Ok(None)

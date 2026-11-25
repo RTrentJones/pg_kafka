@@ -31,6 +31,11 @@ pub const MAX_WORKER_LOCK_TIMEOUT_MS: i32 = 600_000;
 /// Upper bound of `pg_kafka.shutdown_timeout_ms`.
 const MAX_SHUTDOWN_TIMEOUT_MS: i32 = 60_000;
 
+/// Default of `pg_kafka.fetch_max_bytes`: Kafka's `fetch.max.bytes` (55 MiB).
+pub const DEFAULT_FETCH_MAX_BYTES: i32 = 55 * 1024 * 1024;
+/// Lower bound of `pg_kafka.fetch_max_bytes` (Kafka's `fetch.max.bytes` is at least 1024).
+pub const MIN_FETCH_MAX_BYTES: i32 = 1024;
+
 /// The Rust type of a GUC kind in [`gucs!`].
 macro_rules! guc_type {
     (int) => { i32 };
@@ -201,6 +206,23 @@ gucs! {
         long: c"A waiting FetchRequest re-runs when new data is signalled (Produce, EndTxn) or max_wait_ms expires; this interval is only the safety-net re-check for a missed signal. Default: 1000ms.",
         context: Postmaster,
         range: (MIN_FETCH_POLL_INTERVAL_MS, MAX_FETCH_POLL_INTERVAL_MS),
+    }
+
+    /// The most a Fetch response may hold, whatever the request's `max_bytes` (Kafka's
+    /// broker `fetch.max.bytes`). Read by the network thread through the `Config` snapshot.
+    int FETCH_MAX_BYTES = DEFAULT_FETCH_MAX_BYTES => c"pg_kafka.fetch_max_bytes" {
+        short: c"Most bytes a Fetch response returns, whatever the request asks (Kafka's fetch.max.bytes)",
+        long: c"Each Fetch request's max_bytes is lowered to this, and its min_bytes to the result, \
+          as Kafka's broker fetch.max.bytes does. Records are still returned if the first \
+          record of the first partition with data is larger, so a consumer always makes \
+          progress; later partitions return only what fits. The per-partition limit is the \
+          request's partition_max_bytes, within what is left of this. It is also each \
+          connection's budget for responses not yet written: past it the connection reads no \
+          further request until its client reads. Default: 57671680 (55 MiB). Reloadable via \
+          SIGHUP: the cap applies to requests read after the reload, the budget to \
+          connections opened after it.",
+        context: Sighup,
+        range: (MIN_FETCH_MAX_BYTES, i32::MAX),
     }
 
     /// DR-2: time-based retention of kafka.messages, enforced by the retention sweep
@@ -513,6 +535,8 @@ pub struct Config {
     pub default_partitions: i32,
     /// Polling interval for long polling fallback (milliseconds)
     pub fetch_poll_interval_ms: i32,
+    /// `pg_kafka.fetch_max_bytes`: the broker-side cap of a Fetch response.
+    pub fetch_max_bytes: i32,
     /// Whether long polling is enabled
     pub enable_long_polling: bool,
     /// Compression type for FetchResponse encoding (none, gzip, snappy, lz4, zstd)
@@ -563,6 +587,7 @@ impl std::fmt::Debug for Config {
             .field("shutdown_timeout_ms", &self.shutdown_timeout_ms)
             .field("default_partitions", &self.default_partitions)
             .field("fetch_poll_interval_ms", &self.fetch_poll_interval_ms)
+            .field("fetch_max_bytes", &self.fetch_max_bytes)
             .field("enable_long_polling", &self.enable_long_polling)
             .field("compression_type", &self.compression_type)
             .field("log_timing", &self.log_timing)
@@ -601,6 +626,7 @@ impl Config {
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
             default_partitions: DEFAULT_PARTITIONS.get(),
             fetch_poll_interval_ms: FETCH_POLL_INTERVAL_MS.get(),
+            fetch_max_bytes: FETCH_MAX_BYTES.get(),
             enable_long_polling: ENABLE_LONG_POLLING.get(),
             compression_type: guc_string(&COMPRESSION_TYPE)
                 .unwrap_or_else(|| DEFAULT_COMPRESSION_TYPE.to_string()),
@@ -637,6 +663,7 @@ impl Config {
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
             default_partitions: DEFAULT_TOPIC_PARTITIONS,
             fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
+            fetch_max_bytes: DEFAULT_FETCH_MAX_BYTES,
             enable_long_polling: true,
             compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
             log_timing: false,
@@ -716,6 +743,7 @@ mod tests {
         assert!(MIN_SHUTDOWN_TIMEOUT_MS > 0);
         assert!(DEFAULT_SHUTDOWN_TIMEOUT_MS <= MAX_SHUTDOWN_TIMEOUT_MS);
         assert!(DEFAULT_WORKER_LOCK_TIMEOUT_MS <= MAX_WORKER_LOCK_TIMEOUT_MS);
+        assert!(MIN_FETCH_MAX_BYTES <= DEFAULT_FETCH_MAX_BYTES);
     };
 
     #[test]

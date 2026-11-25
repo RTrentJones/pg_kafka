@@ -234,20 +234,26 @@ pub async fn test_saturated_large_decodes_wait_instead_of_closing() -> TestResul
 const FRAME_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Connections that each send a large Metadata frame while hostile Produce requests keep
-/// the large-decode slots busy.
-const WAITING_CONNECTIONS: u8 = 8;
+/// the large-decode slots busy: more than the frame budget holds of them plus the slots.
+const WAITING_CONNECTIONS: u8 = 10;
+
+/// The large-decode slots, `LARGE_DECODE_SLOTS` in `src/kafka/protocol/decode_budget.rs`. A
+/// frame decoding in one is no longer charged to the frame budget.
+const LARGE_DECODE_SLOTS: usize = 2;
 
 /// Hostile connections that keep the large-decode slots and their queue busy.
 const SLOT_HOGS: usize = 8;
 
-/// Eight connections each send an 88 MB Metadata frame (1.7 million names, which decode to
+/// Ten connections each send an 88 MB Metadata frame (1.7 million names, which decode to
 /// more than the inline limit and so wait for a large-decode slot) while eight hostile
 /// connections keep both slots and their queue busy with Produce requests of 10 MB of
 /// empty gzip blocks (each holds a slot for its two-second decode time limit). A frame
-/// waiting for a slot is charged to the 512 MiB frame budget as a frame still arriving is:
-/// no more than five of them wait at once, and the broker closes the connection of a frame
+/// waiting for a slot is charged to the 512 MiB frame budget as a frame still arriving is,
+/// so of the connections that are open and unanswered no more than the budget holds of
+/// their frames (six of 88 MB) wait or arrive at once, plus at most the two decoding in the
+/// slots, whose frames are no longer charged: the broker closes the connection of a frame
 /// the budget cannot take (as it closes one whose arriving frame the budget cannot take),
-/// instead of holding 700 MB of frames the budget does not count. Ordinary clients keep
+/// instead of holding 880 MB of frames the budget does not count. Ordinary clients keep
 /// working.
 pub async fn test_frames_waiting_to_decode_stay_within_the_frame_budget() -> TestResult {
     println!(
@@ -298,9 +304,14 @@ pub async fn test_frames_waiting_to_decode_stay_within_the_frame_budget() -> Tes
         waiting.push((s, client));
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // A connection the broker answered (or is closing) holds no frame: only one that is
+    // still open with nothing to read waits for its frame to be decoded.
     let mut open = 0usize;
-    for (_, client) in &waiting {
-        if broker_side_state(*client)? == Some(ESTABLISHED) {
+    for (s, client) in &waiting {
+        let mut byte = [0u8; 1];
+        let answered =
+            !matches!(s.try_read(&mut byte), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+        if broker_side_state(*client)? == Some(ESTABLISHED) && !answered {
             open += 1;
         }
     }
@@ -319,9 +330,9 @@ pub async fn test_frames_waiting_to_decode_stay_within_the_frame_budget() -> Tes
     drop(waiting);
     roundtrip?;
     assert!(
-        still_waiting * frame.len() <= FRAME_BUDGET_BYTES,
+        still_waiting <= FRAME_BUDGET_BYTES / frame.len() + LARGE_DECODE_SLOTS,
         "{still_waiting} frames of {} bytes wait at once: more than the {FRAME_BUDGET_BYTES} \
-         byte frame budget",
+         byte frame budget holds, plus the {LARGE_DECODE_SLOTS} large-decode slots",
         frame.len()
     );
     assert!(

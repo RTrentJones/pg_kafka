@@ -313,6 +313,17 @@ pub async fn test_a_stalled_writer_closes_after_the_idle_timeout() -> TestResult
     super::stalled_writers::stalled_writer_closes_after(Duration::from_millis(IDLE_MS)).await
 }
 
+/// A client that reads nothing behind a long poll is closed after
+/// `connections_max_idle_ms`, and its unread responses stop the broker reading (see
+/// `fetch_limits`).
+pub async fn test_a_non_reading_client_behind_a_long_poll_closes_after_the_idle_timeout(
+) -> TestResult {
+    super::fetch_limits::non_reading_client_behind_a_long_poll_closes_after(Duration::from_millis(
+        IDLE_MS,
+    ))
+    .await
+}
+
 /// One pre-auth deadline (10 s) from accept. A SASL_SSL client whose TLS
 /// handshake takes 7 s is closed at ~10 s, not given another 10 s for SASL. Also a
 /// SASL_PLAINTEXT client that stops after the handshake.
