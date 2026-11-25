@@ -18,7 +18,21 @@ use tokio::net::TcpStream;
 /// How much later than its `max_wait_ms` (or than at once) an empty Fetch may be answered:
 /// the broker's own work and the test host's scheduling, well under the 1000 ms safety-net
 /// re-check of a waiting fetch (`pg_kafka.fetch_poll_interval_ms`).
-pub(super) const ANSWER_SLACK: Duration = Duration::from_millis(500);
+const ANSWER_SLACK: Duration = Duration::from_millis(500);
+/// The most an observed round trip adds to [`ANSWER_SLACK`] (see [`late_slack`]).
+const MAX_ROUND_TRIP_SLACK: Duration = Duration::from_millis(1_500);
+
+/// How much later than its `max_wait_ms` the next empty Fetch on `s` may be answered:
+/// [`ANSWER_SLACK`] plus the round trip of an empty `max_wait_ms = 0` Fetch (correlation
+/// `corr`) sent just before, at most [`MAX_ROUND_TRIP_SLACK`]. The answer at the deadline is
+/// one more fetch on the DB thread, queued behind whatever else it is doing then, so a busy
+/// broker answers it later by about what a fetch costs right now; a broker that waits the
+/// wrong time is still late by far more.
+pub(super) async fn late_slack(s: &mut TcpStream, corr: i32, topic: &str) -> DynResult<Duration> {
+    let round_trip = timed_empty_fetch(s, corr, topic, 0, 1).await?;
+    println!("  an empty max_wait_ms=0 Fetch took {round_trip:?}");
+    Ok(ANSWER_SLACK + round_trip.min(MAX_ROUND_TRIP_SLACK))
+}
 /// How much earlier than its `max_wait_ms` an empty Fetch may be answered: the client's
 /// clock starts before the broker's, so a broker that waits `max_wait_ms` is never early by
 /// more than timer granularity.
@@ -81,10 +95,11 @@ pub async fn test_long_poll_immediate_return() -> TestResult {
     println!("Step 1: empty topic {topic}");
 
     for (corr, max_wait_ms, min_bytes) in [(1, 0, 1), (2, 0, 1_000_000), (3, 5_000, 0)] {
+        let slack = late_slack(&mut s, 100 + corr, &topic).await?;
         let took = timed_empty_fetch(&mut s, corr, &topic, max_wait_ms, min_bytes).await?;
         println!("  max_wait_ms={max_wait_ms}, min_bytes={min_bytes}: answered in {took:?}");
         assert!(
-            took < ANSWER_SLACK,
+            took < slack,
             "an empty Fetch with max_wait_ms={max_wait_ms} and min_bytes={min_bytes} is answered \
              at once, took {took:?}"
         );
@@ -105,10 +120,11 @@ pub async fn test_long_poll_timeout() -> TestResult {
 
     let max_wait = Duration::from_millis(2_000);
     for (corr, min_bytes) in [(1, 1), (2, 1_000_000)] {
+        let slack = late_slack(&mut s, 100 + corr, &topic).await?;
         let took = timed_empty_fetch(&mut s, corr, &topic, 2_000, min_bytes).await?;
         println!("  max_wait_ms=2000, min_bytes={min_bytes}: answered in {took:?}");
         assert!(
-            took + EARLY_SLACK >= max_wait && took < max_wait + ANSWER_SLACK,
+            took + EARLY_SLACK >= max_wait && took < max_wait + slack,
             "an empty Fetch with max_wait_ms=2000 is answered after about 2 s, took {took:?}"
         );
     }
