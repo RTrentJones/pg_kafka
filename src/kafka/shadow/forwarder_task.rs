@@ -2277,7 +2277,9 @@ mod tests {
 
     /// A panic while sending one record fails that record (a counted attempt, so
     /// a record that always panics is dead-lettered in the end) and fences its
-    /// partition; the records after it are still sent.
+    /// partition: a later record of that partition is answered NotAttempted, as
+    /// `forward_one` answers a record the fence holds back, while the records of
+    /// other partitions after it are still sent.
     #[test]
     fn a_panic_while_sending_fails_only_that_record() {
         let mut core = ForwarderCore::default();
@@ -2290,17 +2292,26 @@ mod tests {
             })
             .collect();
         core.pump_backlog(&mut backlog, now, TIMEOUT, |core, q| {
+            if core.admit(&q.record) == Admit::Fenced {
+                core.not_attempted(q.record.row, "an earlier record of the partition failed");
+                return None;
+            }
             core.sent(q.record.row, 1, q.received_at);
             assert_ne!(q.record.row, RowKey::new(1, 0, 1), "injected panic");
             None
         });
         assert!(backlog.is_empty());
         let got = outcomes(&mut core);
-        assert_eq!(got.len(), 1);
+        assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, RowKey::new(1, 0, 1));
         assert!(matches!(&got[0].1, ForwardOutcome::Failed(e) if e.contains("panicked")));
-        assert!(!core.outstanding.contains_key(&RowKey::new(1, 0, 1)));
-        assert_eq!(core.outstanding.len(), 2, "the later records were sent");
+        assert_eq!(got[1].0, RowKey::new(1, 0, 2));
+        assert!(matches!(&got[1].1, ForwardOutcome::NotAttempted(e) if e.contains("earlier")));
+        assert_eq!(
+            core.outstanding.keys().copied().collect::<Vec<_>>(),
+            vec![RowKey::new(1, 1, 1)],
+            "only the other partition's record was sent"
+        );
         assert_eq!(core.admit(&rec(0, 3, false)), Admit::Fenced);
         assert_eq!(
             core.admit(&rec(0, 1, false)),
