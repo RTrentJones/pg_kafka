@@ -39,8 +39,10 @@ async fn alter_system(db: &Client, sql: &str) -> TestResult {
 
 /// Runs `ALTER SYSTEM` statements that undo a test's settings when it drops, also when an
 /// assert panics or the runner aborts the test at its timeout. They run on a thread of their
-/// own with its own runtime and connection, and the drop waits for them, so they are in force
-/// (reloaded) before the next test starts whatever state the test's runtime is in.
+/// own with its own runtime and connection, whatever state the test's runtime is in, and the
+/// drop waits for them. The runner starts the next test only once the test's task has ended
+/// (an aborted one: once its drops ran, waiting up to 30 s), so they are in force (reloaded)
+/// before it starts.
 struct SystemReset(Vec<String>);
 
 impl Drop for SystemReset {

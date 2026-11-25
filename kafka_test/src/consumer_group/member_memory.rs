@@ -13,7 +13,8 @@ use tokio_postgres::Client;
 const GUC: &str = "pg_kafka.max_group_memory";
 
 /// Set `pg_kafka.max_group_memory` for the test. The guard restores the earlier setting when
-/// the test calls `restore`, and on drop when an assert panics or the runner aborts the test.
+/// the test calls `restore`, and on drop when an assert panics or the runner aborts the test
+/// (the runner waits for an aborted test's drops before it starts the next test).
 async fn set_budget(db: &Client, value: &str) -> DynResult<SystemGucGuard> {
     SystemGucGuard::set(db, GUC, value)
         .await

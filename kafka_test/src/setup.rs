@@ -194,9 +194,10 @@ pub type GucError = Box<dyn std::error::Error + Send + Sync>;
 /// restore fails or the server does not report the earlier value afterwards. A guard
 /// dropped without it (an early `?` return, a failed `assert!`, the runner aborting the
 /// test at its timeout) restores on a thread of its own with its own runtime and
-/// connection, and the drop waits for it, so the setting is back before the next test
-/// starts; a failure there panics (the test fails), or, when the test is already
-/// panicking, is printed.
+/// connection, and the drop waits for it. The runner starts the next test only once the
+/// test's task has ended, an aborted one once its drops ran (it waits up to 30 s for them),
+/// so the setting is back before the next test starts; a failure there panics (the test
+/// fails), or, when the test is already panicking, is printed.
 pub struct SystemGucGuard {
     name: String,
     /// The `postgresql.auto.conf` value before the guard (`None`: no entry).
