@@ -354,9 +354,19 @@ pub(crate) fn owned_headers(headers: &[(String, Vec<u8>)]) -> Result<OwnedHeader
 /// An `rd_kafka_headers_t` owned by this value and destroyed with it.
 struct NativeHeaders(NonNull<rdsys::rd_kafka_headers_t>);
 
-/// What an empty header value points at: librdkafka copies zero bytes from it, and a
-/// non-NULL pointer keeps the value empty rather than null.
-const EMPTY_VALUE: &[u8] = &[0];
+/// What an empty header key or value points at: librdkafka copies zero bytes from it with
+/// `memcpy`, which needs a valid pointer even for zero bytes (an empty slice's pointer is
+/// dangling), and a non-NULL value pointer keeps the value empty rather than null.
+const EMPTY_BYTES: &[u8] = &[0];
+
+/// A pointer to `bytes` valid for reads of `bytes.len()` bytes, an empty slice's included.
+fn readable_ptr(bytes: &[u8]) -> *const u8 {
+    if bytes.is_empty() {
+        EMPTY_BYTES.as_ptr()
+    } else {
+        bytes.as_ptr()
+    }
+}
 
 impl NativeHeaders {
     fn new(capacity: usize) -> Result<Self, String> {
@@ -372,20 +382,17 @@ impl NativeHeaders {
         let too_long = |_| "a record header is too long for librdkafka".to_string();
         let key_len = isize::try_from(key.len()).map_err(too_long)?;
         let value_len = isize::try_from(value.len()).map_err(too_long)?;
-        let value_ptr = if value.is_empty() {
-            EMPTY_VALUE.as_ptr()
-        } else {
-            value.as_ptr()
-        };
+        let (key_ptr, value_ptr) = (readable_ptr(key), readable_ptr(value));
         // SAFETY: `self.0` is a live, writable list owned by `self` (from
-        // `rd_kafka_headers_new`, destroyed only on drop). `key` and `value_ptr` are
-        // valid for reads of `key_len` and `value_len` bytes for the call;
+        // `rd_kafka_headers_new`, destroyed only on drop). `key_ptr` and `value_ptr` are
+        // valid for reads of `key_len` and `value_len` bytes for the call (see
+        // `readable_ptr`);
         // librdkafka copies exactly that many bytes of each (it calls `strlen` only
         // for a size of -1) and keeps no pointer to them.
         let err = unsafe {
             rdsys::rd_kafka_header_add(
                 self.0.as_ptr(),
-                key.as_ptr().cast(),
+                key_ptr.cast(),
                 key_len,
                 value_ptr.cast(),
                 value_len,
@@ -459,7 +466,8 @@ mod tests {
     }
 
     /// A header key holding U+0000 keeps all its bytes (rdkafka's `insert` panics on
-    /// it); values keep theirs, NUL bytes and empty values included, in order.
+    /// it); values keep theirs, NUL bytes and empty values included, in order, and an empty
+    /// key is stored empty.
     #[test]
     fn owned_headers_keep_a_key_holding_nul() {
         use rdkafka::message::Headers;
@@ -467,9 +475,10 @@ mod tests {
             ("a\0b".to_string(), b"\0v\0".to_vec()),
             ("k".to_string(), b"plain".to_vec()),
             ("e".to_string(), Vec::new()),
+            (String::new(), b"empty key".to_vec()),
         ])
         .expect("headers build");
-        assert_eq!(headers.count(), 3);
+        assert_eq!(headers.count(), 4);
         // rdkafka reads a key as a C string, so it shows the key up to its NUL.
         let first = headers.get(0);
         assert_eq!((first.key, first.value), ("a", Some(&b"\0v\0"[..])));
@@ -484,6 +493,19 @@ mod tests {
             Some(Vec::new()),
             "an empty value is not null"
         );
+        assert_eq!(lookup(&headers, ""), Some(b"empty key".to_vec()));
+    }
+
+    /// librdkafka copies a header's key and value with `memcpy`, which needs a valid
+    /// pointer even for zero bytes: an empty key or value is passed as a pointer to a live
+    /// static, not an empty slice's dangling one.
+    #[test]
+    fn empty_header_bytes_are_passed_as_a_valid_pointer() {
+        assert_eq!(readable_ptr(b""), EMPTY_BYTES.as_ptr());
+        assert_eq!(readable_ptr("".as_bytes()), EMPTY_BYTES.as_ptr());
+        assert_eq!(readable_ptr(&Vec::new()), EMPTY_BYTES.as_ptr());
+        let bytes = b"key";
+        assert_eq!(readable_ptr(bytes), bytes.as_ptr());
     }
 
     fn record(topic: &str, headers: Vec<(String, Vec<u8>)>) -> ForwardRecord {

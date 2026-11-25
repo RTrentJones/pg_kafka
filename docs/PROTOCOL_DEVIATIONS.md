@@ -62,7 +62,9 @@ This document lists intentional deviations from the official Kafka protocol spec
 **Implementation:**
 - ✅ **Inbound (Producer → Server)**: pg_kafka reads the RecordBatch v2 itself, with Kafka 3.7's
   record grammar (varints of at most 5 bytes, the timestamp delta a varlong of at most 10)
-- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC
+- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC (the
+  last batch of a partition's Fetch records is sent uncompressed when only that fits the
+  Fetch's byte limits, §7)
 - ✅ **Supported codecs**: none, gzip, snappy, lz4, zstd
 
 **Configuration:**
@@ -587,9 +589,14 @@ algorithm; see "Server-side sticky assignment" below)
   the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
   within both limits, but for the first one above. With `pg_kafka.compression_type` set, a
   codec adds framing per batch (some 15 to 20 bytes) and per block of incompressible data
-  that this count does not cover, so a partition whose records compress poorly returns them
-  up to the last whose encoded batches still fit its limit (counted at that encoded size
-  against `max_bytes`); the first record of the response is returned whatever its size. The database reads (and holds) no more than
+  that this count does not cover. Each batch is then encoded once and checked at its encoded
+  size: a partition returns every batch that still fits its limit and, of the first batch
+  that does not, the longest prefix of its records that fits by their counted sizes, that
+  prefix compressed if it fits so and uncompressed otherwise (an uncompressed batch always
+  fits by that count, and it is smaller than a compressed one that does not); the records
+  after it are left for the next Fetch. A partition counts the larger of its counted and
+  encoded sizes against `max_bytes`, and the first record of the response is returned
+  whatever its size (alone, when it does not fit). The database reads (and holds) no more than
   that of a partition, and a later partition whose first record is larger than its limit does
   not read that record (sizes are stored with each record at Produce, so a fetch reads the key,
   value and headers only of the records it returns). Kafka counts

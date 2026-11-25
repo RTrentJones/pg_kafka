@@ -111,11 +111,12 @@ The forwarder runs detached on the network thread, so a panic in it would stop f
 every shadow topic with nothing to notice. Sending one record runs under `catch_unwind`: a panic
 there fails that record (a counted attempt, so a record that always panics is dead-lettered after
 `shadow_max_retries`) and fences its partition. The loop itself is supervised: after a panic
-anywhere else, the records it held (on a producer or waiting in its backlog) are answered
+anywhere else, the records it held (on a producer, waiting in its backlog, or the one whose
+delivery report was being handled, unless its ack was already queued) are answered
 `NotAttempted` and fence their partitions, its producers are dropped (which purges them), and it
-runs again after 1 s, keeping its fences, held sync responses and queued acks. A record whose
-answer is lost with the panic (the one whose delivery report was being handled) is claimed again
-after the DB thread's in-flight eviction, as for any lost ack.
+runs again after 1 s, keeping its fences, held sync responses and queued acks. A record that was
+delivered but whose report was being handled is so sent again (a duplicate, as after any lost
+ack), and no later record of its partition goes out ahead of it.
 
 ### Ordering
 

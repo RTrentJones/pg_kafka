@@ -193,6 +193,38 @@ fn encode_records(
     Ok(encoded.freeze())
 }
 
+/// The index ranges of `records` that the encoder writes as one RecordBatch each: a batch
+/// runs while a record matches the batch's first in its flags, producer id and epoch and
+/// `offset - sequence` (compared as the encoder does, in wrapping i32 arithmetic), so each
+/// range encodes alone to exactly the bytes it takes in the encoding of all of them.
+/// O(records) time, one range per batch.
+fn batch_ranges(records: &[Record]) -> Vec<std::ops::Range<usize>> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the encoder compares offset - sequence truncated to i32"
+    )]
+    fn sequence_base(r: &Record) -> i32 {
+        (r.offset as i32).wrapping_sub(r.sequence)
+    }
+    let same_batch = |first: &Record, r: &Record| {
+        r.transactional == first.transactional
+            && r.control == first.control
+            && r.partition_leader_epoch == first.partition_leader_epoch
+            && r.producer_id == first.producer_id
+            && r.producer_epoch == first.producer_epoch
+            && sequence_base(r) == sequence_base(first)
+    };
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for i in 1..=records.len() {
+        if i == records.len() || !same_batch(&records[start], &records[i]) {
+            ranges.push(start..i);
+            start = i;
+        }
+    }
+    ranges
+}
+
 /// Encode `messages`, already trimmed to `limit` by their estimates
 /// ([`trim_to_response_budget`]), as record batches of at most `limit` bytes, and the bytes
 /// they count against the response budget: their estimated size, or their encoded size
@@ -202,36 +234,98 @@ fn encode_records(
 /// one: a codec adds its own framing per batch (gzip some 18 bytes, the xerial snappy
 /// header 16 and 4 per block, an lz4 frame 15 to 19, zstd a frame header) and per block
 /// (gzip about 5 bytes per 64 KiB of incompressible data), so records that compress
-/// poorly can encode past what their estimates sum to. Trailing records are then dropped
-/// until the batches fit, but for the first record of the response (`returned_any`
-/// false), which is returned alone whatever its size, as Kafka returns the first record
-/// batch.
+/// poorly can encode past what their estimates sum to. See [`encode_within_limit_with`]
+/// for where the records are then cut.
 fn encode_within_limit(
     messages: Vec<FetchedMessage>,
     compression: Compression,
     limit: i64,
     returned_any: bool,
 ) -> std::result::Result<Option<(bytes::Bytes, i64)>, String> {
+    encode_within_limit_with(messages, compression, limit, returned_any, encode_records)
+}
+
+/// [`encode_within_limit`] with the encoder passed in (tests count the work it does).
+///
+/// Batches are independent compression units, so each is encoded once, alone, and the
+/// batches are kept in order while their encodings fit `limit`. The first batch that does
+/// not fit is cut by its own records: its longest prefix whose estimates fit what is left
+/// of `limit`, or its first record alone when that is the first record of the response,
+/// returned whatever its size as Kafka returns the first record batch. A shorter prefix
+/// than the whole batch is encoded again; if its encoding does not fit, it is encoded
+/// uncompressed, which fits (it fits by its estimates) and is the smaller of the two (a
+/// compressed encoding past the estimates is larger than the uncompressed one). The
+/// response holds every record of the batches that fit and that prefix of the next one;
+/// the records after it are left for the next fetch.
+///
+/// Cost: each record is encoded (and compressed) once, and those of the one cut batch at
+/// most twice more, so O(records + their key, value and header bytes) time, and memory for
+/// the encoded batches plus two encodings of one batch.
+fn encode_within_limit_with(
+    messages: Vec<FetchedMessage>,
+    compression: Compression,
+    limit: i64,
+    returned_any: bool,
+    mut encode_records: impl FnMut(&[Record], Compression) -> std::result::Result<bytes::Bytes, String>,
+) -> std::result::Result<Option<(bytes::Bytes, i64)>, String> {
+    let len_of = |b: &[u8]| i64::try_from(b.len()).unwrap_or(i64::MAX);
     let estimates: Vec<i64> = messages.iter().map(message_size_estimate).collect();
     let records = batch_records(messages)?;
-    let min_kept = usize::from(!returned_any);
-    let mut kept = records.len();
-    while kept > 0 {
-        let encoded = encode_records(&records[..kept], compression)?;
-        let len = i64::try_from(encoded.len()).unwrap_or(i64::MAX);
-        if len <= limit || kept <= min_kept {
-            let counted = estimates[..kept].iter().sum::<i64>().max(len);
-            return Ok(Some((encoded, counted)));
+    let mut encoded = bytes::BytesMut::new();
+    let mut kept = 0;
+    for batch in batch_ranges(&records) {
+        let whole = encode_records(&records[batch.clone()], compression)?;
+        let fits = |encoded: &bytes::BytesMut, part: &[u8]| {
+            len_of(encoded).saturating_add(len_of(part)) <= limit
+        };
+        if fits(&encoded, &whole) {
+            encoded.extend_from_slice(&whole);
+            kept = batch.end;
+            continue;
         }
-        // Drop the trailing records whose estimates cover the excess (at least one) and
-        // encode again: what they leave out of the encoding can be less than their estimates.
-        let mut excess = len - limit;
-        while kept > min_kept && excess > 0 {
-            kept -= 1;
-            excess -= estimates[kept];
+        // The longest prefix of this batch that fits what is left by its estimates; the
+        // first record of the response is taken whatever its size (`forced`).
+        let mut room = limit - len_of(&encoded);
+        let (mut end, mut forced) = (batch.start, false);
+        while end < batch.end {
+            let first_of_response = !returned_any && end == 0;
+            if estimates[end] > room && !first_of_response {
+                break;
+            }
+            forced |= estimates[end] > room;
+            room -= estimates[end];
+            end += 1;
         }
+        if end == batch.start {
+            break;
+        }
+        let prefix = &records[batch.start..end];
+        let compressed = if end == batch.end {
+            whole
+        } else {
+            drop(whole);
+            encode_records(prefix, compression)?
+        };
+        let part = if forced || fits(&encoded, &compressed) {
+            Some(compressed)
+        } else if compression == Compression::None {
+            None
+        } else {
+            drop(compressed);
+            let plain = encode_records(prefix, Compression::None)?;
+            fits(&encoded, &plain).then_some(plain)
+        };
+        if let Some(part) = part {
+            encoded.extend_from_slice(&part);
+            kept = end;
+        }
+        break;
     }
-    Ok(None)
+    if kept == 0 {
+        return Ok(None);
+    }
+    let counted = estimates[..kept].iter().sum::<i64>().max(len_of(&encoded));
+    Ok(Some((encoded.freeze(), counted)))
 }
 
 /// Bytes of a RecordBatch v2 header (everything but the records).
@@ -1148,6 +1242,179 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Each range of [`batch_ranges`] encodes alone to its bytes in the encoding of all the
+    /// records, so batches encoded one by one concatenate to the same response.
+    #[test]
+    fn batch_ranges_encode_alone_as_they_do_together() {
+        let mut sets = byte_limit_record_sets();
+        sets.extend(
+            overhead_heavy_record_sets(20, 5)
+                .into_iter()
+                .filter(|(n, _)| !n.starts_with("large")),
+        );
+        for compression in [Compression::None, Compression::Gzip, Compression::Zstd] {
+            for (name, set) in &sets {
+                let records = batch_records(set.clone()).unwrap();
+                let together = encode_records(&records, compression).unwrap();
+                let mut alone = Vec::new();
+                for range in batch_ranges(&records) {
+                    alone.extend_from_slice(&encode_records(&records[range], compression).unwrap());
+                }
+                assert_eq!(alone, together.to_vec(), "{compression:?}, {name}");
+            }
+        }
+    }
+
+    /// Record sets whose batches encode past their estimates followed by `tail` records
+    /// that share one batch and compress to almost nothing: lone 1-byte records (split by
+    /// timestamps more than i32::MAX ms apart, by alternating producers, or by every other
+    /// offset missing, as read_committed leaves around aborted rows), and a few large random
+    /// values sharing a batch with the tail.
+    fn overhead_heavy_record_sets(
+        lone: i64,
+        tail: i64,
+    ) -> Vec<(&'static str, Vec<FetchedMessage>)> {
+        use rand::{RngCore, SeedableRng};
+        let now = 1_700_000_000_000;
+        let record = |offset: i64, value: Option<Vec<u8>>, timestamp, producer_id: Option<i64>| {
+            FetchedMessage {
+                partition_offset: offset,
+                key: None,
+                value,
+                timestamp,
+                headers: vec![],
+                producer_id,
+                producer_epoch: producer_id.map(|_| 0),
+            }
+        };
+        let with_tail = |mut set: Vec<FetchedMessage>| {
+            let next = set.last().map_or(0, |m| m.partition_offset + 1);
+            set.extend((next..next + tail).map(|o| record(o, None, now, None)));
+            set
+        };
+        let v = || Some(vec![b'v']);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let mut random = |n: usize| {
+            let mut v = vec![0u8; n];
+            rng.fill_bytes(&mut v);
+            Some(v)
+        };
+        vec![
+            (
+                "lone records by timestamp",
+                with_tail(
+                    (0..lone)
+                        .map(|o| record(o, v(), if o % 2 == 0 { -1 } else { now }, None))
+                        .collect(),
+                ),
+            ),
+            (
+                "lone records by producer",
+                with_tail(
+                    (0..lone)
+                        .map(|o| record(o, v(), now, (o % 2 == 1).then_some(7)))
+                        .collect(),
+                ),
+            ),
+            (
+                "lone records around missing offsets",
+                with_tail((0..lone).map(|o| record(2 * o, v(), now, None)).collect()),
+            ),
+            (
+                "large random values",
+                with_tail(
+                    (0..3)
+                        .map(|o| record(o, random(4 << 20), now, None))
+                        .collect(),
+                ),
+            ),
+        ]
+    }
+
+    /// Fitting a partition's records to its limit costs one encode of each batch, plus at
+    /// most two of the last, partial one: the records and bytes compressed stay within three
+    /// times those returned, whatever the codec and however the records compress. Dropping
+    /// trailing records by their estimates and re-encoding the rest until the batches fit
+    /// would compress the whole set again per round, each round shedding only the ~2
+    /// encoded bytes of every well-compressing record dropped.
+    #[test]
+    fn fitting_records_to_the_limit_encodes_each_batch_once() {
+        let codecs = [
+            Compression::None,
+            Compression::Gzip,
+            Compression::Snappy,
+            Compression::Lz4,
+            Compression::Zstd,
+        ];
+        let size = |m: &FetchedMessage| {
+            1 + m.key.as_ref().map_or(0, Vec::len) + m.value.as_ref().map_or(0, Vec::len)
+        };
+        let mut too_costly = Vec::new();
+        for compression in codecs {
+            for tail in (0..=60).step_by(3) {
+                for (name, set) in overhead_heavy_record_sets(1000, tail) {
+                    if name == "large random values" && tail > 30 {
+                        continue;
+                    }
+                    let limit = set.iter().map(message_size_estimate).sum::<i64>();
+                    let (records, bytes) = (set.len(), set.iter().map(size).sum::<usize>());
+                    for returned_any in [false, true] {
+                        let mut work = (0usize, 0usize);
+                        let encode = |r: &[Record], c| {
+                            work.0 += r.len();
+                            work.1 += r
+                                .iter()
+                                .map(|r| {
+                                    1 + r.key.as_ref().map_or(0, bytes::Bytes::len)
+                                        + r.value.as_ref().map_or(0, bytes::Bytes::len)
+                                })
+                                .sum::<usize>();
+                            encode_records(r, c)
+                        };
+                        let (encoded, counted) = encode_within_limit_with(
+                            set.clone(),
+                            compression,
+                            limit,
+                            returned_any,
+                            encode,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let case = format!("{compression:?}, {name}, tail {tail}");
+                        if work.0 > 3 * records || work.1 > 3 * bytes {
+                            too_costly.push(format!(
+                                "{case}: {work:?} records and bytes encoded for {records} \
+                                 records of {bytes} bytes"
+                            ));
+                        }
+                        let len = i64::try_from(encoded.len()).unwrap();
+                        assert!(len <= limit, "{case}: {len} bytes for a limit of {limit}");
+                        // The records returned are a prefix of the set: no record is skipped.
+                        let mut b = encoded.clone();
+                        let offsets: Vec<i64> = RecordBatchDecoder::decode_all(&mut b)
+                            .unwrap()
+                            .iter()
+                            .flat_map(|batch| batch.records.iter().map(|r| r.offset))
+                            .collect();
+                        assert!(!offsets.is_empty(), "{case}");
+                        assert!(
+                            offsets
+                                .iter()
+                                .copied()
+                                .eq(set.iter().map(|m| m.partition_offset).take(offsets.len())),
+                            "{case}"
+                        );
+                        assert!(
+                            counted >= len && counted <= limit,
+                            "{case}: counted {counted}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(too_costly.is_empty(), "{}", too_costly.join("\n"));
     }
 
     #[test]
