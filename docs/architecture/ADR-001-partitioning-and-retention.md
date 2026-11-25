@@ -110,9 +110,13 @@ later pass.
    before. Empty past leaves (from the check before the steps) are found drops too. With no
    finite window anywhere (the default), no leaf is probed.
 2. **Row expiry.** Its items, per (topic, leaf): the found trims, and the row-level items, a
-   topic whose window is shorter than one width in every leaf that may hold its expired rows
-   and every topic with a window in the DEFAULT leaf (unless it is empty), none in a leaf found
-   droppable. One 10,000-row batch a turn, an item until caught up; a trim is done (forgotten)
+   topic whose window is shorter than one width in the leaf holding its cutoff (`now -
+   window`) and in the newest leaf wholly behind it (which the cutoff has just left), and
+   every topic with a window in the DEFAULT leaf (unless it is empty), none in a leaf found
+   droppable. Older leaves are wholly expired for such a topic, so they are probe candidates
+   and its rows there are found trims: the row-level items are at most two per topic,
+   whatever the number of leaves (they were one per topic and past leaf, millions for
+   thousands of topics over a year of daily leaves, each a DELETE turn every rotation). One 10,000-row batch a turn, an item until caught up; a trim is done (forgotten)
    when its batch comes back short. Each statement is confined to one leaf (the leaf's bounds
    make the planner prune to it, and `tableoid` keeps `ctid` unambiguous; the DEFAULT leaf is
    addressed directly). The items rotate by (topic, leaf upper bound): an item with a large

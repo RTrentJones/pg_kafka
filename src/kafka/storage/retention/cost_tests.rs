@@ -1,7 +1,7 @@
 //! The per-pass cost of the sweep's planning as a function of what clients can create
 //! (topics, their windows, leaves kept by their rows, the trims the probes find),
 //! counted rather than timed: comparisons of a lap's keys, trim entries a probe
-//! examines.
+//! examines, expiry items a pass builds.
 
 use super::*;
 use std::cell::Cell;
@@ -107,4 +107,60 @@ fn probe_touches_only_its_leaf_trims() {
         "{} trim entries examined for {total} trims replaced",
         found.probe_work
     );
+}
+
+/// Row-level expiry items: a topic with a window shorter than one leaf gets items only
+/// where its cutoff is (the leaf holding it, and the newest leaf wholly behind it, which
+/// the cutoff just left), not in every past leaf: the older leaves are wholly expired
+/// for it, so the contents probes find its rows there as trims. With `T` such topics and
+/// `L` past leaves the items were `T * L`, built, sorted and each given a DELETE turn
+/// every rotation (10,000 topics and a year of daily leaves: 3.65 million).
+#[test]
+fn row_level_items_follow_the_cutoff_not_the_leaf_count() {
+    const DAY: i64 = 86_400_000;
+    let past: i64 = 365;
+    let mut leaves: Vec<TimePartition> = (0..=past)
+        .map(|i| TimePartition {
+            oid: u32::try_from(i + 1).unwrap_or(0),
+            name: format!("l{i}"),
+            lower_ms: Some(i * DAY),
+            upper_ms: Some((i + 1) * DAY),
+            is_default: false,
+        })
+        .collect();
+    leaves.push(TimePartition {
+        oid: 9_999,
+        name: "default".into(),
+        lower_ms: None,
+        upper_ms: None,
+        is_default: true,
+    });
+    let topics: i32 = 2_000;
+    let finite: Vec<(i32, i64)> = (0..topics).map(|t| (t, 1_000 + i64::from(t))).collect();
+    // Early in the current leaf: every cutoff is in the newest past leaf.
+    let now_ms = past * DAY + 500;
+    let clock = SweepClock {
+        now_ms,
+        width_ms: DAY,
+    };
+    let items = expiry_items(&leaves, &finite, clock, false, &FoundWork::new());
+    let t = usize::try_from(topics).unwrap_or(0);
+    assert!(
+        items.len() <= 2 * t,
+        "{} row-level items for {topics} short-window topics",
+        items.len()
+    );
+    for &(topic, window) in &finite {
+        let cutoff = now_ms - window;
+        let holding = leaves
+            .iter()
+            .find(|l| !l.is_default && l.lower_ms <= Some(cutoff) && Some(cutoff) < l.upper_ms)
+            .map(|l| l.oid);
+        assert!(
+            items
+                .iter()
+                .any(|i| i.topic_id == topic && Some(i.leaf_oid) == holding),
+            "topic {topic} has no item in the leaf holding its cutoff"
+        );
+    }
 }

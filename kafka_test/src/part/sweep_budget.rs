@@ -534,6 +534,139 @@ async fn expiry_rotation() -> SendResult<()> {
     Ok(())
 }
 
+/// Past leaves kept by an infinite-retention topic in the row-expiry cost test.
+const ITEMS_LEAVES: i32 = 40;
+/// Short-window topics (1 s retention, no rows) in that test.
+const SHORT_TOPICS: i32 = 30;
+
+/// Row expiry's row-level items grow with the short-window topics, not with topics
+/// times leaves: each such topic has items only at its cutoff (the leaf holding it and
+/// the newest leaf wholly behind it); the contents probes find its rows in older leaves.
+/// With an item for every short-window topic in every past leaf, a rotation over them
+/// took (topics x leaves) turns, and a topic's expired rows in the current leaf waited
+/// as many passes when the budget was spent.
+///
+/// Asserts: with the pass budget at 0 (one expiry turn a pass), 40 past leaves kept by
+/// an infinite-retention topic and 30 short-window topics, the rows of a 1 s retention
+/// topic in the current leaf are expired within three passes per topic with a window
+/// (plus ten), far fewer than the topics times the leaves.
+pub async fn test_sweep_expiry_items_do_not_grow_with_the_leaves() -> TestResult {
+    into_test_result(expiry_items_cost().await)
+}
+
+async fn expiry_items_cost() -> SendResult<()> {
+    println!("=== Test: row expiry's items do not grow with the leaves ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let forever = create_topic(&db, &unique("items-forever"), -1).await?;
+    let mut topics = vec![forever];
+    for i in 0..SHORT_TOPICS {
+        topics.push(create_topic(&db, &unique(&format!("items-short-{i}")), 1000).await?);
+    }
+    let target = create_topic(&db, &unique("items-target"), 1000).await?;
+    topics.push(target);
+    // One-hour leaves in 2002 (a year no other test's leaves use), each holding a row of
+    // the infinite topic, so none is empty or droppable.
+    let base_hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let mut leaves = Vec::new();
+    for h in 0..ITEMS_LEAVES {
+        let hour = base_hour + h;
+        db.execute(
+            "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
+             FROM (SELECT timestamptz '2002-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
+            &[&hour],
+        )
+        .await
+        .map_err(boxed)?;
+        leaves.push(
+            db.query_one(
+                "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
+                 WHERE lower_bound = timestamptz '2002-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
+                &[&hour],
+            )
+            .await
+            .map_err(boxed)?
+            .get::<_, String>(0),
+        );
+        db.execute(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+             VALUES ($1, 0, $2, 'v'::bytea,
+                     timestamptz '2002-01-01 00:00+00' + $3::int * INTERVAL '1 hour')",
+            &[&forever, &i64::from(h), &hour],
+        )
+        .await
+        .map_err(boxed)?;
+    }
+    fill_current_leaf(&db, target, 0, 20, "5 seconds", None).await?;
+    println!(
+        "Step 0: {ITEMS_LEAVES} kept past leaves, {SHORT_TOPICS} short-window topics, 20 \
+         expired rows of the target topic in the current leaf"
+    );
+
+    let budget = pass_budget(&db, "0").await?;
+    let result: SendResult<()> = async {
+        let (finite, all_leaves): (i64, i64) = {
+            let row = db
+                .query_one(
+                    "SELECT (SELECT count(*) FROM kafka.topics WHERE retention_ms >= 0),
+                            (SELECT count(*) FROM kafka.message_partitions())",
+                    &[],
+                )
+                .await
+                .map_err(boxed)?;
+            (row.get(0), row.get(1))
+        };
+        let passes = 3 * finite + 10;
+        for pass in 1..=passes {
+            db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            if topic_rows(&db, target).await? == 0 {
+                println!(
+                    "Step 1: expired after {pass} sweep(s) ({finite} topics with a window, \
+                     {all_leaves} leaves)"
+                );
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "{} rows still there after {passes} sweeps ({finite} topics with a window, \
+             {all_leaves} leaves)",
+            topic_rows(&db, target).await?
+        )
+        .into())
+    }
+    .await;
+    let restored = budget.restore().await;
+    for leaf in &leaves {
+        db.query(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[$2::int])",
+            &[leaf, &forever],
+        )
+        .await
+        .map_err(boxed)?;
+    }
+    db.execute(
+        "DELETE FROM kafka.messages WHERE topic_id = ANY($1)",
+        &[&topics],
+    )
+    .await
+    .map_err(boxed)?;
+    db.execute("DELETE FROM kafka.topics WHERE id = ANY($1)", &[&topics])
+        .await
+        .map_err(boxed)?;
+    result?;
+    restored?;
+    println!("✅ the current leaf's expired rows were reached within the topics' rotation");
+    Ok(())
+}
+
 /// Wholly expired topics in the kept leaf of the probe-cost test, one row each: a client
 /// can create this many one-partition topics (the default cap is 200,000 partitions),
 /// each with a short `retention.ms`.

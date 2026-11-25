@@ -37,8 +37,9 @@
 //!    ([`KeyCursor`]), and one that needs `b` turns (`b` batches of rows) is done within
 //!    `b * N`. So a trim or a drop of a leaf among `P` probe candidates is found within
 //!    `P` passes of becoming due (an empty leaf: the next pass), a found trim is done
-//!    within `b * E` more passes (`E` expiry items: topics with a window times leaves in
-//!    their scope, plus found trims), and a found drop within `D` more passes (`D` found
+//!    within `b * E` more passes (`E` expiry items: the found trims plus at most two
+//!    row-level items per short-window topic and one per topic with a window in a
+//!    non-empty DEFAULT leaf, [`expiry_items`]), and a found drop within `D` more passes (`D` found
 //!    drops), one more for each drop of that leaf that ran out of its lock wait. The
 //!    prunes and reapers delete their due rows oldest first (or by key), one batch a
 //!    turn, so a due row goes within one pass per batch of due rows ahead of it, and the
@@ -50,7 +51,9 @@
 //!    its final log-start update, each one statement.) The planning between the
 //!    statements is O(n log n) in what the pass reads and holds (topics, leaves, found
 //!    work), so no turn hides work the budget does not see: a lap's push is O(log n)
-//!    ([`Lap`]) and a probe replaces only its own leaf's trims ([`FoundWork`]).
+//!    ([`Lap`]), a probe replaces only its own leaf's trims ([`FoundWork`]), and the
+//!    row-level expiry items grow with the topics, not with topics times leaves
+//!    ([`expiry_items`]).
 //! 3. **No share is wasted while a step has work.** Phase 2 stops only at the budget or
 //!    when no step has work; the time one step does not use goes to the others, and a
 //!    step with work all pass gets at least `budget / steps - one turn` of it (each turn
@@ -728,10 +731,24 @@ pub struct SweepClock {
 }
 
 /// Row expiry's items for a pass: the found trims, plus the row-level items: a topic
-/// whose window is shorter than one leaf ([`row_level_expiry`]) in every leaf that may
-/// hold its expired rows, and every topic with a window in the DEFAULT leaf, unless it is
-/// empty (`default_has_rows`); none in a leaf found droppable (its drop removes them).
-/// `finite` lists the topics with a window.
+/// whose window is shorter than one leaf ([`row_level_expiry`]) in the leaf holding its
+/// cutoff (`now - window`, when that leaf may hold rows older than it) and in the newest
+/// leaf wholly behind the cutoff, and every topic with a window in the DEFAULT leaf,
+/// unless it is empty (`default_has_rows`); none in a leaf found droppable (its drop
+/// removes them). `finite` lists the topics with a window.
+///
+/// The older leaves are wholly expired for such a topic (`upper + window <= now`), so
+/// they are contents-probe candidates ([`needs_contents_probe`]: the shortest window is
+/// at most the topic's), and the topic's rows there are found trims; the newest of them
+/// keeps its row-level item so that the rows that expired since the last pass, as the
+/// cutoff left it, go at the next expiry turn instead of waiting for a probe. So every
+/// (topic, leaf) with expired rows has an item, from here or from a probe, and a pass
+/// has at most `F + 2 * S + W` items (`F` found trims, `S` short-window topics, `W`
+/// topics with a window when the DEFAULT leaf holds rows), whatever the number of
+/// leaves.
+///
+/// Cost: O(L log L) to order the `L` leaves by bound, O(log L) per topic to find its
+/// cutoff, O(F) for the found trims, and the items' memory.
 pub fn expiry_items(
     leaves: &[TimePartition],
     finite: &[(i32, i64)],
@@ -752,13 +769,15 @@ pub fn expiry_items(
             })
         })
         .collect();
+    let mut time_leaves: Vec<&TimePartition> = leaves.iter().filter(|l| !l.is_default).collect();
+    time_leaves.sort_by_key(|l| leaf_key(l));
+    let defaults: Vec<&TimePartition> = leaves
+        .iter()
+        .filter(|l| l.is_default && default_has_rows)
+        .collect();
     for &(topic_id, window_ms) in finite {
-        for leaf in leaves {
-            if found.has_drop(leaf_key(leaf), leaf.oid) || (leaf.is_default && !default_has_rows) {
-                continue;
-            }
-            let in_scope = leaf.is_default || row_level_expiry(window_ms, clock.width_ms);
-            if in_scope && may_hold_expired(leaf, clock.now_ms, window_ms) {
+        let mut push = |leaf: &TimePartition| {
+            if !found.has_drop(leaf_key(leaf), leaf.oid) {
                 items.push(ExpiryItem {
                     topic_id,
                     window_ms,
@@ -766,6 +785,22 @@ pub fn expiry_items(
                     leaf_key: leaf_key(leaf),
                 });
             }
+        };
+        for &leaf in &defaults {
+            push(leaf);
+        }
+        if !row_level_expiry(window_ms, clock.width_ms) {
+            continue;
+        }
+        let cutoff = clock.now_ms.saturating_sub(window_ms);
+        let at = time_leaves.partition_point(|l| leaf_key(l) <= cutoff);
+        if let Some(&holding) = time_leaves.get(at) {
+            if may_hold_expired(holding, clock.now_ms, window_ms) {
+                push(holding);
+            }
+        }
+        if let Some(&behind) = at.checked_sub(1).and_then(|i| time_leaves.get(i)) {
+            push(behind);
         }
     }
     items
