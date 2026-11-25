@@ -128,7 +128,8 @@
 //! (the work that handles what a client put into it) runs under `catch_unwind`:
 //! a panic there fails that record, a counted attempt, and fences its
 //! partition. The loop itself runs supervised: after a panic anywhere else the
-//! records it held are answered `NotAttempted` and fence their partitions (see
+//! records it held (the one whose delivery report was being handled included)
+//! are answered `NotAttempted` and fence their partitions (see
 //! [`ForwarderCore::recover_from_panic`]), its producers are dropped (which
 //! purges them), and it runs again after [`RESTART_BACKOFF`].
 //!
@@ -236,6 +237,14 @@ pub(crate) struct ForwarderCore {
     /// The schema epoch of the last [`ForwardRequest::Reset`]: every ack sent is
     /// stamped with it.
     pub(crate) epoch: u64,
+    /// The record whose delivery report [`Self::on_result`] is handling, and how many
+    /// acks were queued when it started: a panic there leaves it untracked (no longer
+    /// outstanding) and possibly unanswered and unfenced, which
+    /// [`Self::recover_from_panic`] repairs.
+    handling: Option<(RowKey, usize)>,
+    /// Test hook: panic once in [`Self::on_result`], after the record was resolved.
+    #[cfg(test)]
+    panic_in_on_result: bool,
 }
 
 impl ForwarderCore {
@@ -438,8 +447,9 @@ impl ForwarderCore {
 
     /// The forwarder loop panicked and is about to run again with new producers:
     /// the old ones (dropped with the loop, which purges them) and their delivery
-    /// reports are gone. Every record the loop held, on a producer or in the
-    /// `backlog`, is answered `NotAttempted` (its row becomes due again, without
+    /// reports are gone. Every record the loop held, on a producer, in the
+    /// `backlog` or with its delivery report being handled when the panic hit, is
+    /// answered `NotAttempted` (its row becomes due again, without
     /// a counted attempt) and fences its partition, so a later record of the
     /// partition still on its way does not overtake the re-send. The producer
     /// generations are forgotten (the new loop numbers its producers from the
@@ -448,6 +458,14 @@ impl ForwarderCore {
     pub(crate) fn recover_from_panic(&mut self, backlog: &mut VecDeque<Queued>) {
         let mut lost: Vec<RowKey> = self.outstanding.keys().copied().collect();
         lost.extend(backlog.drain(..).map(|queued| queued.record.row));
+        // A panic while handling a delivery report: unless its ack was queued before the
+        // panic, the record is answered and fenced like the others (a delivered one is
+        // then sent again, a duplicate as after any lost ack). O(acks queued since).
+        if let Some((key, acks_before)) = self.handling.take() {
+            if !self.acks.iter().skip(acks_before).any(|ack| ack.row == key) {
+                lost.push(key);
+            }
+        }
         lost.sort_unstable();
         self.outstanding.clear();
         self.by_age.clear();
@@ -547,7 +565,25 @@ impl ForwarderCore {
         result: Result<i64, String>,
         producer_fatal: bool,
     ) {
+        self.handling = Some((key, self.acks.len()));
+        self.handle_result(key, generation, result, producer_fatal);
+        self.handling = None;
+    }
+
+    /// [`Self::on_result`] once the record is marked as being handled.
+    fn handle_result(
+        &mut self,
+        key: RowKey,
+        generation: u64,
+        result: Result<i64, String>,
+        producer_fatal: bool,
+    ) {
         self.resolved(key);
+        #[cfg(test)]
+        assert!(
+            !std::mem::take(&mut self.panic_in_on_result),
+            "injected on_result panic"
+        );
         let timed_out = self.take_timed_out(key, generation);
         match result {
             Ok(external_offset) => {
@@ -2318,6 +2354,47 @@ mod tests {
             Admit::Send,
             "its retry lifts the fence"
         );
+    }
+
+    /// A panic while handling a failed delivery report, after the record was taken off
+    /// the outstanding records and before it was fenced and answered: recovery answers
+    /// it NotAttempted and fences its partition, so a later record of the partition does
+    /// not go out ahead of its re-send. A report whose ack was queued before the panic is
+    /// not answered twice.
+    #[test]
+    fn a_panic_while_handling_a_delivery_report_fences_that_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, now);
+        core.sent(RowKey::new(1, 0, 2), 1, now);
+        core.panic_in_on_result = true;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            core.on_result(RowKey::new(1, 0, 1), 1, Err("boom".into()), false);
+        }));
+        assert!(panicked.is_err());
+        assert!(core.acks.is_empty() && !core.outstanding.contains_key(&RowKey::new(1, 0, 1)));
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        let answered: Vec<RowKey> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(answered, vec![RowKey::new(1, 0, 1), RowKey::new(1, 0, 2)]);
+        assert!(got
+            .iter()
+            .all(|(_, o)| matches!(o, ForwardOutcome::NotAttempted(e) if e.contains("restarted"))));
+        assert_eq!(core.admit(&rec(0, 2, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 1, false)), Admit::Send);
+
+        // The ack was queued before the panic: recovery does not answer it again.
+        let mut core = ForwarderCore::default();
+        core.on_result(RowKey::new(1, 0, 3), 1, Ok(9), false);
+        core.handling = Some((RowKey::new(1, 0, 4), core.acks.len()));
+        core.acks.push_back(ForwardAck::new(
+            RowKey::new(1, 0, 4),
+            ForwardOutcome::Delivered(10),
+        ));
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(core.handling.is_none());
     }
 
     /// After a panic of the loop, every record it held (on a producer or in the
