@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->1065<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
-| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->453<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1528<!--/gen-->** | |
+| Unit Tests | <!--gen:tests-unit-->1068<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest round-trips of the kafka-protocol crate's header and field encodings that pg_kafka relies on (no pg_kafka code) |
+| E2E Tests | <!--gen:tests-e2e-->455<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1533<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -40,7 +40,7 @@ module):
 | Module | Focus |
 |--------|-------|
 | Shadow Mode (`kafka/shadow/`) | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
-| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests.rs`) |
+| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests/`) |
 | Protocol (`kafka/protocol/`) | Decoding, encoding, RecordBatch framing, proptest fuzz harnesses |
 | Assignment (`kafka/assignment/`) | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
 | Storage Layer (`kafka/storage/`) | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
@@ -81,14 +81,14 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `compression` | 10 |
 | `idempotent` | 17 |
 | `transaction` | 42 |
-| `shadow` | 55 |
+| `shadow` | 57 |
 | `metadata` | 5 |
 | `protocol` | 5 |
 | `part` | 27 |
 | `auth` | 16 |
 | `network` | 62 |
 | `worker` | 6 |
-| **Total** | **453** |
+| **Total** | **455** |
 <!--/gen-->
 
 ### Running E2E Tests

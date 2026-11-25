@@ -109,7 +109,7 @@ fn sent_records(h: &Harness) -> Vec<ForwardRecord> {
         .try_iter()
         .filter_map(|m| match m {
             ForwardRequest::Record(r) => Some(r),
-            ForwardRequest::Hold(_) => None,
+            ForwardRequest::Hold(_) | ForwardRequest::Reset(_) => None,
         })
         .collect()
 }
@@ -189,6 +189,83 @@ fn outbox_row_is_only_written_for_an_existing_message() {
 }
 
 #[test]
+fn acks_from_a_dropped_schema_do_not_touch_its_successors_rows() {
+    let h = async_harness(16);
+    let delivered = RowKey::new(T, 0, 0);
+    let failed = RowKey::new(T, 0, 1);
+    seed_rows(&h.store, &[delivered, failed]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    sent_records(&h);
+
+    // DROP + CREATE EXTENSION: the new schema's first rows reuse the keys.
+    {
+        let mut state = h.store.db().state();
+        state.tracking.clear();
+        state.messages.clear();
+    }
+    h.store.forget_dropped_schema();
+    seed_rows(&h.store, &[delivered, failed]);
+
+    // The forwarder is told first, then the new rows go out: their keys are
+    // not in flight any more.
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
+    assert!(
+        matches!(sent.first(), Some(ForwardRequest::Reset(1))),
+        "{sent:?}"
+    );
+    assert_eq!(sent.len(), 3);
+
+    // Late acks of the old forwards (epoch 0) are ignored.
+    h.acks.send(ok_ack(delivered, 9)).unwrap();
+    h.acks.send(err_ack(failed)).unwrap();
+    assert_eq!(drain(&h), 0);
+    let row = h.store.db().row(delivered).unwrap();
+    assert_eq!(row.external_offset, None);
+    assert_eq!(h.store.db().row(failed).unwrap().retry_count, 0);
+
+    // The new forwards' own acks are applied.
+    let mut ack = ok_ack(delivered, 3);
+    ack.epoch = 1;
+    h.acks.send(ack).unwrap();
+    assert_eq!(drain(&h), 1);
+    assert_eq!(
+        h.store.db().row(delivered).unwrap().external_offset,
+        Some(3)
+    );
+}
+
+#[test]
+fn a_reset_the_forward_channel_refused_goes_out_before_any_record() {
+    let h = async_harness(1);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    // The channel is full: the reset waits, and so does every record.
+    h.store.forget_dropped_schema();
+    {
+        let mut state = h.store.db().state();
+        state.tracking.clear();
+        state.messages.clear();
+    }
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Record(_))
+    ));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Reset(1))
+    ));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Record(_))
+    ));
+}
+
+#[test]
 fn duplicate_success_ack_counts_once() {
     let h = async_harness(16);
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
@@ -255,7 +332,8 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
         },
     );
 
-    // No RAM buffer (e.g. after a worker restart): the DB read still finds them.
+    // The store keeps nothing for the transaction: the commit finds its records
+    // in kafka.messages.
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
     assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());
@@ -1224,7 +1302,7 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
             assert_eq!(released.load(Ordering::SeqCst), 0);
             hold.release.release();
         }
-        ForwardRequest::Record(record) => panic!("expected a hold, got {record:?}"),
+        other => panic!("expected a hold, got {other:?}"),
     }
     assert_eq!(released.load(Ordering::SeqCst), 1);
 

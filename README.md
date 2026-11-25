@@ -249,7 +249,7 @@ CREATE TABLE kafka.producer_sequences (
 |------|----------|
 | `src/` | The extension: worker, listener, protocol, handlers, coordinator, storage, shadow mode ([module map](CLAUDE.md#codebase-structure)) |
 | `sql/` | Schema (`bootstrap.sql`), the 0.0.0 to 0.1.0 upgrade script, optional tuning |
-| `tests/property_tests.rs` | proptest suite |
+| `tests/property_tests.rs` | proptest round-trips of the kafka-protocol crate's encodings (no pg_kafka code) |
 | `kafka_test/` | E2E suite: a real rdkafka client against a running extension |
 | `fuzz/` | libFuzzer targets for the network-edge decoders |
 | `interop/` | Apache Kafka Java client checks and the differential harness against a real broker |
@@ -264,7 +264,7 @@ CREATE TABLE kafka.producer_sequences (
 ### Test Coverage
 
 Unit tests (`src/`, with `MockKafkaStore` standing in for Postgres), property tests
-(`tests/property_tests.rs`, proptest) and the E2E suite (`kafka_test/`, a real rdkafka
+(`tests/property_tests.rs`, proptest round-trips of the kafka-protocol crate's encodings) and the E2E suite (`kafka_test/`, a real rdkafka
 client against a running extension). Current counts, per module and per E2E
 category, are kept in one place: [docs/TEST_STRATEGY.md](docs/TEST_STRATEGY.md#test-summary).
 

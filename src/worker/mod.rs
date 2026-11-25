@@ -271,6 +271,8 @@ impl MainLoop<'_> {
             return;
         }
         reapply_worker_role();
+        // The old outbox is gone and a re-created one reuses its row keys.
+        self.env.shadow_store.forget_dropped_schema();
         self.schema = SchemaState::default();
         refresh_schema_state(&mut self.schema);
         self.resume_on_current_schema();

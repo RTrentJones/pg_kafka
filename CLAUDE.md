@@ -123,9 +123,11 @@ src/
     ├── api/            # One `KafkaApi` impl per API + the kafka_apis! registry (decode, versions,
     │                   # lanes, error responses, dispatch, generated docs)
     ├── protocol/       # Framing (FrameCodec), header decoding, response encoding, RecordBatch parsing
-    ├── listener/       # Network thread: accept and connection caps (accept), TLS (tls), the read
-    │                   # loop (connection), ordered responses (writer), SASL frames (sasl),
-    │                   # hand-off to the DB thread (dispatch), Fetch long polling (long_poll)
+    ├── listener/       # Network thread: its setup (thread), accept and connection caps
+    │                   # (accept), TLS (tls), the read loop (connection), ordered responses
+    │                   # (writer) and what they may hold (response_budget), SASL frames
+    │                   # (sasl), hand-off to the DB thread (dispatch), Fetch long polling
+    │                   # (long_poll)
     ├── conn_limits.rs  # Per-listener / per-IP connection caps, SASL lookup rate limit
     ├── auth/           # TLS config, SASL session state machine, SCRAM/PLAIN, credentials, user SQL
     ├── messages.rs     # KafkaRequest/KafkaResponse envelopes, request lanes

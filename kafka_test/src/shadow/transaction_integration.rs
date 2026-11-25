@@ -243,11 +243,11 @@ pub async fn test_committed_transaction_uses_durable_outbox() -> TestResult {
 }
 
 /// B1: a transactional commit must not enqueue outbox pointers for message rows
-/// that do not exist any more. This reproduces the mid-txn rollback leak black-box: the
-/// pending message row is deleted after it is written but before commit, while the
-/// worker's in-RAM forward buffer still holds the offset. The existence-checked
-/// enqueue drops it; an orphan `kafka.shadow_tracking` row would never be claimable by
-/// the poll's EXISTS guard and never cleaned (a slow leak).
+/// that do not exist any more. The pending message row is deleted after it is written
+/// but before commit. The commit enqueues the transaction's records from the
+/// producer's pending rows in kafka.messages, so a deleted row gets no outbox row; an
+/// orphan `kafka.shadow_tracking` row would never be claimable by the poll's EXISTS
+/// guard and never cleaned (a slow leak).
 pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     println!("=== Test: Committed Txn Leaves No Orphan Outbox Rows (B1) ===\n");
 
@@ -270,9 +270,9 @@ pub async fn test_committed_txn_leaves_no_orphan_outbox_rows() -> TestResult {
     )
     .await?;
 
-    // 2. ACTION — produce in a txn (message row lands with txn_state='pending' and
-    // the shadow forward buffer is populated in the worker's RAM), then delete the
-    // pending row before committing to simulate the mid-txn rollback.
+    // 2. ACTION — produce in a txn (the message row lands with txn_state='pending';
+    // nothing is enqueued until the commit), then delete the pending row before
+    // committing.
     let producer = create_transactional_producer(&txn_id)?;
     producer.init_transactions(Duration::from_secs(10))?;
     producer.begin_transaction()?;
@@ -403,7 +403,7 @@ const LARGE_TXN_RECORDS: usize = 250_000;
 
 /// The worker's private memory may grow by at most this much while the measured
 /// 200,000 records of each topic go into the open transaction: holding a per-record
-/// forward buffer in RAM grows it by about 50 MB there.
+/// forward buffer in RAM would grow it by about 50 MB there.
 const LARGE_TXN_GROWTH_BOUND: u64 = 8 * 1024 * 1024;
 
 /// A large committed transaction on two shadowed topics, one forwarding everything and

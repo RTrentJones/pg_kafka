@@ -79,6 +79,9 @@ impl TestContext {
         // Instead, each test sets the GUCs it needs via enable_shadow_mode(),
         // and the per-topic shadow_config table controls forwarding behavior.
         // Tests that don't need shadow mode simply don't insert shadow_config rows.
+        // The shadow category's last test
+        // (`shadow::helpers::test_shadow_teardown_turns_shadow_mode_off`) resets the
+        // GUCs once, after all of them.
 
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;
@@ -393,6 +396,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "connects to the test database"]
     async fn test_unique_names_are_unique() {
         let ctx = TestContext::new().await.unwrap();
         let topic1 = ctx.unique_topic("test").await;

@@ -57,7 +57,7 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 
 #### 6.4 DeleteGroups (API 42)
 **Files to modify:**
-- `src/kafka/coordinator.rs` - Add `remove_group()` method (as built)
+- `src/kafka/coordinator/mod.rs` - Add `remove_group()` method (as built)
 - `src/kafka/storage/postgres/offsets.rs` - Delete from `kafka.consumer_offsets`
 
 **Testing:**
@@ -213,11 +213,11 @@ SELECT pg_reload_conf();
 #### 12.1 Cooperative Rebalancing (KIP-429)
 **Files to modify:**
 - `src/kafka/assignment/strategies/sticky.rs` - Two-phase revoke/assign
-- `src/kafka/coordinator.rs` - Track `owned_partitions` per member
+- `src/kafka/coordinator/mod.rs` - Track `owned_partitions` per member
 
 #### 12.2 Static Group Membership (KIP-345)
 **Files to modify:**
-- `src/kafka/coordinator.rs` - Honor `group_instance_id`, skip rebalance on reconnect
+- `src/kafka/coordinator/mod.rs` - Honor `group_instance_id`, skip rebalance on reconnect
 
 ---
 
@@ -248,7 +248,7 @@ SELECT pg_reload_conf();
 | `src/kafka/handlers/` | All API handlers |
 | `src/kafka/storage/mod.rs` | KafkaStore trait |
 | `src/kafka/storage/postgres.rs`, `postgres/` | PostgresStore implementation (one submodule per storage concern) |
-| `src/kafka/coordinator.rs` | Group state machine |
+| `src/kafka/coordinator/mod.rs` | Group state machine |
 | `src/kafka/protocol/decoding.rs` | Request header parsing (bodies go to the registry) |
 | `src/kafka/messages.rs` | `KafkaRequest`/`KafkaResponse` envelopes, request lanes |
 | `src/worker/` | Background worker loop, transaction + response-after-commit barrier |

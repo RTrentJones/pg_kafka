@@ -305,6 +305,14 @@ within one producer session. A record re-sent by a new producer (rebuilt after a
 settings change) or after a lost ack can land twice. Consumers that need exactly-once should
 deduplicate on an application id.
 
+`DROP EXTENSION` takes the outbox with it. A re-created extension starts `kafka.topics.id` again,
+so its first rows reuse the keys of rows the old outbox had dispatched: when the worker finds the
+schema again it forgets every forward still in flight, moves to a new schema epoch and tells the
+forwarder first, which drops the old forwards' fences, queued records and held responses and stamps
+its acks with the epoch. A late ack of an old forward is then ignored instead of finalizing (or
+charging an attempt to) the new row that shares its key; the old records may still reach the
+external broker.
+
 ### Replay
 
 `kafka.replay_shadow_messages(p_topic_id INT, p_from_offset BIGINT DEFAULT 0, p_to_offset BIGINT DEFAULT NULL)`
