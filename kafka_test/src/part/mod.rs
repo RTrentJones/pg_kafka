@@ -9,6 +9,7 @@ mod sweep_budget;
 mod sweep_concurrency;
 mod sweep_cost;
 mod sweep_datestyle;
+mod sweep_isolation;
 pub mod time_partitions;
 
 /// The `part` tests, in run order.
@@ -43,5 +44,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_budget::test_sweep_producer_prune_reads_through_indexes: sequential,
         sweep_budget::test_sweep_forgets_a_deferred_drop_when_retention_is_raised: sequential,
         sweep_datestyle::test_sweep_bounds_survive_the_session_datestyle: sequential,
+        sweep_isolation::test_sweep_keeps_rows_committed_during_a_repeatable_read_drop: sequential,
+        sweep_isolation::test_worker_sweep_drops_under_a_repeatable_read_default: sequential,
     ]
 }

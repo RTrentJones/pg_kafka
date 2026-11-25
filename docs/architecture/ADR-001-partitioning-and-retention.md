@@ -129,7 +129,17 @@ later pass.
    long. That leaf stays found and the next pass starts after it. The 2 s is the functions' own
    `lock_timeout`, not `pg_kafka.worker_lock_timeout_ms` (default 5 s, sized for request
    batches), so one blocked drop stalls the worker at most 2 s. A drop's lock is held until the
-   pass commits.
+   pass commits. The re-check is only sound at READ COMMITTED, where it reads a snapshot taken
+   after the lock wait. A REPEATABLE READ or SERIALIZABLE snapshot predates the wait, so a row
+   committed while the drop waited for its writer would be invisible to the re-check and
+   dropped with the leaf, after its producer was acked. So `drop_message_partition` refuses at
+   those levels (a WARNING, `dropped = false`), and a sweep running at one (a manual
+   `pg_kafka_run_retention_sweep()` in such a transaction, or under such a
+   `default_transaction_isolation`) skips its drop step with one WARNING: its found leaves stay
+   found, and its other steps run as usual (a row delete removes only rows its snapshot sees,
+   and a concurrent change to one of them fails the statement with a serialization error). The
+   worker sets `default_transaction_isolation = 'read committed'` for its own session, so a
+   cluster default of another level does not stop its drops.
 4. **Log start.** `log_start_offset` of every touched (topic, partition) advances to the oldest
    surviving offset or the HWM, only forward (GREATEST), exactly as for row deletes: before
    each turn of the orphaned-outbox reaper and at the end of the pass. Offsets are assigned in

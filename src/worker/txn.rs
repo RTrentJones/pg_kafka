@@ -276,6 +276,23 @@ pub(super) fn apply_worker_lock_timeout() {
     }
 }
 
+/// Run the worker session's transactions at READ COMMITTED whatever the cluster's
+/// `default_transaction_isolation`: the worker's SQL relies on each statement taking a
+/// fresh snapshot (a leaf drop re-checks the leaf after waiting for its locks, and
+/// refuses at any other level). A session-level setting outranks postgresql.conf, so a
+/// reload keeps it. Called at start, outside any transaction.
+pub(super) fn apply_worker_isolation() {
+    // SAFETY: both strings are NUL-terminated literals; SetConfigOption copies them.
+    unsafe {
+        pg_sys::SetConfigOption(
+            c"default_transaction_isolation".as_ptr(),
+            c"read committed".as_ptr(),
+            pg_sys::GucContext::PGC_USERSET,
+            pg_sys::GucSource::PGC_S_SESSION,
+        );
+    }
+}
+
 /// Extract a human-readable message from a caught panic payload.
 ///
 /// Postgres ERRORs crossing the pgrx FFI boundary arrive as a panic whose

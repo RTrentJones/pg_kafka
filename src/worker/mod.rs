@@ -82,6 +82,8 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     crate::kafka::storage::postgres::apply_worker_role();
     // Bounded lock waits for every worker transaction.
     apply_worker_lock_timeout();
+    // A fresh snapshot per statement in every worker transaction.
+    txn::apply_worker_isolation();
 
     // Whether the schema is current (an older extension version is not served until
     // ALTER EXTENSION pg_kafka UPDATE; the main loop waits for it).
