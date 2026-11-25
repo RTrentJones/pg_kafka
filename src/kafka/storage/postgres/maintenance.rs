@@ -1046,6 +1046,20 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
 /// retention already removed. Offsets grow with created_at, so retention removes an
 /// offset-contiguous prefix; the new log start is the oldest surviving offset, or
 /// next_offset (the high watermark) when the partition is now empty.
+///
+/// Concurrency: `pg_kafka_run_retention_sweep()` runs this in its own session while the
+/// worker produces. A Produce inserts its records and then upserts the counter row,
+/// holding both until it commits. The first statement's upsert locks every affected
+/// counter row, waiting for such a Produce, and the second statement runs with a
+/// snapshot taken after that (READ COMMITTED: a fresh snapshot per statement), so its
+/// MIN sees the committed records whose offsets its next_offset counts, and it updates
+/// rows this transaction already holds, so nothing re-evaluates it against a newer
+/// counter. A Produce that reaches the counter after the first statement waits for the
+/// sweep's commit, and its records are at or past the next_offset the sweep read. Keep
+/// the two statements in this order: an UPDATE alone that waited for the Produce would
+/// re-read next_offset from the committed counter while its MIN kept the old snapshot,
+/// and move the log start past the new record. Under REPEATABLE READ or SERIALIZABLE
+/// the upsert fails with a serialization error instead.
 fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -> Result<()> {
     if affected.is_empty() {
         return Ok(());

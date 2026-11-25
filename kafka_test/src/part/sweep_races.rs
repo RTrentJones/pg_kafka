@@ -216,3 +216,117 @@ async fn revived_producer() -> SendResult<()> {
     println!("✅ the revived producer and its sequences survive the prune");
     Ok(())
 }
+
+/// The log start a sweep sets after removing every visible row of a partition is the
+/// partition's next offset, which a Produce committing during the sweep advances past
+/// a record the sweep never saw. The sweep's counter upsert locks the counter rows
+/// first, so it waits for that Produce and the log-start update reads a snapshot that
+/// holds its record: the log start never passes a record the sweep did not delete.
+///
+/// Asserts: a partition with offsets 0-4 expired (rows in the DEFAULT leaf) and a
+/// writer holding a Produce of offset 5 (the worker's statements: append lock, insert,
+/// counter upsert) open; an on-demand sweep that removes 0-4 waits for the writer, and
+/// afterwards the log start is 5 with the record at 5 present.
+pub async fn test_sweep_log_start_never_passes_a_concurrent_produce() -> TestResult {
+    into_test_result(log_start_race().await)
+}
+
+async fn log_start_race() -> SendResult<()> {
+    println!("=== Test: the sweep's log start never passes a record produced during it ===\n");
+    let sweeper = sweeper_session().await?;
+    let topic = create_topic(&sweeper, &unique("logstart-race"), 3_600_000).await?;
+    let result: SendResult<()> = async {
+        // 1990: older than every leaf, so the rows are in kafka.messages_default.
+        sweeper
+            .execute(
+                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                             created_at)
+                 SELECT $1, 0, g, 'old'::bytea,
+                        timestamptz '1990-01-01 00:00+00' + g * INTERVAL '1 second'
+                 FROM generate_series(0::bigint, 4) AS g",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?;
+        sweeper
+            .execute(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                 VALUES ($1, 0, 5)",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?;
+        println!("Step 1: offsets 0-4 expired (1990, retention.ms 1 h); next offset 5");
+
+        let writer = session().await?;
+        let observer = session().await?;
+        writer
+            .batch_execute(&format!(
+                "BEGIN;
+                 SELECT pg_advisory_xact_lock({topic}, 0);
+                 INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
+                 VALUES ({topic}, 0, 5, 'new'::bytea);
+                 INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                 VALUES ({topic}, 0, 6)
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE
+                     SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                                EXCLUDED.next_offset);"
+            ))
+            .await
+            .map_err(boxed)?;
+        println!("Step 2: a writer holds a Produce of offset 5 open (counter at 6)");
+
+        let (expired, waited) =
+            sweep_against_writer(&sweeper, &observer, &writer, "expired_messages").await?;
+        println!("Step 3: the sweep expired {expired} row(s); it waited for the writer: {waited}");
+        let offsets: Vec<i64> = sweeper
+            .query(
+                "SELECT partition_offset FROM kafka.messages WHERE topic_id = $1
+                 ORDER BY partition_offset",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let row = sweeper
+            .query_one(
+                "SELECT next_offset, log_start_offset FROM kafka.partition_offsets
+                 WHERE topic_id = $1 AND partition_id = 0",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?;
+        let (next, log_start): (i64, i64) = (row.get(0), row.get(1));
+        println!("Step 4: offsets {offsets:?}, next offset {next}, log start {log_start}");
+        if expired != 5 || !waited {
+            return Err(format!(
+                "the sweep did not remove offsets 0-4 while waiting for the writer \
+                 (expired {expired}, waited {waited})"
+            )
+            .into());
+        }
+        if offsets != [5] || next != 6 || log_start != 5 {
+            return Err(format!(
+                "the log start passed a record the sweep did not delete \
+                 (offsets {offsets:?}, next {next}, log start {log_start})"
+            )
+            .into());
+        }
+        Ok(())
+    }
+    .await;
+    sweeper
+        .execute("DELETE FROM kafka.messages WHERE topic_id = $1", &[&topic])
+        .await
+        .map_err(boxed)?;
+    sweeper
+        .execute("DELETE FROM kafka.topics WHERE id = $1", &[&topic])
+        .await
+        .map_err(boxed)?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ the log start stops at the record produced during the sweep");
+    Ok(())
+}
