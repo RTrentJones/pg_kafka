@@ -34,12 +34,15 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
         sweep_cost::test_sweep_reads_only_what_it_deletes: sequential,
         sweep_cost::test_sweep_reaps_outbox_rows_of_removed_messages: sequential,
+        sweep_cost::test_sweep_drop_recheck_is_linear_in_the_leaf_topics: sequential,
         sweep_budget::test_system_guc_guard_restores_on_every_path: sequential,
         sweep_budget::test_sweep_probe_rotation_reaches_every_leaf: sequential,
         sweep_budget::test_sweep_drops_bounded_behind_a_held_reader: sequential,
         sweep_budget::test_sweep_aborted_cleanup_reaches_every_leaf: sequential,
         sweep_budget::test_sweep_expiry_reaches_the_current_leaf_on_a_spent_budget: sequential,
         sweep_budget::test_sweep_expiry_keeps_its_share_behind_an_aborted_backlog: sequential,
+        sweep_budget::test_sweep_expiry_items_do_not_grow_with_the_leaves: sequential,
+        sweep_budget::test_sweep_probe_of_many_expired_topics_stays_within_its_budget: sequential,
         sweep_budget::test_sweep_prunes_producers_within_its_budget: sequential,
         sweep_budget::test_sweep_trims_reach_every_kept_leaf: sequential,
         sweep_budget::test_sweep_producer_prune_reads_through_indexes: sequential,
@@ -49,5 +52,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_isolation::test_worker_sweep_drops_under_a_repeatable_read_default: sequential,
         sweep_races::test_sweep_prune_keeps_a_producer_revived_during_its_wait: sequential,
         sweep_races::test_sweep_log_start_never_passes_a_concurrent_produce: sequential,
+        sweep_races::test_sweep_prune_keeps_a_producer_whose_produce_is_open: sequential,
+        sweep_races::test_sweep_prune_then_produce_keeps_producer_state: sequential,
     ]
 }

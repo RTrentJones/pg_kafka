@@ -110,9 +110,13 @@ later pass.
    before. Empty past leaves (from the check before the steps) are found drops too. With no
    finite window anywhere (the default), no leaf is probed.
 2. **Row expiry.** Its items, per (topic, leaf): the found trims, and the row-level items, a
-   topic whose window is shorter than one width in every leaf that may hold its expired rows
-   and every topic with a window in the DEFAULT leaf (unless it is empty), none in a leaf found
-   droppable. One 10,000-row batch a turn, an item until caught up; a trim is done (forgotten)
+   topic whose window is shorter than one width in the leaf holding its cutoff (`now -
+   window`) and in the newest leaf wholly behind it (which the cutoff has just left), and
+   every topic with a window in the DEFAULT leaf (unless it is empty), none in a leaf found
+   droppable. Older leaves are wholly expired for such a topic, so they are probe candidates
+   and its rows there are found trims: the row-level items are at most two per topic,
+   whatever the number of leaves (they were one per topic and past leaf, millions for
+   thousands of topics over a year of daily leaves, each a DELETE turn every rotation). One 10,000-row batch a turn, an item until caught up; a trim is done (forgotten)
    when its batch comes back short. Each statement is confined to one leaf (the leaf's bounds
    make the planner prune to it, and `tableoid` keeps `ctid` unambiguous; the DEFAULT leaf is
    addressed directly). The items rotate by (topic, leaf upper bound): an item with a large
@@ -314,7 +318,15 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   and is left for the next pass), or repeats on the row itself every condition a worker
   write can change: the producer prune re-checks `last_active_at` against the window, so
   a producer that InitProducerId or an epoch bump revived while the prune waited for it
-  is kept. The log-start update after a sweep's deletes first upserts the affected
+  is kept. An idempotent Produce writes the sequence and batch rows, which the prune's
+  subqueries read from their snapshot, so it also moves `last_active_at` whenever that is
+  more than half the window old (one UPDATE per producer per 3.5 days, under the row lock
+  the prune then waits for): a producer the prune can take is always one whose Produce
+  writes its row first. A Produce that commits while the prune waits keeps its producer;
+  one that reaches the row after the prune deleted it waits for the prune, finds no row
+  and starts the producer afresh (adopted at its batch's sequence, as a producer the
+  broker holds no state for), so the batch it acks is recorded and its retry is
+  deduplicated. The log-start update after a sweep's deletes first upserts the affected
   `kafka.partition_offsets` rows, which waits for a Produce holding them (it inserts its
   records, then advances the counter, and commits), and only then reads the oldest
   surviving offset with a new snapshot, so the log start never passes a record the sweep

@@ -28,7 +28,7 @@ use pgrx::spi::SpiClient;
 pub const ABORTED_MESSAGE_GRACE: Duration = Duration::from_secs(60);
 /// Idle window after which a producer id (and its sequences) is reclaimed.
 /// Kafka: `transactional.id.expiration.ms` defaults to 7 days.
-const PRODUCER_ID_RETENTION: Duration = Duration::from_hours(168);
+pub(super) const PRODUCER_ID_RETENTION: Duration = Duration::from_hours(168);
 /// Age after which terminal (`CompleteCommit`/`CompleteAbort`) transaction rows are
 /// deleted. Matches [`PRODUCER_ID_RETENTION`] so a transaction row never outlives its
 /// producer.
@@ -260,6 +260,7 @@ impl PostgresStore {
             let default_has_rows = default_leaf_has_rows(client, partitioned)?;
             let partitions: Vec<TimePartition> =
                 leaves.iter().map(|l| l.partition.clone()).collect();
+            let by_oid: HashMap<u32, &Leaf> = leaves.iter().map(|l| (l.partition.oid, l)).collect();
             let state = &SWEEP_STATE;
             let mut found = state.found();
             found.retain_current(&partitions, now_ms, |t| windows.window(t));
@@ -268,11 +269,11 @@ impl PostgresStore {
             let (probe, check_empty) = retention::split_past_leaves(&partitions, now_ms, shortest);
             let check_empty: Vec<&Leaf> = check_empty
                 .iter()
-                .filter_map(|p| leaves.iter().find(|l| l.partition.oid == p.oid))
+                .filter_map(|p| by_oid.get(&p.oid).copied())
                 .collect();
             for oid in empty_leaves(client, &check_empty)? {
-                if let Some(leaf) = partitions.iter().find(|l| l.oid == oid) {
-                    found.record_empty(leaf);
+                if let Some(leaf) = by_oid.get(&oid) {
+                    found.record_empty(&leaf.partition);
                 }
             }
 
@@ -300,7 +301,7 @@ impl PostgresStore {
                     &state.expiry,
                     usize::MAX,
                 ),
-                leaves: &leaves,
+                leaves: &by_oid,
                 partitioned,
             };
             let drops_allowed = read_committed(client)?;
@@ -847,9 +848,13 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for ProbeStep<'_> {
 /// its topic_id-prefixed unique index. Pending transactional rows are never deleted.
 /// The window is built by multiplication: PG14 rejects a text 'N milliseconds' literal
 /// above the int32 range.
+///
+/// Cost per turn: the statement, a hash lookup of its leaf, and pushing the trims this
+/// pass's probes found since the last turn (O(log n) each, [`Lap::push`]).
 struct ExpiryStep<'l> {
     lap: Lap<'static, (i32, i64), ExpiryItem>,
-    leaves: &'l [Leaf],
+    /// The leaves by oid.
+    leaves: &'l HashMap<u32, &'l Leaf>,
     partitioned: bool,
 }
 
@@ -865,10 +870,7 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for ExpiryStep<'_> {
         let Some(&(key, item)) = self.lap.current() else {
             return Ok(());
         };
-        let leaf = self
-            .leaves
-            .iter()
-            .find(|l| l.partition.oid == item.leaf_oid);
+        let leaf = self.leaves.get(&item.leaf_oid).copied();
         let target = match leaf {
             Some(leaf) => delete_target(leaf, self.partitioned),
             None if !self.partitioned => DeleteTarget::Unpartitioned,
@@ -1214,7 +1216,13 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// statement's snapshot), so the idle condition on producer_ids itself is repeated
 /// there: InitProducerId and an epoch bump (KIP-360, a transactional re-init) set
 /// last_active_at, and the producer they revived stays. The re-check filters the row
-/// the primary-key probe already fetched: no extra read per candidate.
+/// the primary-key probe already fetched: no extra read per candidate. An idempotent
+/// Produce writes the sequence rows, which the subquery reads from the snapshot, so
+/// it also sets last_active_at on a producer idle for more than half the window, the
+/// only ones this can take (`producers::read_producer_state`), before it writes them:
+/// a Produce open while this runs holds the producer row, and its producer is kept;
+/// one that comes after this deleted the row waits for this commit and starts the
+/// producer afresh.
 fn producer_prune_sql(with_cursor: bool) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
@@ -1242,8 +1250,9 @@ fn producer_prune_sql(with_cursor: bool) -> String {
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
                )
-               -- last_active_at only moves on InitProducerId; a long-running
-               -- producer shows its activity through its sequence rows.
+               -- last_active_at moves on InitProducerId and, at most every half
+               -- window, on a Produce; a producer's appends since then show in its
+               -- sequence rows.
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.producer_sequences s
                    WHERE s.producer_id = p.producer_id

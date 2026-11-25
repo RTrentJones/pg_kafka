@@ -348,6 +348,7 @@ fn expiry_items_are_found_trims_plus_row_level_items() {
     let width = 1_000;
     let past = leaf_at(1, 0, 1_000);
     let dropping = leaf_at(2, 1_000, 2_000);
+    let behind = leaf_at(5, 4_000, 5_000);
     let current = leaf_at(3, 5_000, 6_000);
     let default = TimePartition {
         oid: 4,
@@ -356,9 +357,17 @@ fn expiry_items_are_found_trims_plus_row_level_items() {
         upper_ms: None,
         is_default: true,
     };
-    let leaves = vec![default, past.clone(), dropping.clone(), current];
+    let leaves = vec![
+        default,
+        past.clone(),
+        dropping.clone(),
+        current,
+        behind.clone(),
+    ];
     let mut found = FoundWork::new();
-    // Topic 2 (window >= width): only its found trim and the DEFAULT leaf.
+    // Topic 1 (window < width): the leaf holding its cutoff (5,490) and the newest leaf
+    // wholly behind it, not the older past leaf (a probe finds its rows there as a
+    // trim). Topic 2 (window >= width): only its found trim and the DEFAULT leaf.
     found.record_probe(&past, &LeafAction::Trim { topics: vec![2] });
     found.record_empty(&dropping);
     let finite = [(1, 10), (2, 2_000)];
@@ -366,17 +375,22 @@ fn expiry_items_are_found_trims_plus_row_level_items() {
         now_ms: 5_500,
         width_ms: width,
     };
-    let keys = |default_has_rows| {
-        let mut k: Vec<(i32, u32)> =
-            expiry_items(&leaves, &finite, clock, default_has_rows, &found)
-                .iter()
-                .map(|i| (i.topic_id, i.leaf_oid))
-                .collect();
+    let keys = |found: &FoundWork, default_has_rows| {
+        let mut k: Vec<(i32, u32)> = expiry_items(&leaves, &finite, clock, default_has_rows, found)
+            .iter()
+            .map(|i| (i.topic_id, i.leaf_oid))
+            .collect();
         k.sort_unstable();
         k
     };
-    assert_eq!(keys(false), vec![(1, 1), (1, 3), (2, 1)]);
-    assert_eq!(keys(true), vec![(1, 1), (1, 3), (1, 4), (2, 1), (2, 4)]);
+    assert_eq!(keys(&found, false), vec![(1, 3), (1, 5), (2, 1)]);
+    assert_eq!(
+        keys(&found, true),
+        vec![(1, 3), (1, 4), (1, 5), (2, 1), (2, 4)]
+    );
+    // The leaf behind the cutoff found droppable: its drop removes the rows.
+    found.record_empty(&behind);
+    assert_eq!(keys(&found, false), vec![(1, 3), (2, 1)]);
 }
 
 /// One topic's rows in one leaf, in the model.
@@ -498,11 +512,11 @@ fn model_sweep(
     leaves_n: i64,
     shorts: i32,
     long_first: bool,
+    target_window: i64,
     budget_ms: u64,
     backlog: bool,
     rng: &mut Rng,
 ) -> (u64, u64, Vec<i64>) {
-    const DAY: i64 = 86_400_000;
     let width = DAY;
     // A1..An, then the current leaf C a few days later.
     let mut leaves: Vec<TimePartition> = (0..leaves_n)
@@ -517,7 +531,7 @@ fn model_sweep(
     let short_ids: Vec<i32> = (1..=shorts + 1).filter(|&t| t != long).collect();
     let keeper = shorts + 2;
     let mut windows: BTreeMap<i32, i64> = short_ids.iter().map(|&t| (t, 1_000)).collect();
-    windows.insert(long, DAY);
+    windows.insert(long, target_window);
     let finite: Vec<(i32, i64)> = windows.iter().map(|(&t, &w)| (t, w)).collect();
 
     let batch = RETENTION_DELETE_BATCH.unsigned_abs();
@@ -604,6 +618,9 @@ fn model_sweep(
     (pass, bound, never)
 }
 
+/// One day, the model's leaf width, in milliseconds.
+const DAY: i64 = 86_400_000;
+
 /// Guarantee 4 (and 1 for the trims): a long-window topic's rows in leaves kept by an
 /// infinite-retention topic are trimmed in every such leaf, within the bound, at every
 /// budget (0 included), with any number of short-window topics whose row-level items
@@ -611,28 +628,41 @@ fn model_sweep(
 /// another step's endless backlog. When a trim existed only in the pass whose probe
 /// reached its leaf, the probe rotation and the expiry rotation phase-locked and some
 /// leaves were never trimmed (5 leaves, one short topic, budget 0: never the first).
+/// The same for a target topic whose window is shorter than one leaf (a backlog left
+/// in every past leaf, as when a window is shortened): its row-level items cover only
+/// the leaves at its cutoff, so the probes must find its rows in the older ones.
 #[test]
 fn trims_reach_every_kept_leaf_at_any_budget() {
     let mut rng = Rng(0x0123_4567_89ab_cdef);
     let mut configs = 0;
-    for leaves in [2, 3, 4, 5, 6, 8, 13, 40, 70] {
-        for shorts in [1, 2, 3, 5] {
-            for long_first in [false, true] {
-                for budget_ms in [0, 1, 2, 3, 7, 64] {
-                    for backlog in [false, true] {
-                        let (passes, bound, never) =
-                            model_sweep(leaves, shorts, long_first, budget_ms, backlog, &mut rng);
-                        assert!(
-                            never.is_empty() && passes <= bound,
-                            "{leaves} leaves, {shorts} short topics, long first {long_first}, \
-                             budget {budget_ms} ms, backlog {backlog}: after {passes} passes \
-                             (bound {bound}) leaves {never:?} still hold expired rows"
-                        );
-                        configs += 1;
+    for target_window in [DAY, 1_000] {
+        for leaves in [2, 3, 4, 5, 6, 8, 13, 40, 70] {
+            for shorts in [1, 2, 3, 5] {
+                for long_first in [false, true] {
+                    for budget_ms in [0, 1, 2, 3, 7, 64] {
+                        for backlog in [false, true] {
+                            let (passes, bound, never) = model_sweep(
+                                leaves,
+                                shorts,
+                                long_first,
+                                target_window,
+                                budget_ms,
+                                backlog,
+                                &mut rng,
+                            );
+                            assert!(
+                                never.is_empty() && passes <= bound,
+                                "{leaves} leaves, {shorts} short topics, long first \
+                                 {long_first}, target window {target_window} ms, budget \
+                                 {budget_ms} ms, backlog {backlog}: after {passes} passes \
+                                 (bound {bound}) leaves {never:?} still hold expired rows"
+                            );
+                            configs += 1;
+                        }
                     }
                 }
             }
         }
     }
-    assert_eq!(configs, 9 * 4 * 2 * 6 * 2);
+    assert_eq!(configs, 2 * 9 * 4 * 2 * 6 * 2);
 }

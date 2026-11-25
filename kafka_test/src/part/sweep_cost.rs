@@ -296,3 +296,95 @@ pub async fn test_sweep_reaps_outbox_rows_of_removed_messages() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Topics in the leaf of the drop-cost test, one partition and one row each: a client
+/// can create this many (CreateTopics, the default cap is 200,000 partitions) and give
+/// each a short `retention.ms`.
+const DROP_TOPICS: i32 = 80_000;
+/// What the drop of that leaf may take: its contents probe and its log-end read (one
+/// btree descent per pair each) and the DROP, with slack for a loaded host. Comparing
+/// every topic in the leaf with every expired topic (the array operator `<@`) took
+/// about 6 s here, holding ACCESS EXCLUSIVE on kafka.messages.
+const DROP_LIMIT: Duration = Duration::from_millis(2_500);
+
+/// The re-check of `kafka.drop_message_partition` (every topic in the leaf is in the
+/// expired set) is linear in the two arrays: one entry per (topic, partition) pair in
+/// the leaf and one per expired topic, both client-driven. As `<@` it compared every
+/// element of one with every element of the other, under the drop's ACCESS EXCLUSIVE
+/// lock on kafka.messages, which stops every Produce and Fetch for as long.
+///
+/// Asserts: a past leaf holding one row of each of 80,000 topics, all wholly expired,
+/// drops (through `drop_message_partition` with the 80,000 expired topics, as the
+/// sweep calls it) within 2.5 s.
+pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResult {
+    println!("=== Test: a leaf drop's re-check is linear in its topics ===\n");
+    let ctx = TestContext::new().await?;
+    let db = ctx.db();
+    db.batch_execute("SET statement_timeout = '120s'").await?;
+    let prefix = ctx.unique_topic("drop-cost").await;
+    let topic_ids: Vec<i32> = db
+        .query(
+            "INSERT INTO kafka.topics (name, partitions, retention_ms)
+             SELECT $1 || '-' || g, 1, 1000 FROM generate_series(1, $2) AS g
+             RETURNING id",
+            &[&prefix, &DROP_TOPICS],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    // A one-hour leaf in 2001 (no other test's leaves use that year), a row per topic.
+    let hour: i32 = db
+        .query_one("SELECT (random() * 8000)::int", &[])
+        .await?
+        .get(0);
+    db.execute(
+        "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
+         FROM (SELECT timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
+        &[&hour],
+    )
+    .await?;
+    let leaf: String = db
+        .query_one(
+            "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
+             WHERE lower_bound = timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
+            &[&hour],
+        )
+        .await?
+        .get(0);
+    db.execute(
+        "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+         SELECT t, 0, 0, 'v'::bytea,
+                timestamptz '2001-01-01 00:00+00' + $2::int * INTERVAL '1 hour'
+         FROM unnest($1::int[]) AS t",
+        &[&topic_ids, &hour],
+    )
+    .await?;
+    println!("Step 1: {leaf} holds one row of each of {DROP_TOPICS} expired topics");
+
+    let started = std::time::Instant::now();
+    let dropped: bool = db
+        .query_one(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
+            &[&leaf, &topic_ids],
+        )
+        .await?
+        .get(0);
+    let took = started.elapsed();
+    println!("Step 2: dropped {dropped} in {took:?}");
+    db.execute(
+        "DELETE FROM kafka.topics WHERE id = ANY ($1::int[])",
+        &[&topic_ids],
+    )
+    .await?;
+    assert!(
+        dropped,
+        "{leaf} holds only expired topics and must be dropped"
+    );
+    assert!(
+        took <= DROP_LIMIT,
+        "dropping a leaf of {DROP_TOPICS} expired topics took {took:?} (limit {DROP_LIMIT:?})"
+    );
+    println!("✅ the drop's re-check stays linear");
+    Ok(())
+}
