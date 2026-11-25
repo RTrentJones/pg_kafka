@@ -15,8 +15,11 @@
 //!   topic's `write_mode`. Each record that percentage routing selects then
 //!   gets a pending `kafka.shadow_tracking` row in the SAME transaction: the
 //!   durable outbox, exactly consistent with what was persisted. No payload is
-//!   copied; it stays in `kafka.messages`. Transactional records are buffered
-//!   and enqueued at commit.
+//!   copied; it stays in `kafka.messages`. Nothing is kept for an open
+//!   transaction: its commit enqueues the records it selects straight from
+//!   `kafka.messages` (an `INSERT ... SELECT` over the producer's pending rows;
+//!   a sampled topic's rows are routed a chunk at a time through a cursor), in
+//!   the commit's own transaction.
 //! - **The outbox tick** (driven by the worker) claims due rows, joins
 //!   `kafka.messages` for the payload, and hands them to the network thread,
 //!   which owns the idempotent rdkafka producer (`forwarder_task`). Its acks

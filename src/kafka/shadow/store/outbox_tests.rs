@@ -332,7 +332,8 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
         },
     );
 
-    // No RAM buffer (e.g. after a worker restart): the DB read still finds them.
+    // The store keeps nothing for the transaction: the commit finds its records
+    // in kafka.messages.
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
     assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());

@@ -191,8 +191,9 @@ pub(super) fn check_member_timeouts(coordinator: &GroupCoordinator) {
 
 /// Abort transactions that outlived their timeout. An abort ends transactions, so
 /// parked read_committed fetches are woken now (their LSO moved) rather than on the
-/// long-poll safety net. The sweep runs through the shadow store, which also drops
-/// the forward buffers of the transactions it ended.
+/// long-poll safety net. The shadow store keeps nothing for an open transaction (a
+/// commit enqueues its records into the outbox from kafka.messages), so an abort
+/// leaves it nothing to undo.
 pub(super) fn check_transaction_timeouts(
     shadow_store: &ShadowStore<PostgresStore>,
     notify_tx: &Sender<InternalNotification>,

@@ -6,8 +6,8 @@
 //! - a record that waits behind a full queue is answered within the delivery
 //!   timeout of its dispatch, so its in-flight entry never expires while it is
 //!   still held (no lost attempt counted, no second copy sent);
-//! - the transaction-timeout sweep drops the forward buffers of the
-//!   transactions it aborts;
+//! - a transaction the timeout sweep aborts is never forwarded (a commit
+//!   enqueues from kafka.messages, so an open transaction has no outbox rows);
 //! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
 //!   no duplicate delivery);
 //! - a failed COMMIT of the transaction that applied forward acks loses no
