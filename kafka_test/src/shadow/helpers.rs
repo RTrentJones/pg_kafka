@@ -98,11 +98,12 @@ pub async fn enable_shadow_mode(
     let topic_id = get_or_create_topic_id(db, topic_name).await?;
 
     // Configure global GUCs for shadow mode
-    // NOTE: Use INTERNAL bootstrap servers because pg_kafka runs INSIDE the container
-    // and needs to reach external-kafka via docker network (port 9094)
+    // pg_kafka runs inside the dev container and reaches external-kafka over the docker
+    // network: the CONTAINER listener (172.18.0.2:9095) by default, or
+    // INTERNAL_KAFKA_BOOTSTRAP_SERVERS (see `get_internal_bootstrap_servers`).
     let bootstrap_servers = get_internal_bootstrap_servers();
     println!(
-        "  Setting pg_kafka.shadow_bootstrap_servers = '{bootstrap_servers}' (INTERNAL listener for container)"
+        "  Setting pg_kafka.shadow_bootstrap_servers = '{bootstrap_servers}' (broker address as seen from pg_kafka)"
     );
 
     db.execute("ALTER SYSTEM SET pg_kafka.shadow_mode_enabled = true", &[])

@@ -107,10 +107,14 @@ cargo test --features pg14 --lib
 
 ### Tier 2: Protocol and Property Tests (No Database Required)
 
-**Location:** the unit-test modules in `src/kafka/protocol/` (`decoding.rs`, `encoding.rs`,
-`recordbatch.rs`, including proptest fuzz harnesses that assert the parsers never panic or abort on
-arbitrary bytes), plus the integration target `tests/property_tests.rs` (proptest invariants for
-header fields, ports, node ids, partition indices, API version ranges, and topic-name lengths).
+**Location:** the unit-test modules of `src/kafka/protocol/` (`decoding/tests.rs` and
+`decoding/tests/`, `decode_budget/tests.rs`, `decode_meter/tests.rs`, and the inline `tests`
+modules of `encoding.rs`, `framing.rs` and `recordbatch.rs`; `decoding/tests.rs` and
+`recordbatch.rs` hold proptest fuzz harnesses that assert the parsers never panic or abort on
+arbitrary bytes), plus the integration target `tests/property_tests.rs`, which round-trips
+arbitrary values through the kafka-protocol crate's encodings pg_kafka relies on (header fields,
+ports, node ids, partition indices, API version ranges, topic-name lengths) and exercises no
+pg_kafka code.
 
 These test wire protocol encoding/decoding without database interaction:
 

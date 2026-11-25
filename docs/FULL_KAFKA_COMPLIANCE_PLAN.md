@@ -61,7 +61,7 @@ fn handle_create_topics(store: &impl KafkaStore, topics: Vec<CreateTopicRequest>
 - `src/kafka/storage/postgres/offsets.rs` - Delete from `kafka.consumer_offsets`
 
 **Testing:**
-- Unit tests in `src/kafka/handlers/tests.rs`
+- Unit tests in `src/kafka/handlers/tests/`
 - E2E tests in `kafka_test/src/admin/mod.rs`
 
 ---

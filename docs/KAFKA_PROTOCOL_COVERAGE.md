@@ -478,7 +478,6 @@ Consumer Flow (Current):
 
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
-- Table partitioning (time-based retention is already implemented)
 
 ---
 
@@ -559,7 +558,6 @@ one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 **Future Phases**:
 1. Cooperative rebalancing (KIP-429)
 2. Static group membership (KIP-345)
-3. Table partitioning
 
 ---
 
