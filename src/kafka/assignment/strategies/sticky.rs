@@ -63,44 +63,39 @@ impl StickyStrategy {
 
     /// Keep each remaining member's previous partitions that still exist, that it still
     /// subscribes to and that no other member kept first; returns the kept partitions.
-    fn keep_previous_assignments(
+    fn keep_previous_assignments<'a>(
         &self,
-        input: &AssignmentInput,
-        all_partitions: &HashSet<(String, i32)>,
+        input: &'a AssignmentInput,
         result: &mut AssignmentOutput,
-    ) -> HashSet<(String, i32)> {
+    ) -> HashSet<(&'a str, i32)> {
         let mut assigned = HashSet::new();
         for (member_id, prev_assignment) in &self.previous_assignments {
             // Departed members keep nothing.
-            let Some(subscription) = input.subscriptions.get(member_id) else {
+            if !input.subscriptions.contains_key(member_id) {
                 continue;
-            };
+            }
             for (topic, prev_partitions) in &prev_assignment.topic_partitions {
                 // The previous assignment is the leader's, whatever names it carries: the
                 // topic is looked up once, and only a topic that exists is keyed per
                 // partition, so a long name over many partitions is not copied or hashed
                 // per partition.
-                let Some(topic) = input
-                    .topic_partitions
-                    .get_key_value(topic)
-                    .map(|(name, _)| name)
-                else {
+                let Some((topic, &count)) = input.topic_partitions.get_key_value(topic) else {
                     continue;
                 };
-                if !subscription.topics.contains(topic) {
+                if !input.is_subscribed(member_id, topic) {
                     continue;
                 }
                 for &partition in prev_partitions {
-                    let key = (topic.clone(), partition);
-                    if all_partitions.contains(&key) && !assigned.contains(&key) {
-                        result
+                    if (0..count).contains(&partition)
+                        && assigned.insert((topic.as_str(), partition))
+                    {
+                        let partitions = result
                             .get_mut(member_id)
                             .expect("every member is initialised in `result` before this step")
                             .topic_partitions
                             .entry(topic.clone())
-                            .or_default()
-                            .push(partition);
-                        assigned.insert(key);
+                            .or_default();
+                        partitions.push(partition);
                     }
                 }
             }
@@ -140,22 +135,26 @@ impl AssignmentStrategy for StickyStrategy {
             return result;
         }
 
-        // Collect all available (topic, partition) pairs
-        let mut all_partitions: HashSet<(String, i32)> = HashSet::new();
-        for (topic, count) in &input.topic_partitions {
-            for partition in 0..*count {
-                all_partitions.insert((topic.clone(), partition));
-            }
-        }
-
         // Step 1: Preserve valid assignments from previous state
-        let assigned = self.keep_previous_assignments(input, &all_partitions, &mut result);
+        let assigned = self.keep_previous_assignments(input, &mut result);
 
-        // Step 2: Collect orphaned partitions (not yet assigned), sorted for a deterministic
-        // assignment order
-        let mut orphaned: Vec<(String, i32)> =
-            all_partitions.difference(&assigned).cloned().collect();
-        orphaned.sort();
+        // Step 2: Collect orphaned partitions (not yet assigned), by topic name and then
+        // partition for a deterministic assignment order
+        let mut topics: Vec<(&String, i32)> = input
+            .topic_partitions
+            .iter()
+            .map(|(topic, &count)| (topic, count))
+            .collect();
+        topics.sort_unstable();
+        let orphaned: Vec<(String, i32)> = topics
+            .into_iter()
+            .flat_map(|(topic, count)| {
+                let assigned = &assigned;
+                (0..count)
+                    .filter(move |&partition| !assigned.contains(&(topic.as_str(), partition)))
+                    .map(move |partition| (topic.clone(), partition))
+            })
+            .collect();
 
         // Step 3: Distribute orphaned partitions to members
         let mut members = Members::new(input, &result);
@@ -910,9 +909,11 @@ mod tests {
             if all_partitions.is_empty() {
                 return result;
             }
-            let assigned = previous.keep_previous_assignments(input, &all_partitions, &mut result);
-            let mut orphaned: Vec<(String, i32)> =
-                all_partitions.difference(&assigned).cloned().collect();
+            let assigned = previous.keep_previous_assignments(input, &mut result);
+            let mut orphaned: Vec<(String, i32)> = all_partitions
+                .into_iter()
+                .filter(|(topic, partition)| !assigned.contains(&(topic.as_str(), *partition)))
+                .collect();
             orphaned.sort();
             distribute_orphans(input, orphaned, &mut result);
             balance_assignments(&mut result, input);

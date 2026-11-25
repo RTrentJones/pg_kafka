@@ -51,63 +51,55 @@ impl AssignmentStrategy for RoundRobinStrategy {
             result.insert(member_id.clone(), MemberAssignment::new());
         }
 
-        // Collect all (topic, partition) pairs from subscribed topics
-        let mut all_partitions: Vec<(String, i32)> = Vec::new();
-        for (topic, partition_count) in &input.topic_partitions {
-            // Only include topics that have at least one subscriber
-            let has_subscriber = input
-                .subscriptions
-                .values()
-                .any(|sub| sub.topics.contains(topic));
-
-            if has_subscriber && *partition_count > 0 {
-                for partition in 0..*partition_count {
-                    all_partitions.push((topic.clone(), partition));
-                }
-            }
-        }
-
-        // Sort for deterministic order (by topic name, then partition)
-        all_partitions.sort();
-
-        // Get sorted member IDs
-        let mut member_ids: Vec<&String> = input.subscriptions.keys().collect();
-        member_ids.sort();
-
-        if member_ids.is_empty() {
+        // Get sorted member IDs; a member is its index here.
+        let mut member_ids: Vec<&str> = input.subscriptions.keys().map(String::as_str).collect();
+        member_ids.sort_unstable();
+        let member_count = member_ids.len();
+        if member_count == 0 {
             return result;
         }
+
+        // Per topic with at least one subscriber, the indexes of its subscribers in
+        // ascending order (the index lists ids in ascending order too).
+        let mut topics: Vec<(&str, i32, Vec<usize>)> = input
+            .topic_partitions
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .filter_map(|(topic, &count)| {
+                let subscribers: Vec<usize> = input
+                    .members_for_topic(topic)
+                    .iter()
+                    .filter_map(|m| member_ids.binary_search(&m.as_str()).ok())
+                    .collect();
+                (!subscribers.is_empty()).then_some((topic.as_str(), count, subscribers))
+            })
+            .collect();
+        // All (topic, partition) pairs in order: by topic name, then partition.
+        topics.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
         // Use a SINGLE global round-robin pointer across all (topic, partition) pairs — as
         // Kafka does and as this module's doc example describes — not a per-topic counter that
         // restarts at 0 for each topic (which imbalances heterogeneous multi-topic subscriptions).
-        // The pointer walks the sorted members and skips any not subscribed to the current topic.
+        // The pointer walks the sorted members and skips any not subscribed to the current
+        // topic: the member it lands on is the topic's first subscriber at or after the
+        // pointer (wrapping around), found by binary search instead of by walking.
         let mut position = 0usize;
-        let member_count = member_ids.len();
-
-        for (topic, partition) in all_partitions {
-            // Advance the global pointer to the next member subscribed to this topic.
-            let mut assigned: Option<&String> = None;
-            for _ in 0..member_count {
-                let candidate = member_ids[position % member_count];
-                position += 1;
-                let subscribed = input
-                    .subscriptions
-                    .get(candidate)
-                    .is_some_and(|sub| sub.topics.contains(&topic));
-                if subscribed {
-                    assigned = Some(candidate);
-                    break;
-                }
-            }
-
-            if let Some(member_id) = assigned {
-                if let Some(assignment) = result.get_mut(member_id) {
-                    assignment
-                        .topic_partitions
-                        .entry(topic)
-                        .or_default()
-                        .push(partition);
+        for (topic, partition_count, subscribers) in topics {
+            for partition in 0..partition_count {
+                let at = position % member_count;
+                let next = subscribers.partition_point(|&m| m < at);
+                let member = subscribers.get(next).copied().unwrap_or(subscribers[0]);
+                position = member + 1;
+                let assignment = result
+                    .get_mut(member_ids[member])
+                    .expect("every member is initialised in `result`");
+                match assignment.topic_partitions.get_mut(topic) {
+                    Some(partitions) => partitions.push(partition),
+                    None => {
+                        assignment
+                            .topic_partitions
+                            .insert(topic.to_string(), vec![partition]);
+                    }
                 }
             }
         }
@@ -325,5 +317,78 @@ mod tests {
         let result = strategy.assign(&input);
 
         assert_eq!(result["member-1"].partitions("topic-a"), [] as [i32; 0]);
+    }
+
+    /// The assignor as a walk: the global pointer steps member by member until it reaches
+    /// a subscriber of the partition's topic.
+    fn walk_reference(input: &AssignmentInput) -> AssignmentOutput {
+        let mut result: AssignmentOutput = input
+            .subscriptions
+            .keys()
+            .map(|m| (m.clone(), MemberAssignment::new()))
+            .collect();
+        let mut members: Vec<&String> = input.subscriptions.keys().collect();
+        members.sort();
+        let mut partitions: Vec<(String, i32)> = input
+            .topic_partitions
+            .iter()
+            .filter(|(t, _)| !input.members_for_topic(t).is_empty())
+            .flat_map(|(t, &n)| (0..n).map(move |p| (t.clone(), p)))
+            .collect();
+        partitions.sort();
+        let mut position = 0;
+        for (topic, partition) in partitions {
+            loop {
+                let candidate = members[position % members.len()];
+                position += 1;
+                if input.subscriptions[candidate].topics.contains(&topic) {
+                    result
+                        .get_mut(candidate)
+                        .unwrap()
+                        .topic_partitions
+                        .entry(topic.clone())
+                        .or_default()
+                        .push(partition);
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_matches_the_pointer_walk_on_mixed_subscriptions() {
+        // Members subscribed to different topic sets, so the pointer skips members, wraps
+        // and lands mid-list.
+        let topics = ["a", "b", "c", "d", "e"];
+        for seed in 0..50_usize {
+            let members: Vec<(String, Vec<&str>)> = (0..=(seed % 7))
+                .map(|m| {
+                    let subs = topics
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| (seed + m * 3 + i * 5) % 3 != 0)
+                        .map(|(_, t)| *t)
+                        .collect();
+                    (format!("m{m}"), subs)
+                })
+                .collect();
+            let input = make_input(
+                members
+                    .iter()
+                    .map(|(id, subs)| (id.as_str(), subs.clone()))
+                    .collect(),
+                topics
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (*t, i32::try_from((seed + i * 2) % 9).unwrap()))
+                    .collect(),
+            );
+            assert_eq!(
+                RoundRobinStrategy::new().assign(&input),
+                walk_reference(&input),
+                "seed {seed}"
+            );
+        }
     }
 }

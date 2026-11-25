@@ -263,13 +263,17 @@ pub trait TopicStore {
     /// * `default_partitions` - Number of partitions to create if topic doesn't exist
     ///
     /// # Returns
-    /// Tuple of (topic_id, partition_count) on success, error otherwise
+    /// Tuple of (topic_id, partition_count) on success, error otherwise; `PolicyViolation`
+    /// (nothing created) when creating it would take the partitions of all topics above
+    /// `pg_kafka.max_total_partitions`
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
 
     /// Create each of `names` that does not exist with `partition_count` partitions, in one
     /// statement however many names: the topics of `names` afterwards, created here, before
     /// or concurrently by another session, in no particular order. (A name another session
-    /// commits while the insert waits on it takes a second statement to read.)
+    /// commits while the insert waits on it takes a second statement to read.) When creating
+    /// the missing names would take the partitions of all topics above
+    /// `pg_kafka.max_total_partitions`, none is created and the result is `PolicyViolation`.
     fn get_or_create_topics(
         &self,
         names: &[String],
@@ -360,6 +364,9 @@ pub trait TopicStore {
     /// equal (Kafka's metric-name collision rule), the names themselves included, sorted;
     /// one statement however many names.
     fn colliding_topics(&self, names: &[String]) -> Result<Vec<String>>;
+
+    /// The partitions of all topics together, for `pg_kafka.max_total_partitions`.
+    fn total_partition_count(&self) -> Result<i64>;
 }
 
 /// The message log: append, read (with isolation), offset bounds and truncation.

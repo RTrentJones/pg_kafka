@@ -130,6 +130,17 @@ impl MemberSubscription {
         })
     }
 
+    /// The topic count `bytes` claims (its topics array length), read without parsing the
+    /// topics: an upper bound on the entries [`Self::parse`] returns, 0 for metadata too
+    /// short to carry one or a negative length.
+    pub fn topic_count_hint(bytes: &[u8]) -> usize {
+        bytes
+            .get(2..6)
+            .and_then(|len| <[u8; 4]>::try_from(len).ok())
+            .and_then(|len| usize::try_from(i32::from_be_bytes(len)).ok())
+            .unwrap_or(0)
+    }
+
     /// Encode this subscription to bytes for wire format
     ///
     /// # Returns

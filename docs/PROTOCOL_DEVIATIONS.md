@@ -395,7 +395,16 @@ pg_kafka.compression_type = 'gzip'
   leaves, or the sweep evicts the members that did not sync, below), and
   UNKNOWN_MEMBER_ID if the member itself is removed. Like a waiting joiner, a member
   whose SyncGroup is held is exempt from its session timeout. Server-side
-  assignment (a leader sending empty assignments) is computed only for the leader.
+  assignment (a leader sending empty assignments) is computed only for the SyncGroup the
+  coordinator takes assignments from: the leader's, at the current generation, while the
+  group is in its sync phase (a stale generation or a Stable group's SyncGroup ignores its
+  assignments, so nothing is computed for it). A member's repeated subscriptions count once,
+  and the assignment takes about as many steps as there are subscription entries plus
+  partitions; one over 2,000,000 entries (subscribed topics per member, repeats included, the
+  sticky assignor's previous partitions and the partitions of the subscribed topics) is
+  refused with POLICY_VIOLATION (44) and the group stays in its sync phase (the rebalance
+  timeout evicts the leader), since it would hold the DB thread that serves every client.
+  Kafka assigns on the client and has no such limit.
 - ✅ As in Kafka 3.0+ (`pendingSyncMembers`, checked against a 3.7 broker): every member of
   a new generation must send its SyncGroup within the group's rebalance timeout of the
   join's completion. The sweep removes those that have not, though they heartbeat and
@@ -682,6 +691,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 
 **Implementation:**
 - ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated, so a corrupt count cannot make the worker allocate without bound. Kafka itself has no per-topic cap.
+- ✅ The partitions of all topics together are capped by `pg_kafka.max_total_partitions` (default 200000, at most 10000000). Partitions cost nothing to create here, and every all-topics Metadata request (AdminClient listTopics, `kcat -L`, pattern-subscribed consumers) builds one entry per partition on the worker's DB thread, so without it one CreateTopics of 10,000 topics of 10,000 partitions would make that allocation about 17 GB, abort the worker and send Postgres into crash recovery, again after every restart. CreateTopics (validate_only included, counting the request's earlier topics), CreatePartitions and auto-creation (Metadata, Produce) that would take the total above the cap are refused with POLICY_VIOLATION (44, the code Kafka answers when a broker policy refuses a request) and create nothing; the missing names of one Metadata request are created together or not at all. Topics already above a lowered cap stay. Kafka has no such cap.
 - ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
 - ✅ Explicit partition assignment in ProduceRequest supported
 - ✅ Metadata reports correct partition count
@@ -714,7 +724,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 
 - **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`) and manual replica assignments are accepted but not applied. Set `retention.ms` afterwards with IncrementalAlterConfigs.
 - **CreateTopics validation follows Kafka 3.7** (checked against a real 3.7 broker): a name repeated in one request gets a single INVALID_REQUEST "Duplicate topic name." result and is not created; a name that collides with an existing topic once `.` and `_` are treated as equal (`a.b` vs `a_b`) gets INVALID_TOPIC_EXCEPTION "Topic 'a_b' collides with existing topic: a.b"; `replication_factor` must be 1 or -1 (the default): 0 or below -1 gets INVALID_REPLICATION_FACTOR "Replication factor must be larger than 0, or -1 to use the default value.", above 1 gets INVALID_REPLICATION_FACTOR (single broker), and the response reports 1. Remaining differences: two colliding names created in the *same* request are refused here (Kafka 3.7 creates both, checking collisions only against existing topics), and topics auto-created by Metadata/Produce are not collision-checked (that would cost a query per produce).
-- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap).
+- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap). A topic or growth that would take the partitions of all topics above `pg_kafka.max_total_partitions` is refused with POLICY_VIOLATION.
 - **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).

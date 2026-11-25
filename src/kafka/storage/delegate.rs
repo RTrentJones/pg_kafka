@@ -77,6 +77,9 @@ macro_rules! delegate_topic_store {
         fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
             $via::colliding_topics(names)
         }
+        fn total_partition_count(&self) -> $crate::kafka::error::Result<i64> {
+            $via::total_partition_count()
+        }
     };
     ($via:ident, $field:ident) => {
         fn get_or_create_topic(
@@ -143,6 +146,9 @@ macro_rules! delegate_topic_store {
         }
         fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
             $via::colliding_topics(&self.$field, names)
+        }
+        fn total_partition_count(&self) -> $crate::kafka::error::Result<i64> {
+            $via::total_partition_count(&self.$field)
         }
     };
 }

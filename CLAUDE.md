@@ -399,10 +399,10 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 
 | Category | Purpose |
 |----------|---------|
-| **admin** | CreateTopics (incl. validation and the partition cap), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
+| **admin** | CreateTopics (incl. validation, the per-topic and total partition caps), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
 | **producer** | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
 | **consumer** | Basic consume, from offset, multiple messages, headers, fetch record batching |
-| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart, a silent follower outliving a slow leader's SyncGroup, a lowered group cap |
+| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart, a silent follower outliving a slow leader's SyncGroup, a lowered group cap, server-side assignment computed only for the sync-phase leader and in about linear time |
 | **offset_management** | Commit/fetch, OffsetCommit generation/member rules, boundary conditions, multi-partition, by-timestamp, ListOffsets isolation, OffsetFetch require_stable, no offset reuse |
 | **partition** | Multi-partition topics, key routing, distribution |
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
