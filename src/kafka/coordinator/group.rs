@@ -277,10 +277,10 @@ pub struct ConsumerGroup {
     pub protocol_type: Option<String>,
 
     /// The generation whose server-side assignment (the leader's SyncGroup with empty
-    /// assignments) was refused as too large: the leader's retries in that generation are
+    /// assignments) was refused, and why: the leader's retries in that generation are
     /// answered with the refusal without computing again (see
     /// `GroupCoordinator::refuse_assignment`).
-    pub(super) refused_assignment: Option<i32>,
+    pub(super) refused_assignment: Option<(i32, super::AssignmentRefusal)>,
 
     /// What the group held in coordinator memory when last counted ([`Self::recount`]): the
     /// coordinator recounts a group after every operation that changes it, and bounds the

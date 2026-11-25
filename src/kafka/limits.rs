@@ -220,10 +220,35 @@ pub fn max_consumer_groups() -> usize {
 /// The configured memory budget for coordinator member state, in bytes
 /// (`pg_kafka.max_group_memory`).
 pub fn max_group_memory_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(bytes) = test_max_group_memory::get() {
+        return bytes;
+    }
     let kb = read(&MAX_GROUP_MEMORY_KB, DEFAULT_MAX_GROUP_MEMORY_KB).max(MIN_MAX_GROUP_MEMORY_KB);
     usize::try_from(kb)
         .expect("clamped to a positive i32")
         .saturating_mul(1024)
+}
+
+/// A per-thread override of [`max_group_memory_bytes`] for unit tests (the GUC cannot be set
+/// without a backend, and the handlers read it on every JoinGroup and SyncGroup).
+#[cfg(test)]
+pub mod test_max_group_memory {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// The override on this thread, if any.
+    pub fn get() -> Option<usize> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// Make [`super::max_group_memory_bytes`] return `bytes` on this thread.
+    pub fn set(bytes: usize) {
+        OVERRIDE.with(|o| o.set(Some(bytes)));
+    }
 }
 
 /// Why a requested partition count is refused, or `Ok` if `1 <= count <= max`.

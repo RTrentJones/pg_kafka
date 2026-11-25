@@ -2,7 +2,7 @@
 //! DescribeGroups and ListGroups, over the in-memory `GroupCoordinator`.
 
 use crate::kafka::constants::{DEFAULT_BROKER_ID, ERROR_NONE, MAX_PREALLOC_ELEMENTS};
-use crate::kafka::coordinator::{ConsumerGroup, GroupMember};
+use crate::kafka::coordinator::{AssignmentRefusal, ConsumerGroup, GroupMember};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
 use kafka_protocol::messages::describe_groups_response::{
@@ -433,7 +433,7 @@ pub fn handle_sync_group<F>(
     );
 
     // Convert assignments to coordinator format
-    let mut coord_assignments: Vec<(String, Vec<u8>)> = assignments
+    let coord_assignments: Vec<(String, Vec<u8>)> = assignments
         .into_iter()
         .map(|a| (a.member_id, a.assignment))
         .collect();
@@ -449,23 +449,39 @@ pub fn handle_sync_group<F>(
         // A refused assignment is not computed again in its generation: the leader's
         // retries get the refusal at the cost of a lookup (see
         // `GroupCoordinator::refuse_assignment`).
-        if coordinator.assignment_refused(group_id, generation_id) {
+        if let Some(why) = coordinator.assignment_refused(group_id, generation_id) {
             crate::pg_debug!(
                 "SyncGroup: the server-side assignment of group {} at generation {} was refused before",
                 group_id,
                 generation_id
             );
-            respond(build_sync_group_response(Err(
-                crate::kafka::error::KafkaError::PolicyViolation {
+            respond(build_sync_group_response(Err(match why {
+                AssignmentRefusal::TooLarge => crate::kafka::error::KafkaError::PolicyViolation {
                     message: format!(
                         "the server-side assignment of group '{group_id}' at generation {generation_id} was refused as too large"
                     ),
                 },
-            )));
+                AssignmentRefusal::OverMemory => {
+                    crate::kafka::error::KafkaError::CoordinatorNotAvailable {
+                        group_id: group_id.to_string(),
+                    }
+                }
+            })));
             return;
         }
         match server_side_assignments(ctx, group_id) {
-            Ok(Some(computed)) => coord_assignments = computed,
+            Ok(Some(computed)) => {
+                // A refusal by the memory budget is remembered for the generation, like one
+                // for size.
+                coordinator.sync_group_computed(
+                    group_id,
+                    member_id,
+                    generation_id,
+                    computed,
+                    Box::new(move |outcome| respond(build_sync_group_response(outcome))),
+                );
+                return;
+            }
             Ok(None) => {}
             Err(e) => {
                 // Too large to compute: nothing is stored and the group stays in its sync
@@ -1556,6 +1572,41 @@ mod tests {
             assert_eq!(
                 take_sync(&refused).unwrap().error_code,
                 crate::kafka::constants::ERROR_POLICY_VIOLATION,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+    }
+
+    /// A computed assignment refused by the memory budget is not computed again either: the
+    /// leader's retries in the generation (COORDINATOR_NOT_AVAILABLE, retriable, so clients
+    /// retry it at once) are answered without reading the topics or running the assignor.
+    /// Each computation here reads a topic of 100,000 partitions and encodes a 400 kB
+    /// assignment that a 256 kB budget refuses.
+    #[test]
+    fn test_sync_group_retry_of_an_assignment_over_the_memory_budget_computes_nothing() {
+        crate::kafka::limits::test_max_group_memory::set(256 << 10);
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(1).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: crate::kafka::limits::HARD_MAX_PARTITIONS,
+            }])
+        });
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        for attempt in 0..3 {
+            let refused = f.sync("g", &member, join.generation_id, vec![]);
+            assert_eq!(
+                take_sync(&refused).unwrap().error_code,
+                crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE,
                 "attempt {attempt}"
             );
         }
