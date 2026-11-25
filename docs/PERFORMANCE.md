@@ -420,8 +420,10 @@ least-served first, so a backlog in one step takes what the others leave, never 
 drains over several passes, each step resuming where the last pass left it (ADR-001, "Cost",
 has the guarantees). The producer and transaction prunes are indexed too (idle producer ids
 through `(last_active_at, producer_id)`, terminal transactions through a partial index on
-`last_updated_at`, and the foreign key of `kafka.transactions` on each deleted producer id
-through `producer_id`): 40,000 idle producer ids with their terminal transactions took
+`last_updated_at`, the producer ids a batch deletes and their transaction and sequence rows
+through their indexes, named by an array rather than a join, which let the planner hash the
+candidates and read `kafka.producer_ids` and `kafka.transactions` whole every batch: 115 ms a
+batch with 220,000 producer ids): 40,000 idle producer ids with their terminal transactions took
 one 18.6 s statement before (each deleted id's foreign-key check read the whole transactions table),
 and 2,000,000 now drain 10,000 producer ids and up to 190,000 transactions per 1.6-1.8 s pass;
 with 2,000,000 producer ids none of which is idle, a pass takes 2.5 ms (PG17). Measured on PG16 (3,000,000 committed rows

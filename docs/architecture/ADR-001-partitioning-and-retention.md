@@ -140,9 +140,10 @@ later pass.
    terminal transactions (through a partial index on `last_updated_at` of the terminal rows;
    their first turn comes before the producer prune's, whose candidates they reference) and
    stale producers (through an index on `(last_active_at, producer_id)`, resuming after the last
-   candidate the previous batch examined, since the ones it keeps stay idle by that column; each
-   deleted id's foreign-key check reads `kafka.transactions` through an index on
-   `producer_id`); outbox rows delivered more than a
+   candidate the previous batch examined, since the ones it keeps stay idle by that column; the
+   batch names its rows by `= ANY (ARRAY(...))`, so each candidate costs index probes of
+   `kafka.producer_ids`, of `kafka.transactions` through an index on `producer_id` and of
+   `kafka.producer_sequences`, never a read of those tables); outbox rows delivered more than a
    day ago (walked per partition in offset order through `idx_shadow_tracking_delivered`, one
    index step per due row; a partition with none due costs one descent); and shadow-outbox rows
    below their partition's log start (their message is gone: one primary-key range per
@@ -188,8 +189,10 @@ Each step resumes where the last pass left it, by the identity of its items (a l
 bound, a (topic, leaf) pair, a producer's `(last_active_at, producer_id)`), not their position,
 so leaves dropped or created between passes do not shift it. (Before the budget, the aborted-row
 DELETE read every block of every leaf: a 20 ms Metadata probe saw a 200-300 ms stall every
-minute with 3,000,000 stored rows; and every stale producer id deleted read all of
-`kafka.transactions` for its foreign key, 18.6 s for 40,000 ids. PERFORMANCE.md "The sweep's cost" has the numbers.)
+minute with 3,000,000 stored rows; every stale producer id deleted read all of
+`kafka.transactions` for its foreign key, 18.6 s for 40,000 ids; and a producer-prune batch
+joined to its candidates read `kafka.producer_ids` and `kafka.transactions` whole, 115 ms a
+batch with 220,000 ids. PERFORMANCE.md "The sweep's cost" has the numbers.)
 
 A pending transactional row blocks its leaf's drop until the transaction ends (the transaction
 timeout bounds that). `pg_kafka_run_retention_sweep()` reports the drops as `dropped_partitions`.

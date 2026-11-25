@@ -1160,6 +1160,13 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// microseconds and the id) when there is one, and delete those not referenced by a
 /// transaction row and without recent sequence activity, with their sequences. Returns
 /// the rows deleted, the candidates examined and the key of the last one.
+///
+/// The deletes name their rows by `= ANY (ARRAY(...))`, not a join with the CTE: a join
+/// lets the planner hash the candidates and read kafka.producer_ids (and, for the
+/// anti-join, kafka.transactions) whole, which with many producer ids made every
+/// statement cost the whole table; an array is probed through the primary keys, and the
+/// anti-joins of a few rows through idx_transactions_producer and the sequences' primary
+/// key.
 fn producer_prune_sql(with_cursor: bool) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
@@ -1177,8 +1184,7 @@ fn producer_prune_sql(with_cursor: bool) -> String {
          ),
          doomed AS (
              DELETE FROM kafka.producer_ids p
-             USING candidates c
-             WHERE p.producer_id = c.producer_id
+             WHERE p.producer_id = ANY (ARRAY(SELECT c.producer_id FROM candidates c))
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
                    WHERE t.producer_id = p.producer_id
@@ -1194,8 +1200,7 @@ fn producer_prune_sql(with_cursor: bool) -> String {
          ),
          seqs AS (
              DELETE FROM kafka.producer_sequences s
-             USING doomed d
-             WHERE s.producer_id = d.producer_id
+             WHERE s.producer_id = ANY (ARRAY(SELECT d.producer_id FROM doomed d))
          )
          SELECT (SELECT count(*) FROM doomed)::bigint AS deleted,
                 (SELECT count(*) FROM candidates)::bigint AS examined,
@@ -1219,8 +1224,9 @@ fn producer_prune_sql(with_cursor: bool) -> String {
 /// Index-driven and bounded: producer ids are client-driven (every InitProducerId
 /// without a transactional id makes one), so each statement examines at most
 /// [`RETENTION_DELETE_BATCH`] candidates through idx_producer_ids_last_active (a pass
-/// with none idle costs one descent), the foreign key of kafka.transactions on each
-/// deleted id is checked through idx_transactions_producer. Candidates it keeps (still
+/// with none idle costs one descent), and every candidate costs index probes only
+/// ([`producer_prune_sql`]), including the foreign key of kafka.transactions on each
+/// deleted id, checked through idx_transactions_producer. Candidates it keeps (still
 /// referenced, or active through their sequences) stay idle by last_active_at, so the
 /// step resumes after the last one it examined
 /// ([`retention::SweepState::producer_prune`]) and starts from the oldest again once it

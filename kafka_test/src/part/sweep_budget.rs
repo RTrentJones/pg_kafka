@@ -938,3 +938,131 @@ async fn kept_leaf_trims() -> SendResult<()> {
     println!("✅ every found trim was done");
     Ok(())
 }
+
+/// Idle producer ids for the prune-plan test: enough that reading kafka.producer_ids
+/// whole is far more than a batch's index probes.
+const IDLE_PRODUCERS: i64 = 220_000;
+/// Producer ids with a transaction row each (recent, so kept): a kafka.transactions the
+/// prune's anti-join must probe, not read whole.
+const TRANSACTIONAL_PRODUCERS: i64 = 50_000;
+/// Tuples a sweep may read sequentially from each of the producer tables: far below
+/// either table, above what other tests' leftovers in a small table cost.
+const MAX_SEQ_TUPLES: i64 = 20_000;
+
+/// The stale-producer prune probes indexes: each batch names its candidates through an
+/// array, so the delete reaches kafka.producer_ids through its primary key and each
+/// candidate's transaction and sequence rows through idx_transactions_producer and the
+/// sequences' primary key. Joined to the candidates instead, the planner hashed them and
+/// read kafka.producer_ids and kafka.transactions whole for every batch (220,000 ids:
+/// 115 ms a batch), so a statement cost O(table), not O(batch).
+///
+/// Asserts: with 220,000 producer ids idle for 8 days (no transaction or sequence rows)
+/// and 50,000 recent ids with a transaction row each, analyzed, one sweep (in a
+/// transaction, read through `pg_stat_xact_user_tables`) deletes idle ids and reads at
+/// most 20,000 tuples sequentially from each of kafka.producer_ids, kafka.transactions
+/// and kafka.producer_sequences.
+pub async fn test_sweep_producer_prune_reads_through_indexes() -> TestResult {
+    into_test_result(producer_prune_plan().await)
+}
+
+async fn producer_prune_plan() -> SendResult<()> {
+    println!("=== Test: the producer prune reads through indexes ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '120s'")
+        .await
+        .map_err(boxed)?;
+    let prefix = unique("prune-plan");
+    // Explicit negative ids, never issued by the sequence (see the prune test above).
+    let base: i64 = db
+        .query_one(
+            "SELECT -(floor(random() * 1000000)::bigint + 1) * 1000000",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let result: SendResult<()> = async {
+        db.execute(
+            "INSERT INTO kafka.producer_ids (producer_id, created_at, last_active_at)
+             SELECT $1::bigint - g, now() - INTERVAL '8 days', now() - INTERVAL '8 days'
+             FROM generate_series(1, $2::bigint) AS g",
+            &[&base, &IDLE_PRODUCERS],
+        )
+        .await
+        .map_err(boxed)?;
+        db.execute(
+            "WITH p AS (
+                 INSERT INTO kafka.producer_ids (producer_id, transactional_id, created_at,
+                                                 last_active_at)
+                 SELECT $1::bigint - $3::bigint - g, $2 || '-' || g, now(), now()
+                 FROM generate_series(1, $4::bigint) AS g
+                 RETURNING producer_id, transactional_id)
+             INSERT INTO kafka.transactions (transactional_id, producer_id, producer_epoch, state)
+             SELECT transactional_id, producer_id, 0, 'Empty' FROM p",
+            &[&base, &prefix, &IDLE_PRODUCERS, &TRANSACTIONAL_PRODUCERS],
+        )
+        .await
+        .map_err(boxed)?;
+        db.batch_execute(
+            "ANALYZE kafka.producer_ids; ANALYZE kafka.transactions;
+             ANALYZE kafka.producer_sequences;",
+        )
+        .await
+        .map_err(boxed)?;
+        println!(
+            "Step 0: {IDLE_PRODUCERS} idle producer ids, {TRANSACTIONAL_PRODUCERS} recent ones \
+             with a transaction each"
+        );
+
+        db.batch_execute("BEGIN").await.map_err(boxed)?;
+        let rows = db
+            .query(
+                "SELECT category, deleted FROM pg_kafka_run_retention_sweep(0, 3600)",
+                &[],
+            )
+            .await
+            .map_err(boxed)?;
+        let read = db
+            .query(
+                "SELECT relname::text, COALESCE(seq_tup_read, 0)::bigint
+                 FROM pg_stat_xact_user_tables
+                 WHERE schemaname = 'kafka'
+                   AND relname IN ('producer_ids', 'transactions', 'producer_sequences')
+                 ORDER BY 1",
+                &[],
+            )
+            .await
+            .map_err(boxed)?;
+        db.batch_execute("COMMIT").await.map_err(boxed)?;
+        let pruned = rows
+            .iter()
+            .find(|r| r.get::<_, String>(0) == "stale_producers")
+            .map_or(0, |r| r.get::<_, i64>(1));
+        let read: Vec<(String, i64)> = read.iter().map(|r| (r.get(0), r.get(1))).collect();
+        println!("Step 1: one sweep pruned {pruned} ids; sequential tuples read {read:?}");
+        if pruned == 0 {
+            return Err("the sweep pruned no idle producer id".into());
+        }
+        if let Some((table, n)) = read.iter().find(|(_, n)| *n > MAX_SEQ_TUPLES) {
+            return Err(format!("the sweep read {n} tuples of kafka.{table} sequentially").into());
+        }
+        Ok(())
+    }
+    .await;
+    db.execute(
+        "DELETE FROM kafka.transactions WHERE transactional_id LIKE $1 || '-%'",
+        &[&prefix],
+    )
+    .await
+    .map_err(boxed)?;
+    db.execute(
+        "DELETE FROM kafka.producer_ids
+         WHERE producer_id BETWEEN $1::bigint - $2::bigint AND $1::bigint - 1",
+        &[&base, &(IDLE_PRODUCERS + TRANSACTIONAL_PRODUCERS)],
+    )
+    .await
+    .map_err(boxed)?;
+    result?;
+    println!("✅ the prune read through its indexes");
+    Ok(())
+}
