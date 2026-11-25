@@ -96,7 +96,7 @@ pub fn register_gucs() {
     GucRegistry::define_int_guc(
         c"pg_kafka.max_group_memory",
         c"Maximum memory consumer group member state may take in the coordinator",
-        c"The member ids, protocols, metadata and assignments of all groups together. Empty groups (no members) are forgotten, least recently active first, to make room; a JoinGroup or a leader's SyncGroup whose state does not fit even so gets COORDINATOR_NOT_AVAILABLE (retriable; the memory frees as members leave or time out). Default 128MB. Reloadable.",
+        c"The member ids, protocols, metadata and assignments of all groups together; a group's copies of its leader's id and of its protocol name count as its longest member id and protocol name, so the count exceeds the state held by at most those two lengths per group. Empty groups (no members) are forgotten, least recently active first, to make room; a JoinGroup or a leader's SyncGroup whose state does not fit even so gets COORDINATOR_NOT_AVAILABLE (retriable; the memory frees as members leave or time out). Default 128MB. Reloadable.",
         &MAX_GROUP_MEMORY_KB,
         MIN_MAX_GROUP_MEMORY_KB,
         i32::MAX,
