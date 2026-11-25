@@ -16,7 +16,7 @@ mod hot_updates;
 mod invisible_offsets;
 mod isolation;
 mod kafka_parity;
-mod pending_reads;
+pub(crate) mod pending_reads;
 mod producer_epochs;
 mod timeouts;
 mod validation;

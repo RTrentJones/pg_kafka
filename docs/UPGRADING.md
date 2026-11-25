@@ -100,8 +100,8 @@ EXTENSION pg_kafka` has run, without a restart.
   the old table once (adding `kafka.messages.record_bytes`, the size of each record a
   Fetch sums, computed for every row: a full read with each row's headers detoasted, a
   full write and the rebuild of its two unique indexes, so it needs free disk for a
-  second copy of the table) and reads it five more times (bound, attach check, BRIN,
-  aborted-row and pending-producer index builds);
+  second copy of the table) and reads it six more times (bound, attach check, BRIN,
+  aborted-row, pending-producer and timestamp index builds);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
@@ -111,6 +111,9 @@ EXTENSION pg_kafka` has run, without a restart.
   sweep's aborted-row cleanup and outbox reaping stop reading whole tables;
 - adds `idx_messages_txn_pending_producer` (partial, `producer_id, producer_epoch` of
   pending rows), so ending a transaction reads only its producer's pending rows;
+- adds `idx_messages_timestamp` (partial, `topic_id, partition_id, timestamp_ms,
+  partition_offset` of non-aborted rows with a timestamp), so ListOffsets by timestamp and
+  MAX_TIMESTAMP stop reading whole partitions;
 - adds `pg_kafka_run_partition_maintenance()`, and revokes EXECUTE on it and on
   `pg_kafka_run_retention_sweep()` from PUBLIC (superusers only, as in a fresh install;
   ADR-001, "Concurrency with the worker and with manual maintenance");

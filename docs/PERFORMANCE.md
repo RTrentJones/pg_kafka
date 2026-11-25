@@ -333,6 +333,17 @@ layout, uniqueness, least-privilege DDL and upgrade. Costs to keep in mind:
   broker. Planning such a
   statement expands every leaf, so the hot read statements run through kept prepared plans
   (`select_cached` in `storage/postgres.rs`).
+- ListOffsets by timestamp and MAX_TIMESTAMP (-3) read through `idx_messages_timestamp`
+  (`topic_id, partition_id, timestamp_ms, partition_offset`, partial on non-aborted rows with a
+  timestamp), so MAX_TIMESTAMP and a lookup past the last timestamp (offsetsForTimes(now)) are
+  one descent per leaf. Timestamps need not grow with offsets, so a lookup that matches then
+  checks the rows below its candidate for an earlier match: it reads the smaller side, as the
+  planner estimates it, of the rows before the answer (through the offset key) and the index
+  entries at or after the timestamp (index-only). That is still linear in the partition for a
+  timestamp in its middle (2M rows: about 30-45 ms around the middle, under 1 ms near either
+  end, against 136-360 ms for each of them without the index); Kafka's per-segment time index
+  answers in O(log n). The index costs every Produce one btree entry per record (about 40
+  bytes; a bulk insert measured about 15% slower).
 - Retention of a leaf is a `DROP TABLE`. On 1M expired rows (PG15 sandbox): 0.35 s and 0.16 MB of WAL
   with 0 dead tuples, versus 2.9 s, 240 MB of WAL and 1M dead tuples (plus a 0.37 s VACUUM) for the
   row-delete sweep, and the table shrinks to the retained data instead of keeping its size.

@@ -286,11 +286,11 @@ async fn write_transaction(producer: &FutureProducer, topic: &str) -> SendResult
 }
 
 /// What the worker's statistics count so far.
-struct WorkerReads {
+pub(crate) struct WorkerReads {
     /// Rows of the foreign rows' leaf read by sequential and index scans.
-    rows_read: i64,
+    pub(crate) rows_read: i64,
     /// Rows inserted into kafka.messages, over all its leaves.
-    inserted: i64,
+    pub(crate) inserted: i64,
 }
 
 /// The worker flushes its statistics only when it exits, so it is ended first (and
@@ -298,7 +298,7 @@ struct WorkerReads {
 /// apart agree: statistics reach the views late (PostgreSQL 14's collector lags behind
 /// a busy server, and a backend may defer its flush), so reads from before the window,
 /// such as an earlier test's DELETE of its rows, would otherwise land inside it.
-async fn worker_reads(db: &Client, leaf: &str) -> SendResult<WorkerReads> {
+pub(crate) async fn worker_reads(db: &Client, leaf: &str) -> SendResult<WorkerReads> {
     let old = listener_pid(db).await?;
     if let Some(pid) = old {
         db.execute("SELECT pg_terminate_backend($1)", &[&pid])

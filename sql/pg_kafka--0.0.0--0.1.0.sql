@@ -7,7 +7,7 @@
 --
 -- Converts kafka.messages to a time-partitioned table (the existing rows become one
 -- leaf) under an ACCESS EXCLUSIVE lock, rewrites it once to fill record_bytes and reads it
--- five more times (see step 1; once more, and rewrites it again, for an install whose
+-- six more times (see step 1; once more, and rewrites it again, for an install whose
 -- created_at is a naive TIMESTAMP); run it in a quiet period on a large table.
 
 \echo Use "ALTER EXTENSION pg_kafka UPDATE TO '0.1.0'" to load this file. \quit
@@ -65,9 +65,10 @@ CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id
 -- a window shorter than one partition width). New rows go to the new time leaves.
 --
 -- Cost: ACCESS EXCLUSIVE on the old table for the whole script; one rewrite of it (the
--- record_bytes fill, which also rebuilds its two unique indexes) and five sequential
+-- record_bytes fill, which also rebuilds its two unique indexes) and six sequential
 -- reads (MAX(created_at) for the leaf bound, the attach's bound check, and the BRIN,
--- idx_messages_txn_aborted and idx_messages_txn_pending_producer builds).
+-- idx_messages_txn_aborted, idx_messages_txn_pending_producer and idx_messages_timestamp
+-- builds).
 ALTER TABLE kafka.messages RENAME TO messages_legacy;
 ALTER INDEX kafka.messages_pkey RENAME TO messages_legacy_offset_key;
 ALTER INDEX kafka.messages_global_offset_key RENAME TO messages_legacy_global_offset_key;
@@ -184,6 +185,20 @@ WHERE txn_state = 'pending';
 CREATE INDEX idx_messages_txn_aborted
 ON kafka.messages(created_at)
 WHERE txn_state = 'aborted';
+
+-- Records by producer timestamp, for ListOffsets by timestamp and MAX_TIMESTAMP (-3):
+-- the record with the largest timestamp is one descent, and the earliest offset whose
+-- timestamp is at or after T is found among the rows that match from either side, the
+-- rows below the first match in timestamp order (through the offset key) or the rows at
+-- or after T (index only, partition_offset is a key column), whichever the planner
+-- estimates smaller; without it either lookup read every row of the partition.
+-- Partial on what a lookup can match (rows with a timestamp, not aborted). It costs
+-- every Produce one more btree entry per record (about 40 bytes, and its WAL) and a
+-- transaction commit one more per record (its UPDATE of txn_state is not HOT anyway:
+-- txn_state is in the partial indexes' predicates). Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_timestamp
+ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)
+WHERE timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted';
 
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every

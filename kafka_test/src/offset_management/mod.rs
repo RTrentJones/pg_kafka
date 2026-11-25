@@ -15,6 +15,7 @@ mod fetch_parity;
 mod list_offsets_isolation;
 mod no_reuse;
 mod require_stable;
+mod timestamp_index;
 
 /// The `offset_management` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -24,6 +25,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         no_reuse::test_offset_no_reuse_after_cleanup,
         no_reuse::test_high_watermark_no_regress_after_cleanup,
         by_timestamp::test_list_offsets_by_timestamp,
+        // Sequential: it ends the worker to flush its statistics.
+        timestamp_index::test_list_offsets_by_timestamp_reads_through_an_index: sequential,
         edge_cases::test_offset_commit_with_metadata,
         edge_cases::test_fetch_offset_new_group,
         edge_cases::test_offset_reset_policy,
