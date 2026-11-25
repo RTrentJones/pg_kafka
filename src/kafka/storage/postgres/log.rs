@@ -12,8 +12,8 @@ use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, IN
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    decode_headers_json, encode_headers_json, FetchedMessage, IsolationLevel, PartitionBounds,
-    MAX_TIMESTAMP,
+    decode_headers_json, encode_headers_json, FetchedMessage, FetchedRecords, IsolationLevel,
+    PartitionBounds, MAX_TIMESTAMP,
 };
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
@@ -30,15 +30,22 @@ const LOG_END_OFFSET_SQL: &str = "SELECT GREATEST(
 /// A fetch query: the rows of one partition from `$3` in offset order, at most `$4` of
 /// them, each with the running total of the bytes it adds to a Fetch response
 /// (`cumulative_bytes`, see `record_bytes_sql!`); of those, only the rows whose running
-/// total is within `$5` bytes, and the first row whatever its size when `$6` is true. The
-/// cut is made here so that the result set, which SPI holds whole, never holds the rows a
-/// byte budget leaves out. `$filter` is the isolation level's extra condition.
+/// total is within `$5` bytes, and the first row whatever its size. The cut is made here so
+/// that the result set, which SPI holds whole, never holds the rows a byte budget leaves
+/// out. The first row past the budget carries its key, value and headers only when `$6` is
+/// true (`whole`); otherwise they are NULL, so it is never read from TOAST, and it only
+/// tells the caller that a record is there. `$filter` is the isolation level's extra
+/// condition.
 ///
-/// `headers` is cast to text in the outer query, for the rows returned only.
+/// `headers` is cast to text in the outer query, for the rows returned whole only.
 macro_rules! fetch_sql {
     ($filter:literal) => {
         concat!(
-            "SELECT partition_offset, key, value, headers::text AS headers_json,
+            "SELECT partition_offset,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN key END AS key,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN value END AS value,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN headers::text END AS headers_json,
+        cumulative_bytes <= $5 OR $6 AS whole,
         producer_id, producer_epoch, timestamp_ms, cumulative_bytes
  FROM (
    SELECT partition_offset, key, value, headers, producer_id, producer_epoch,
@@ -56,7 +63,7 @@ macro_rules! fetch_sql {
    ORDER BY partition_offset
    LIMIT $4
  ) fetched
- WHERE cumulative_bytes <= $5 OR (row_number = 1 AND $6)
+ WHERE cumulative_bytes <= $5 OR row_number = 1
  ORDER BY partition_offset"
         )
     };
@@ -284,20 +291,25 @@ impl PostgresStore {
         }))
     }
 
-    /// Records from `fetch_offset` on, up to `max_bytes` of what they add to the response
-    /// (always at least one record, as Kafka does), for either isolation level (DR-24).
-    /// Each query is bounded to [`MAX_ROWS_PER_QUERY`] rows and returns only the rows within
-    /// what is left of the budget, so neither a pass nor its result set holds more than the
-    /// budget (and the one first record); the loop runs until the budget is spent or the
-    /// partition has no more rows (DR-9). Sizes are the uncompressed key, value and header
-    /// lengths, summed by a window function (`record_bytes_sql!`, ADR-002).
+    /// Records from `fetch_offset` on, up to `max_bytes` of what they add to the response,
+    /// for either isolation level (DR-24). With `whole_first_record` the first record is
+    /// returned whatever its size, as Kafka returns the first record batch of the first
+    /// partition with data (KIP-74); without it a first record larger than `max_bytes` is not
+    /// read, only reported (`first_left_out`), so a partition that could not return it costs
+    /// the DB thread nothing of its size. Each query is bounded to [`MAX_ROWS_PER_QUERY`] rows
+    /// and returns only the rows within what is left of the budget, so neither a pass nor its
+    /// result set holds more than the budget (and the one first record); the loop runs until
+    /// the budget is spent or the partition has no more rows (DR-9). Sizes are the
+    /// uncompressed key, value and header lengths, summed by a window function
+    /// (`record_bytes_sql!`, ADR-002).
     fn fetch_records_filtered(
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         let query = match isolation_level {
             IsolationLevel::ReadCommitted => FETCH_COMMITTED_SQL,
             IsolationLevel::ReadUncommitted => FETCH_ALL_SQL,
@@ -308,8 +320,9 @@ impl PostgresStore {
             let budget = i64::from(max_bytes.max(0));
             let mut consumed: i64 = 0;
             let mut next_offset = fetch_offset;
+            let mut first_left_out = false;
 
-            loop {
+            'passes: loop {
                 let remaining = budget - consumed;
                 if remaining <= 0 && !messages.is_empty() {
                     break;
@@ -334,7 +347,7 @@ impl PostgresStore {
                         next_offset.into(),
                         limit.into(),
                         remaining.into(),
-                        messages.is_empty().into(),
+                        (whole_first_record && messages.is_empty()).into(),
                     ],
                 )?;
                 // The query leaves out every row past the budget: fewer rows than the
@@ -342,6 +355,12 @@ impl PostgresStore {
                 let row_count = i64::try_from(table.len()).unwrap_or(i64::MAX);
 
                 for row in table {
+                    // The first row of a pass past what is left of the budget, without its
+                    // key, value and headers: nothing more fits.
+                    if !row.get_by_name::<bool, _>("whole")?.unwrap_or(false) {
+                        first_left_out = messages.is_empty();
+                        break 'passes;
+                    }
                     // cumulative_bytes restarts per query; add the running total.
                     let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
                     let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
@@ -365,10 +384,13 @@ impl PostgresStore {
             }
 
             crate::pg_debug!(
-                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?})",
+                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?}, first left out: {first_left_out})",
                 messages.len()
             );
-            Ok(messages)
+            Ok(FetchedRecords {
+                messages,
+                first_left_out,
+            })
         })
         .map_err(internal("fetch_records"))
     }
@@ -401,8 +423,10 @@ impl PostgresStore {
             partition_id,
             fetch_offset,
             max_bytes,
+            true,
             IsolationLevel::ReadUncommitted,
         )
+        .map(|fetched| fetched.messages)
     }
 
     pub(super) fn fetch_records_with_isolation(
@@ -410,16 +434,18 @@ impl PostgresStore {
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         crate::pg_debug!(
-            "PostgresStore::fetch_records_with_isolation: topic_id={topic_id}, partition_id={partition_id}, offset={fetch_offset}, isolation={isolation_level:?}"
+            "PostgresStore::fetch_records_with_isolation: topic_id={topic_id}, partition_id={partition_id}, offset={fetch_offset}, whole_first_record={whole_first_record}, isolation={isolation_level:?}"
         );
         Self::fetch_records_filtered(
             topic_id,
             partition_id,
             fetch_offset,
             max_bytes,
+            whole_first_record,
             isolation_level,
         )
     }

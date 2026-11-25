@@ -177,13 +177,15 @@ macro_rules! delegate_log_store {
             partition_id: i32,
             fetch_offset: i64,
             max_bytes: i32,
+            whole_first_record: bool,
             isolation_level: $crate::kafka::storage::IsolationLevel,
-        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::FetchedRecords> {
             $via::fetch_records_with_isolation(
                 topic_id,
                 partition_id,
                 fetch_offset,
                 max_bytes,
+                whole_first_record,
                 isolation_level,
             )
         }
@@ -270,14 +272,16 @@ macro_rules! delegate_log_store {
             partition_id: i32,
             fetch_offset: i64,
             max_bytes: i32,
+            whole_first_record: bool,
             isolation_level: $crate::kafka::storage::IsolationLevel,
-        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::FetchedRecords> {
             $via::fetch_records_with_isolation(
                 &self.$field,
                 topic_id,
                 partition_id,
                 fetch_offset,
                 max_bytes,
+                whole_first_record,
                 isolation_level,
             )
         }

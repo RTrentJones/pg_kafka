@@ -11,9 +11,9 @@ mod store {
     use crate::kafka::error::Result;
     use crate::kafka::messages::Record;
     use crate::kafka::storage::{
-        CommittedOffset, FetchedMessage, IsolationLevel, LogStore, MaintenanceStore, OffsetStore,
-        ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata, TopicStore, TransactionState,
-        TransactionStore, TransactionalProducer,
+        CommittedOffset, FetchedMessage, FetchedRecords, IsolationLevel, LogStore,
+        MaintenanceStore, OffsetStore, ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata,
+        TopicStore, TransactionState, TransactionStore, TransactionalProducer,
     };
     use mockall::mock;
     use mockall::predicate::*;
@@ -54,8 +54,9 @@ mod store {
                 partition_id: i32,
                 fetch_offset: i64,
                 max_bytes: i32,
+                whole_first_record: bool,
                 isolation_level: IsolationLevel,
-            ) -> Result<Vec<FetchedMessage>>;
+            ) -> Result<FetchedRecords>;
             fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
             fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
             fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
