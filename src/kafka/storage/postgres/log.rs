@@ -88,7 +88,8 @@ macro_rules! fetch_sql {
 /// and the DB thread hold of it, and headers would not count at all. A header key stored
 /// as hex (one holding U+0000, marked `"hex"`, see `encode_headers_json`) counts half its
 /// stored length, as its value does. Rows written before headers were stored as an ordered
-/// array hold a `{key: hex}` object; `{}` is a record without headers. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
+/// array hold a `{key: hex}` object; `{}` is a record without headers. Any other JSON value
+/// (a scalar written out of band) counts no headers, as a fetch decodes none from it. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
 /// `message_size_estimate` uses, counts the same. COALESCE evaluates it only for a row whose
 /// `record_bytes` is NULL; it reads the whole headers value, from TOAST when stored there.
 macro_rules! record_bytes_sql {
@@ -100,6 +101,7 @@ macro_rules! record_bytes_sql {
                                             / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
+                   WHEN jsonb_typeof(headers) <> 'object' THEN 0
                    ELSE
                      (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
                       FROM jsonb_each_text(headers) e(k, v))

@@ -165,3 +165,50 @@ pub async fn test_header_key_with_nul_roundtrips() -> TestResult {
     Ok(())
 }
 
+/// Rows written by SQL outside the extension carry no `record_bytes`, and a fetch sizes
+/// them from their columns. A headers value that is neither an array nor an object (a
+/// JSON scalar) went to `jsonb_each_text`, which refuses a non-object, so the fetch query
+/// failed and every Fetch reaching the row failed with it.
+///
+/// Asserts: rows at offsets 0..3 whose headers are `null`, `"s"` and `5` (JSONB scalars)
+/// and whose `record_bytes` is NULL are fetched with error 0, all three, without headers.
+pub async fn test_rows_with_scalar_headers_are_fetched() -> TestResult {
+    use crate::setup::TestContext;
+    use crate::wire::Wire;
+    use kafka_protocol::records::RecordBatchDecoder;
+    println!("=== Test: rows whose headers are JSON scalars are fetched ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "headers-scalar")
+        .build()
+        .await?
+        .name;
+    let inserted = ctx
+        .db()
+        .execute(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, headers)
+             SELECT t.id, 0, h.o, 'v'::bytea, h.headers
+             FROM kafka.topics t,
+                  (VALUES (0, 'null'::jsonb), (1, '\"s\"'::jsonb), (2, '5'::jsonb))
+                      AS h(o, headers)
+             WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    assert_eq!(inserted, 3);
+    println!("Step 1: three rows of headers null, \"s\" and 5, without record_bytes");
+
+    let mut wire = Wire::connect().await?;
+    let p = wire.fetch(&topic, 0, 0, 0).await?;
+    assert_eq!(p.error_code, 0, "the fetch is answered");
+    let mut records = p.records.unwrap_or_default();
+    let fetched: Vec<(i64, usize)> = RecordBatchDecoder::decode_all(&mut records)?
+        .iter()
+        .flat_map(|b| b.records.iter())
+        .map(|r| (r.offset, r.headers.len()))
+        .collect();
+    assert_eq!(fetched, vec![(0, 0), (1, 0), (2, 0)]);
+    println!("✅ fetched all three without headers");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

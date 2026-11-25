@@ -704,6 +704,7 @@ AS $$
                                             / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
                                           + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
                       FROM jsonb_array_elements(headers) h)
+                   WHEN jsonb_typeof(headers) <> 'object' THEN 0
                    ELSE
                      (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
                       FROM jsonb_each_text(headers) e(k, v))

@@ -17,6 +17,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         basic::test_consumer_basic,
         headers::test_consumer_receives_headers,
         headers::test_header_key_with_nul_roundtrips,
+        headers::test_rows_with_scalar_headers_are_fetched,
         multiple::test_consumer_multiple_messages,
         from_offset::test_consumer_from_offset,
         batching::test_fetch_groups_records_into_batches,
