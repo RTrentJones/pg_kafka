@@ -130,7 +130,8 @@ pub async fn test_offset_commit_fetch() -> TestResult {
 
     // 6. Verify the new consumer starts from offset 3 (not 0)
     println!("\nStep 6: Verifying consumer resumes from committed offset...");
-    let timeout = Duration::from_secs(5);
+    // Offsets 3 and 4 are left to read; joining the group takes a few seconds.
+    let timeout = Duration::from_secs(30);
     let start = std::time::Instant::now();
     let mut first_offset_received = None;
 
@@ -148,12 +149,15 @@ pub async fn test_offset_commit_fetch() -> TestResult {
         }
     }
 
-    if let Some(offset) = first_offset_received {
-        assert_eq!(offset, 3, "Consumer should resume from offset 3");
-        println!("✅ Consumer correctly resumed from committed offset!");
-    } else {
-        println!("⚠️  No messages received (may be expected if all consumed)");
-    }
+    let Some(offset) = first_offset_received else {
+        consumer2.close(CLOSE_TIMEOUT).await?;
+        return Err(format!(
+            "the resumed member received nothing within {timeout:?} (offsets 3 and 4 are unread)"
+        )
+        .into());
+    };
+    assert_eq!(offset, 3, "Consumer should resume from offset 3");
+    println!("✅ Consumer correctly resumed from committed offset!");
 
     consumer2.close(CLOSE_TIMEOUT).await?;
     println!("\n✅ OffsetCommit/OffsetFetch test PASSED\n");

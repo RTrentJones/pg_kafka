@@ -142,19 +142,11 @@ pub async fn test_txn_offset_commit() -> TestResult {
     commit_tpl.add_partition_offset(&source_topic, 0, Offset::Offset(commit_offset))?;
 
     // Get consumer group metadata and send offsets to transaction
-    let cgm = consumer.group_metadata();
-    if let Some(metadata) = cgm {
-        txn_producer.send_offsets_to_transaction(
-            &commit_tpl,
-            &metadata,
-            Duration::from_secs(10),
-        )?;
-        println!("  Sent offset {commit_offset} to transaction\n");
-    } else {
-        // If group_metadata returns None, we can still test via database verification
-        println!("  Note: group_metadata() returned None, skipping send_offsets_to_transaction");
-        println!("  Will verify via database instead\n");
-    }
+    let metadata = consumer
+        .group_metadata()
+        .ok_or("the consumer has a group.id, so it must have group metadata")?;
+    txn_producer.send_offsets_to_transaction(&commit_tpl, &metadata, Duration::from_secs(10))?;
+    println!("  Sent offset {commit_offset} to transaction\n");
 
     // Step 6: Commit transaction
     println!("Step 6: Committing transaction...");
@@ -209,32 +201,24 @@ pub async fn test_txn_offset_commit() -> TestResult {
         )
         .await?;
 
-    if let Some(row) = committed_offset_row {
-        let committed: i64 = row.get(0);
-        println!("  Consumer offset committed: {committed} (expected: {commit_offset})");
-        assert_eq!(
-            committed, commit_offset,
-            "Committed offset should match expected"
-        );
-        println!("  Consumer offset correctly committed as part of transaction\n");
-    } else {
-        // Check if offsets are in pending table (transaction not fully processed)
-        let pending_row = client
-            .query_opt(
-                "SELECT pending_offset FROM kafka.txn_pending_offsets
-                 WHERE transactional_id = $1 AND group_id = $2",
-                &[&txn_id, &group_id],
-            )
-            .await?;
-
-        if pending_row.is_some() {
-            return Err("Offset still pending after transaction commit".into());
-        }
-
-        // If no offset in either table but group_metadata was None, that's OK
-        println!("  Note: No committed offset found (group_metadata may have been None)");
-        println!("  Destination messages verified as committed\n");
-    }
+    let committed: i64 = committed_offset_row
+        .ok_or("the offset sent to the transaction was not committed with it")?
+        .get(0);
+    println!("  Consumer offset committed: {committed} (expected: {commit_offset})");
+    assert_eq!(
+        committed, commit_offset,
+        "Committed offset should match expected"
+    );
+    let pending: i64 = client
+        .query_one(
+            "SELECT count(*) FROM kafka.txn_pending_offsets
+             WHERE transactional_id = $1 AND group_id = $2",
+            &[&txn_id, &group_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(pending, 0, "no offset may stay pending after the commit");
+    println!("  Consumer offset correctly committed as part of transaction\n");
 
     // Verify transaction state
     let txn_state_row = client
