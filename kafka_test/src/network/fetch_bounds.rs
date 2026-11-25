@@ -2,14 +2,14 @@
 
 use crate::common::{DynResult, TestResult};
 use crate::setup::TestContext;
-use crate::wire::records::{encode, plain_batch, plain_record};
+use crate::wire::records::{batch, encode, plain_batch, plain_record};
 use crate::wire::requests::{creatable, create_topics_raw, fetch_request, produce_request};
 use crate::wire::{decode_response, read_frame_within, request_frame};
 use bytes::Bytes;
 use kafka_protocol::messages::{FetchRequest, FetchResponse, ProduceRequest};
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Compression, RecordBatchDecoder};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -166,6 +166,63 @@ pub async fn test_fetch_limits_count_uncompressed_and_header_bytes() -> TestResu
         "the first record is returned although larger"
     );
     assert_eq!(first[0].1, VALUE);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Kafka's `DelayedFetch` counts, per partition, the bytes available up to its
+/// `partition_max_bytes` against `min_bytes`. A long poll whose partition stops short because
+/// of a small `partition_max_bytes` therefore waits for its `min_bytes` (the broker answered
+/// at once, because the partition had more than it returned), while one the request's
+/// `max_bytes` cuts short is answered at once (the data available meets its `min_bytes`).
+pub async fn test_long_poll_min_bytes_counts_each_partition_up_to_its_limit() -> TestResult {
+    println!("=== Test: a long poll counts each partition up to its partition_max_bytes ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-lp-minbytes").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    let value = "m".repeat(1000);
+    let values = [value.as_str(); 5];
+    produce_batch(&mut s, 1, &topic, batch(&values, -1, -1, -1, false, None)).await?;
+    println!("Step 1: 5 records of 1000 bytes");
+
+    // partition_max_bytes 1500 holds one record; 1500 bytes available < min_bytes 100,000.
+    let mut req = fetch_request(&topic, 0, 0, 2000);
+    req.min_bytes = 100_000;
+    req.max_bytes = 1 << 20;
+    req.topics[0].partitions[0].partition_max_bytes = 1500;
+    let started = Instant::now();
+    let records = fetch(&mut s, 2, &req).await?;
+    let took = started.elapsed();
+    println!(
+        "Step 2: partition_max_bytes 1500, min_bytes 100000: {} record(s) after {took:?}",
+        records.len()
+    );
+    assert_eq!(records.len(), 1);
+    assert!(
+        took >= Duration::from_millis(1500),
+        "answered after {took:?}: 1500 bytes available do not meet min_bytes 100000"
+    );
+
+    // max_bytes 3000 (and min_bytes 3000) holds two records of the 5000 bytes available.
+    let mut req = fetch_request(&topic, 0, 0, 5000);
+    req.min_bytes = 3000;
+    req.max_bytes = 3000;
+    req.topics[0].partitions[0].partition_max_bytes = i32::MAX;
+    let started = Instant::now();
+    let records = fetch(&mut s, 3, &req).await?;
+    let took = started.elapsed();
+    println!(
+        "Step 3: max_bytes = min_bytes = 3000: {} records after {took:?}",
+        records.len()
+    );
+    assert_eq!(records.len(), 2);
+    assert!(
+        took < Duration::from_secs(2),
+        "answered after {took:?}: the data available meets min_bytes"
+    );
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

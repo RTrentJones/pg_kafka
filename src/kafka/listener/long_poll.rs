@@ -28,10 +28,11 @@ use super::dispatch::send_with_backpressure;
 use super::response_budget::ReplyCharge;
 use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
 use crate::kafka::constants::API_KEY_FETCH;
-use crate::kafka::messages::{KafkaRequest, KafkaResponse};
+use crate::kafka::messages::{KafkaRequest, KafkaResponse, PartitionFetchData};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
 use crate::kafka::protocol::DecodedCharge;
 use crate::kafka::storage::IsolationLevel;
+use std::collections::HashMap;
 
 /// The safety-net interval for a `pg_kafka.fetch_poll_interval_ms` value (at least 1 ms).
 pub(super) fn poll_interval(fetch_poll_interval_ms: i32) -> Duration {
@@ -157,19 +158,15 @@ impl LongPoll {
             };
             let response = self.fetch_once().await?;
 
-            let total_bytes = calculate_response_bytes(&response);
+            let available = available_bytes(&response, &self.fetch, read_committed);
             let min_bytes = self.fetch.min_bytes;
-            debug!("Long poll fetch returned {total_bytes} bytes (min_bytes={min_bytes})");
+            debug!("Long poll fetch found {available} bytes available (min_bytes={min_bytes})");
             // A partition error (unknown partition, offset out of range, ...) is returned
             // straight away, as Kafka does, so the consumer can react instead of waiting
             // out max_wait_ms for data that will not arrive. A non-positive min_bytes is
             // met by any response.
-            // A response that stopped short of a partition's readable end is as full as the
-            // request's limits let it be: Kafka counts the bytes available (more than fit), so
-            // it answers too, and a min_bytes the cap lowered to max_bytes is never waited out.
-            let enough = min_bytes <= 0
-                || usize::try_from(min_bytes).is_ok_and(|min| total_bytes >= min)
-                || stopped_short(&response, read_committed);
+            let enough =
+                min_bytes <= 0 || u64::try_from(min_bytes).is_ok_and(|min| available >= min);
             if enough || response_has_partition_error(&response) {
                 debug!("Long poll: min_bytes threshold met, returning response");
                 reply.hold(charge);
@@ -237,6 +234,7 @@ impl LongPoll {
 }
 
 /// Calculate the total bytes in a FetchResponse
+#[cfg(test)]
 fn calculate_response_bytes(response: &KafkaResponse) -> usize {
     match &response.body {
         ResponseBody::Fetch(response) => response
@@ -250,28 +248,64 @@ fn calculate_response_bytes(response: &KafkaResponse) -> usize {
     }
 }
 
-/// Whether a partition of a Fetch response returned records but stopped before its readable
-/// end (the high watermark, or the last stable offset for `read_committed`): the request's
-/// `max_bytes` or the partition's `partition_max_bytes` cut it short.
-fn stopped_short(response: &KafkaResponse, read_committed: bool) -> bool {
+/// The bytes a Fetch response finds available, as Kafka 3.7's `DelayedFetch.tryComplete` counts
+/// them against `min_bytes`: per partition, the bytes from its fetch offset to its readable end
+/// (the high watermark, or the last stable offset for `read_committed`), at most its
+/// `partition_max_bytes`. A partition read to its readable end counts the records it returned
+/// (at most its `partition_max_bytes`). One that stopped before it, cut by its
+/// `partition_max_bytes` or by what was left of the request's `max_bytes`, or not read once
+/// that was spent, counts its whole `partition_max_bytes`: cut by its own limit, it has more
+/// than that available; cut by the request's, the response holds what `max_bytes` allows,
+/// which is at least `min_bytes` (lowered to `max_bytes`), so Kafka answers it too. A
+/// partition with an error counts nothing (the response is answered for the error).
+fn available_bytes(
+    response: &KafkaResponse,
+    fetch: &FetchRequestData,
+    read_committed: bool,
+) -> u64 {
     let ResponseBody::Fetch(response) = &response.body else {
-        return false;
+        return 0;
     };
-    response
-        .responses
+    // A repeated partition is read once, at its last entry (see the Fetch handler).
+    let requested: HashMap<(&str, i32), &PartitionFetchData> = fetch
+        .topic_data
         .iter()
-        .flat_map(|t| t.partitions.iter())
-        .any(|p| {
+        .flat_map(|t| {
+            t.partitions
+                .iter()
+                .map(move |p| ((t.name.as_str(), p.partition_index), p))
+        })
+        .collect();
+    let mut available = 0u64;
+    for topic in &response.responses {
+        for p in &topic.partitions {
+            let Some(asked) = requested.get(&(&**topic.topic, p.partition_index)) else {
+                continue;
+            };
+            if p.error_code != 0 {
+                continue;
+            }
+            let limit = u64::try_from(asked.partition_max_bytes).unwrap_or(0);
             let readable_end = if read_committed {
                 p.last_stable_offset
             } else {
                 p.high_watermark
             };
-            p.records
-                .as_ref()
+            let returned = p.records.as_ref();
+            let next = returned
                 .and_then(next_offset_after)
-                .is_some_and(|next| next < readable_end)
-        })
+                .unwrap_or(asked.fetch_offset);
+            let counted = if next < readable_end {
+                limit
+            } else {
+                u64::try_from(returned.map_or(0, Bytes::len))
+                    .unwrap_or(u64::MAX)
+                    .min(limit)
+            };
+            available = available.saturating_add(counted);
+        }
+    }
+    available
 }
 
 /// The offset after the last batch of encoded RecordBatch v2 `records` (base offset plus
@@ -347,11 +381,17 @@ mod tests {
         }
     }
 
+    /// Kafka's `DelayedFetch` count: a partition read to its readable end counts what it
+    /// returned, one that stopped before it its `partition_max_bytes`, so a `min_bytes` above
+    /// what a small `partition_max_bytes` lets through is waited for, and one the request's
+    /// `max_bytes` cut short is met.
     #[test]
-    fn test_a_response_cut_short_by_its_limits_is_enough() {
+    fn test_available_bytes_count_each_partition_up_to_its_limit() {
         use kafka_protocol::messages::fetch_response::{
             FetchResponse, FetchableTopicResponse, PartitionData,
         };
+        use kafka_protocol::messages::TopicName;
+        use kafka_protocol::protocol::StrBytes;
         // The 61-byte header of a batch of offsets 5..=7 (base offset 5, last offset
         // delta 2), records left out.
         let mut header = Vec::new();
@@ -362,24 +402,64 @@ mod tests {
         header.resize(61, 0);
         let records = Bytes::from(header);
         assert_eq!(next_offset_after(&records), Some(8));
-        let response = |high_watermark, last_stable_offset| {
-            let mut partition = PartitionData::default();
-            partition.high_watermark = high_watermark;
-            partition.last_stable_offset = last_stable_offset;
-            partition.records = Some(records.clone());
+        assert!(next_offset_after(&Bytes::new()).is_none());
+        // Partition 0 holds the batch, partition 1 nothing; each has `ends` as its high
+        // watermark and last stable offset.
+        let response = |ends: [(i64, i64); 2]| {
+            let partitions = ends
+                .iter()
+                .enumerate()
+                .map(|(i, &(high_watermark, last_stable_offset))| {
+                    let mut partition = PartitionData::default();
+                    partition.partition_index = i32::try_from(i).unwrap();
+                    partition.high_watermark = high_watermark;
+                    partition.last_stable_offset = last_stable_offset;
+                    partition.records = Some(if i == 0 {
+                        records.clone()
+                    } else {
+                        Bytes::new()
+                    });
+                    partition
+                })
+                .collect();
             let mut topic = FetchableTopicResponse::default();
-            topic.partitions = vec![partition];
+            topic.topic = TopicName(StrBytes::from_static_str("t"));
+            topic.partitions = partitions;
             let mut fetch = FetchResponse::default();
             fetch.responses = vec![topic];
             KafkaResponse::new(1, 4, ResponseBody::Fetch(fetch))
         };
-        assert!(stopped_short(&response(20, 20), false), "more to read");
-        assert!(!stopped_short(&response(8, 8), false), "read to the end");
-        assert!(
-            !stopped_short(&response(20, 8), true),
-            "read_committed stops at the last stable offset"
-        );
-        assert!(next_offset_after(&Bytes::new()).is_none());
+        let request = |limits: [i32; 2]| FetchRequestData {
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1 << 20,
+            isolation_level: 0,
+            topic_data: vec![TopicFetchData {
+                name: "t".to_string(),
+                partitions: (0..2)
+                    .map(|i| PartitionFetchData {
+                        partition_index: i,
+                        fetch_offset: 5,
+                        partition_max_bytes: limits[usize::try_from(i).unwrap()],
+                    })
+                    .collect(),
+            }],
+        };
+        // Both read to the end: the 61 bytes returned.
+        let at_end = response([(8, 8), (5, 5)]);
+        assert_eq!(available_bytes(&at_end, &request([1000, 1000]), false), 61);
+        // At most partition_max_bytes of them.
+        assert_eq!(available_bytes(&at_end, &request([40, 1000]), false), 40);
+        // Partition 0 stopped before offset 20: its whole partition_max_bytes.
+        let short = response([(20, 20), (5, 5)]);
+        assert_eq!(available_bytes(&short, &request([1000, 300]), false), 1000);
+        // Partition 1 was not read although it has data: its limit too.
+        let unread = response([(8, 8), (9, 9)]);
+        assert_eq!(available_bytes(&unread, &request([1000, 300]), false), 361);
+        // read_committed stops at the last stable offset.
+        let stable = response([(20, 8), (9, 5)]);
+        assert_eq!(available_bytes(&stable, &request([1000, 300]), true), 61);
+        assert_eq!(available_bytes(&stable, &request([1000, 300]), false), 1300);
     }
 
     #[test]
@@ -428,15 +508,19 @@ mod tests {
         }
     }
 
-    fn fetch_response(with_records: bool) -> KafkaResponse {
+    /// A response to a Fetch of partition 0 of `topic`, with records or none.
+    fn fetch_response(with_records: bool, topic_name: &str) -> KafkaResponse {
         use kafka_protocol::messages::fetch_response::{
             FetchResponse, FetchableTopicResponse, PartitionData,
         };
+        use kafka_protocol::messages::TopicName;
+        use kafka_protocol::protocol::StrBytes;
         let mut response = FetchResponse::default();
         if with_records {
             let mut partition = PartitionData::default();
             partition.records = Some(Bytes::from_static(b"some-record-bytes"));
             let mut topic = FetchableTopicResponse::default();
+            topic.topic = TopicName(StrBytes::from_string(topic_name.to_string()));
             topic.partitions = vec![partition];
             response.responses = vec![topic];
         }
@@ -460,13 +544,14 @@ mod tests {
             loop {
                 match rx.try_recv() {
                     Ok(KafkaRequest {
-                        body: RequestBody::Fetch(_),
+                        body: RequestBody::Fetch(fetch),
                         response_tx,
                         ..
                     }) => {
                         let n = served.fetch_add(1, Ordering::SeqCst) + 1;
                         let with_records = before_answer(n).await;
-                        let _ = response_tx.send(fetch_response(with_records));
+                        let name = fetch.topic_data.first().map_or("", |t| t.name.as_str());
+                        let _ = response_tx.send(fetch_response(with_records, name));
                     }
                     Ok(_) => {}
                     Err(crossbeam_channel::TryRecvError::Empty) => {

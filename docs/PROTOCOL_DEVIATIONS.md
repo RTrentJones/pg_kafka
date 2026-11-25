@@ -532,9 +532,11 @@ pg_kafka.compression_type = 'gzip'
   result, as Kafka 3.7's `KafkaApis.handleFetchRequest` does, so a `max_bytes` of `i32::MAX`
   returns at most the cap; each partition reads up to its `partition_max_bytes` within what is
   left, and the first record of the first partition with data is returned whole even when it
-  is larger (KIP-74; Kafka returns the first record batch). A long poll answers once its
-  response holds `min_bytes` or a partition stopped short of its readable end (the limits cut
-  it: Kafka counts the bytes available, which are more). `max_wait_ms` is not capped, as in
+  is larger (KIP-74; Kafka returns the first record batch). A long poll answers once the bytes
+  available reach `min_bytes`, counted as Kafka 3.7's `DelayedFetch` counts them: per
+  partition, what lies between its fetch offset and its readable end, at most its
+  `partition_max_bytes` (a partition that returned everything up to its readable end counts
+  the bytes it returned; one cut short or not read counts its whole `partition_max_bytes`). `max_wait_ms` is not capped, as in
   Kafka; a connection waiting on one is closed by the idle timeout once responses behind it
   wait unread (Network Security Posture)
 - ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
