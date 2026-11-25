@@ -683,6 +683,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         configs::test_delete_records_truncates_partition,
         configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
         configs::test_config_api_answers_match_kafka,
+        configs::test_incremental_alter_configs_duplicate_keys,
         test_create_multiple_topics,
         test_create_topic_invalid_name,
         test_create_partitions_not_found,

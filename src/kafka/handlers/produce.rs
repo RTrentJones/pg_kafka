@@ -296,30 +296,44 @@ type PartitionRecords = (Vec<Record>, Option<ProducerMetadata>);
 /// Group a topic's records by target partition, keeping each partition's own producer
 /// metadata: every RecordBatch carries its own base_sequence, so partitions must not
 /// share one request-level sequence number. Records sent to partition -1 are routed by
-/// key. Also returns the partitions that are refused before grouping (an idempotent
-/// batch sent to -1).
+/// key. Also returns the partitions that are refused before grouping (a -1 batch that is
+/// idempotent, or that shares its topic with an idempotent or transactional batch).
 fn group_by_partition(
     topic: TopicProduceData,
     partition_count: i32,
     producer_metadata: Option<&ProducerMetadata>,
 ) -> (HashMap<i32, PartitionRecords>, Vec<i32>) {
+    // Per-partition metadata; fall back to the request-level metadata only when the
+    // batch carried none (e.g. a legacy MessageSet).
+    let meta_of = |batch: Option<ProducerMetadata>| batch.or_else(|| producer_metadata.cloned());
+    let is_producer_batch =
+        |meta: Option<&ProducerMetadata>| meta.is_some_and(|m| m.producer_id >= 0);
+    // Routed records join the batch written to their target partition and are written
+    // under that batch's producer metadata. Next to an idempotent or transactional batch
+    // they would be sequence-checked as part of it (moving its producer's sequence past
+    // what the producer sent) or written into its transaction, so -1 is refused in a
+    // topic that has one.
+    let topic_has_producer_batch = topic.partitions.iter().any(|p| {
+        is_producer_batch(
+            p.producer_metadata
+                .as_ref()
+                .or(producer_metadata)
+                .filter(|_| p.partition_index != -1),
+        )
+    });
     let mut by_partition: HashMap<i32, PartitionRecords> = HashMap::new();
     let mut rejected = Vec::new();
     for partition_data in topic.partitions {
         let explicit_partition = partition_data.partition_index;
-        // Per-partition metadata; fall back to the request-level metadata only when the
-        // batch carried none (e.g. a legacy MessageSet).
-        let partition_meta = partition_data
-            .producer_metadata
-            .or_else(|| producer_metadata.cloned());
-        let is_idempotent = partition_meta.as_ref().is_some_and(|m| m.producer_id >= 0);
+        let partition_meta = meta_of(partition_data.producer_metadata);
+        let is_idempotent = is_producer_batch(partition_meta.as_ref());
 
         if explicit_partition == -1 {
             // An idempotent batch's sequence numbers are tracked per partition. Splitting
             // one batch across several partitions by key would record the whole batch's
             // sequence range on each of them and break the producer's next batch, so
             // server-side routing is refused for it.
-            if is_idempotent {
+            if is_idempotent || topic_has_producer_batch {
                 rejected.push(explicit_partition);
                 continue;
             }

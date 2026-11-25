@@ -7,7 +7,7 @@
 //! - Request/response framing
 
 use crate::common::TestResult;
-use crate::wire::{raw_frame, read_raw_response};
+use crate::wire::{raw_frame, read_frame, read_raw_response};
 use bytes::{BufMut, BytesMut};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -102,8 +102,9 @@ pub async fn test_correlation_id_preserved() -> TestResult {
     Ok(())
 }
 
-/// Test: Unknown API key returns appropriate error
-/// Verifies that sending an unknown API key returns an error response
+/// Test: an API key without a request header schema (999) closes the connection.
+/// Its header cannot be decoded, so there is no correlation id to answer under; Kafka 3.7
+/// closes the connection too. A response or a connection left open fails the test.
 pub async fn test_unknown_api_key_handling() -> TestResult {
     println!("=== Test: Unknown API Key Handling ===\n");
 
@@ -112,34 +113,67 @@ pub async fn test_unknown_api_key_handling() -> TestResult {
 
     println!("Step 1: Connected to broker\n");
 
-    // Send request with unknown API key (999)
     let request = raw_frame(999, 0, 77777, &[]);
     stream.write_all(&request).await?;
 
     println!("Step 2: Sent request with unknown API key 999\n");
 
-    // Read response (may be error or connection close)
-    let result = tokio::time::timeout(Duration::from_secs(5), read_raw_response(&mut stream)).await;
-
-    match result {
-        Ok(Ok((corr_id, body))) => {
-            println!("Step 3: Received response with correlation ID: {corr_id}\n");
-
-            // Check for error code in response
-            if body.len() >= 2 {
-                let error_code = i16::from_be_bytes([body[0], body[1]]);
-                println!("✅ Error code in response: {error_code}\n");
-                // UNSUPPORTED_VERSION = 35
-                assert!(error_code != 0, "Unknown API key should return an error");
-            }
-        }
-        Ok(Err(e)) => {
-            println!("✅ Connection error (expected for unknown API): {e}\n");
-        }
-        Err(_) => {
-            println!("✅ Request timed out (acceptable behavior)\n");
-        }
+    let read = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut stream))
+        .await
+        .map_err(|_| "the broker neither answered nor closed the connection within 10 s")??;
+    if let Some(frame) = read {
+        return Err(format!(
+            "expected the connection closed, got a {}-byte frame",
+            frame.len()
+        )
+        .into());
     }
+    println!("✅ Connection closed\n");
+
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Test: an API key that kafka-protocol knows but pg_kafka does not serve (29,
+/// DescribeAcls) is answered with the generic error frame under the request's correlation
+/// id: UNSUPPORTED_VERSION and a null error message. The connection stays usable.
+pub async fn test_unserved_api_key_gets_generic_error_frame() -> TestResult {
+    println!("=== Test: Unserved API Key Gets The Generic Error Frame ===\n");
+
+    let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
+    stream.set_nodelay(true)?;
+
+    // DescribeAcls v1 uses the non-flexible request header v1, which raw_frame writes.
+    // The body is not read: the key is refused before its body is decoded.
+    stream.write_all(&raw_frame(29, 1, 88888, &[])).await?;
+    println!("Step 1: Sent DescribeAcls v1 (API key 29)\n");
+
+    let (correlation_id, body) =
+        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
+    assert_eq!(
+        correlation_id, 88888,
+        "the frame answers the request's correlation id"
+    );
+    let mut expected = crate::error_codes::UNSUPPORTED_VERSION
+        .to_be_bytes()
+        .to_vec();
+    expected.extend_from_slice(&(-1i16).to_be_bytes());
+    assert_eq!(
+        body, expected,
+        "UNSUPPORTED_VERSION and a null error message"
+    );
+    println!("✅ Generic error frame received\n");
+
+    stream.write_all(&raw_frame(18, 0, 88889, &[])).await?;
+    let (correlation_id, body) =
+        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
+    assert_eq!(correlation_id, 88889);
+    assert_eq!(
+        body.get(..2),
+        Some(&[0u8, 0][..]),
+        "ApiVersions succeeds afterwards"
+    );
+    println!("✅ Connection still serves requests\n");
 
     println!("✅ Test PASSED\n");
     Ok(())
@@ -310,6 +344,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_api_versions_negotiation,
         test_correlation_id_preserved,
         test_unknown_api_key_handling,
+        test_unserved_api_key_gets_generic_error_frame,
         test_protocol_request_pipelining,
         test_response_ordering_with_long_poll: sequential, // timing-sensitive: asserts long-poll wait duration
     ]

@@ -483,3 +483,74 @@ pub async fn test_config_api_answers_match_kafka() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Kafka 3.7 (`ConfigAdminManager.preprocess`) answers a resource that names one config key
+/// twice INVALID_REQUEST "Error due to duplicate config keys" and applies none of it, and
+/// it checks that, and a SET without a value, before it looks the topic up: a malformed
+/// resource for an unknown topic is INVALID_REQUEST, not UNKNOWN_TOPIC_OR_PARTITION.
+pub async fn test_incremental_alter_configs_duplicate_keys() -> TestResult {
+    const OP_DELETE: i8 = 1;
+    println!("=== Test: IncrementalAlterConfigs duplicate config keys ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::topic_with_partitions(&ctx, "configs-dup", 1).await?;
+    let missing = ctx.unique_topic("configs-dup-missing").await;
+    let config = |op: i8, value: Option<&str>| {
+        AlterableConfig::default()
+            .with_name(StrBytes::from_static_str("retention.ms"))
+            .with_config_operation(op)
+            .with_value(value.map(|v| StrBytes::from_string(v.to_string())))
+    };
+    let resource = |name: &str, configs: Vec<AlterableConfig>| {
+        AlterConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_TOPIC)
+            .with_resource_name(StrBytes::from_string(name.to_string()))
+            .with_configs(configs)
+    };
+
+    println!("Step 1: SET then DELETE retention.ms in one resource of an existing topic...");
+    let (code, message) = alter_topic_config(&topic, "retention.ms", OP_SET, Some("5000")).await?;
+    assert_eq!(code, error_codes::NONE, "{message:?}");
+    let request = IncrementalAlterConfigsRequest::default().with_resources(vec![resource(
+        &topic,
+        vec![config(OP_SET, Some("1000")), config(OP_DELETE, None)],
+    )]);
+    let response = call(0, 7004, &request).await?;
+    let r = &response.responses[0];
+    assert_eq!(r.error_code, error_codes::INVALID_REQUEST, "{r:?}");
+    assert_eq!(
+        r.error_message.as_deref(),
+        Some("Error due to duplicate config keys")
+    );
+    assert_eq!(
+        db_topic_retention(ctx.db(), &topic).await?,
+        Some(5000),
+        "nothing of the refused resource is applied"
+    );
+    println!("✅ Duplicate keys refused, retention.ms unchanged\n");
+
+    println!("Step 2: duplicate keys and a null SET for an unknown topic...");
+    for (configs, expected) in [
+        (
+            vec![config(OP_SET, Some("1")), config(OP_SET, Some("2"))],
+            "Error due to duplicate config keys",
+        ),
+        (
+            vec![config(OP_SET, None)],
+            "Null value not supported for : retention.ms",
+        ),
+    ] {
+        let request = IncrementalAlterConfigsRequest::default()
+            .with_resources(vec![resource(&missing, configs)]);
+        let response = call(0, 7005, &request).await?;
+        let r = &response.responses[0];
+        assert_eq!(r.error_code, error_codes::INVALID_REQUEST, "{r:?}");
+        assert_eq!(r.error_message.as_deref(), Some(expected));
+    }
+    let (code, _) = alter_topic_config(&missing, "retention.ms", OP_SET, Some("1")).await?;
+    assert_eq!(code, error_codes::UNKNOWN_TOPIC_OR_PARTITION);
+    println!("✅ Malformed resources refused before the topic lookup\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

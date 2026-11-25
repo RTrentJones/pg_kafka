@@ -233,6 +233,13 @@ pg_kafka.compression_type = 'gzip'
   older than the producer's current one is INVALID_PRODUCER_EPOCH on every partition.
   Kafka compares the epoch with the producer's state on the batch's partition only and
   accepts an older epoch on a partition where the producer has no state.
+- **Deviation:** a producer id that a transactional id owns takes no epoch it presents
+  itself: any batch of it, transactional or not, at an epoch other than its current one is
+  INVALID_PRODUCER_EPOCH, a higher epoch too (its epoch moves only with InitProducerId).
+  Kafka 3.7 (`ProducerAppendInfo.checkProducerEpoch`) refuses only a lower epoch, and
+  accepts a non-transactional batch at a higher one as the producer's new epoch. The one
+  exception is a partition its open transaction has written to, where a higher epoch is
+  answered as Kafka answers it (§4).
 - Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**
@@ -267,8 +274,10 @@ pg_kafka.compression_type = 'gzip'
   refuses the other producer's batch there on its own, 49, where Kafka answers 3); and a non-transactional batch of a producer whose open transaction has written
   to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
   request, after the epoch and sequence checks (one at a bumped epoch must start at
-  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch; a
-  partition the transaction only added takes it, committed). **Deviation:** transactional batches of one producer id at two
+  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch). On a
+  partition the transaction only added, a non-transactional batch at the current epoch is
+  written, committed; one at a bumped epoch is INVALID_PRODUCER_EPOCH (§3: a producer id
+  that a transactional id owns takes no epoch it presents; Kafka 3.7 writes it). **Deviation:** transactional batches of one producer id at two
   epochs are checked per epoch (the current epoch's written, the other refused); Kafka
   verifies all of them with the epoch of whichever partition its request map yields first,
   so it refuses or accepts them all. AddPartitionsToTxn,
@@ -635,7 +644,11 @@ honored; producer CreateTime timestamps are preserved).
   last offset of that record's batch (KAFKA-16310, fixed in later releases)
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
-  (`read_committed`: the LSO) is offset -1; aborted records are never a match
+  (`read_committed`: the LSO) is offset -1
+- ⚠️ **Deviation:** aborted records are never a match of a timestamp or MAX_TIMESTAMP
+  lookup, at either isolation level; the answer is the next record that matches. Kafka 3.7
+  (`FileRecords.searchForTimestamp`, `LogSegment.findOffsetByTimestamp`) searches the batches
+  without a transactional filter, so it can answer an aborted record's offset and timestamp.
 - ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION
 
 ## Metadata API Deviations
@@ -676,7 +689,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 **Technical Details:**
 - Uses `murmur2` crate with `KAFKA_SEED` for hash compatibility with Kafka
 - When partition_index == -1, server computes: `murmur2(key) % partition_count`
-- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all; clients always pick the partition).
+- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all and answers every -1 entry so; clients always pick the partition). So is a plain -1 batch in a topic of the request that also has an idempotent or transactional batch: its records would join that batch's partition and be written under its producer state (sequence-checked as part of it, or pending in its transaction). A routed batch is answered on the partitions it was written to, not on -1.
 
 ### 12. Null Key Partition Routing (Minor Deviation)
 
@@ -705,7 +718,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 - **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
-- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted. A SET, APPEND or SUBTRACT without a value is INVALID_REQUEST (42) whatever the key, checked first, as in Kafka 3.7.
+- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted. A resource that names one key twice is INVALID_REQUEST (42) "Error due to duplicate config keys", and then a SET, APPEND or SUBTRACT without a value is INVALID_REQUEST whatever the key; both are checked first, before the resource type and the topic lookup (an unknown topic is then INVALID_REQUEST, not UNKNOWN_TOPIC_OR_PARTITION), and nothing of the resource is applied, as in Kafka 3.7.
 - **DescribeConfigs config types** are Kafka 3.7's: `retention.ms` LONG (5), `cleanup.policy` LIST (7).
 - **AlterConfigs (33)** is not implemented.
 - **Repeated entries follow Kafka 3.7** (checked against a 3.7 broker). OffsetCommit, TxnOffsetCommit, DeleteRecords, OffsetFetch and Fetch act on a partition the request names more than once a single time, with its last entry, and answer it once, under one entry per distinct topic; ListOffsets answers every entry of a repeated partition INVALID_REQUEST; DeleteTopics and CreatePartitions answer a repeated name with one INVALID_REQUEST "Duplicate topic name." entry; IncrementalAlterConfigs answers every entry of a repeated resource INVALID_REQUEST "Each resource must appear at most once."; DeleteGroups deletes and answers a repeated group once; DescribeConfigs and AddPartitionsToTxn answer every entry. Whatever a request repeats, its topics (and, for DescribeGroups/DeleteGroups, its groups' committed offsets) are looked up in one statement, so a small request cannot hold the DB thread, which serves every client, for one round trip per entry. Remaining difference: entries are answered in the order first named; Kafka answers merged entries in no particular order.

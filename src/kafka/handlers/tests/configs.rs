@@ -218,12 +218,17 @@ fn test_handle_incremental_alter_configs_rejections() {
             (
                 RESOURCE_TYPE_TOPIC,
                 "v".to_string(),
-                // Valid SET followed by an invalid APPEND: the valid one
+                // Valid SET followed by an unsupported key: the valid one
                 // must NOT be applied (all-or-nothing per resource).
                 vec![
                     ("retention.ms".to_string(), OP_SET, Some("1000".to_string())),
-                    ("retention.ms".to_string(), OP_APPEND, Some("1".to_string())),
+                    ("segment.ms".to_string(), OP_SET, Some("1".to_string())),
                 ],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "w".to_string(),
+                vec![("retention.ms".to_string(), OP_APPEND, Some("1".to_string()))],
             ),
         ],
         false,
@@ -439,6 +444,122 @@ fn test_handle_incremental_alter_configs_null_value_is_invalid_request() {
             ERROR_INVALID_REQUEST,
             ERROR_INVALID_REQUEST,
             ERROR_NONE
+        ]
+    );
+}
+
+/// Kafka 3.7 (`ConfigAdminManager.preprocess`) refuses a resource that names one config
+/// key twice, INVALID_REQUEST "Error due to duplicate config keys", and applies none of
+/// its alterations (a SET then a DELETE of retention.ms leaves it as it is).
+#[test]
+fn test_handle_incremental_alter_configs_duplicate_keys_are_invalid_request() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
+    // Only the resource without a repeated key is applied.
+    mock.expect_set_topic_retention_ms()
+        .withf(|_, ms| *ms == Some(5))
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let set = |ms: &str| ("retention.ms".to_string(), OP_SET, Some(ms.to_string()));
+    let delete = ("retention.ms".to_string(), OP_DELETE, None);
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            (
+                RESOURCE_TYPE_TOPIC,
+                "a".to_string(),
+                vec![set("1000"), delete.clone()],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "b".to_string(),
+                vec![set("1"), set("2")],
+            ),
+            (RESOURCE_TYPE_TOPIC, "c".to_string(), vec![set("5")]),
+        ],
+        false,
+    )
+    .unwrap();
+    let answers: Vec<(i16, Option<&str>)> = response
+        .responses
+        .iter()
+        .map(|r| (r.error_code, r.error_message.as_deref()))
+        .collect();
+    assert_eq!(
+        answers[..2],
+        [
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+        ]
+    );
+    assert_eq!(answers[2].0, ERROR_NONE);
+}
+
+/// Kafka 3.7 checks repeated keys and missing values before it looks the topic up, so a
+/// malformed resource naming an unknown topic is INVALID_REQUEST, not
+/// UNKNOWN_TOPIC_OR_PARTITION; a well-formed one is UNKNOWN_TOPIC_OR_PARTITION. The null
+/// message names every key without a value.
+#[test]
+fn test_handle_incremental_alter_configs_malformed_before_topic_lookup() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(None));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let set =
+        |name: &str, value: Option<&str>| (name.to_string(), OP_SET, value.map(str::to_string));
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            (
+                RESOURCE_TYPE_TOPIC,
+                "dup".to_string(),
+                vec![
+                    set("retention.ms", Some("1")),
+                    set("retention.ms", Some("2")),
+                ],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "null".to_string(),
+                vec![set("retention.ms", None), set("segment.ms", None)],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "plain".to_string(),
+                vec![set("retention.ms", Some("1"))],
+            ),
+        ],
+        false,
+    )
+    .unwrap();
+    let answers: Vec<(i16, Option<&str>)> = response
+        .responses
+        .iter()
+        .map(|r| (r.error_code, r.error_message.as_deref()))
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Null value not supported for : retention.ms, segment.ms")
+            ),
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                Some("Unknown topic 'plain'")
+            ),
         ]
     );
 }

@@ -115,7 +115,7 @@ cancels the run in progress for the same ref. The workflow file is the reference
 |-----|------|
 | `Lint & Format` | `cargo fmt --check` and `cargo clippy --all-targets -D warnings` for both crates (pg14); the QA-1 coverage-policy check |
 | `Test Suite` | Unit tests with coverage (`cargo llvm-cov --lib --features pg14`), uploaded to Codecov; property tests |
-| `Build kafka_test` | Builds the E2E runner once for the E2E jobs |
+| `Build kafka_test` | Builds the E2E runner once for the E2E jobs and runs kafka_test's own unit tests (`cargo test --lib --bin kafka_test`; those that need a database are `#[ignore]`d) |
 | `E2E pgN` (14-18) | Clippy and unit/property tests on that major, installs the extension into PostgreSQL N (apt.postgresql.org), starts it with `scripts/ci-pg.sh`, runs the functional E2E suite, `scripts/check-upgrade.sh` and the generated-GUC-docs check; pg14 also runs the shadow (against `docker compose`'s `external-kafka`) and performance categories and the test-count docs check; pg18 ends with `scripts/postmaster-death-check.sh` (SIGKILL the postmaster, the listener must exit, the cluster must restart) |
 | `Interop (Java clients, differential vs Kafka)` | `interop/run-java-checks.sh` and `interop/diff/run.py` against a reference Apache Kafka 3.7 |
 | `Security Audit` | `cargo audit` and `cargo deny check` for both crates (stable toolchain) |

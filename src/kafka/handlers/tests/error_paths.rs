@@ -32,7 +32,6 @@ type AlterResource = (i8, String, Vec<(String, i8, Option<String>)>);
 
 const RESOURCE_TYPE_TOPIC: i8 = 2;
 const OP_SET: i8 = 0;
-const OP_DELETE: i8 = 1;
 
 fn boom() -> KafkaError {
     KafkaError::database("boom")
@@ -736,65 +735,6 @@ fn incremental_alter_configs_write_failure_does_not_stop_later_resources() {
 
     assert_eq!(resp.responses[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
     assert_eq!(resp.responses[1].error_code, ERROR_NONE);
-}
-
-/// Several alterations of one resource are applied as ONE write of the final
-/// value, so a resource cannot end up half-applied.
-#[test]
-fn incremental_alter_configs_applies_a_resource_with_one_write() {
-    let mut store = MockKafkaStore::new();
-    expect_topics(&mut store, |_| Ok(Some((4, 1))));
-    store
-        .expect_set_topic_retention_ms()
-        .with(eq(4), eq(Some(3_000i64)))
-        .times(1)
-        .returning(|_, _| Ok(()));
-
-    let resp = with_ctx(&store, |ctx| {
-        handle_incremental_alter_configs(
-            ctx,
-            vec![(
-                RESOURCE_TYPE_TOPIC,
-                "t".to_string(),
-                vec![
-                    ("retention.ms".to_string(), OP_SET, Some("1000".to_string())),
-                    ("retention.ms".to_string(), OP_DELETE, None),
-                    ("retention.ms".to_string(), OP_SET, Some("3000".to_string())),
-                ],
-            )],
-            false,
-        )
-    })
-    .unwrap();
-    assert_eq!(resp.responses[0].error_code, ERROR_NONE);
-}
-
-#[test]
-fn incremental_alter_configs_last_delete_wins() {
-    let mut store = MockKafkaStore::new();
-    expect_topics(&mut store, |_| Ok(Some((4, 1))));
-    store
-        .expect_set_topic_retention_ms()
-        .with(eq(4), eq(None))
-        .times(1)
-        .returning(|_, _| Ok(()));
-
-    let resp = with_ctx(&store, |ctx| {
-        handle_incremental_alter_configs(
-            ctx,
-            vec![(
-                RESOURCE_TYPE_TOPIC,
-                "t".to_string(),
-                vec![
-                    ("retention.ms".to_string(), OP_SET, Some("1000".to_string())),
-                    ("retention.ms".to_string(), OP_DELETE, None),
-                ],
-            )],
-            false,
-        )
-    })
-    .unwrap();
-    assert_eq!(resp.responses[0].error_code, ERROR_NONE);
 }
 
 /// A resource with no alterations writes nothing and succeeds.
