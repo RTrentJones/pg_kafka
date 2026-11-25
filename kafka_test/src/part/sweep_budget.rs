@@ -1073,8 +1073,9 @@ async fn producer_prune_plan() -> SendResult<()> {
 /// topics against the expired set it is given, not against retention, so a found drop
 /// kept across a raised window dropped the leaf with rows the new window keeps.
 ///
-/// Asserts: with the pass budget at 0, the oldest past leaf holding only rows of a 1 s
-/// topic and the next one rows of an infinite topic (so the next probe goes there), a
+/// Asserts: with the pass budget at 0, the oldest past leaf holding only rows of a
+/// one-day topic (wider than the leaf, so only a whole-leaf drop removes them) and the
+/// next one rows of an infinite topic (so the next probe goes there), a
 /// sweep behind a reader drops nothing; after the topic's retention is made infinite and
 /// the reader ends, the next sweep keeps the leaf and all of its rows.
 pub async fn test_sweep_forgets_a_deferred_drop_when_retention_is_raised() -> TestResult {
@@ -1083,6 +1084,9 @@ pub async fn test_sweep_forgets_a_deferred_drop_when_retention_is_raised() -> Te
 
 /// Rows of the deferred-drop test's topic in its leaf.
 const DEFERRED_ROWS: i64 = 10;
+/// The deferred-drop test's window before it is raised: wider than its one-hour leaf, so
+/// the leaf's rows are not expired row by row, and long past for a leaf before 2000.
+const ONE_DAY_MS: i64 = 86_400_000;
 
 async fn deferred_drop_after_raise() -> SendResult<()> {
     println!("=== Test: a deferred leaf drop is re-checked against raised retention ===\n");
@@ -1090,7 +1094,7 @@ async fn deferred_drop_after_raise() -> SendResult<()> {
     db.batch_execute("SET statement_timeout = '30s'")
         .await
         .map_err(boxed)?;
-    let raised = create_topic(&db, &unique("deferred-raised"), 1000).await?;
+    let raised = create_topic(&db, &unique("deferred-raised"), ONE_DAY_MS).await?;
     let forever = create_topic(&db, &unique("deferred-forever"), -1).await?;
     // Before 2000, so these are the oldest leaves and the first probes reach them.
     let hour: i32 = db
@@ -1102,7 +1106,9 @@ async fn deferred_drop_after_raise() -> SendResult<()> {
     let next = hour_leaf(&db, hour + 1).await?;
     fill_leaf(&db, raised, hour, 0, DEFERRED_ROWS).await?;
     fill_leaf(&db, forever, hour + 1, 0, DEFERRED_ROWS).await?;
-    println!("Step 0: {leaf} holds {DEFERRED_ROWS} rows of a 1 s topic, {next} an infinite one's");
+    println!(
+        "Step 0: {leaf} holds {DEFERRED_ROWS} rows of a one-day topic, {next} an infinite one's"
+    );
 
     let budget = pass_budget(&db, "0").await?;
     let reader = session().await?;
