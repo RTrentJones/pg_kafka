@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 /// Run `f` and return its result with the time the calling thread spent on the CPU.
 ///
 /// Tests that bound an algorithm's cost measure this instead of wall-clock time, which
-/// grows with whatever else the machine runs. On Linux it is the thread's run time from
-/// `/proc/thread-self/schedstat`; elsewhere it falls back to wall-clock time.
+/// grows with whatever else the machine runs. On Unix it is the thread's CPU clock
+/// (`CLOCK_THREAD_CPUTIME_ID`, the clock the decode budget's time limit reads), which is
+/// exact to the nanosecond at every reading; elsewhere it falls back to wall-clock time.
 pub fn cpu_time<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     let before = thread_cpu();
     let started = Instant::now();
@@ -62,9 +63,8 @@ pub fn flat_growth(n: usize, run: impl FnMut(usize)) -> f64 {
 /// stopping early once one is under `enough`.
 ///
 /// Each measurement repeats `run(size)` for at least [`MEASURE_FOR`] and divides the CPU
-/// time by the runs: a single short run can read as no time at all where the thread's CPU
-/// clock only advances at scheduler ticks, and the ratio of two such readings means
-/// nothing.
+/// time by the runs, so a run of a few microseconds is measured over many and one
+/// preemption or cache miss weighs little in the ratio.
 fn growth_under(enough: f64, rounds: usize, n: usize, mut run: impl FnMut(usize)) -> f64 {
     let mut per_run = |size: usize| {
         let mut runs = 0_u32;
@@ -96,14 +96,32 @@ fn growth_under(enough: f64, rounds: usize, n: usize, mut run: impl FnMut(usize)
     smallest
 }
 
-/// How long one [`growth`] measurement repeats its work: many scheduler ticks, so a clock
-/// that only advances at ticks still measures it to within a few percent.
+/// How long one [`growth`] measurement repeats its work.
 const MEASURE_FOR: Duration = Duration::from_millis(40);
 
+/// The CPU time the calling thread has run, or `None` where it cannot be read.
+#[cfg(unix)]
 fn thread_cpu() -> Option<Duration> {
-    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
-    let nanos = stat.split_whitespace().next()?.parse().ok()?;
-    Some(Duration::from_nanos(nanos))
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the duration of the call, which only
+    // writes it; CLOCK_THREAD_CPUTIME_ID needs no other state.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) };
+    if read != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    ))
+}
+
+/// The CPU time the calling thread has run, or `None` where it cannot be read.
+#[cfg(not(unix))]
+fn thread_cpu() -> Option<Duration> {
+    None
 }
 
 /// Answer `store`'s lookups of named topics (`get_topic_metadata(Some(..))`, one statement
