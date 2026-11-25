@@ -519,9 +519,14 @@ pg_kafka.compression_type = 'gzip'
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count
 - ✅ Request-level `max_bytes` (KIP-74): partitions are filled in request order until
-  the response budget is spent; the first partition with data always returns at least
-  one message, later partitions return only what still fits (sizes are estimated as
-  key + value + 64 bytes per record, the same accounting `partition_max_bytes` uses)
+  the response budget is spent, each up to its own `partition_max_bytes`; the first
+  partition with data always returns at least one message, later partitions return only
+  what still fits. Both limits count what a record adds to the response: its key, value and
+  header keys and values uncompressed, plus 64 bytes per record and 10 per header for its
+  framing; the database reads (and holds) no more than that of a partition. Kafka counts
+  the bytes of the record batches as stored, compressed when the producer compressed them,
+  so a compressible topic returns fewer records per Fetch than Kafka would, never more
+  than the limits
 - ✅ Broker-side response cap (`pg_kafka.fetch_max_bytes`, default 55 MiB, Kafka's broker
   `fetch.max.bytes`): a request's `max_bytes` is lowered to it and its `min_bytes` to the
   result, as Kafka 3.7's `KafkaApis.handleFetchRequest` does, so a `max_bytes` of `i32::MAX`
@@ -905,7 +910,8 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
   decodes again once there is, waiting up to 10 s (a Produce: half its `timeout_ms`, at most
   10 s, from when its frame was read; its connection reads nothing meanwhile), after which the
   connection closes, a Produce's too. A Fetch response holds at most the request's `max_bytes`,
-  lowered to `pg_kafka.fetch_max_bytes` (§7); a large response is written from its own buffer,
+  lowered to `pg_kafka.fetch_max_bytes`, of uncompressed record bytes, and its first record
+  whole when that is larger (§7); a large response is written from its own buffer,
   and a connection's read buffer starts small again after a large frame, so neither keeps the
   largest frame's memory for the connection's life (Kafka allocates per receive and send).
   `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited

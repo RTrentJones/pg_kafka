@@ -27,40 +27,83 @@ const LOG_END_OFFSET_SQL: &str = "SELECT GREATEST(
                    WHERE topic_id = $1 AND partition_id = $2), 0)
      ) AS log_end_offset";
 
+/// A fetch query: the rows of one partition from `$3` in offset order, at most `$4` of
+/// them, each with the running total of the bytes it adds to a Fetch response
+/// (`cumulative_bytes`, see `record_bytes_sql!`); of those, only the rows whose running
+/// total is within `$5` bytes, and the first row whatever its size when `$6` is true. The
+/// cut is made here so that the result set, which SPI holds whole, never holds the rows a
+/// byte budget leaves out. `$filter` is the isolation level's extra condition.
+///
+/// `headers` is cast to text in the outer query, for the rows returned only.
+macro_rules! fetch_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT partition_offset, key, value, headers::text AS headers_json,
+        producer_id, producer_epoch, timestamp_ms, cumulative_bytes
+ FROM (
+   SELECT partition_offset, key, value, headers, producer_id, producer_epoch,
+          CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
+               ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
+          (SUM(",
+            record_bytes_sql!(),
+            ") OVER w)::bigint AS cumulative_bytes,
+          ROW_NUMBER() OVER w AS row_number
+   FROM kafka.messages
+   WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3",
+            $filter,
+            "
+   WINDOW w AS (ORDER BY partition_offset)
+   ORDER BY partition_offset
+   LIMIT $4
+ ) fetched
+ WHERE cumulative_bytes <= $5 OR (row_number = 1 AND $6)
+ ORDER BY partition_offset"
+        )
+    };
+}
+
+/// The bytes one stored row adds to a Fetch response, as SQL over its columns: the
+/// uncompressed lengths of its key, value and header keys and values (`octet_length`
+/// reads a bytea's raw length from its TOAST header without decompressing it; the stored
+/// header value is hex, two characters a byte), plus 64 bytes per record and 10 per header
+/// for the record's framing (its length, attributes, deltas and varint lengths are at most
+/// 31 bytes, a header's two lengths at most 10; the rest is its share of a batch header). Stored (compressed) sizes
+/// would let a highly compressible record count as a small fraction of what the response
+/// and the DB thread hold of it, and headers would not count at all. Rows written before
+/// headers were stored as an ordered array hold a `{key: hex}` object; `{}` is a record
+/// without headers. The Fetch handler's `message_size_estimate` counts the same.
+macro_rules! record_bytes_sql {
+    () => {
+        "COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 64
+            + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
+                   WHEN jsonb_typeof(headers) = 'array' THEN
+                     (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                          + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
+                      FROM jsonb_array_elements(headers) h)
+                   ELSE
+                     (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
+                      FROM jsonb_each_text(headers) e(k, v))
+              END"
+    };
+}
+
 /// Fetch of committed records (ReadCommitted). RV-4: besides filtering uncommitted
 /// rows it stops below the last stable offset: a committed record above a still-open
 /// lower-offset transaction must not be returned, or the consumer moves past the
 /// pending offset and never re-reads it. With nothing pending the COALESCE default
 /// makes the bound a no-op.
-const FETCH_COMMITTED_SQL: &str =
-    "SELECT partition_offset, key, value, headers::text AS headers_json,
-        producer_id, producer_epoch,
-        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
-             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
-        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-            OVER (ORDER BY partition_offset) AS cumulative_bytes
- FROM kafka.messages
- WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-   AND txn_state IS NULL
-   AND partition_offset < COALESCE(
-       (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
-        WHERE m2.topic_id = $1 AND m2.partition_id = $2
-          AND m2.txn_state = 'pending'),
-       partition_offset + 1)
- ORDER BY partition_offset
- LIMIT $4";
+const FETCH_COMMITTED_SQL: &str = fetch_sql!(
+    "
+     AND txn_state IS NULL
+     AND partition_offset < COALESCE(
+         (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
+          WHERE m2.topic_id = $1 AND m2.partition_id = $2
+            AND m2.txn_state = 'pending'),
+         partition_offset + 1)"
+);
 
 /// Fetch of every record (ReadUncommitted).
-const FETCH_ALL_SQL: &str = "SELECT partition_offset, key, value, headers::text AS headers_json,
-        producer_id, producer_epoch,
-        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
-             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
-        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-            OVER (ORDER BY partition_offset) AS cumulative_bytes
- FROM kafka.messages
- WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
- ORDER BY partition_offset
- LIMIT $4";
+const FETCH_ALL_SQL: &str = fetch_sql!("");
 
 /// Rough size of one stored message, to turn a byte budget into a row LIMIT.
 const ESTIMATE_BYTES_PER_MESSAGE: i64 = 500;
@@ -241,11 +284,13 @@ impl PostgresStore {
         }))
     }
 
-    /// Records from `fetch_offset` on, up to about `max_bytes` (always at least one
-    /// record, as Kafka does), for either isolation level (DR-24). Each query is
-    /// bounded to [`MAX_ROWS_PER_QUERY`] rows so a pass never holds a huge result set;
-    /// the loop runs until the byte budget is spent or the partition has no more rows
-    /// (DR-9). Sizes come from `pg_column_size()` in a window function (ADR-002).
+    /// Records from `fetch_offset` on, up to `max_bytes` of what they add to the response
+    /// (always at least one record, as Kafka does), for either isolation level (DR-24).
+    /// Each query is bounded to [`MAX_ROWS_PER_QUERY`] rows and returns only the rows within
+    /// what is left of the budget, so neither a pass nor its result set holds more than the
+    /// budget (and the one first record); the loop runs until the budget is spent or the
+    /// partition has no more rows (DR-9). Sizes are the uncompressed key, value and header
+    /// lengths, summed by a window function (`record_bytes_sql!`, ADR-002).
     fn fetch_records_filtered(
         topic_id: i32,
         partition_id: i32,
@@ -275,27 +320,30 @@ impl PostgresStore {
                 let table = select_cached(
                     client,
                     query,
-                    &[INT4OID, INT4OID, INT8OID, INT8OID],
+                    &[
+                        INT4OID,
+                        INT4OID,
+                        INT8OID,
+                        INT8OID,
+                        INT8OID,
+                        PgBuiltInOids::BOOLOID,
+                    ],
                     &[
                         topic_id.into(),
                         partition_id.into(),
                         next_offset.into(),
                         limit.into(),
+                        remaining.into(),
+                        messages.is_empty().into(),
                     ],
                 )?;
+                // The query leaves out every row past the budget: fewer rows than the
+                // limit means the budget is spent or the partition has no more rows.
                 let row_count = i64::try_from(table.len()).unwrap_or(i64::MAX);
-                let batch_base = consumed;
-                let mut budget_hit = false;
 
                 for row in table {
                     // cumulative_bytes restarts per query; add the running total.
                     let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
-                    let total = batch_base + batch_cumulative;
-                    if !messages.is_empty() && total > budget {
-                        budget_hit = true;
-                        break;
-                    }
-
                     let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                     let headers_json: Option<String> = row.get_by_name("headers_json")?;
                     messages.push(FetchedMessage {
@@ -308,11 +356,10 @@ impl PostgresStore {
                         producer_epoch: row.get_by_name("producer_epoch")?,
                     });
                     next_offset = partition_offset + 1;
-                    consumed = total;
+                    consumed = budget - remaining + batch_cumulative;
                 }
 
-                // A short batch means no more matching rows past next_offset.
-                if budget_hit || row_count < limit {
+                if row_count < limit {
                     break;
                 }
             }

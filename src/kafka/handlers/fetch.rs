@@ -46,14 +46,28 @@ pub fn handle_fetch(
     handle_fetch_with_max_bytes(ctx, topic_data, isolation_level, i32::MAX)
 }
 
-/// Per-message size estimate used for the response-level `max_bytes` budget. Matches
-/// the storage layer's own byte accounting (key + value + 64 bytes of overhead).
+/// The bytes one record adds to a Fetch response, the size both byte limits
+/// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
+/// value and header keys and values, 64 bytes per record and 10 per header for its framing.
+/// Matches the storage layer's own accounting (`record_bytes_sql!` in
+/// `storage/postgres/log.rs`), so storage and this handler cut a partition at the same
+/// record.
 pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
-    let len = |b: Option<&Vec<u8>>| b.map_or(0, |b| i64::try_from(b.len()).unwrap_or(i64::MAX));
-    len(msg.key.as_ref())
-        .saturating_add(len(msg.value.as_ref()))
-        .saturating_add(64)
+    let len = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let headers = msg.headers.iter().fold(0i64, |sum, (k, v)| {
+        sum.saturating_add(len(k.len()))
+            .saturating_add(len(v.len()))
+            .saturating_add(HEADER_OVERHEAD)
+    });
+    len(msg.key.as_ref().map_or(0, Vec::len))
+        .saturating_add(len(msg.value.as_ref().map_or(0, Vec::len)))
+        .saturating_add(RECORD_OVERHEAD)
+        .saturating_add(headers)
 }
+
+/// The framing bytes [`message_size_estimate`] counts per record and per header.
+const RECORD_OVERHEAD: i64 = 64;
+const HEADER_OVERHEAD: i64 = 10;
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
 /// records for it. `remaining` is what is left of the request-level `max_bytes`;
@@ -74,12 +88,14 @@ pub(crate) fn partition_fetch_limit(
     Some(i32::try_from(limit).unwrap_or(partition_max_bytes))
 }
 
-/// Drop trailing messages that overflow the remaining response budget. The first
-/// message is always kept when no earlier partition returned records (see
-/// [`partition_fetch_limit`]). Returns the kept messages and their estimated size.
+/// Drop trailing messages past `limit`, the partition's own limit: its
+/// `partition_max_bytes` within what is left of the request-level `max_bytes` (see
+/// [`partition_fetch_limit`]). The first message is kept whatever its size when no earlier
+/// partition returned records, as Kafka returns the first record batch of the first
+/// partition with data. Returns the kept messages and their estimated size.
 pub(crate) fn trim_to_response_budget(
     messages: Vec<FetchedMessage>,
-    remaining: i64,
+    limit: i64,
     returned_any: bool,
 ) -> (Vec<FetchedMessage>, i64) {
     let mut kept = Vec::with_capacity(messages.len());
@@ -87,7 +103,7 @@ pub(crate) fn trim_to_response_budget(
     for msg in messages {
         let size = message_size_estimate(&msg);
         let first_of_response = !returned_any && kept.is_empty();
-        if !first_of_response && used + size > remaining {
+        if !first_of_response && used + size > limit {
             break;
         }
         used += size;
@@ -485,7 +501,7 @@ fn read_partition(
     };
     let storage_empty = fetched.is_empty();
     let (db_records, used) =
-        trim_to_response_budget(fetched, budget.remaining, budget.returned_any);
+        trim_to_response_budget(fetched, i64::from(limit), budget.returned_any);
     budget.remaining -= used;
     budget.returned_any |= !db_records.is_empty();
 
@@ -892,6 +908,57 @@ mod tests {
         assert!(!parts[0].records.as_ref().unwrap().is_empty());
         assert_eq!(parts[1].error_code, ERROR_NONE);
         assert_eq!(parts[1].high_watermark, 3);
+        assert!(parts[1].records.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn size_estimate_counts_headers() {
+        let mut m = msg(0, 10);
+        m.headers = vec![("trace".to_string(), vec![0; 100_000])];
+        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10);
+        m.headers.push((String::new(), vec![]));
+        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10 + 10);
+    }
+
+    /// Records a store returns past a partition's `partition_max_bytes` are dropped even when
+    /// the request-level budget has room, and after the first partition with data a record
+    /// larger than its partition's limit is not returned at all; header bytes count.
+    #[test]
+    fn each_partition_is_trimmed_to_its_partition_max_bytes() {
+        let mut mock = mock_with_two_partitions();
+        let with_headers = |offset| {
+            let mut m = msg(offset, 0);
+            m.headers = vec![("h".to_string(), vec![0; 400])];
+            m
+        };
+        mock.expect_fetch_records_with_isolation()
+            .times(2)
+            .returning(move |_, partition, _, _, _| {
+                Ok(if partition == 0 {
+                    (0..10).map(|o| msg(o, 400)).collect()
+                } else {
+                    (0..10).map(with_headers).collect()
+                })
+            });
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut request = two_partition_request();
+        request[0].partitions[0].partition_max_bytes = 1000;
+        request[0].partitions[1].partition_max_bytes = 400;
+
+        let response = handle_fetch_with_max_bytes(
+            &ctx,
+            request,
+            IsolationLevel::ReadUncommitted,
+            1 << 20,
+        )
+        .unwrap();
+        let parts = &response.responses[0].partitions;
+        let mut records = parts[0].records.clone().unwrap();
+        let batches = RecordBatchDecoder::decode_all(&mut records).unwrap();
+        // 464 bytes a record: two fit 1000.
+        assert_eq!(batches.iter().map(|b| b.records.len()).sum::<usize>(), 2);
+        // 475 bytes a record (its header counts), over partition 1's 400.
         assert!(parts[1].records.as_ref().unwrap().is_empty());
     }
 
