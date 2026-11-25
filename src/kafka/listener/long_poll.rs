@@ -28,7 +28,8 @@ use super::dispatch::send_with_backpressure;
 use super::response_budget::ReplyCharge;
 use crate::kafka::api::{FetchRequestData, RequestBody, RequestHeader, ResponseBody};
 use crate::kafka::constants::API_KEY_FETCH;
-use crate::kafka::messages::{KafkaRequest, KafkaResponse, PartitionFetchData};
+use crate::kafka::handlers::merge_by_partition;
+use crate::kafka::messages::{KafkaRequest, KafkaResponse, PartitionFetchData, TopicFetchData};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
 use crate::kafka::protocol::DecodedCharge;
 use crate::kafka::storage::IsolationLevel;
@@ -71,9 +72,14 @@ pub(super) struct LongPoll {
 
 impl LongPoll {
     /// The long poll of one Fetch request; `request_tx` is the worker's main lane.
+    ///
+    /// A repeated topic-partition is merged into one entry, its last, as the Fetch handler
+    /// reads it (Kafka's fetch data is a map by partition): the long poll registers, sends
+    /// and checks each distinct partition once. Cost: O(bytes of the request's topics)
+    /// time, O(distinct partitions) memory.
     pub(super) fn new(
         header: RequestHeader,
-        fetch: FetchRequestData,
+        mut fetch: FetchRequestData,
         request_tx: Sender<KafkaRequest>,
         response_tx: UnboundedSender<KafkaResponse>,
     ) -> Self {
@@ -81,6 +87,15 @@ impl LongPoll {
             "Fetch request with long polling: max_wait_ms={}, min_bytes={}, isolation_level={}",
             fetch.max_wait_ms, fetch.min_bytes, fetch.isolation_level
         );
+        fetch.topic_data = merge_by_partition(
+            std::mem::take(&mut fetch.topic_data)
+                .into_iter()
+                .map(|t| (t.name, t.partitions)),
+            |p| p.partition_index,
+        )
+        .into_iter()
+        .map(|(name, partitions)| TopicFetchData { name, partitions })
+        .collect();
         LongPoll {
             header,
             fetch,
@@ -110,27 +125,37 @@ impl LongPoll {
         let read_committed =
             IsolationLevel::from_i8(self.fetch.isolation_level) == IsolationLevel::ReadCommitted;
 
-        // Registered topic by topic: the registry holds and hashes a name once per topic.
+        // `new` merged repeated partitions, so each is registered once.
         let notify = std::sync::Arc::new(Notify::new());
-        for topic in &self.fetch.topic_data {
-            let partitions = topic
-                .partitions
-                .iter()
-                .map(|p| (p.partition_index, p.fetch_offset));
-            registry
-                .register(&topic.name, partitions, &notify, read_committed)
-                .await;
-        }
+        let topics = || self.fetch.topic_data.iter();
+        let id = registry
+            .register(
+                topics().map(|t| {
+                    let partitions = t.partitions.iter();
+                    (
+                        t.name.as_str(),
+                        partitions.map(|p| (p.partition_index, p.fetch_offset)),
+                    )
+                }),
+                &notify,
+                read_committed,
+            )
+            .await;
 
         let result = self
             .fetch_until_done(read_committed, &notify, deadline, poll_interval, reply)
             .await;
 
         // Always drop the registrations, whatever the outcome.
-        for topic in &self.fetch.topic_data {
-            let partitions = topic.partitions.iter().map(|p| p.partition_index);
-            registry.unregister(&topic.name, partitions, &notify).await;
-        }
+        registry
+            .unregister(
+                id,
+                topics().map(|t| {
+                    let partitions = t.partitions.iter();
+                    (t.name.as_str(), partitions.map(|p| p.partition_index))
+                }),
+            )
+            .await;
         result
     }
 
@@ -268,7 +293,7 @@ fn available_bytes(
     let ResponseBody::Fetch(response) = &response.body else {
         return 0;
     };
-    // A repeated partition is read once, at its last entry (see the Fetch handler).
+    // `LongPoll::new` merged repeated partitions, as the Fetch handler does.
     let requested: HashMap<(&str, i32), &PartitionFetchData> = fetch
         .topic_data
         .iter()
@@ -343,7 +368,6 @@ fn response_has_partition_error(response: &KafkaResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -566,6 +590,78 @@ mod tests {
             }
         });
         served_out
+    }
+
+    /// A long poll of one partition named 50,000 times (plus a second topic entry naming it
+    /// again, at a later offset) registers it once and sends it to the DB thread once, at its
+    /// last entry's offset.
+    #[tokio::test]
+    async fn a_repeated_partition_is_registered_and_fetched_once() {
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+        let registry = Arc::new(PendingFetchRegistry::new());
+        let reg = registry.clone();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                match request_rx.try_recv() {
+                    Ok(KafkaRequest {
+                        body: RequestBody::Fetch(fetch),
+                        response_tx,
+                        ..
+                    }) => {
+                        let sent: Vec<(String, Vec<(i32, i64)>)> = fetch
+                            .topic_data
+                            .iter()
+                            .map(|t| {
+                                let p = t.partitions.iter();
+                                (
+                                    t.name.clone(),
+                                    p.map(|p| (p.partition_index, p.fetch_offset)).collect(),
+                                )
+                            })
+                            .collect();
+                        let _ = seen_tx.send((sent, reg.len().await));
+                        let _ = response_tx.send(fetch_response(false, "t"));
+                    }
+                    Ok(_) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                }
+            }
+        });
+        let entry = |fetch_offset| PartitionFetchData {
+            partition_index: 0,
+            fetch_offset,
+            partition_max_bytes: 1024,
+        };
+        let topics = vec![
+            TopicFetchData {
+                name: "t".to_string(),
+                partitions: (0..50_000).map(entry).collect(),
+            },
+            TopicFetchData {
+                name: "t".to_string(),
+                partitions: vec![entry(70_000)],
+            },
+        ];
+        let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+        let built = long_poll(0, 1, 0, topics, request_tx, final_tx);
+        LongPoll::new(
+            built.header,
+            built.fetch,
+            built.request_tx,
+            built.response_tx,
+        )
+        .run(&registry, Duration::from_millis(10_000), &test_reply())
+        .await
+        .unwrap();
+        let (sent, registered) = seen_rx.recv().await.unwrap();
+        assert_eq!(sent, vec![("t".to_string(), vec![(0, 70_000)])]);
+        assert_eq!(registered, 1, "registrations while the long poll ran");
+        assert!(final_rx.try_recv().is_ok());
+        assert!(registry.is_empty().await);
     }
 
     #[tokio::test]
