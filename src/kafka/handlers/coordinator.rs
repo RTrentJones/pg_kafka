@@ -604,8 +604,8 @@ pub fn handle_describe_groups(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // Whether each group the coordinator does not hold has committed offsets, in one
-    // lookup however many groups the request names.
+    // Whether each group the coordinator does not hold has offsets (committed, or pending in
+    // an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = groups
         .iter()
         .filter(|g| !coordinator_groups.contains_key(*g))
@@ -762,9 +762,9 @@ pub fn handle_list_groups(
             )
         })
         .collect();
-    // Groups known only by their committed offsets are Empty "consumer" groups
-    // (see handle_describe_groups), so `kafka-consumer-groups --list` keeps showing them after a
-    // worker restart.
+    // Groups known only by their offsets (committed, or pending in an open transaction) are
+    // Empty "consumer" groups (see handle_describe_groups), so `kafka-consumer-groups --list`
+    // keeps showing them after a worker restart.
     for group_id in ctx.store.list_offset_groups()? {
         if !coordinator_groups.contains_key(&group_id) {
             listed.push((group_id, "consumer".to_string(), "Empty"));

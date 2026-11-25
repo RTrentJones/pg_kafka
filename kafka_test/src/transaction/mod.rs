@@ -60,5 +60,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_end_txn_of_an_empty_transaction_is_invalid_txn_state,
         kafka_parity::test_txn_offset_commit_metadata_longer_than_4096_is_refused,
         kafka_parity::test_read_uncommitted_fetch_reports_the_last_stable_offset,
+        kafka_parity::test_delete_groups_drops_pending_txn_offsets,
     ]
 }

@@ -125,6 +125,14 @@ impl PostgresStore {
                 None,
                 &[group_id.into()],
             )?;
+            // The group's pending transactional offsets go with it, as Kafka 3.7 drops
+            // them with the group: otherwise the open transaction's commit would copy them
+            // into consumer_offsets and bring the deleted group back.
+            client.update(
+                "DELETE FROM kafka.txn_pending_offsets WHERE group_id = $1",
+                None,
+                &[group_id.into()],
+            )?;
 
             crate::pg_debug!("Deleted consumer offsets for group '{}'", group_id);
             Ok(())
@@ -132,11 +140,14 @@ impl PostgresStore {
         .map_err(internal("delete_consumer_group_offsets"))
     }
 
-    /// Every group with a committed offset, sorted.
+    /// Every group with a committed offset or a pending transactional offset, sorted.
     pub(super) fn list_offset_groups() -> Result<Vec<String>> {
         Spi::connect(|client| {
             let table = client.select(
-                "SELECT DISTINCT group_id FROM kafka.consumer_offsets ORDER BY group_id",
+                "SELECT group_id FROM kafka.consumer_offsets
+                 UNION
+                 SELECT group_id FROM kafka.txn_pending_offsets
+                 ORDER BY group_id",
                 None,
                 &[],
             )?;
@@ -157,7 +168,9 @@ impl PostgresStore {
         }
         Spi::connect(|client| {
             let table = client.select(
-                "SELECT DISTINCT group_id FROM kafka.consumer_offsets
+                "SELECT group_id FROM kafka.consumer_offsets WHERE group_id = ANY($1::text[])
+                 UNION
+                 SELECT group_id FROM kafka.txn_pending_offsets
                  WHERE group_id = ANY($1::text[])",
                 None,
                 &[group_ids.to_vec().into()],

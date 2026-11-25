@@ -434,8 +434,8 @@ pub fn handle_delete_groups(
     let store = ctx.store;
     let coordinator = ctx.coordinator;
     let mut results = Vec::new();
-    // Which of the groups the coordinator does not hold have committed offsets, in one
-    // lookup however many groups the request names.
+    // Which of the groups the coordinator does not hold have offsets (committed, or pending
+    // in an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = group_names
         .iter()
         .filter(|g| !coordinator.has_group(g))
@@ -477,9 +477,11 @@ pub fn handle_delete_groups(
                 }
             }
             None => {
-                // A group the coordinator does not hold exists only through its
-                // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
-                // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
+                // A group the coordinator does not hold exists only through its offsets,
+                // committed or pending in an open transaction (an Empty group, as
+                // DescribeGroups/ListGroups report it; Kafka 3.7's TxnOffsetCommit creates
+                // the group). Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka
+                // answers.
                 match &with_offsets {
                     Ok(groups) if !groups.contains(&group_name) => {
                         result.error_code = ERROR_GROUP_ID_NOT_FOUND;

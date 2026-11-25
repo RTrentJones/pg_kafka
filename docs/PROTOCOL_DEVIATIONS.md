@@ -441,7 +441,12 @@ pg_kafka.compression_type = 'gzip'
   ListGroups and DescribeGroups as Empty groups with protocol type "consumer", so
   `kafka-consumer-groups --list/--describe` shows them with offsets and lag. (Kafka keeps the
   group's actual protocol type; an offsets-only group here is always "consumer", which also
-  covers groups that only ever committed as simple consumers, for which Kafka reports "".)
+  covers groups that only ever committed as simple consumers, for which Kafka reports "".) A
+  group with only a pending transactional offset (a TxnOffsetCommit whose transaction is still
+  open, which in Kafka 3.7 creates the group) is such a group too, for DeleteGroups as well:
+  deleting it, or any group, also drops its pending transactional offsets, so the
+  transaction's commit stores none for it, as in Kafka. (When that transaction aborts, such a
+  group is gone at once; Kafka keeps it Empty until its ~10-minute offsets cleanup.)
 - Resource bounds (deviation: Kafka's `group.max.size` defaults to unlimited and it has no
   group-count cap): `pg_kafka.group_max_size` (default 1000) members per group, beyond which a
   new member gets GROUP_MAX_SIZE_REACHED; `pg_kafka.max_consumer_groups` (default 100000) groups

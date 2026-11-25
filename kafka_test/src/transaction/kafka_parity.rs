@@ -174,3 +174,131 @@ pub async fn test_read_uncommitted_fetch_reports_the_last_stable_offset() -> Tes
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The group state ListGroups (v4) and DescribeGroups report for `group`:
+/// `(listed state, described error, described state)`.
+async fn group_state(
+    w: &mut Wire,
+    group: &str,
+) -> Result<(Option<String>, i16, String), Box<dyn std::error::Error>> {
+    use kafka_protocol::messages::describe_groups_request::DescribeGroupsRequest;
+    use kafka_protocol::messages::describe_groups_response::DescribeGroupsResponse;
+    use kafka_protocol::messages::list_groups_request::ListGroupsRequest;
+    use kafka_protocol::messages::list_groups_response::ListGroupsResponse;
+    let listed: ListGroupsResponse = w.call(4, &ListGroupsRequest::default()).await?;
+    let listed = listed
+        .groups
+        .iter()
+        .find(|g| g.group_id.as_str() == group)
+        .map(|g| g.group_state.to_string());
+    let mut req = DescribeGroupsRequest::default();
+    req.groups = vec![GroupId(s(group))];
+    let described: DescribeGroupsResponse = w.call(5, &req).await?;
+    let d = &described.groups[0];
+    Ok((listed, d.error_code, d.group_state.to_string()))
+}
+
+/// DeleteGroups v2 of one group: its error code.
+async fn delete_group(w: &mut Wire, group: &str) -> Result<i16, Box<dyn std::error::Error>> {
+    use kafka_protocol::messages::delete_groups_request::DeleteGroupsRequest;
+    use kafka_protocol::messages::delete_groups_response::DeleteGroupsResponse;
+    let mut req = DeleteGroupsRequest::default();
+    req.groups_names = vec![GroupId(s(group))];
+    let resp: DeleteGroupsResponse = w.call(2, &req).await?;
+    Ok(resp.results[0].error_code)
+}
+
+/// A simple-consumer OffsetCommit v8 (generation -1) of one partition.
+async fn commit_offset(
+    w: &mut Wire,
+    group: &str,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<i16, Box<dyn std::error::Error>> {
+    use kafka_protocol::messages::offset_commit_request::{
+        OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+    };
+    use kafka_protocol::messages::offset_commit_response::OffsetCommitResponse;
+    let mut p = OffsetCommitRequestPartition::default();
+    p.partition_index = partition;
+    p.committed_offset = offset;
+    let mut t = OffsetCommitRequestTopic::default();
+    t.name = TopicName(s(topic));
+    t.partitions = vec![p];
+    let mut req = OffsetCommitRequest::default();
+    req.group_id = GroupId(s(group));
+    req.generation_id_or_member_epoch = -1;
+    req.topics = vec![t];
+    let resp: OffsetCommitResponse = w.call(8, &req).await?;
+    Ok(resp.topics[0].partitions[0].error_code)
+}
+
+/// DeleteGroups of a group with a pending transactional offset commit, as Kafka 3.7
+/// answers it: a TxnOffsetCommit makes the group exist (Empty, in ListGroups and
+/// DescribeGroups) even without a committed offset, so DeleteGroups deletes it (NONE),
+/// and with it the pending offsets: the transaction's commit then leaves the deleted
+/// group without offsets (OffsetFetch -1), with or without an earlier committed offset.
+pub async fn test_delete_groups_drops_pending_txn_offsets() -> TestResult {
+    println!("=== Test: DeleteGroups drops the group's pending transactional offsets ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-delete-pending", 2).await?;
+    let mut w = Wire::connect().await?;
+
+    for committed_before in [false, true] {
+        let id = format!("txn-delete-pending-{}", Uuid::new_v4());
+        let group = format!("txn-delete-pending-g-{}", Uuid::new_v4());
+        if committed_before {
+            assert_eq!(
+                commit_offset(&mut w, &group, &t, 1, 1).await?,
+                error_codes::NONE
+            );
+        }
+        let (err, pid, epoch) = w.init_producer_id(Some(&id), 60_000).await?;
+        assert_eq!(err, error_codes::NONE);
+        assert_eq!(
+            w.add_offsets(&id, pid, epoch, &group).await?,
+            error_codes::NONE
+        );
+        assert_eq!(
+            w.txn_offset_commit(&id, pid, epoch, &group, &t, 0, 5)
+                .await?,
+            error_codes::NONE
+        );
+        println!("Step: committed_before={committed_before}: the group with a pending offset...");
+        let (listed, described_err, described) = group_state(&mut w, &group).await?;
+        assert_eq!(
+            (listed.as_deref(), described_err, described.as_str()),
+            (Some("Empty"), error_codes::NONE, "Empty"),
+            "a group with a pending transactional offset exists, Empty, as in Kafka 3.7"
+        );
+        assert_eq!(
+            delete_group(&mut w, &group).await?,
+            error_codes::NONE,
+            "DeleteGroups deletes it"
+        );
+        let pending: i64 = ctx
+            .db()
+            .query_one(
+                "SELECT COUNT(*) FROM kafka.txn_pending_offsets WHERE group_id = $1",
+                &[&group],
+            )
+            .await?
+            .get(0);
+        assert_eq!(pending, 0, "the group's pending offsets go with it");
+        assert_eq!(w.end_txn(&id, pid, epoch, true).await?, error_codes::NONE);
+        let (err, parts) = w.offset_fetch(&group, &t, &[0, 1], true).await?;
+        assert_eq!(err, error_codes::NONE);
+        assert_eq!(
+            parts,
+            vec![(0, -1, error_codes::NONE), (1, -1, error_codes::NONE)],
+            "the commit leaves the deleted group without offsets"
+        );
+        let (listed, _, _) = group_state(&mut w, &group).await?;
+        assert_eq!(listed, None, "the deleted group is not listed");
+        println!("✅ Deleted with its pending offset; nothing committed for it\n");
+    }
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
