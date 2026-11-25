@@ -349,9 +349,11 @@ ATTACH as a leaf of `idx_messages_txn_pending`, each a full read of the new copy
 the attach's bound check, the BRIN, `idx_messages_txn_aborted`,
 `idx_messages_txn_pending_producer` and `idx_messages_timestamp` builds). The legacy leaf is then retained and dropped like any past leaf.
 The views that read the table are recreated on the parent. A new binary
-running before the update (docs/UPGRADING.md step 2) detects the missing partitioning and
-skips partition maintenance; its retention sweep expires rows row by row on the
-unpartitioned table. `scripts/check-upgrade.sh` compares
+running before the update (docs/UPGRADING.md step 2) detects the older schema and runs no
+maintenance at all (no partition maintenance, no retention sweep, no transaction timeouts):
+it answers every request with KAFKA_STORAGE_ERROR and re-checks the schema every 500 ms until
+the update commits. Only `pg_kafka_run_retention_sweep()` called from SQL in that window expires
+rows, row by row on the unpartitioned table. `scripts/check-upgrade.sh` compares
 the upgraded and fresh schemas with leaves normalized (each leaf's index set and grants must be
 identical; leaf names and counts are data-dependent), then checks that maintenance works on both,
 that the legacy leaf drops whole without losing the sequence, and that `pg_dump` emits no kafka
