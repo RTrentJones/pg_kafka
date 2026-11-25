@@ -71,12 +71,14 @@ impl RetentionSweepStats {
 }
 
 /// A leaf of kafka.messages as the sweep sees it: the pure-planning view plus its
-/// bounds as SQL text. The bounds travel back into SQL as text: same session, same
-/// DateStyle, so the timestamptz round-trips exactly (to the microsecond).
+/// bounds as timestamptz datums, which go back into SQL unchanged. Never as text: a
+/// timestamptz printed under DateStyle SQL, Postgres or German carries a zone
+/// abbreviation that reads back through `timezone_abbreviations`, not TimeZone, so it
+/// can come back hours away from the bound (IST as +02:00 instead of +05:30).
 struct Leaf {
     partition: TimePartition,
-    lower_txt: Option<String>,
-    upper_txt: Option<String>,
+    lower: Option<TimestampWithTimeZone>,
+    upper: Option<TimestampWithTimeZone>,
 }
 
 /// What one batch of row deletes removes from its leaf.
@@ -554,14 +556,14 @@ fn default_leaf_has_rows(client: &SpiClient<'_>, partitioned: bool) -> Result<bo
 fn list_leaves(client: &SpiClient<'_>, partitioned: bool) -> Result<Vec<Leaf>> {
     let sql = if partitioned {
         "SELECT partition_oid::bigint AS oid, partition_name, is_default,
-                lower_bound::text AS lower_txt, upper_bound::text AS upper_txt,
+                lower_bound, upper_bound,
                 (EXTRACT(EPOCH FROM lower_bound) * 1000)::bigint AS lower_ms,
                 (EXTRACT(EPOCH FROM upper_bound) * 1000)::bigint AS upper_ms
          FROM kafka.message_partitions()
          ORDER BY lower_bound NULLS FIRST, upper_bound"
     } else {
         "SELECT 0::bigint AS oid, 'messages'::text AS partition_name, true AS is_default,
-                NULL::text AS lower_txt, NULL::text AS upper_txt,
+                NULL::timestamptz AS lower_bound, NULL::timestamptz AS upper_bound,
                 NULL::bigint AS lower_ms, NULL::bigint AS upper_ms"
     };
     let mut leaves = Vec::new();
@@ -577,8 +579,8 @@ fn list_leaves(client: &SpiClient<'_>, partitioned: bool) -> Result<Vec<Leaf>> {
                 upper_ms: row.get_by_name("upper_ms")?,
                 is_default: row.get_by_name("is_default")?.unwrap_or(false),
             },
-            lower_txt: row.get_by_name("lower_txt")?,
-            upper_txt: row.get_by_name("upper_txt")?,
+            lower: row.get_by_name("lower_bound")?,
+            upper: row.get_by_name("upper_bound")?,
         });
     }
     Ok(leaves)
@@ -714,8 +716,8 @@ fn empty_leaves(client: &SpiClient<'_>, candidates: &[&Leaf]) -> Result<Vec<u32>
         .iter()
         .map(|l| i64::from(l.partition.oid))
         .collect();
-    let lowers: Vec<Option<String>> = candidates.iter().map(|l| l.lower_txt.clone()).collect();
-    let uppers: Vec<Option<String>> = candidates.iter().map(|l| l.upper_txt.clone()).collect();
+    let lowers: Vec<Option<TimestampWithTimeZone>> = candidates.iter().map(|l| l.lower).collect();
+    let uppers: Vec<Option<TimestampWithTimeZone>> = candidates.iter().map(|l| l.upper).collect();
     let mut empty = Vec::new();
     for row in client.select(
         // LATERAL ... LIMIT 1, not NOT EXISTS: the planner turns NOT EXISTS into a
@@ -723,11 +725,11 @@ fn empty_leaves(client: &SpiClient<'_>, candidates: &[&Leaf]) -> Result<Vec<u32>
         // whose rescans prune the Append to the one leaf (run-time pruning) and stop
         // at its first row.
         "SELECT l.oid
-         FROM unnest($1::int8[], $2::text[], $3::text[]) AS l(oid, lo, up)
+         FROM unnest($1::int8[], $2::timestamptz[], $3::timestamptz[]) AS l(oid, lo, up)
          LEFT JOIN LATERAL (
              SELECT true AS found FROM kafka.messages m
-             WHERE m.created_at >= COALESCE(l.lo::timestamptz, '-infinity')
-               AND m.created_at < COALESCE(l.up::timestamptz, 'infinity')
+             WHERE m.created_at >= COALESCE(l.lo, '-infinity')
+               AND m.created_at < COALESCE(l.up, 'infinity')
                AND m.tableoid = l.oid::oid
              LIMIT 1) e ON true
          WHERE e.found IS NULL",
@@ -908,19 +910,19 @@ fn delete_batch(
             )?
         }
         DeleteTarget::Leaf(leaf) => {
-            let lower = leaf.and_then(|l| l.lower_txt.clone());
-            let upper = leaf.and_then(|l| l.upper_txt.clone());
+            let lower = leaf.and_then(|l| l.lower);
+            let upper = leaf.and_then(|l| l.upper);
             let oid = leaf.map_or(0, |l| i64::from(l.partition.oid));
             client.update(
                 &format!(
                     "DELETE FROM kafka.messages
-                     WHERE created_at >= COALESCE($4::text::timestamptz, '-infinity')
-                       AND created_at < COALESCE($5::text::timestamptz, 'infinity')
+                     WHERE created_at >= COALESCE($4::timestamptz, '-infinity')
+                       AND created_at < COALESCE($5::timestamptz, 'infinity')
                        AND tableoid = $6::bigint::oid
                        AND ctid = ANY (ARRAY(
                            SELECT m.ctid FROM kafka.messages m
-                           WHERE m.created_at >= COALESCE($4::text::timestamptz, '-infinity')
-                             AND m.created_at < COALESCE($5::text::timestamptz, 'infinity')
+                           WHERE m.created_at >= COALESCE($4::timestamptz, '-infinity')
+                             AND m.created_at < COALESCE($5::timestamptz, 'infinity')
                              AND m.tableoid = $6::bigint::oid
                              AND {predicate}
                            LIMIT $3))

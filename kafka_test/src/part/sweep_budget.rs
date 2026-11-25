@@ -46,7 +46,7 @@ impl Drop for StopOnDrop {
 
 /// Create the one-hour leaf starting `hour` hours after 2000-01-01 (a year no other
 /// test's leaves use, so these are the oldest leaves) and return its name.
-async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
+pub(super) async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
     db.query_one(
         "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
          FROM (SELECT timestamptz '2000-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
@@ -66,7 +66,7 @@ async fn hour_leaf(db: &Client, hour: i32) -> SendResult<String> {
 }
 
 /// `rows` committed rows of `topic_id` in the leaf of `hour`, from `first_offset`.
-async fn fill_leaf(
+pub(super) async fn fill_leaf(
     db: &Client,
     topic_id: i32,
     hour: i32,
@@ -94,7 +94,7 @@ async fn leaf_exists(db: &Client, leaf: &str) -> SendResult<bool> {
         .get(0))
 }
 
-async fn create_topic(db: &Client, name: &str, retention_ms: i64) -> SendResult<i32> {
+pub(super) async fn create_topic(db: &Client, name: &str, retention_ms: i64) -> SendResult<i32> {
     Ok(db
         .query_one(
             "INSERT INTO kafka.topics (name, partitions, retention_ms) VALUES ($1, 1, $2)
