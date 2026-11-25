@@ -70,7 +70,8 @@ async fn run(
     topic_out: &mut Option<i32>,
     leaf_out: &mut Option<String>,
 ) -> SendResult<()> {
-    // Before 2000, so no other test's leaves are there.
+    // An hour of 1999 (20 to 8020 hours before 2000): the other tests that create leaves
+    // there are sequential part tests that drop them, so no other test's leaves are there.
     let hour: i32 = sweeper
         .query_one("SELECT -20 - (random() * 8000)::int", &[])
         .await

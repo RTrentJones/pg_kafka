@@ -98,16 +98,17 @@ async fn ending_reads() -> SendResult<()> {
     Ok(())
 }
 
-/// The leaf the foreign rows live in: an hour of 1999 that nothing else writes to, of a
-/// topic with infinite retention, so no maintenance has a reason to read it and its
-/// statistics count only what the transaction ends read.
-const FOREIGN_LEAF: &str = "messages_p19990601_030000";
+/// The leaf the foreign rows live in: an hour of 1998 that nothing else writes to (the
+/// `part` tests' random leaves are in 1999 and later), of a topic with infinite
+/// retention, so no maintenance has a reason to read it and its statistics count only
+/// what the transaction ends read.
+const FOREIGN_LEAF: &str = "messages_p19980601_030000";
 
 /// Create [`FOREIGN_LEAF`] and return its name, schema-qualified.
 async fn foreign_leaf(db: &Client) -> SendResult<String> {
     db.execute(
-        "SELECT kafka.create_message_partition(timestamptz '1999-06-01 03:00+00',
-                                               timestamptz '1999-06-01 04:00+00')",
+        "SELECT kafka.create_message_partition(timestamptz '1998-06-01 03:00+00',
+                                               timestamptz '1998-06-01 04:00+00')",
         &[],
     )
     .await
@@ -131,7 +132,7 @@ async fn steps(db: &Client, foreign_topic: i32, leaf: &str) -> SendResult<()> {
                                      producer_id, producer_epoch, txn_state, created_at)
          SELECT $1, 0, g, 'v'::bytea, -1 - (g % $3::bigint), 0,
                 CASE WHEN g % 2 = 0 THEN 'pending' END,
-                timestamptz '1999-06-01 03:00+00' + g * INTERVAL '1 millisecond'
+                timestamptz '1998-06-01 03:00+00' + g * INTERVAL '1 millisecond'
          FROM generate_series(0::bigint, 2 * $2::bigint - 1) AS g",
         &[&foreign_topic, &FOREIGN_PENDING, &FOREIGN_PRODUCERS],
     )
