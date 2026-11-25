@@ -220,9 +220,11 @@ gucs! {
           uncompressed key, value and header bytes plus 84 bytes per record and 10 per \
           header for its framing, or the encoded size of the record batches when \
           pg_kafka.compression_type encodes them larger. It is also each connection's budget for responses not yet written: past it the connection reads no \
-          further request until its client reads. Default: 57671680 (55 MiB). Reloadable via \
-          SIGHUP: the cap applies to requests read after the reload, the budget to \
-          connections opened after it.",
+          further request until its client reads. It also bounds a DescribeGroups response: \
+          a group whose description would take the response past it is answered \
+          COORDINATOR_NOT_AVAILABLE (retriable), except the first group described. Default: \
+          57671680 (55 MiB). Reloadable via SIGHUP: the caps apply to requests read after \
+          the reload, the budget to connections opened after it.",
         context: Sighup,
         range: (MIN_FETCH_MAX_BYTES, i32::MAX),
     }
@@ -524,6 +526,18 @@ pub fn shadow_outbox_settings() -> crate::kafka::shadow::outbox::OutboxSettings 
         metrics_enabled: SHADOW_METRICS_ENABLED.get(),
         sync_timeout_ms: u64::try_from(SHADOW_SYNC_TIMEOUT_MS.get()).unwrap_or(0),
     }
+}
+
+/// `pg_kafka.fetch_max_bytes` read on the DB thread: also the bound of the responses whose
+/// size grows with server-side state rather than with the request (DescribeGroups), as it is
+/// each connection's budget for responses not yet written. Unit tests (no backend, many
+/// threads) see the default.
+pub fn response_max_bytes() -> usize {
+    #[cfg(not(test))]
+    let bytes = FETCH_MAX_BYTES.get();
+    #[cfg(test)]
+    let bytes = DEFAULT_FETCH_MAX_BYTES;
+    usize::try_from(bytes.max(MIN_FETCH_MAX_BYTES)).unwrap_or(usize::MAX)
 }
 
 /// A snapshot of the pg_kafka GUCs the worker and the network thread read
