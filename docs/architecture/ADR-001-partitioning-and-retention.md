@@ -252,10 +252,13 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   timeout) and a later pass moves the rows. Trying the schema lock while holding the tables
   waits for nothing, so it cannot close a cycle. The upgrade scripts take the same lock
   first. No other path waits for the schema lock after a table lock.
-* **Sweeps and partition maintenance never overlap.** A retention sweep deletes rows first
-  (the aborted-row cleanup, then the expired rows), which leaves its transaction holding
-  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves last,
-  which needs `ACCESS EXCLUSIVE` there. Two sweeps interleaving those steps form a lock cycle
+* **Sweeps and partition maintenance never overlap.** A retention sweep both deletes rows
+  (the aborted-row cleanup, the expired rows), which leaves its transaction holding
+  `ROW EXCLUSIVE` on `kafka.messages` and the row locks of its deletes, and drops leaves,
+  which needs `ACCESS EXCLUSIVE` there, in one transaction and in either order: the drop step
+  is the fourth of the pass's eight steps, after the first deletes, and the budget-driven
+  second phase can run more deletes after a drop, while the transaction still holds that
+  `ACCESS EXCLUSIVE`. Two sweeps interleaving those steps form a lock cycle
   (one waits for `ACCESS EXCLUSIVE` behind the other's `ROW EXCLUSIVE`, the other waits for
   the first's deleted rows or for the maintenance lock) and Postgres aborts one with
   `deadlock detected`. So every sweep takes the partition-maintenance advisory lock
