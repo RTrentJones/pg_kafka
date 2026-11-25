@@ -230,6 +230,7 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_sync_forward_skips_rolled_back_request` | A sync-mode Produce whose request rolls back (a test trigger raises on its second partition) leaves no copy on the external broker; a clean produce afterwards is still delivered |
 | `test_shadow_forward_throughput` | 20 000 records forwarded end to end at ≥ 2000 msg/s with no failed attempts (pipelined forwarder) |
 | `test_shadow_forwards_headers_and_timestamps` | Record headers (in order, binary values) and the producer's CreateTime reach the external topic |
+| `test_shadow_forwards_a_header_key_holding_nul` | A record whose header keys hold U+0000 (`"a\0b"`, `"\0"`) is forwarded with its headers byte for byte, and the forwarder keeps forwarding: the next record of its topic and one of another shadow topic are delivered |
 | `test_shadow_order_preserved_across_a_retried_failure` | An external topic rejects the batch holding an oversized record until its `max.message.bytes` is raised; nothing after the failed record is delivered before its retry and the external order equals the local order |
 | `test_shadow_order_preserved_across_a_delivery_timeout` | With the external broker paused and records enqueued at staggered times (`pg_kafka.test_shadow_delivery_timeout_ms`), the first records' delivery timeout does not let later records overtake them once the broker resumes |
 | `test_shadow_sync_stall_is_bounded_to_its_own_response` | External cluster unreachable: a sync produce is held ~`shadow_sync_timeout_ms` (3 s) while produces to another topic stay < 1 s |
@@ -252,6 +253,8 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_shadow_dead_letters_follow_the_retry_cap` | Dead letters follow `pg_kafka.shadow_max_retries` as it is raised and lowered, and a replay forwards them again |
 | `test_shadow_failure_acks_make_dead_letters` | Failure acks that reach the retry cap flag their rows dead; raising the cap revives them, and they are forwarded once the external topic takes them |
 | `test_shadow_lag_view_is_per_partition` | `kafka.shadow_partition_status` / `kafka.shadow_status` report lag, dead letters and in-flight counts per partition (needs no external Kafka; runs in the shadow job with the rest of the category) |
+| `test_shadow_acks_from_a_dropped_schema_are_ignored` | Acks of forwards dispatched before DROP EXTENSION + CREATE EXTENSION (held back by `pg_kafka.test_forward_ack_delay_ms`) do not finalize the re-created schema's outbox rows that reuse their keys |
+| `test_shadow_teardown_turns_shadow_mode_off` | The category's teardown, registered last: resets the settings its tests leave (shadow mode on, the test broker, a 2 s reload interval) and fails unless the server reports each at its default, so later categories and runs do not run with shadow mode on |
 
 ## Running Tests
 
