@@ -72,16 +72,21 @@ macro_rules! fetch_sql {
 /// The bytes one stored row adds to a Fetch response, as SQL over its columns: the
 /// uncompressed lengths of its key, value and header keys and values (`octet_length`
 /// reads a bytea's raw length from its TOAST header without decompressing it; the stored
-/// header value is hex, two characters a byte), plus 64 bytes per record and 10 per header
-/// for the record's framing (its length, attributes, deltas and varint lengths are at most
-/// 31 bytes, a header's two lengths at most 10; the rest is its share of a batch header). Stored (compressed) sizes
+/// header value is hex, two characters a byte), plus 84 bytes per record and 10 per header
+/// for the record's framing in an uncompressed RecordBatch: a header's two varint lengths are
+/// at most 10 bytes, and a record alone in its batch (a run of one producer's consecutive
+/// offsets is one batch, so read_committed skipping aborted offsets or alternating producers
+/// make lone records) takes the whole 61-byte batch header plus at most 23 bytes of its own
+/// (length, key, value and header-count varints of at most 5 bytes, attributes and two zero
+/// deltas of one); a record that shares its batch takes at most 31 of its own plus half the
+/// batch header or less. So the count is never under what the record adds. Stored (compressed) sizes
 /// would let a highly compressible record count as a small fraction of what the response
 /// and the DB thread hold of it, and headers would not count at all. Rows written before
 /// headers were stored as an ordered array hold a `{key: hex}` object; `{}` is a record
 /// without headers. The Fetch handler's `message_size_estimate` counts the same.
 macro_rules! record_bytes_sql {
     () => {
-        "COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 64
+        "COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 84
             + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
                    WHEN jsonb_typeof(headers) = 'array' THEN
                      (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)

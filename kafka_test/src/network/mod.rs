@@ -177,6 +177,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         fetch_bounds::test_long_poll_min_bytes_counts_each_partition_up_to_its_limit: sequential,
         fetch_bounds::test_pipelined_responses_stay_within_the_connection_budget: sequential,
         fetch_bounds::test_fetch_reads_no_first_record_a_partition_cannot_return: sequential,
+        fetch_bounds::test_fetch_limits_count_records_alone_in_their_batch: sequential,
         hostile_clients::test_pipelined_requests_are_not_delayed_by_nagle: sequential,
         hostile_clients::test_acks0_produce_error_closes_connection: sequential,
         hostile_clients::test_invalid_acks_rejected_and_nothing_written: sequential,

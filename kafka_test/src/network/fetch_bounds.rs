@@ -27,11 +27,11 @@ const METADATA: usize = 128;
 const FETCHES: i32 = 30;
 
 /// What one record of no key adds to a Fetch response, as the broker counts it: value and
-/// header bytes uncompressed, 64 bytes a record and 10 a header (the records here have at
+/// header bytes uncompressed, 84 bytes a record and 10 a header (the records here have at
 /// most one).
 fn record_bytes(value: usize, header_bytes: usize) -> usize {
     value
-        + 64
+        + 84
         + if header_bytes > 0 {
             header_bytes + 10
         } else {
@@ -587,6 +587,84 @@ pub async fn test_fetch_reads_no_first_record_a_partition_cannot_return() -> Tes
          {small_first:?}: the later partitions read their first records although they cannot \
          return them"
     );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Records of [`test_fetch_limits_count_records_alone_in_their_batch`].
+const LONE_RECORDS: i64 = 400;
+/// The value of each of them.
+const LONE_VALUE: usize = 10;
+
+/// A record alone in its RecordBatch carries the whole 61-byte batch header besides its own
+/// framing: here records whose neighbours were deleted (as aborted-row cleanup deletes them),
+/// so no two returned offsets are consecutive. Each record of 10 bytes takes 78 bytes of the
+/// response, and the byte limits counted 74 (10 plus 64 a record), so a Fetch returned more
+/// than its `partition_max_bytes` and its `max_bytes`. Now a record counts 84 bytes besides
+/// its key, value and headers, what one alone in its batch takes at most, and the records
+/// returned fit both limits.
+pub async fn test_fetch_limits_count_records_alone_in_their_batch() -> TestResult {
+    println!("=== Test: Fetch limits count records alone in their batch ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("net-fetch-lone").await;
+    let created = create_topics_raw(vec![creatable(&topic, 1, 1)]).await?;
+    assert_eq!(created[0].error_code, 0, "{created:?}");
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    let value = [b'v'; LONE_VALUE];
+    let records: Vec<_> = (0..LONE_RECORDS)
+        .map(|offset| {
+            let mut r = plain_record(offset, None, &value);
+            // One batch: offset - sequence is the same for every record.
+            r.sequence = i32::try_from(offset).unwrap_or(0) - 1;
+            r
+        })
+        .collect();
+    produce_batch(&mut s, 1, &topic, encode(&records, Compression::None)).await?;
+    let deleted = ctx
+        .db()
+        .execute(
+            "DELETE FROM kafka.messages m USING kafka.topics t \
+             WHERE t.id = m.topic_id AND t.name = $1 AND m.partition_offset % 2 = 1",
+            &[&topic],
+        )
+        .await?;
+    assert_eq!(i64::try_from(deleted)?, LONE_RECORDS / 2);
+    println!(
+        "Step 1: {LONE_RECORDS} records of {LONE_VALUE} bytes, every second one deleted: each \
+         left is alone in its batch"
+    );
+
+    let limit: i32 = 74 * 100;
+    for (corr, (max_bytes, partition_max)) in [(i32::MAX, limit), (limit, i32::MAX)]
+        .into_iter()
+        .enumerate()
+    {
+        let req = fetch_with_limits(&topic, 0, max_bytes, partition_max);
+        s.write_all(&request_frame(4, i32::try_from(corr)? + 2, &req))
+            .await?;
+        let frame = read_frame_within(&mut s, Duration::from_secs(30))
+            .await?
+            .ok_or("closed on fetch")?;
+        let (_, resp) = decode_response::<FetchRequest>(4, &frame)?;
+        let partition = &resp.responses[0].partitions[0];
+        assert_eq!(partition.error_code, 0);
+        let mut records = partition.records.clone().unwrap_or_default();
+        let bytes = records.len();
+        let sets = RecordBatchDecoder::decode_all(&mut records)?;
+        let count: usize = sets.iter().map(|set| set.records.len()).sum();
+        println!(
+            "Step {}: max_bytes {max_bytes}, partition_max_bytes {partition_max}: {count} \
+             records in {} batches, {bytes} bytes",
+            corr + 2,
+            sets.len()
+        );
+        assert!(count > 1, "{count} records returned");
+        assert!(
+            usize::try_from(limit).is_ok_and(|limit| bytes <= limit),
+            "{bytes} bytes of records returned for a limit of {limit}"
+        );
+    }
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

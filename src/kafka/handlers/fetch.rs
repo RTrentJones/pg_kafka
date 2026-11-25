@@ -48,7 +48,8 @@ pub fn handle_fetch(
 
 /// The bytes one record adds to a Fetch response, the size both byte limits
 /// (`partition_max_bytes` and the request-level `max_bytes`) count: the uncompressed key,
-/// value and header keys and values, 64 bytes per record and 10 per header for its framing.
+/// value and header keys and values, 84 bytes per record and 10 per header for its framing
+/// (what a record alone in its RecordBatch adds at most, see [`RECORD_OVERHEAD`]).
 /// Matches the storage layer's own accounting (`record_bytes_sql!` in
 /// `storage/postgres/log.rs`), so storage and this handler cut a partition at the same
 /// record.
@@ -65,8 +66,16 @@ pub(crate) fn message_size_estimate(msg: &FetchedMessage) -> i64 {
         .saturating_add(headers)
 }
 
-/// The framing bytes [`message_size_estimate`] counts per record and per header.
-const RECORD_OVERHEAD: i64 = 64;
+/// The framing bytes [`message_size_estimate`] counts per record and per header, upper
+/// bounds of what an uncompressed RecordBatch v2 spends on them. A record alone in its batch
+/// (each run of one producer's consecutive offsets is a batch: read_committed skipping
+/// aborted offsets, or alternating producers, leave records alone) carries the whole 61-byte
+/// batch header ([`BATCH_HEADER_LEN`]) and at most 23 bytes of its own: its length, key and
+/// value length and header count varints (at most 5 bytes each), attributes, and timestamp
+/// and offset deltas of 0 (1 byte each). A record sharing its batch takes at most 31 bytes of
+/// its own (both deltas up to 5) and at most half the header. A header's key and value
+/// lengths are two varints of at most 5 bytes.
+const RECORD_OVERHEAD: i64 = 61 + 23;
 const HEADER_OVERHEAD: i64 = 10;
 
 /// The byte limit to pass to storage for one partition, or `None` to return no
@@ -822,11 +831,60 @@ mod tests {
     #[test]
     fn size_estimate_counts_key_value_and_overhead() {
         let mut m = msg(0, 10);
-        assert_eq!(message_size_estimate(&m), 74);
+        assert_eq!(message_size_estimate(&m), 94);
         m.key = Some(vec![1, 2, 3]);
-        assert_eq!(message_size_estimate(&m), 77);
+        assert_eq!(message_size_estimate(&m), 97);
         m.value = None;
-        assert_eq!(message_size_estimate(&m), 67);
+        assert_eq!(message_size_estimate(&m), 87);
+    }
+
+    /// The estimate is never under what a record adds to the response, alone in its batch
+    /// (the most it can add) or sharing one.
+    #[test]
+    fn size_estimate_covers_the_encoded_record() {
+        let mut lone = Vec::new();
+        for (key, value, headers) in [
+            (None, Some(0), 0),
+            (None, Some(10), 0),
+            (Some(3), None, 0),
+            (Some(100), Some(10_000), 2),
+            (Some(70), Some(1 << 20), 1),
+            (None, None, 0),
+        ] {
+            let mut m = msg(0, 0);
+            m.key = key.map(|n| vec![b'k'; n]);
+            m.value = value.map(|n| vec![b'v'; n]);
+            m.timestamp = 1_700_000_000_000;
+            m.headers = (0..headers)
+                .map(|i| (format!("h{i}"), vec![b'x'; 200]))
+                .collect();
+            lone.push(m);
+        }
+        for m in &lone {
+            let estimate = message_size_estimate(m);
+            let encoded = encode_record_batches(vec![m.clone()], Compression::None).unwrap();
+            assert!(
+                i64::try_from(encoded.len()).unwrap() <= estimate,
+                "a record alone in its batch takes {} bytes, counted {estimate}",
+                encoded.len()
+            );
+        }
+        // Alternating producers: one batch a record.
+        let alternating: Vec<_> = (0..6)
+            .map(|o| {
+                let mut m = msg(o, 10);
+                m.producer_id = (o % 2 == 1).then_some(7);
+                m.producer_epoch = m.producer_id.map(|_| 0);
+                m
+            })
+            .collect();
+        // Consecutive records of no producer: one batch.
+        let shared: Vec<_> = (0..6).map(|o| msg(o, 10)).collect();
+        for records in [alternating, shared] {
+            let estimate: i64 = records.iter().map(message_size_estimate).sum();
+            let encoded = encode_record_batches(records, Compression::None).unwrap();
+            assert!(i64::try_from(encoded.len()).unwrap() <= estimate);
+        }
     }
 
     #[test]
@@ -844,7 +902,7 @@ mod tests {
     fn trim_keeps_first_message_of_response_even_if_oversized() {
         let (kept, used) = trim_to_response_budget(vec![msg(0, 500), msg(1, 10)], 100, false);
         assert_eq!(kept.len(), 1);
-        assert_eq!(used, 564);
+        assert_eq!(used, 584);
     }
 
     #[test]
@@ -853,9 +911,9 @@ mod tests {
         assert!(kept.is_empty());
         assert_eq!(used, 0);
         let (kept, used) =
-            trim_to_response_budget(vec![msg(0, 10), msg(1, 10), msg(2, 10)], 150, true);
+            trim_to_response_budget(vec![msg(0, 10), msg(1, 10), msg(2, 10)], 200, true);
         assert_eq!(kept.len(), 2);
-        assert_eq!(used, 148);
+        assert_eq!(used, 188);
     }
 
     fn two_partition_request() -> Vec<TopicFetchData> {
@@ -925,9 +983,9 @@ mod tests {
     fn size_estimate_counts_headers() {
         let mut m = msg(0, 10);
         m.headers = vec![("trace".to_string(), vec![0; 100_000])];
-        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10);
+        assert_eq!(message_size_estimate(&m), 94 + 5 + 100_000 + 10);
         m.headers.push((String::new(), vec![]));
-        assert_eq!(message_size_estimate(&m), 74 + 5 + 100_000 + 10 + 10);
+        assert_eq!(message_size_estimate(&m), 94 + 5 + 100_000 + 10 + 10);
     }
 
     /// Records a store returns past a partition's `partition_max_bytes` are dropped even when
@@ -969,9 +1027,9 @@ mod tests {
         let parts = &response.responses[0].partitions;
         let mut records = parts[0].records.clone().unwrap();
         let batches = RecordBatchDecoder::decode_all(&mut records).unwrap();
-        // 464 bytes a record: two fit 1000.
+        // 484 bytes a record: two fit 1000.
         assert_eq!(batches.iter().map(|b| b.records.len()).sum::<usize>(), 2);
-        // 475 bytes a record (its header counts), over partition 1's 400.
+        // 495 bytes a record (its header counts), over partition 1's 400.
         assert!(parts[1].records.as_ref().unwrap().is_empty());
     }
 
