@@ -149,14 +149,14 @@ impl LongPoll {
                 debug!("Long poll: client disconnected, abandoning fetch");
                 return Ok(());
             }
-            let charge = tokio::select! {
-                charge = reply.reserve(self.fetch.max_bytes) => charge,
+            let (charge, alone) = tokio::select! {
+                reserved = reply.reserve(self.fetch.max_bytes) => reserved,
                 () = self.response_tx.closed() => {
                     debug!("Long poll: client disconnected while waiting for response room");
                     return Ok(());
                 }
             };
-            let response = self.fetch_once().await?;
+            let response = self.fetch_once(alone).await?;
 
             let available = available_bytes(&response, &self.fetch, read_committed);
             let min_bytes = self.fetch.min_bytes;
@@ -205,8 +205,9 @@ impl LongPoll {
     }
 
     /// One fetch attempt on the worker, without waiting (`max_wait_ms = 0`) and accepting
-    /// any amount of data (`min_bytes = 0`).
-    async fn fetch_once(&self) -> Result<KafkaResponse, LongPollError> {
+    /// any amount of data (`min_bytes = 0`); `alone` is whether its connection held nothing
+    /// else when it reserved its bytes (see `FetchRequestData::whole_first_record`).
+    async fn fetch_once(&self, alone: bool) -> Result<KafkaResponse, LongPollError> {
         let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
         let request = KafkaRequest {
             header: RequestHeader {
@@ -216,6 +217,7 @@ impl LongPoll {
             body: RequestBody::Fetch(FetchRequestData {
                 max_wait_ms: 0,
                 min_bytes: 0,
+                whole_first_record: alone,
                 ..self.fetch.clone()
             }),
             response_tx: attempt_tx,
@@ -375,6 +377,7 @@ mod tests {
                 max_bytes: 1024,
                 isolation_level,
                 topic_data: topics,
+                whole_first_record: true,
             },
             request_tx,
             response_tx,
@@ -444,6 +447,7 @@ mod tests {
                     })
                     .collect(),
             }],
+            whole_first_record: true,
         };
         // Both read to the end: the 61 bytes returned.
         let at_end = response([(8, 8), (5, 5)]);

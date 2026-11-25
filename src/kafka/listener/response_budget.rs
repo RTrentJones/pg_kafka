@@ -5,22 +5,39 @@
 //! `MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION` requests ahead (pipelining); this budget bounds the
 //! response bytes those requests may hold together, whether or not the client reads them:
 //!
-//! * a Fetch reserves its `max_bytes` (at most the budget) before it runs: before the DB thread
-//!   reads its records, or before each attempt of a long poll;
+//! * a Fetch reserves its `max_bytes` (at least one byte, at most the budget) before it runs:
+//!   before the DB thread reads its records, or before each attempt of a long poll. Only a
+//!   Fetch that reserves while the connection holds nothing else and waits for no other
+//!   response (the usual consumer, one Fetch at a time) may return a first record larger than
+//!   its limits, as Kafka returns the first record batch; any other Fetch returns at most its
+//!   `max_bytes` of records;
+//! * the size of any other response is known only once it arrives, so at most
+//!   [`MAX_UNANSWERED`] such requests may wait for their response at once (Heartbeats, whose
+//!   responses are a few bytes, do not count);
 //! * the writer replaces a reservation by the encoded size of the response once it arrives,
 //!   counts every other response the same way, and gives the bytes back once written;
-//! * the reader reads no further request while the connection holds more than the budget.
+//! * the reader reads no further request while the connection holds more than the budget or
+//!   [`MAX_UNANSWERED`] requests wait for their response.
 //!
 //! A reservation that does not fit waits, except for the oldest request whose response is not
 //! written yet (the head): everything before it is on the socket, so it always proceeds, as
 //! Kafka's one response does, and nothing waits on a response that cannot be written. What a
-//! connection holds is therefore at most the budget plus the head's response (and the first
-//! record of a partition that is larger than the request's `max_bytes`, which Kafka returns too).
+//! connection holds is therefore at most the budget, plus the head's reservation, plus the
+//! responses of the at most [`MAX_UNANSWERED`] requests other than Fetch read while it was
+//! within the budget, plus one first record larger than its Fetch's limits. Every Fetch
+//! response also carries its partitions' entries (some 40 bytes each) beside the records its
+//! `max_bytes` counts, as in Kafka.
 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+/// How many requests other than Fetch and Heartbeat may wait for their response at once per
+/// connection (see the module docs): enough for a producer's usual five in-flight requests
+/// and a few more, while a client that pipelines requests with large responses (Metadata of
+/// every topic, say) and reads none holds a few of them, not one per in-flight request.
+pub(super) const MAX_UNANSWERED: usize = 8;
 
 /// One connection's response budget (see the module docs).
 pub(super) struct ResponseBudget {
@@ -34,7 +51,10 @@ pub(super) struct ResponseBudget {
     /// Encoded responses waiting for the socket (the idle rule: a connection whose responses
     /// wait unwritten is waiting for its client).
     ready: AtomicUsize,
-    /// Told whenever bytes are given back or the head moves.
+    /// Requests whose response size is not known before it arrives (any but Fetch and
+    /// Heartbeat) that wait for it.
+    unanswered: AtomicUsize,
+    /// Told whenever bytes are given back, the head moves or a response arrives.
     changed: Notify,
 }
 
@@ -46,6 +66,7 @@ impl ResponseBudget {
             held: Mutex::new(0),
             written: AtomicU64::new(0),
             ready: AtomicUsize::new(0),
+            unanswered: AtomicUsize::new(0),
             changed: Notify::new(),
         })
     }
@@ -60,6 +81,12 @@ impl ResponseBudget {
         self.held() > self.limit
     }
 
+    /// Whether the reader may read another request: the connection holds no more than its
+    /// budget and fewer than [`MAX_UNANSWERED`] requests wait for their response.
+    pub(super) fn may_read(&self) -> bool {
+        !self.over_limit() && self.unanswered.load(Ordering::Acquire) < MAX_UNANSWERED
+    }
+
     /// Whether request `seq` is the head: every response of the requests before it is written.
     fn is_head(&self, seq: u64) -> bool {
         seq <= self.written.load(Ordering::Acquire)
@@ -67,14 +94,18 @@ impl ResponseBudget {
 
     /// Reserve `bytes` (at most the budget) for the response of request `seq`, if they fit or
     /// `seq` is the head.
+    /// A reservation is at least one byte, so a connection that holds nothing has no
+    /// reservation out either.
     pub(super) fn try_reserve(self: &Arc<Self>, seq: u64, bytes: usize) -> Option<ResponseCharge> {
-        let bytes = bytes.min(self.limit);
+        let bytes = bytes.clamp(1, self.limit);
         let mut held = self.held.lock();
         if *held + bytes <= self.limit || self.is_head(seq) {
+            let alone = *held == 0 && self.unanswered.load(Ordering::Acquire) == 0;
             *held += bytes;
             return Some(ResponseCharge {
                 budget: Arc::clone(self),
                 bytes,
+                alone,
             });
         }
         None
@@ -93,17 +124,28 @@ impl ResponseBudget {
         }
     }
 
-    /// Wait until the connection holds no more than its budget.
-    pub(super) async fn under_limit(&self) {
+    /// Wait until [`Self::may_read`].
+    pub(super) async fn readable(&self) {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if !self.over_limit() {
+            if self.may_read() {
                 return;
             }
             changed.await;
         }
+    }
+
+    /// A request whose response size is unknown until it arrives now waits for it.
+    fn awaiting(&self) {
+        self.unanswered.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Such a request's response arrived, or the request will not be answered.
+    fn answered(&self) {
+        self.unanswered.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
     }
 
     /// Count `bytes` of a response that has arrived, whether or not they fit.
@@ -112,6 +154,7 @@ impl ResponseBudget {
         ResponseCharge {
             budget: Arc::clone(self),
             bytes,
+            alone: false,
         }
     }
 
@@ -150,6 +193,9 @@ impl ResponseBudget {
 pub(super) struct ResponseCharge {
     budget: Arc<ResponseBudget>,
     bytes: usize,
+    /// A reservation made while the connection held nothing else and no request waited for a
+    /// response of unknown size.
+    alone: bool,
 }
 
 impl ResponseCharge {
@@ -187,6 +233,25 @@ struct SlotChargeState {
     charge: Option<ResponseCharge>,
     /// The charge is a reservation no response has replaced yet.
     reserved: bool,
+    /// The budget counts the request as waiting for a response of unknown size.
+    awaiting: Option<Arc<ResponseBudget>>,
+}
+
+impl SlotChargeState {
+    /// The request no longer waits for a response of unknown size.
+    fn answered(&mut self) {
+        if let Some(budget) = self.awaiting.take() {
+            budget.answered();
+        }
+    }
+}
+
+impl Drop for SlotChargeState {
+    fn drop(&mut self) {
+        // A request that is never answered (an acks=0 Produce, a closed connection) stops
+        // counting once its slot is gone.
+        self.answered();
+    }
 }
 
 impl SlotCharge {
@@ -202,10 +267,16 @@ impl SlotCharge {
     pub(super) fn arrived(&self, budget: &Arc<ResponseBudget>, bytes: usize) {
         let mut state = self.0.lock();
         let reserved = std::mem::take(&mut state.reserved);
+        let was_awaiting = state.awaiting.is_some();
         match &mut state.charge {
             Some(charge) if reserved => charge.resize(bytes),
             Some(charge) => charge.resize(charge.bytes() + bytes),
             None => state.charge = Some(budget.hold(bytes)),
+        }
+        // Held before the request stops counting as unanswered, so the reader never sees the
+        // response counted by neither.
+        if was_awaiting {
+            state.answered();
         }
     }
 
@@ -241,10 +312,27 @@ impl ReplyCharge {
     }
 
     /// Reserve `max_bytes` for a Fetch response, waiting for room (see [`ResponseBudget`]).
-    pub(super) async fn reserve(&self, max_bytes: i32) -> ResponseCharge {
-        self.budget
+    /// Also returns whether the connection held nothing else when the bytes were reserved
+    /// and no request waited for a response of unknown size: only such a Fetch may return a
+    /// first record larger than its limits, so that record is all the connection holds
+    /// beyond the budget for it.
+    pub(super) async fn reserve(&self, max_bytes: i32) -> (ResponseCharge, bool) {
+        let charge = self
+            .budget
             .reserve(self.seq, usize::try_from(max_bytes).unwrap_or(0))
-            .await
+            .await;
+        let alone = charge.alone;
+        (charge, alone)
+    }
+
+    /// Count the request as waiting for a response whose size is unknown until it arrives
+    /// (anything but a Fetch or a Heartbeat), until it arrives or the slot is gone.
+    pub(super) fn awaits_response(&self) {
+        let mut state = self.slot.0.lock();
+        if state.awaiting.is_none() {
+            self.budget.awaiting();
+            state.awaiting = Some(Arc::clone(&self.budget));
+        }
     }
 
     /// Hand a reservation to the slot just before the response is sent: the writer replaces
@@ -340,13 +428,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_under_limit_waits_for_written_bytes() {
+    async fn test_readable_waits_for_written_bytes() {
         let budget = ResponseBudget::new(100);
         let slot = SlotCharge::default();
         slot.arrived(&budget, 150);
         let wait = tokio::spawn({
             let budget = Arc::clone(&budget);
-            async move { budget.under_limit().await }
+            async move { budget.readable().await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!wait.is_finished());
@@ -355,5 +443,69 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// Requests whose response size is unknown stop the reader at `MAX_UNANSWERED`, however
+    /// little the connection holds, until one is answered: a response arriving or a slot
+    /// dropped unanswered (an acks=0 Produce) gives the place back, and a response counts in
+    /// what is held before its request stops counting as unanswered.
+    #[tokio::test]
+    async fn test_unanswered_requests_stop_the_reader() {
+        let budget = ResponseBudget::new(1 << 20);
+        let replies: Vec<ReplyCharge> = (0..u64::try_from(MAX_UNANSWERED).unwrap())
+            .map(|seq| ReplyCharge::new(Arc::clone(&budget), seq))
+            .collect();
+        for (i, reply) in replies.iter().enumerate() {
+            assert!(budget.may_read(), "{i} unanswered");
+            reply.awaits_response();
+            // Marking twice counts once.
+            reply.awaits_response();
+        }
+        assert!(!budget.may_read());
+        assert_eq!(budget.held(), 0, "nothing is held: only the count stops it");
+        let wait = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.readable().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!wait.is_finished());
+        // The first response arrives: counted, and its request answered.
+        let slot = replies[0].slot();
+        slot.arrived(&budget, 3000);
+        assert_eq!(budget.held(), 3000);
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        // A later response of the same request changes nothing in the count.
+        slot.arrived(&budget, 10);
+        assert!(budget.may_read());
+        replies[1].awaits_response();
+        replies[0].awaits_response();
+        assert!(!budget.may_read(), "marked again, it counts again");
+        // Slots dropped without a response give their places back.
+        drop(slot);
+        let mut replies = replies.into_iter();
+        drop(replies.next());
+        assert!(budget.may_read());
+        drop(replies.collect::<Vec<_>>());
+        assert_eq!(budget.unanswered.load(Ordering::Acquire), 0);
+    }
+
+    /// A reservation reports whether the connection held nothing else and no request
+    /// waited for a response of unknown size; a reservation of no bytes counts one.
+    #[tokio::test]
+    async fn test_a_reservation_reports_whether_it_is_alone() {
+        let budget = ResponseBudget::new(100);
+        let (charge, alone) = ReplyCharge::new(Arc::clone(&budget), 0).reserve(0).await;
+        assert!(alone);
+        assert_eq!(charge.bytes(), 1);
+        let (later, alone) = ReplyCharge::new(Arc::clone(&budget), 1).reserve(10).await;
+        assert!(!alone, "the first reservation is out");
+        drop((charge, later));
+        let waiting = ReplyCharge::new(Arc::clone(&budget), 2);
+        waiting.awaits_response();
+        let (_charge, alone) = ReplyCharge::new(Arc::clone(&budget), 3).reserve(10).await;
+        assert!(!alone, "a request waits for its response");
     }
 }

@@ -36,7 +36,7 @@ use super::is_peer_disconnect;
 use super::response_budget::{ReplyCharge, ResponseBudget};
 use super::sasl::ConnectionAuth;
 use super::writer::{self, ResponseSlot, WriterContext};
-use crate::kafka::api::{RequestBody, ResponseBody};
+use crate::kafka::api::{Lane, RequestBody, ResponseBody};
 use crate::kafka::auth::session::{is_sasl_api, peek_api_key};
 use crate::kafka::constants::{
     MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, MAX_LONG_POLLS_PER_CONNECTION, MAX_REQUEST_SIZE,
@@ -419,13 +419,17 @@ where
                     self.dispatcher.spawn_long_poll(job, reply);
                     Ok(())
                 }
-                Route::Lane(request) => {
+                Route::Lane(mut request) => {
                     // A Fetch reserves its max_bytes of the response budget before the DB
                     // thread reads its records; this connection reads nothing more until it
-                    // has room.
-                    if let RequestBody::Fetch(fetch) = &request.body {
-                        let charge = self.wait_for_room(&reply, fetch.max_bytes).await?;
+                    // has room. Any other response's size is known only once it arrives:
+                    // it counts as unanswered until then (see `response_budget`).
+                    if let RequestBody::Fetch(fetch) = &mut request.body {
+                        let (charge, alone) = self.wait_for_room(&reply, fetch.max_bytes).await?;
+                        fetch.whole_first_record = alone;
                         reply.hold(charge);
+                    } else if request.body.lane() != Lane::Liveness {
+                        reply.awaits_response();
                     }
                     if self.dispatcher.send(request).await {
                         Ok(())
@@ -471,7 +475,7 @@ where
         &mut self,
         reply: &ReplyCharge,
         max_bytes: i32,
-    ) -> Result<super::response_budget::ResponseCharge, Close> {
+    ) -> Result<(super::response_budget::ResponseCharge, bool), Close> {
         loop {
             // The request's own slot is queued: every permit out is a request read and not
             // yet written.
@@ -487,19 +491,20 @@ where
         }
     }
 
-    /// Wait for an in-flight slot, and for the unwritten responses to hold no more than the
-    /// response budget, before reading the next frame. A client that pipelines without
+    /// Wait for an in-flight slot, for the unwritten responses to hold no more than the
+    /// response budget and for fewer than `MAX_UNANSWERED` requests to wait for a response of
+    /// unknown size, before reading the next frame. A client that pipelines without
     /// reading its responses is bound here by the pre-auth deadline while unauthenticated,
     /// and by the idle timeout once its responses wait for it to read them.
     async fn acquire_slot(&mut self) -> Result<OwnedSemaphorePermit, Close> {
         let permit = self.acquire_in_flight().await?;
         let pre_auth = !self.auth.sasl.admits(-1);
-        while self.budget.over_limit() {
+        while !self.budget.may_read() {
             let wake = self.idle_wake(tokio::time::Instant::now(), self.outstanding(), false)?;
             tokio::select! {
                 biased;
                 _ = &mut self.writer_gone => return Err(Close::WriterGone),
-                () = self.budget.under_limit() => {}
+                () = self.budget.readable() => {}
                 () = tokio::time::sleep_until(self.pre_auth_deadline), if pre_auth => {
                     return Err(pre_auth_timeout(&self.auth.peer));
                 }
@@ -693,7 +698,8 @@ mod tests {
     async fn test_connection_bounds_in_flight_requests() {
         use tokio::io::AsyncWriteExt;
 
-        // A client pipelines CAP + 20 requests. The fake DB thread holds every request
+        // A client pipelines CAP + 20 Fetches of one byte (their reservations fit the
+        // response budget many times over). The fake DB thread holds every request
         // (unanswered), so no response slot completes: the reader must stop after exactly CAP
         // requests instead of reading (and buffering) all of them. Releasing the held requests
         // frees the slots and the rest flow through.
@@ -705,7 +711,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut bytes = Vec::new();
         for i in 0..total {
-            bytes.extend_from_slice(&api_versions_v0_frame(i32::try_from(i).unwrap()));
+            bytes.extend_from_slice(&fetch_v4_frame(i32::try_from(i).unwrap(), 1));
         }
         client.write_all(&bytes).await.unwrap();
         client.flush().await.unwrap();
@@ -742,6 +748,53 @@ mod tests {
             first_batch + released,
             total,
             "all requests flow once slots free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_requests_of_unknown_response_size_stop_the_reader() {
+        // Any request but a Fetch or Heartbeat is answered with a response whose size is known
+        // only once it arrives: with the fake DB thread holding them all unanswered, the
+        // reader stops after MAX_UNANSWERED, far below the in-flight cap, and reads the rest
+        // as they are answered (here: dropped, as an acks=0 Produce is).
+        use super::super::response_budget::MAX_UNANSWERED;
+        use tokio::io::AsyncWriteExt;
+        let total = 3 * MAX_UNANSWERED;
+        let (addr, main_rx) = serve_one(NetworkLimits::default(), 10_000).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut bytes = Vec::new();
+        for i in 0..total {
+            bytes.extend_from_slice(&api_versions_v0_frame(i32::try_from(i).unwrap()));
+        }
+        client.write_all(&bytes).await.unwrap();
+
+        let mut held = Vec::new();
+        let collect_until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < collect_until {
+            while let Ok(req) = main_rx.try_recv() {
+                held.push(req);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            held.len(),
+            MAX_UNANSWERED,
+            "the reader stops at MAX_UNANSWERED"
+        );
+
+        let mut seen = held.len();
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen < total && Instant::now() < deadline {
+            while let Ok(req) = main_rx.try_recv() {
+                drop(req);
+                seen += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            seen, total,
+            "the rest are read as earlier ones are answered"
         );
     }
 

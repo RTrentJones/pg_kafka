@@ -209,6 +209,7 @@ mod tests {
             max_bytes,
             isolation_level: 0,
             topic_data: Vec::new(),
+            whole_first_record: true,
         }
     }
 

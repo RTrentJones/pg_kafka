@@ -43,7 +43,7 @@ pub fn handle_fetch(
     topic_data: Vec<TopicFetchData>,
     isolation_level: IsolationLevel,
 ) -> Result<FetchResponse> {
-    handle_fetch_with_max_bytes(ctx, topic_data, isolation_level, i32::MAX)
+    handle_fetch_with_max_bytes(ctx, topic_data, isolation_level, i32::MAX, true)
 }
 
 /// The bytes one record adds to a Fetch response, the size both byte limits
@@ -302,17 +302,22 @@ fn crc32c(data: &[u8]) -> u32 {
 
 /// [`handle_fetch`] honouring the request-level `max_bytes` (Fetch v3+): partitions
 /// are filled in request order until the response budget is spent, in addition to
-/// each partition's own `partition_max_bytes`.
+/// each partition's own `partition_max_bytes`. `whole_first_record` returns the first record
+/// of the first partition with data even when it is larger than both (KIP-74); without it
+/// no record past the limits is returned.
 pub fn handle_fetch_with_max_bytes(
     ctx: &HandlerContext,
     topic_data: Vec<TopicFetchData>,
     isolation_level: IsolationLevel,
     max_bytes: i32,
+    whole_first_record: bool,
 ) -> Result<FetchResponse> {
     let store = ctx.store;
+    // Without `whole_first_record` every partition is read as if an earlier one had
+    // returned records: nothing past its limits is returned.
     let mut budget = FetchBudget {
         remaining: i64::from(max_bytes.max(0)),
-        returned_any: false,
+        returned_any: !whole_first_record,
     };
     let settings = FetchSettings {
         isolation_level,
@@ -901,6 +906,7 @@ mod tests {
             two_partition_request(),
             IsolationLevel::ReadUncommitted,
             1,
+            true,
         )
         .unwrap();
         let parts = &response.responses[0].partitions;
@@ -951,6 +957,7 @@ mod tests {
             request,
             IsolationLevel::ReadUncommitted,
             1 << 20,
+            true,
         )
         .unwrap();
         let parts = &response.responses[0].partitions;

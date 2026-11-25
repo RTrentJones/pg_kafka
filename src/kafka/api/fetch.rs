@@ -34,6 +34,12 @@ pub struct FetchRequestData {
     pub isolation_level: i8,
     /// Topic → partition fetch positions.
     pub topic_data: Vec<TopicFetchData>,
+    /// Whether the first record of the first partition with data is returned even when it
+    /// is larger than the limits, as Kafka returns the first record batch (KIP-74). The
+    /// listener clears it for a Fetch read while its connection held other responses or
+    /// waited for one, so what its response holds stays within the `max_bytes` it reserved
+    /// of the connection's response budget (`listener::response_budget`).
+    pub whole_first_record: bool,
 }
 
 impl ApiSchema for FetchApi {
@@ -115,6 +121,7 @@ impl KafkaApi for FetchApi {
                         .collect(),
                 })
                 .collect(),
+            whole_first_record: true,
         })
     }
 
@@ -138,6 +145,7 @@ impl KafkaApi for FetchApi {
                 r.topic_data,
                 IsolationLevel::from_i8(r.isolation_level),
                 r.max_bytes,
+                r.whole_first_record,
             )
         })
     }

@@ -1,14 +1,18 @@
-//! What a Fetch counts against its byte limits and its `min_bytes`.
+//! What a Fetch counts against its byte limits and its `min_bytes`, and what the responses of
+//! pipelined requests on a connection that reads nothing may hold together.
 
+use super::fetch_limits::{restore_fetch_max_bytes, set_fetch_max_bytes, AbortOnDrop};
+use super::stalled_writers::{metadata_of, non_reading};
 use crate::common::{DynResult, TestResult};
-use crate::setup::TestContext;
+use crate::setup::{GucError, SystemGucGuard, TestContext};
 use crate::wire::records::{batch, encode, plain_batch, plain_record};
 use crate::wire::requests::{creatable, create_topics_raw, fetch_request, produce_request};
 use crate::wire::{decode_response, read_frame_within, request_frame};
 use bytes::Bytes;
-use kafka_protocol::messages::{FetchRequest, FetchResponse, ProduceRequest};
+use kafka_protocol::messages::{FetchRequest, FetchResponse, MetadataRequest, ProduceRequest};
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Compression, RecordBatchDecoder};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -17,6 +21,10 @@ use tokio::net::TcpStream;
 const VALUE: usize = 1_000_000;
 /// The header value of each of the header-heavy records.
 const HEADER: usize = 96_000;
+/// Metadata requests the non-reading client pipelines.
+const METADATA: usize = 128;
+/// Fetch requests the non-reading client pipelines.
+const FETCHES: i32 = 30;
 
 /// What one record of no key adds to a Fetch response, as the broker counts it: value and
 /// header bytes uncompressed, 64 bytes a record and 10 a header (the records here have at
@@ -228,3 +236,197 @@ pub async fn test_long_poll_min_bytes_counts_each_partition_up_to_its_limit() ->
     Ok(())
 }
 
+/// From `/proc/net/tcp`, the bytes of a connection's requests the broker has not read (its
+/// receive queue on the broker's side and the client's send queue), and the bytes of
+/// responses the broker has written that sit in the kernel (its send queue and the client's
+/// receive queue): those are on the socket, no longer held by the broker.
+fn socket_queues(client: SocketAddr) -> DynResult<(u64, u64)> {
+    let SocketAddr::V4(client) = client else {
+        return Err("an IPv4 client address".into());
+    };
+    let hex = |a: Ipv4Addr, p: u16| format!("{:08X}:{p:04X}", u32::from_le_bytes(a.octets()));
+    let broker = hex(Ipv4Addr::LOCALHOST, super::port());
+    let me = hex(*client.ip(), client.port());
+    let table = std::fs::read_to_string("/proc/net/tcp")?;
+    let (mut not_read, mut in_kernel) = (0, 0);
+    let mut found = 0;
+    for line in table.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() <= 4 {
+            continue;
+        }
+        let (tx, rx) = cols[4]
+            .split_once(':')
+            .ok_or("a tx_queue:rx_queue column")?;
+        let (tx, rx) = (u64::from_str_radix(tx, 16)?, u64::from_str_radix(rx, 16)?);
+        if cols[1] == broker && cols[2] == me {
+            not_read += rx;
+            in_kernel += tx;
+            found += 1;
+        } else if cols[1] == me && cols[2] == broker {
+            not_read += tx;
+            in_kernel += rx;
+            found += 1;
+        }
+    }
+    if found != 2 {
+        return Err("the connection is gone".into());
+    }
+    Ok((not_read, in_kernel))
+}
+
+/// `pg_kafka.test_pre_commit_delay_ms`, set so that one Produce holds the DB thread.
+const STALL_GUC: &str = "pg_kafka.test_pre_commit_delay_ms";
+
+/// Hold the DB thread for `pg_kafka.test_pre_commit_delay_ms` (a Produce on a connection of
+/// its own whose commit that delays): the requests a client pipelines meanwhile are
+/// all read, as far as the broker reads, before any is answered.
+async fn stall_db_thread(topic: &str) -> DynResult<tokio::task::JoinHandle<()>> {
+    let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+    let topic = topic.to_string();
+    let task = tokio::spawn(async move {
+        let batch = plain_batch(&[Bytes::from_static(b"stall")], Compression::None);
+        let _ = produce_batch(&mut s, 0, &topic, batch).await;
+    });
+    // The Produce reaches the DB thread before the client's requests do.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(task)
+}
+
+/// The guard's errors are `Send + Sync`; this file's results are not.
+fn widen(e: GucError) -> Box<dyn std::error::Error> {
+    e
+}
+
+/// The connection's response budget (`pg_kafka.fetch_max_bytes`, 1 MiB here) bounds what the
+/// responses of its unwritten requests hold, for every request type. The reader stopped only
+/// once the responses held more than the budget, and only a Fetch reserved bytes before it
+/// ran: so with the DB thread busy (here: held 3 s by a Produce) a client that pipelines and
+/// reads nothing had all its requests read, then held all their responses: 128 Metadata
+/// requests answered with some 100 KB each held 12 MB, 30 Fetches of `max_bytes` 1 held 30
+/// first records of 900 KB. Now at most 8 requests whose response size is unknown (anything
+/// but Fetch and Heartbeat) wait for their response at once, and only a Fetch read while the
+/// connection held nothing else returns a first record past its limits: the broker reads
+/// the Metadata requests whose answers the budget and the socket buffers hold, and 8 more,
+/// and one Fetch response holds the record.
+pub async fn test_pipelined_responses_stay_within_the_connection_budget() -> TestResult {
+    println!("=== Test: pipelined responses stay within the connection's budget ===\n");
+    let ctx = TestContext::new().await?;
+    let data = ctx.unique_topic("net-bound-data").await;
+    let stall = ctx.unique_topic("net-bound-stall").await;
+    let created = create_topics_raw(vec![creatable(&data, 1, 1), creatable(&stall, 1, 1)]).await?;
+    assert!(created.iter().all(|t| t.error_code == 0), "{created:?}");
+    let db = crate::common::create_db_client().await?;
+    let guc = set_fetch_max_bytes(&db, 1 << 20).await?;
+    let delay = SystemGucGuard::set(&db, STALL_GUC, "3000")
+        .await
+        .map_err(widen)?
+        .ok_or("the server refused pg_kafka.test_pre_commit_delay_ms")?;
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", super::port())).await?;
+        let record = Bytes::from(vec![b'f'; 900_000]);
+        produce_batch(
+            &mut s,
+            1,
+            &data,
+            plain_batch(std::slice::from_ref(&record), Compression::None),
+        )
+        .await?;
+        println!("Step 1: one record of 900 KB produced");
+
+        // One Metadata request of 2000 missing names, and the size of its answer.
+        let prefix = uuid::Uuid::new_v4().simple().to_string();
+        let names: Vec<String> = (0..2000).map(|i| format!("{prefix}-{i:0>8}")).collect();
+        let metadata = metadata_of(names);
+        let frame = request_frame(4, 7, &metadata);
+        s.write_all(&frame).await?;
+        let answer = read_frame_within(&mut s, Duration::from_secs(30))
+            .await?
+            .ok_or("closed on metadata")?;
+        let _ = decode_response::<MetadataRequest>(4, &answer)?;
+        let (request_len, answer_len) = (frame.len(), answer.len());
+        println!("  a Metadata request of {request_len} bytes is answered with {answer_len}");
+
+        // Metadata: 128 pipelined requests while the DB thread is held.
+        let mut hog = non_reading(Ipv4Addr::new(127, 0, 0, 41)).await?;
+        let client = hog.local_addr()?;
+        let frames = frame.repeat(METADATA);
+        let stalled = stall_db_thread(&stall).await?;
+        // What the client's socket has accepted of the frames so far.
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = tokio::spawn({
+            let sent = std::sync::Arc::clone(&sent);
+            async move {
+                let mut at = 0;
+                while at < frames.len() {
+                    match hog.write(&frames[at..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            at += n;
+                            sent.store(at, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(hog);
+            }
+        });
+        let abort = AbortOnDrop(writer);
+        stalled.await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (not_read, in_kernel) = socket_queues(client)?;
+        let (not_read, in_kernel) = (usize::try_from(not_read)?, usize::try_from(in_kernel)?);
+        let sent = sent.load(std::sync::atomic::Ordering::SeqCst);
+        let read = sent.saturating_sub(not_read).div_ceil(request_len);
+        // Answers the socket took, answers within the budget, at most 8 waiting for an
+        // answer, the head and one partly read.
+        let bound = (in_kernel + (1 << 20)) / answer_len + 1 + 8 + 2;
+        println!(
+            "Step 2: {not_read} bytes of requests not read, {in_kernel} bytes of answers in the \
+             kernel: some {read} of {METADATA} read (bound {bound})"
+        );
+        assert!(
+            read <= bound,
+            "{read} Metadata requests read, answered with {answer_len} bytes each: more than a 1 MiB budget holds"
+        );
+        drop(abort);
+
+        // Fetch: 30 pipelined Fetches of max_bytes 1 while the DB thread is held.
+        let mut hog = non_reading(Ipv4Addr::new(127, 0, 0, 42)).await?;
+        let mut frames = Vec::new();
+        for corr in 0..FETCHES {
+            frames.extend(request_frame(4, corr, &fetch_with_limits(&data, 0, 1, 1)));
+        }
+        let stalled = stall_db_thread(&stall).await?;
+        hog.write_all(&frames).await?;
+        stalled.await?;
+        let mut holding = 0;
+        for corr in 0..FETCHES {
+            let frame = read_frame_within(&mut hog, Duration::from_secs(30))
+                .await?
+                .ok_or("closed on fetch")?;
+            let (c, resp) = decode_response::<FetchRequest>(4, &frame)?;
+            assert_eq!(c, corr);
+            let records = partition_records(&resp)?;
+            if !records.is_empty() {
+                holding += 1;
+            }
+        }
+        println!(
+            "Step 3: {holding} of {FETCHES} Fetch responses of max_bytes 1 hold the 900 KB record"
+        );
+        assert!(
+            (1..=2).contains(&holding),
+            "{holding} responses of 900 KB for Fetches that reserved one byte each, on a 1 MiB budget"
+        );
+        assert!(
+            super::answers(&mut hog, 99).await,
+            "the connection keeps working"
+        );
+    }
+    delay.restore().await.map_err(widen)?;
+    restore_fetch_max_bytes(guc).await?;
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
