@@ -11,6 +11,7 @@ mod coordinator_state;
 mod describe_size;
 mod group_cap;
 mod lifecycle;
+mod list_size;
 mod member_memory;
 mod protocol_rules;
 mod rebalance;
@@ -45,6 +46,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         group_cap::test_lowered_group_cap_still_admits_new_groups: sequential, // changes a GUC
         member_memory::test_member_state_beyond_the_memory_budget_is_refused: sequential, // changes a GUC
         describe_size::test_describe_groups_of_a_repeated_group_is_bounded: sequential, // changes a GUC
+        list_size::test_list_groups_is_bounded_by_fetch_max_bytes: sequential, // changes a GUC
         member_memory::test_empty_groups_do_not_exhaust_the_memory_budget: sequential, // changes a GUC
         member_memory::test_a_rejoin_is_priced_with_the_protocol_it_selects: sequential, // changes a GUC
         sync_liveness::test_member_that_never_syncs_is_removed: sequential, // Has sleep delays

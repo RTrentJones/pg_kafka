@@ -232,18 +232,54 @@ type Unstable = HashMap<String, HashSet<i32>>;
 /// commit whose transaction is still open is answered UNSTABLE_OFFSET_COMMIT with
 /// offset -1 (partition level, as Kafka 3.7), so a read_committed consumer retries
 /// instead of starting from an offset the transaction may still replace.
+///
+/// The response is bounded by [`crate::config::response_max_bytes`]
+/// (`pg_kafka.fetch_max_bytes`): its offsets' metadata (up to 12 KB per partition, for as
+/// many partitions as the group committed or the request names) is read only up to that
+/// many bytes, in the order the partitions are answered, and each partition past it is
+/// answered COORDINATOR_NOT_AVAILABLE with offset -1 ([`OFFSET_LEFT_OUT`]); the first
+/// offset is always answered, so any one partition can be read. A partition without
+/// metadata is always answered. Response size: at most that bound plus one partition's
+/// metadata, plus O(1) per partition answered.
 pub fn handle_offset_fetch(
     ctx: &HandlerContext,
     group_id: &str,
     topics: Option<Vec<OffsetFetchTopicData>>,
     require_stable: bool,
 ) -> Result<OffsetFetchResponse> {
+    offset_fetch(
+        ctx,
+        group_id,
+        topics,
+        require_stable,
+        crate::config::response_max_bytes(),
+    )
+}
+
+/// The error code of an OffsetFetch partition left out of a response at its byte bound
+/// ([`handle_offset_fetch`]). Partition level, so the other partitions are answered: the
+/// Java admin client (`kafka-consumer-groups --describe`) skips such a partition with a
+/// warning, the Java consumer fails the fetch, and librdkafka reports the partition's error
+/// and does not consume it; none of them resets the partition's position as it would for
+/// a partition answered with no offset. COORDINATOR_NOT_AVAILABLE is also what DescribeGroups
+/// answers a group left out at the same bound.
+pub const OFFSET_LEFT_OUT: i16 = crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE;
+
+/// [`handle_offset_fetch`] with the metadata bytes bounded by `max_bytes`.
+fn offset_fetch(
+    ctx: &HandlerContext,
+    group_id: &str,
+    topics: Option<Vec<OffsetFetchTopicData>>,
+    require_stable: bool,
+    max_bytes: usize,
+) -> Result<OffsetFetchResponse> {
     let store = ctx.store;
     let mut kafka_response = OffsetFetchResponse::default();
     kafka_response.throttle_time_ms = 0;
     kafka_response.error_code = ERROR_NONE;
     if let Some(topics) = topics {
-        kafka_response.topics = fetch_requested_offsets(store, group_id, topics, require_stable)?;
+        kafka_response.topics =
+            fetch_requested_offsets(store, group_id, topics, require_stable, max_bytes)?;
     } else {
         let unstable = if require_stable {
             unstable_partitions(store, group_id, None)?
@@ -252,7 +288,7 @@ pub fn handle_offset_fetch(
         };
         // A fetch-all storage failure is a top-level error: a success with no offsets
         // reads to a consumer as "no committed offsets", and it may reset.
-        match fetch_all_group_offsets(store, group_id, &unstable) {
+        match fetch_all_group_offsets(store, group_id, &unstable, max_bytes) {
             Ok(topics) => kafka_response.topics = topics,
             Err(error_code) => kafka_response.error_code = error_code,
         }
@@ -285,6 +321,7 @@ fn fetch_requested_offsets(
     group_id: &str,
     topics: Vec<OffsetFetchTopicData>,
     require_stable: bool,
+    max_bytes: usize,
 ) -> Result<Vec<OffsetFetchResponseTopic>> {
     let topics = merge_by_partition(
         topics.into_iter().map(|t| (t.name, t.partition_indexes)),
@@ -306,12 +343,12 @@ fn fetch_requested_offsets(
     } else {
         Unstable::new()
     };
-    let mut committed: std::result::Result<HashMap<(i32, i32), CommittedOffset>, i16> =
+    let mut committed: std::result::Result<HashMap<(i32, i32), Option<CommittedOffset>>, i16> =
         if requested.is_empty() {
             Ok(HashMap::new())
         } else {
             store
-                .fetch_offsets(group_id, &requested)
+                .fetch_offsets(group_id, &requested, max_bytes)
                 .map(|offsets| {
                     offsets
                         .into_iter()
@@ -358,11 +395,14 @@ fn fetch_requested_offsets(
                     }
                     // Each (topic, partition) is answered once: merged above, and distinct
                     // names are distinct topics.
-                    let offset = committed
+                    match committed
                         .as_mut()
                         .ok()
-                        .and_then(|c| c.remove(&(topic_id, partition_index)));
-                    offset_partition(partition_index, ERROR_NONE, offset)
+                        .and_then(|c| c.remove(&(topic_id, partition_index)))
+                    {
+                        Some(None) => offset_partition(partition_index, OFFSET_LEFT_OUT, None),
+                        offset => offset_partition(partition_index, ERROR_NONE, offset.flatten()),
+                    }
                 })
                 .collect();
             let mut topic_response = OffsetFetchResponseTopic::default();
@@ -373,13 +413,15 @@ fn fetch_requested_offsets(
         .collect())
 }
 
-/// Every committed offset of the group, by topic, or the error code of a failed read.
+/// Every committed offset of the group, by topic, or the error code of a failed read; the
+/// offsets past `max_bytes` of metadata are answered [`OFFSET_LEFT_OUT`].
 fn fetch_all_group_offsets(
     store: &dyn KafkaStore,
     group_id: &str,
     unstable: &Unstable,
+    max_bytes: usize,
 ) -> std::result::Result<Vec<OffsetFetchResponseTopic>, i16> {
-    let offsets = store.fetch_all_offsets(group_id).map_err(|e| {
+    let offsets = store.fetch_all_offsets(group_id, max_bytes).map_err(|e| {
         crate::pg_warning!(
             "Failed to fetch all offsets for group='{}': {}",
             group_id,
@@ -387,24 +429,24 @@ fn fetch_all_group_offsets(
         );
         e.to_kafka_error_code()
     })?;
-    let mut by_topic: HashMap<String, Vec<OffsetFetchResponsePartition>> = HashMap::new();
-    for (topic_name, partition_id, committed) in offsets {
-        let pending = unstable
-            .get(&topic_name)
-            .is_some_and(|u| u.contains(&partition_id));
-        let partition = if pending {
-            offset_partition(partition_id, ERROR_UNSTABLE_OFFSET_COMMIT, None)
-        } else {
-            offset_partition(partition_id, ERROR_NONE, Some(committed))
-        };
-        by_topic.entry(topic_name).or_default().push(partition);
-    }
-    Ok(by_topic
+    Ok(offsets
         .into_iter()
-        .map(|(topic_name, partitions)| {
+        .map(|(topic_name, committed)| {
+            let topic_unstable = unstable.get(&topic_name);
             let mut topic_response = OffsetFetchResponseTopic::default();
+            topic_response.partitions = committed
+                .into_iter()
+                .map(|(partition_id, committed)| {
+                    if topic_unstable.is_some_and(|u| u.contains(&partition_id)) {
+                        return offset_partition(partition_id, ERROR_UNSTABLE_OFFSET_COMMIT, None);
+                    }
+                    match committed {
+                        None => offset_partition(partition_id, OFFSET_LEFT_OUT, None),
+                        committed => offset_partition(partition_id, ERROR_NONE, committed),
+                    }
+                })
+                .collect();
             topic_response.name = TopicName(StrBytes::from_string(topic_name));
-            topic_response.partitions = partitions;
             topic_response
         })
         .collect())
@@ -442,7 +484,7 @@ mod tests {
         let mut store = MockKafkaStore::new();
         store
             .expect_fetch_all_offsets()
-            .returning(|_| Err(KafkaError::database("boom")));
+            .returning(|_, _| Err(KafkaError::database("boom")));
 
         let env = TestEnv::new();
         let ctx = env.ctx(&store);
@@ -450,6 +492,63 @@ mod tests {
         // topics = None selects the fetch-all path.
         let resp = handle_offset_fetch(&ctx, "g", None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
+    }
+
+    /// An OffsetFetch asks the store for the offsets within its byte bound, and answers each
+    /// offset the store left out ([`OFFSET_LEFT_OUT`], COORDINATOR_NOT_AVAILABLE, offset -1)
+    /// while answering the others: on both the fetch-all and the explicit path.
+    #[test]
+    fn test_offset_fetch_answers_offsets_past_its_bound_left_out() {
+        use crate::kafka::storage::TopicMetadata;
+        let committed = |offset| {
+            Some(CommittedOffset {
+                offset,
+                metadata: Some("m".repeat(100)),
+            })
+        };
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_fetch_all_offsets()
+            .withf(|_, max| *max == 1000)
+            .returning(move |_, _| Ok(vec![("t".to_string(), vec![(0, committed(5)), (1, None)])]));
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 2,
+            }])
+        });
+        store
+            .expect_fetch_offsets()
+            .withf(|_, _, max| *max == 1000)
+            .returning(move |_, _, _| Ok(vec![(1, 0, committed(5)), (1, 1, None)]));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let explicit = Some(vec![OffsetFetchTopicData {
+            name: "t".to_string(),
+            partition_indexes: vec![0, 1],
+        }]);
+        for topics in [None, explicit] {
+            let resp = offset_fetch(&ctx, "g", topics, false, 1000).unwrap();
+            assert_eq!(resp.error_code, ERROR_NONE);
+            let parts: Vec<(i32, i16, i64, usize)> = resp.topics[0]
+                .partitions
+                .iter()
+                .map(|p| {
+                    let metadata = p.metadata.as_ref().map_or(0, |m| m.len());
+                    (
+                        p.partition_index,
+                        p.error_code,
+                        p.committed_offset,
+                        metadata,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                parts,
+                vec![(0, ERROR_NONE, 5, 100), (1, OFFSET_LEFT_OUT, -1, 0)]
+            );
+        }
     }
 
     /// A storage failure on every partition of an OffsetCommit logs a line per partition
@@ -557,12 +656,12 @@ mod tests {
         use crate::kafka::messages::OffsetFetchTopicData;
         let mut store = MockKafkaStore::new();
         crate::testing::expect_topics(&mut store, |name| Ok((name == "t").then_some((1, 2))));
-        store.expect_fetch_offsets().returning(|_, _| {
+        store.expect_fetch_offsets().returning(|_, _, _| {
             let offset = CommittedOffset {
                 offset: 4,
                 metadata: None,
             };
-            Ok(vec![(1, 0, offset)])
+            Ok(vec![(1, 0, Some(offset))])
         });
         store
             .expect_pending_txn_offset_partitions()
@@ -672,7 +771,7 @@ mod tests {
                 partition_count: 2,
             }])
         });
-        store.expect_fetch_offsets().returning(|_, partitions| {
+        store.expect_fetch_offsets().returning(|_, partitions, _| {
             Ok(partitions
                 .iter()
                 .map(|&(topic_id, p)| {
@@ -680,7 +779,7 @@ mod tests {
                         offset: 5,
                         metadata: None,
                     };
-                    (topic_id, p, offset)
+                    (topic_id, p, Some(offset))
                 })
                 .collect())
         });
@@ -719,15 +818,17 @@ mod tests {
     #[test]
     fn test_offset_fetch_all_require_stable_reads_the_groups_pending_partitions() {
         let mut store = MockKafkaStore::new();
-        store.expect_fetch_all_offsets().returning(|_| {
-            let offset = |offset| CommittedOffset {
-                offset,
-                metadata: None,
+        store.expect_fetch_all_offsets().returning(|_, _| {
+            let offset = |offset| {
+                Some(CommittedOffset {
+                    offset,
+                    metadata: None,
+                })
             };
-            Ok(vec![
-                ("t".to_string(), 0, offset(5)),
-                ("t".to_string(), 1, offset(6)),
-            ])
+            Ok(vec![(
+                "t".to_string(),
+                vec![(0, offset(5)), (1, offset(6))],
+            )])
         });
         store
             .expect_pending_txn_offset_partitions()
@@ -807,7 +908,7 @@ mod tests {
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, i32::MAX))));
         store
             .expect_fetch_offsets()
-            .returning(|_, _| Ok(Vec::new()));
+            .returning(|_, _, _| Ok(Vec::new()));
         store
             .expect_pending_txn_offset_partitions()
             .returning(|_, _| Ok(Vec::new()));
@@ -834,14 +935,14 @@ mod tests {
         crate::testing::expect_topics(&mut store, |name| Ok((name == "t").then_some((1, 1))));
         store
             .expect_fetch_offsets()
-            .withf(|_, partitions| partitions == [(1, 0), (1, 9)])
+            .withf(|_, partitions, _| partitions == [(1, 0), (1, 9)])
             .times(1)
-            .returning(|_, _| {
+            .returning(|_, _, _| {
                 let offset = CommittedOffset {
                     offset: 6,
                     metadata: None,
                 };
-                Ok(vec![(1, 0, offset)])
+                Ok(vec![(1, 0, Some(offset))])
             });
         let env = TestEnv::new();
         let ctx = env.ctx(&store);

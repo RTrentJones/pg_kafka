@@ -896,11 +896,37 @@ fn describe_unheld_group(
 
 /// Handle ListGroups request
 ///
-/// Returns a list of all consumer groups currently known to the coordinator.
-/// This is useful for discovery, administration, and monitoring.
+/// Returns the consumer groups the coordinator holds and those known by their offsets, within
+/// [`crate::config::response_max_bytes`] (see [`list_groups`]).
 pub fn handle_list_groups(
     ctx: &HandlerContext,
     states_filter: &[String],
+) -> Result<ListGroupsResponse> {
+    list_groups(ctx, states_filter, crate::config::response_max_bytes())
+}
+
+/// ListGroups of the groups in `states_filter` (all if empty) in a response of at most about
+/// `max_bytes`.
+///
+/// The groups are listed in the order of their ids: the groups the coordinator holds, and the
+/// groups known only by their offsets (committed, or pending in an open transaction) as Empty
+/// "consumer" groups (see [`describe_unheld_group`]), so `kafka-consumer-groups --list` keeps
+/// showing them after a worker restart. Group ids are client strings of up to 32 KB and the
+/// offset-only groups are bounded only by the database, so the list is cut where its entries
+/// ([`listed_group_bytes`]) would take the response past `max_bytes`; the first group is always
+/// listed. ListGroups has no per-group error, and an error code would make the Java admin
+/// client drop the whole list, so the cut list is answered NONE and the server logs a WARNING
+/// (docs/PROTOCOL_DEVIATIONS.md). With a state filter the offset-only groups read are counted
+/// as if none were filtered out, so the list may be cut a little earlier than `max_bytes`.
+///
+/// Cost, for `h` held groups and `o` offset-only groups read: the offset-only ids past
+/// `max_bytes` are never read ([`crate::kafka::storage::OffsetStore::list_offset_groups`]);
+/// time O((h + o) log(h + o)) to sort references to them; memory O(h + o) references, the ids
+/// read (at most about `max_bytes`) and a response of at most about `max_bytes`.
+pub fn list_groups(
+    ctx: &HandlerContext,
+    states_filter: &[String],
+    max_bytes: usize,
 ) -> Result<ListGroupsResponse> {
     let coordinator = ctx.coordinator;
 
@@ -919,48 +945,69 @@ pub fn handle_list_groups(
     // Filter groups by state if requested (v4+), case-sensitively as Kafka 3.7 does
     // (`kafka-consumer-groups --state` sends the canonical names). The filter is a set, as in
     // Kafka, so a long filter list costs once, not once per group.
-    let filter_enabled = !states_filter.is_empty();
     let wanted_states: std::collections::HashSet<&str> =
         states_filter.iter().map(String::as_str).collect();
+    let wanted = |state: &str| wanted_states.is_empty() || wanted_states.contains(state);
 
-    let mut listed: Vec<(String, String, &'static str)> = coordinator_groups
+    // Groups known only by their offsets are Empty: read only when Empty groups are wanted.
+    let offset_groups = if wanted("Empty") {
+        ctx.store.list_offset_groups(max_bytes)?
+    } else {
+        Vec::new()
+    };
+    let mut listed: Vec<(&str, &str, &'static str)> = coordinator_groups
         .iter()
+        .filter(|(_, group)| wanted(group.state.as_str()))
         .map(|(group_id, group)| {
             (
-                group_id.clone(),
-                group
-                    .protocol_type
-                    .clone()
-                    .unwrap_or_else(|| "consumer".to_string()),
+                group_id.as_str(),
+                group.protocol_type.as_deref().unwrap_or("consumer"),
                 group.state.as_str(),
             )
         })
         .collect();
-    // Groups known only by their offsets (committed, or pending in an open transaction) are
-    // Empty "consumer" groups (see handle_describe_groups), so `kafka-consumer-groups --list`
-    // keeps showing them after a worker restart.
-    for group_id in ctx.store.list_offset_groups()? {
-        if !coordinator_groups.contains_key(&group_id) {
-            listed.push((group_id, "consumer".to_string(), "Empty"));
-        }
-    }
-    listed.sort();
+    listed.extend(
+        offset_groups
+            .iter()
+            .filter(|group_id| !coordinator_groups.contains_key(*group_id))
+            .map(|group_id| (group_id.as_str(), "consumer", "Empty")),
+    );
+    listed.sort_unstable();
 
+    let mut listed_bytes = 0_usize;
+    let mut cut = false;
     for (group_id, protocol_type, state) in listed {
-        // Apply state filter if provided (v4+)
-        if filter_enabled && !wanted_states.contains(state) {
-            continue;
+        let bytes = listed_group_bytes(group_id, protocol_type, state);
+        if listed_bytes > 0 && listed_bytes.saturating_add(bytes) > max_bytes {
+            cut = true;
+            break;
         }
-
+        listed_bytes = listed_bytes.saturating_add(bytes);
         let mut listed_group = ListedGroup::default();
-        listed_group.group_id = GroupId(StrBytes::from_string(group_id));
-        listed_group.protocol_type = StrBytes::from_string(protocol_type);
+        listed_group.group_id = GroupId(StrBytes::from_string(group_id.to_string()));
+        listed_group.protocol_type = StrBytes::from_string(protocol_type.to_string());
         // Add group state (v4+)
         listed_group.group_state = StrBytes::from_static_str(state);
         response.groups.push(listed_group);
     }
+    if cut {
+        crate::pg_warning!(
+            "ListGroups: {} group(s) listed; the groups after them are left out, as listing them would take the response past pg_kafka.fetch_max_bytes ({} bytes)",
+            response.groups.len(),
+            max_bytes
+        );
+    }
 
     Ok(response)
+}
+
+/// What a ListGroups entry takes when encoded: its id, protocol type and state, and
+/// [`crate::kafka::storage::LISTED_GROUP_OVERHEAD`] for their framing. O(1).
+fn listed_group_bytes(group_id: &str, protocol_type: &str, state: &str) -> usize {
+    group_id.len()
+        + protocol_type.len()
+        + state.len()
+        + crate::kafka::storage::LISTED_GROUP_OVERHEAD
 }
 
 #[cfg(test)]
@@ -992,7 +1039,7 @@ mod tests {
             store
                 .expect_groups_with_offsets()
                 .returning(|_| Ok(std::collections::HashSet::new()));
-            store.expect_list_offset_groups().returning(|| Ok(vec![]));
+            store.expect_list_offset_groups().returning(|_| Ok(vec![]));
             Self {
                 store,
                 coordinator: GroupCoordinator::new(),
@@ -1851,7 +1898,7 @@ mod tests {
         store
             .expect_groups_with_offsets()
             .returning(|_| Ok(std::collections::HashSet::new()));
-        store.expect_list_offset_groups().returning(|| Ok(vec![]));
+        store.expect_list_offset_groups().returning(|_| Ok(vec![]));
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(
             &store,
@@ -1878,7 +1925,7 @@ mod tests {
         });
         store
             .expect_list_offset_groups()
-            .returning(move || Ok(groups.iter().map(ToString::to_string).collect()));
+            .returning(move |_| Ok(groups.iter().map(ToString::to_string).collect()));
         store
     }
 
@@ -1966,7 +2013,7 @@ mod tests {
             let mut store = MockKafkaStore::new();
             store
                 .expect_list_offset_groups()
-                .returning(move || Ok(groups.clone()));
+                .returning(move |_| Ok(groups.clone()));
             let env = TestEnv::new();
             let filter: Vec<String> = (0..n)
                 .map(|i| format!("NotAState{i}"))
@@ -1979,6 +2026,54 @@ mod tests {
             growth < 8.0,
             "4x the groups and filter took {growth:.1}x the time"
         );
+    }
+
+    /// ListGroups is bounded by `max_bytes` whatever the group ids weigh: 40 held groups and
+    /// 40 groups known by their offsets, each with a 30 KB id (2.4 MB of ids), are listed up
+    /// to a 256 kB bound, in the order of their ids, the first always; the store is asked
+    /// for the offset-only ids within the same bound. The list was the whole 2.4 MB.
+    #[test]
+    fn test_list_groups_is_bounded_by_max_bytes() {
+        let mut f = Fixture::new();
+        let id = |c: char, i: usize| format!("{c}{i:03}{}", "x".repeat(30 * 1024));
+        let offset_only: Vec<String> = (0..40).map(|i| id('o', i)).collect();
+        let max_bytes = 256 << 10;
+        f.store.checkpoint();
+        f.store
+            .expect_list_offset_groups()
+            .withf(move |&bytes| bytes == max_bytes || bytes == 1024)
+            .returning(move |max| {
+                // As the store does: the ids within `max`, and the first past it.
+                let mut total = 0;
+                Ok(offset_only
+                    .iter()
+                    .take_while(|g| {
+                        let within = total <= max;
+                        total += g.len() + crate::kafka::storage::LISTED_GROUP_OVERHEAD;
+                        within
+                    })
+                    .cloned()
+                    .collect())
+            });
+        for i in 0..40 {
+            assert_eq!(f.join_now(&id('h', i), "").error_code, ERROR_NONE);
+        }
+        let (listed, allocated) =
+            crate::testing::heap_allocated(|| list_groups(&f.ctx(), &[], max_bytes).unwrap());
+        let ids: Vec<&str> = listed.groups.iter().map(|g| g.group_id.as_str()).collect();
+        let bytes: usize = ids.iter().map(|g| g.len()).sum();
+        assert!(
+            !ids.is_empty() && bytes <= max_bytes,
+            "{bytes} bytes listed"
+        );
+        assert!(ids.len() >= 7, "listed {} groups", ids.len());
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "in id order");
+        assert_eq!(ids[0], id('h', 0), "the first id is listed");
+        assert!(allocated < 3 * max_bytes, "allocated {allocated} bytes");
+
+        // One group larger than the bound is still listed.
+        let one = list_groups(&f.ctx(), &[], 1024).unwrap();
+        assert_eq!(one.groups.len(), 1);
     }
 
     #[test]
