@@ -186,7 +186,8 @@ impl KafkaApi for ProduceApi {
         // INVALID_REQUIRED_ACKS and nothing is written, once the checks Kafka makes before
         // the log append passed (`invalid_acks_answers`).
         if !valid_acks(acks) {
-            warn!("Rejecting Produce with invalid acks={acks}");
+            // A client error, answered in the response: not worth a WARNING per request.
+            debug!("Rejecting Produce with invalid acks={acks}");
             let refused = with_refused_entries(
                 invalid_acks_answers(&wire.topic_data, zstd_allowed),
                 refused_entries,
@@ -613,14 +614,14 @@ fn check_first_batches(
             match first_batch_is_transactional(batch) {
                 Ok(true) if has_transactional_id => return Ok(()),
                 Ok(true) => {
-                    warn!("Refusing a transactional Produce request without a transactional id");
+                    debug!("Refusing a transactional Produce request without a transactional id");
                     return Err(DecodeFailure::Rejected(
                         ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
                     ));
                 }
                 Ok(false) => {}
                 Err(code) => {
-                    warn!(
+                    debug!(
                         "Refusing a Produce request: the first batch of topic={}, partition={} cannot be sized",
                         log_name(topic.name.0.as_str()),
                         partition.index
@@ -1087,17 +1088,16 @@ pub(crate) fn extract_producer_metadata(
 }
 
 /// Send a best-effort notification to the network thread without blocking the single DB
-/// thread: the notify channel is bounded and `try_send` drops on full. Waiting
-/// fetches fall back to their poll interval, so a dropped wake-up only adds latency.
+/// thread (see [`crate::kafka::notifications::send_best_effort`]).
 pub(crate) fn notify_best_effort(
     tx: &crossbeam_channel::Sender<InternalNotification>,
     notification: InternalNotification,
 ) {
-    let _ = tx.try_send(notification);
+    crate::kafka::notifications::send_best_effort(tx, notification);
 }
 
 /// Wake long-poll consumers for every partition a produce appended to. A missing topic id,
-/// a failed high-watermark read or a full notify channel skips that wake-up.
+/// a failed high-watermark read skips that wake-up.
 fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
     response: &ProduceResponse,
     store: &S,

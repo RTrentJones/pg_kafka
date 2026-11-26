@@ -234,6 +234,8 @@ pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 /// UNKNOWN_TOPIC_OR_PARTITION.
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// NOT_LEADER_OR_FOLLOWER (retriable): what Fetch v4-5 answers in place of KAFKA_STORAGE_ERROR.
+pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 /// REQUEST_TIMED_OUT (retriable): the request timed out, e.g. waiting on a lock.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// MESSAGE_TOO_LARGE (Java's RecordTooLargeException): a batch, or a Produce request's

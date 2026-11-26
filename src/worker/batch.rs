@@ -112,10 +112,13 @@ pub(super) fn serve_credential_requests(
 }
 
 /// Tell the network thread that transactions ended, so parked read_committed fetches
-/// re-check their last stable offset now. Best effort: a full channel only means the
-/// long-poll safety net picks it up.
+/// re-check their last stable offset now. Best effort: a full channel records the drop,
+/// and the network thread then wakes every long poll coarsely.
 pub(super) fn notify_transaction_ended(notify_tx: &Sender<InternalNotification>) {
-    let _ = notify_tx.try_send(InternalNotification::TransactionEnded);
+    crate::kafka::notifications::send_best_effort(
+        notify_tx,
+        InternalNotification::TransactionEnded,
+    );
 }
 
 /// Whether a committed batch ended (or may have ended) transactions other than through

@@ -14,8 +14,7 @@ use super::decode_budget::{
 };
 use super::decode_meter::{metered, MeteredBuf};
 use super::framing::FRAME_RESERVE_REMAINING;
-use crate::kafka::api::{self, Decoded, RequestBody, ResponseBody};
-use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
+use crate::kafka::api::{self, Decoded, RequestBody};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 
@@ -275,19 +274,16 @@ fn parse_request_inner(
 
     match api::decode_body(&mut MeteredBuf::new(frame), header, response_tx) {
         Ok(decoded) => Ok(decoded),
-        Err((header, response_tx)) => {
-            // An API key the crate knows but pg_kafka does not serve: there is no
-            // registered response schema, so answer with the generic error frame.
-            warn!("Unsupported API key: {}", header.api_key);
-            // The connection may already be gone; there is nobody left to tell.
-            let _ = response_tx.send(KafkaResponse::new(
-                header.correlation_id,
-                header.api_version,
-                ResponseBody::UnknownApi {
-                    error_code: ERROR_UNSUPPORTED_VERSION,
-                },
-            ));
-            Ok(Decoded::Answered)
+        Err((header, _)) => {
+            // An API key the crate knows but pg_kafka does not serve (and so does not
+            // advertise in ApiVersions): close the connection, as Kafka 3.7 does for an API
+            // that is not enabled (`SocketServer` refuses the request and closes the
+            // channel). A client that negotiates through ApiVersions never sends one.
+            debug!("Unsupported API key: {}", header.api_key);
+            Ok(Decoded::Close(format!(
+                "API key {} is not served",
+                header.api_key
+            )))
         }
     }
 }

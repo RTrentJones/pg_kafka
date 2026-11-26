@@ -683,14 +683,22 @@ algorithm; see "Server-side sticky assignment" below)
   the bytes it returned; one cut short or not read counts its whole `partition_max_bytes`). `max_wait_ms` is not capped, as in
   Kafka; a connection waiting on one is closed by the idle timeout once responses behind it
   wait unread (Network Security Posture)
-- ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
-  when a Produce to one of its partitions (or, for `read_committed`, any transaction
-  end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
-  signals new data, at `max_wait_ms`, or at the slow safety-net interval
-  `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
-  generate repeated fetch work on the DB thread. A fetch that names no partition (no
-  topics, or only empty partition lists) has nothing to wait for and is answered at
-  once, as in Kafka 3.7
+- ✅ Long polling (max_wait_ms/min_bytes support), as Kafka's `DelayedFetch`: a waiting
+  fetch is re-checked when a partition it watches changes, and only that partition is
+  re-read: a Produce to it, DeleteRecords of it, DeleteTopics of its topic, or, for
+  `read_committed`, any transaction end (EndTxn, an abort by fencing InitProducerId or by
+  the transaction timeout; every partition is re-read, the end not naming its partitions).
+  Once the bytes available reach `min_bytes`, or a re-read partition has an error, the
+  whole fetch is read once more and answered. At `max_wait_ms` it is read once more, or,
+  when nothing changed since a read that returned no records, that read is answered. A
+  re-check no notification asks for (the safety-net interval `pg_kafka.fetch_poll_interval_ms`,
+  default 1000 ms; a retention sweep that removed records; a dropped notification) reads
+  every partition and runs only within an allowance of 256 partitions per interval shared
+  by all long polls, so a long poll of more partitions sees such a change (an on-demand
+  `pg_kafka_run_retention_sweep()` in another session, say) at `max_wait_ms` only. An idle
+  long poll therefore costs one read of its partitions per request, as an immediate fetch
+  does. A fetch that names no partition (no topics, or only empty partition lists) has
+  nothing to wait for and is answered at once, as in Kafka 3.7
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
@@ -763,6 +771,9 @@ honored; producer CreateTime timestamps are preserved).
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
   (`read_committed`: the LSO) is offset -1
+- ✅ The leader epoch (v4+) is 0 with every offset found and -1 when none is, as Kafka 3.7
+  answers for a partition whose leader never changed: pg_kafka is one broker that leads every
+  partition in epoch 0 (the record batches it returns carry partition leader epoch 0)
 - ⚠️ **Deviation:** aborted records are never a match of a timestamp or MAX_TIMESTAMP
   lookup, at either isolation level; the answer is the next record that matches. Kafka 3.7
   (`FileRecords.searchForTimestamp`, `LogSegment.findOffsetByTimestamp`) searches the batches
@@ -930,14 +941,19 @@ one and on every requested topic/partition/group/resource it echoes:
 | Handler returns `Err`, or panics (a Postgres ERROR) | the error's code / UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 | The batch's commit fails | UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 
+A Fetch below v6 cannot carry KAFKA_STORAGE_ERROR (56): wherever a Fetch response would hold
+it, a v4 or v5 client gets NOT_LEADER_OR_FOLLOWER (6), which it retries after refreshing its
+metadata, as Kafka 3.7's `KafkaApis.handleFetchRequest` down-converts it
+(`ApiSchema::for_version`, applied to every response just before it is encoded).
+
 Remaining deviations: a body that does not decode has no entries to echo, so APIs without
 a top-level error code (Produce, ListOffsets, DescribeGroups, CreateTopics, ...) answer with
 an empty but well-formed response. A version kafka-protocol cannot encode a response in
 (below the advertised minimum, which is the crate's own minimum, or above the crate's
 maximum) closes the connection, as Kafka does for an unsupported version. A frame whose
-header cannot be parsed closes the connection. An API key pg_kafka does not serve gets the
-generic error frame (correlation id, UNSUPPORTED_VERSION, null message), since there is no
-response schema to answer in. An acks=0 Produce never gets a response.
+header cannot be parsed closes the connection, and so does an API key pg_kafka does not
+serve (it is not advertised in ApiVersions), as Kafka 3.7 closes the connection of a request
+for an API that is not enabled. An acks=0 Produce never gets a response.
 
 ### Notable Missing APIs
 

@@ -11,6 +11,7 @@ use kafka_protocol::messages::list_offsets_response::{
 use kafka_protocol::messages::TopicName;
 
 use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPartitions};
+use crate::kafka::constants::{ERROR_KAFKA_STORAGE_ERROR, ERROR_NOT_LEADER_OR_FOLLOWER};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::{
@@ -90,6 +91,28 @@ impl ApiSchema for FetchApi {
                 .iter()
                 .flat_map(|t| t.partitions.iter())
                 .any(|p| p.error_code != 0)
+    }
+
+    /// KAFKA_STORAGE_ERROR is a Fetch error from v6 on; Kafka 3.7 answers an older client
+    /// NOT_LEADER_OR_FOLLOWER in its place (`KafkaApis.handleFetchRequest`), which such a
+    /// client retries after refreshing its metadata. O(partitions in the response).
+    fn for_version(response: &mut FetchResponse, version: i16) {
+        if version > 5 {
+            return;
+        }
+        let down = |code: &mut i16| {
+            if *code == ERROR_KAFKA_STORAGE_ERROR {
+                *code = ERROR_NOT_LEADER_OR_FOLLOWER;
+            }
+        };
+        down(&mut response.error_code);
+        for p in response
+            .responses
+            .iter_mut()
+            .flat_map(|t| t.partitions.iter_mut())
+        {
+            down(&mut p.error_code);
+        }
     }
 }
 
@@ -207,6 +230,20 @@ impl ApiSchema for ListOffsetsApi {
             .iter()
             .flat_map(|t| t.partitions.iter())
             .any(|p| p.error_code != 0)
+    }
+
+    /// The leader epoch is a field from v4 on: an older response leaves it unset (the
+    /// kafka-protocol encoder refuses a set field a version lacks). O(partitions).
+    fn for_version(response: &mut ListOffsetsResponse, version: i16) {
+        if version < 4 {
+            for p in response
+                .topics
+                .iter_mut()
+                .flat_map(|t| t.partitions.iter_mut())
+            {
+                p.leader_epoch = -1;
+            }
+        }
     }
 }
 

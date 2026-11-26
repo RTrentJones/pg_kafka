@@ -4,6 +4,7 @@ pub const UNKNOWN_SERVER_ERROR: i16 = -1;
 pub const NONE: i16 = 0;
 pub const OFFSET_OUT_OF_RANGE: i16 = 1;
 pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
 pub const OFFSET_METADATA_TOO_LARGE: i16 = 12;
 pub const COORDINATOR_NOT_AVAILABLE: i16 = 15;
 pub const INVALID_TOPIC_EXCEPTION: i16 = 17;

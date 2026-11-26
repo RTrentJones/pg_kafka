@@ -142,6 +142,11 @@ pub trait ApiSchema: Sized + 'static {
 
     /// Whether `response` carries any non-zero error code (metrics).
     fn response_has_error(response: &ResponseOf<Self>) -> bool;
+
+    /// Adjust `response` to what a client of `version` understands, just before it is
+    /// encoded at that version (the one place every response of the API passes, whoever
+    /// built it: the handler, an error path or a refused batch). Default: nothing.
+    fn for_version(_response: &mut ResponseOf<Self>, _version: i16) {}
 }
 
 /// An API the DB thread serves: requests are decoded on the network thread into
@@ -436,11 +441,12 @@ fn reject_unsupported_version<A: KafkaApi>(
 
 /// Encode `response` (header + body) at `version`.
 fn encode_frame<A: ApiSchema>(
-    response: &ResponseOf<A>,
+    response: &mut ResponseOf<A>,
     correlation_id: i32,
     version: i16,
     buf: &mut BytesMut,
 ) -> crate::kafka::error::Result<()> {
+    A::for_version(response, version);
     let header = ResponseHeader::default().with_correlation_id(correlation_id);
     header.encode(
         buf,
@@ -531,8 +537,10 @@ macro_rules! kafka_apis {
                 #[doc = concat!("A ", stringify!($net_variant), " response.")]
                 $net_variant(ResponseOf<$net_api>),
             )*
-            /// The generic error frame for an API key pg_kafka does not serve (there is no
-            /// response schema to answer in): correlation id, error code, null message.
+            /// A schema-less frame: correlation id, error code, null message. No request is
+            /// answered with it (a request for an API key pg_kafka does not serve closes the
+            /// connection, as in Kafka 3.7); it is the response of no API, which the tests of
+            /// the request plumbing use.
             UnknownApi {
                 /// Kafka error code.
                 error_code: i16,
@@ -612,9 +620,9 @@ macro_rules! kafka_apis {
                     Self::CloseConnection => true,
                 }
             }
-            /// Encode header and body.
+            /// Encode header and body, after [`ApiSchema::for_version`].
             pub(crate) fn encode_frame(
-                &self,
+                &mut self,
                 correlation_id: i32,
                 version: i16,
                 buf: &mut BytesMut,
@@ -698,9 +706,8 @@ macro_rules! kafka_apis {
     };
 }
 
-/// The generic error frame for an unknown API key: response header v0, error code, null
-/// error message. Strict clients cannot parse it, but there is no schema to answer an
-/// unknown API in; a client that sends one is not negotiating through ApiVersions.
+/// The schema-less frame of [`ResponseBody::UnknownApi`]: response header v0, error code,
+/// null error message.
 fn encode_unknown_api_frame(
     correlation_id: i32,
     error_code: i16,

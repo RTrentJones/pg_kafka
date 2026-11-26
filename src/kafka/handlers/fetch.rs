@@ -921,6 +921,7 @@ fn list_offsets_partition(
             partition_response.error_code = ERROR_NONE;
             partition_response.offset = offset;
             partition_response.timestamp = timestamp;
+            partition_response.leader_epoch = found_leader_epoch(offset);
             partition_response
         }
         Err(e) => {
@@ -935,6 +936,20 @@ fn list_offsets_partition(
             }
             list_offsets_error(partition_id, e.to_kafka_error_code())
         }
+    }
+}
+
+/// The leader epoch ListOffsets reports with `offset`: 0 for an offset it found, -1 for none
+/// (-1). pg_kafka is one broker that leads every partition from its creation on, in epoch 0
+/// (every record batch it returns carries partition leader epoch 0), so it answers what
+/// Kafka 3.7 answers for a partition whose leader never changed: the epoch of the found
+/// offset, 0 (`UnifiedLog.fetchOffsetByTimestamp`). The epoch is a field from v4 on; the
+/// API's `for_version` clears it for older clients.
+fn found_leader_epoch(offset: i64) -> i32 {
+    if offset >= 0 {
+        0
+    } else {
+        -1
     }
 }
 

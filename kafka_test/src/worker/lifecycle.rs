@@ -1,7 +1,7 @@
 //! Worker lifecycle under extension DDL, old schemas, SIGTERM, lock waits and failed commits.
 
 use crate::common::{get_bootstrap_servers, TestResult};
-use crate::error_codes::KAFKA_STORAGE_ERROR;
+use crate::error_codes::{KAFKA_STORAGE_ERROR, NOT_LEADER_OR_FOLLOWER};
 use crate::members::Member;
 use crate::wire::records::batch;
 use crate::wire::Wire;
@@ -331,7 +331,8 @@ async fn old_schema() -> SendResult<()> {
 /// once it sees the updated schema, without a restart.
 ///
 /// Asserts: on 0.0.0, InitProducerId and an idempotent Produce (raw protocol) are answered
-/// KAFKA_STORAGE_ERROR and nothing is stored; an rdkafka idempotent producer's record stays
+/// KAFKA_STORAGE_ERROR and nothing is stored, and a Fetch KAFKA_STORAGE_ERROR at v11 and
+/// NOT_LEADER_OR_FOLLOWER at v4 and v5 (Kafka 3.7 down-converts it below v6); an rdkafka idempotent producer's record stays
 /// unacknowledged (rdkafka retries); the server log names `ALTER EXTENSION pg_kafka
 /// UPDATE`; after the update and a reload, that same record is acked at offset 0 and stored
 /// once, a new idempotent producer produces, and the listener process is the same.
@@ -392,6 +393,27 @@ async fn old_schema_refuses_clients() -> SendResult<()> {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         println!("✅ InitProducerId and Produce answered KAFKA_STORAGE_ERROR\n");
+
+        println!("Step 1b: raw Fetch v4, v5 and v11 on 0.0.0...");
+        for (version, expected) in [
+            (4, NOT_LEADER_OR_FOLLOWER),
+            (5, NOT_LEADER_OR_FOLLOWER),
+            (11, KAFKA_STORAGE_ERROR),
+        ] {
+            let request = crate::wire::requests::fetch_request(&topic, 0, 0, 0);
+            let response = wire
+                .call(version, &request)
+                .await
+                .map_err(|e| e.to_string())?;
+            let codes: Vec<i16> = response
+                .responses
+                .iter()
+                .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+                .collect();
+            println!("   Fetch v{version}: partition codes {codes:?}");
+            assert_eq!(codes, vec![expected], "Fetch v{version} on the 0.0.0 schema");
+        }
+        println!("✅ Fetch answered NOT_LEADER_OR_FOLLOWER below v6, KAFKA_STORAGE_ERROR from it\n");
 
         println!("Step 2: an rdkafka idempotent producer on 0.0.0...");
         let producer: FutureProducer = ClientConfig::new()

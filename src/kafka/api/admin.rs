@@ -18,6 +18,7 @@ use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
+use crate::kafka::notifications::{send_best_effort, InternalNotification};
 
 fn topic_name(name: &str) -> TopicName {
     TopicName(name.to_string().into())
@@ -181,7 +182,20 @@ impl KafkaApi for DeleteTopicsApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_delete_topics(&env.ctx, r.topic_names)
+            handlers::handle_delete_topics(&env.ctx, r.topic_names).inspect(|response| {
+                // Wake the long polls of each deleted topic: they are answered
+                // UNKNOWN_TOPIC_OR_PARTITION now rather than at their deadline.
+                for topic in response.responses.iter().filter(|t| t.error_code == 0) {
+                    if let Some(name) = &topic.name {
+                        send_best_effort(
+                            env.notify_tx,
+                            InternalNotification::TopicDeleted {
+                                topic_name: name.0.to_string(),
+                            },
+                        );
+                    }
+                }
+            })
         })
     }
 }

@@ -7,6 +7,7 @@
 //! - Edge cases: Timeout precision, disconnect handling, multiple waiters, auto-commit
 
 mod edge_cases;
+mod idle_cost;
 mod task_cap;
 mod timeout;
 mod transaction_end;
@@ -27,5 +28,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         edge_cases::test_long_poll_multiple_consumers_same_partition: sequential, // Multiple consumers
         edge_cases::test_long_poll_auto_commit_interval: sequential, // Timing-sensitive
         transaction_end::test_transaction_end_wakes_parked_read_committed_fetch: sequential,
+        idle_cost::test_idle_long_polls_leave_the_db_thread_free: sequential, // Reads the broker's Fetch counter and times Produce
     ]
 }
