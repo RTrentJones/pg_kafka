@@ -77,8 +77,8 @@ impl Dispatcher {
     }
 
     /// Cap a Fetch ([`cap_fetch`]) and decide where the request goes: a Fetch with
-    /// `max_wait_ms > 0` to a long-poll task while the connection's `long_poll_permits`
-    /// allow, everything else straight to its lane.
+    /// `max_wait_ms > 0` and at least one partition to a long-poll task while the
+    /// connection's `long_poll_permits` allow, everything else straight to its lane.
     pub(super) fn route(
         &self,
         mut request: KafkaRequest,
@@ -147,7 +147,7 @@ impl Dispatcher {
     }
 
     /// A long-poll slot and the safety-net interval, when `request` is a Fetch that may
-    /// wait. A connection holds at most [`MAX_LONG_POLLS_PER_CONNECTION`] long polls; a
+    /// wait: `max_wait_ms > 0` and at least one partition. A connection holds at most [`MAX_LONG_POLLS_PER_CONNECTION`] long polls; a
     /// Fetch over the cap is served by the immediate path, a valid (possibly empty)
     /// response, so the degradation is latency, never an error.
     fn long_poll_slot(
@@ -159,7 +159,10 @@ impl Dispatcher {
         let RequestBody::Fetch(fetch) = &request.body else {
             return None;
         };
-        if fetch.max_wait_ms <= 0 {
+        // A Fetch of no partitions (no topics, or only empty partition lists) has nothing
+        // to wait for: Kafka 3.7 answers it at once, so it goes straight to the worker,
+        // unregistered. O(topics in the request).
+        if fetch.max_wait_ms <= 0 || fetch.topic_data.iter().all(|t| t.partitions.is_empty()) {
             return None;
         }
         let Ok(permit) = Arc::clone(long_poll_permits).try_acquire_owned() else {
@@ -265,6 +268,73 @@ mod tests {
             panic!("a Fetch");
         };
         assert_eq!(sent.max_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_of_no_partitions_is_not_a_long_poll() {
+        use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
+        // Kafka 3.7 answers a waiting Fetch that names no partition at once: it goes
+        // straight to the main lane, holding no long-poll slot and registering nothing.
+        let (main, main_rx) = crossbeam_channel::bounded(4);
+        let (liveness, _liveness_rx) = crossbeam_channel::bounded(4);
+        let dispatcher = Dispatcher {
+            request_lanes: RequestLanes { main, liveness },
+            registry: Arc::new(PendingFetchRegistry::new()),
+            long_poll_interval: Some(Duration::from_secs(1)),
+            runtime_context: Arc::new(crate::kafka::RuntimeContext::new(
+                crate::config::Config::load(),
+            )),
+        };
+        let permits = Arc::new(Semaphore::new(MAX_LONG_POLLS_PER_CONNECTION));
+        let request = |topic_data: Vec<TopicFetchData>| {
+            let (response_tx, _responses) = tokio::sync::mpsc::unbounded_channel();
+            KafkaRequest {
+                header: crate::kafka::api::RequestHeader {
+                    api_key: crate::kafka::constants::API_KEY_FETCH,
+                    api_version: 4,
+                    correlation_id: 1,
+                    client_id: None,
+                },
+                body: RequestBody::Fetch(FetchRequestData {
+                    topic_data,
+                    ..fetch(1 << 20, 1)
+                }),
+                response_tx,
+                decode_charge: DecodedCharge::default(),
+            }
+        };
+        let empty_topic = |name: &str| TopicFetchData {
+            name: name.to_string(),
+            partitions: Vec::new(),
+        };
+        for topic_data in [Vec::new(), vec![empty_topic("a"), empty_topic("b")]] {
+            match dispatcher.route(request(topic_data), &permits) {
+                Route::Lane(request) => assert!(dispatcher.send(request).await),
+                Route::LongPoll(_) => panic!("a Fetch of no partitions must not long-poll"),
+            }
+            assert!(main_rx.try_recv().is_ok(), "sent to the main lane");
+            assert_eq!(
+                permits.available_permits(),
+                MAX_LONG_POLLS_PER_CONNECTION,
+                "no long-poll slot taken"
+            );
+        }
+        // One partition anywhere in the request makes it a long poll.
+        let one = vec![
+            empty_topic("a"),
+            TopicFetchData {
+                name: "b".to_string(),
+                partitions: vec![PartitionFetchData {
+                    partition_index: 0,
+                    fetch_offset: 0,
+                    partition_max_bytes: 1024,
+                }],
+            },
+        ];
+        assert!(matches!(
+            dispatcher.route(request(one), &permits),
+            Route::LongPoll(_)
+        ));
     }
 
     #[tokio::test]

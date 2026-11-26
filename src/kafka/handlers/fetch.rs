@@ -576,10 +576,7 @@ fn fetch_partition(
     // their offsets, and a fetch from such a hole must skip ahead to the next committed
     // record. fetch_offset == high_watermark is valid (caught up, waiting for data).
     if fetch_offset < bounds.log_start_offset || fetch_offset > bounds.high_watermark {
-        let mut partition_data = partition_with_bounds(partition_id, &bounds);
-        partition_data.error_code = ERROR_OFFSET_OUT_OF_RANGE;
-        partition_data.records = None;
-        return partition_data;
+        return offset_out_of_range(partition_id);
     }
 
     // Once the request-level max_bytes is spent, later partitions report their bounds
@@ -732,17 +729,33 @@ fn take_gap_batch(
     Some(gap)
 }
 
-/// A partition entry for an error that leaves its bounds unknown.
+/// A partition entry for an error that leaves its bounds unknown: every offset -1, and
+/// an empty (never null) records field.
 fn partition_error(partition_id: i32, error_code: i16) -> PartitionData {
     let mut partition_data = PartitionData::default();
     partition_data.partition_index = partition_id;
     partition_data.error_code = error_code;
     partition_data.high_watermark = -1;
+    partition_data.last_stable_offset = -1;
+    partition_data.log_start_offset = -1;
+    partition_data.records = Some(bytes::Bytes::new());
+    partition_data
+}
+
+/// The entry of a partition fetched outside its log, as Kafka 3.7 answers it: no bounds
+/// (-1), null aborted transactions and an empty, non-null records field. librdkafka
+/// rejects a whole Fetch response whose records field is null ("invalid MessageSetSize
+/// -1") before it reads the error code, so a null here would leave the consumer
+/// refetching the same offset without ever applying its auto.offset.reset policy.
+fn offset_out_of_range(partition_id: i32) -> PartitionData {
+    let mut partition_data = partition_error(partition_id, ERROR_OFFSET_OUT_OF_RANGE);
+    partition_data.aborted_transactions = None;
     partition_data
 }
 
 /// A successful partition entry with its bounds and no records. Empty bytes rather than
-/// None: a null records field is an "invalid MessageSetSize -1" in the flexible format.
+/// None: librdkafka rejects the whole response over a null records field (see
+/// [`offset_out_of_range`]).
 fn partition_with_bounds(partition_id: i32, bounds: &PartitionBounds) -> PartitionData {
     let mut partition_data = PartitionData::default();
     partition_data.partition_index = partition_id;
@@ -781,9 +794,7 @@ fn fetched_partition_data(
                 partition_id,
                 e
             );
-            let mut partition_data = partition_error(partition_id, ERROR_KAFKA_STORAGE_ERROR);
-            partition_data.records = Some(bytes::Bytes::new());
-            partition_data
+            partition_error(partition_id, ERROR_KAFKA_STORAGE_ERROR)
         }
     }
 }

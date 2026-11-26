@@ -10,17 +10,28 @@ use crate::setup::TestContext;
 use crate::wire::requests::{creatable, create_topics_raw, fetch_request};
 use crate::wire::{decode_response, read_frame_within, request_frame};
 use bytes::Bytes;
-use kafka_protocol::messages::FetchRequest;
+use kafka_protocol::messages::{FetchRequest, FetchResponse, TopicName};
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// How much later than its `max_wait_ms` (or than at once) an empty Fetch may be answered:
-/// the broker's own work and the test host's scheduling, well under the 1000 ms safety-net
-/// re-check of a waiting fetch (`pg_kafka.fetch_poll_interval_ms`).
+/// How much later than its `max_wait_ms` an empty Fetch may be answered, before the round
+/// trip [`late_slack`] adds: the broker's own work and the test host's scheduling. With that
+/// round trip the slack reaches up to 2 s, more than the 1000 ms safety-net re-check of a
+/// waiting fetch (`pg_kafka.fetch_poll_interval_ms`), so it judges only answers due at a
+/// deadline; an answer due at once is judged by [`immediate_bound`], which stays below the
+/// safety net.
 const ANSWER_SLACK: Duration = Duration::from_millis(500);
 /// The most an observed round trip adds to [`ANSWER_SLACK`] (see [`late_slack`]).
 const MAX_ROUND_TRIP_SLACK: Duration = Duration::from_millis(1_500);
+/// How much later than the round trip of a `max_wait_ms = 0` Fetch an answer due at once may
+/// come (see [`immediate_bound`]).
+const IMMEDIATE_SLACK: Duration = Duration::from_millis(300);
+/// How far below the safety-net interval [`immediate_bound`] must stay, so that an answer
+/// from the first safety-net re-check (at the interval, give or take timer and scheduling
+/// jitter) is never taken for an immediate one.
+const SAFETY_NET_MARGIN: Duration = Duration::from_millis(100);
 
 /// How much later than its `max_wait_ms` the next empty Fetch on `s` may be answered:
 /// [`ANSWER_SLACK`] plus the round trip of an empty `max_wait_ms = 0` Fetch (correlation
@@ -33,6 +44,49 @@ pub(super) async fn late_slack(s: &mut TcpStream, corr: i32, topic: &str) -> Dyn
     println!("  an empty max_wait_ms=0 Fetch took {round_trip:?}");
     Ok(ANSWER_SLACK + round_trip.min(MAX_ROUND_TRIP_SLACK))
 }
+/// The longest an answer due at once may take on `s`: the shortest of three round trips of
+/// an empty `max_wait_ms = 0` Fetch (correlations `corr..corr + 3`) plus [`IMMEDIATE_SLACK`].
+/// A broker that wrongly waits answers at the latest at its first safety-net re-check
+/// (`pg_kafka.fetch_poll_interval_ms` after the request), so the bound must stay
+/// [`SAFETY_NET_MARGIN`] below that interval; on a host too slow for that the test cannot
+/// tell the two apart, and fails saying so rather than passing a broker that waits.
+pub(super) async fn immediate_bound(
+    ctx: &TestContext,
+    s: &mut TcpStream,
+    corr: i32,
+    topic: &str,
+) -> DynResult<Duration> {
+    let mut round_trip = Duration::MAX;
+    for c in corr..corr + 3 {
+        round_trip = round_trip.min(timed_empty_fetch(s, c, topic, 0, 1).await?);
+    }
+    let safety_net = safety_net_interval(ctx).await?;
+    let bound = round_trip + IMMEDIATE_SLACK;
+    println!("  an empty max_wait_ms=0 Fetch took {round_trip:?} (safety net {safety_net:?})");
+    if bound + SAFETY_NET_MARGIN > safety_net {
+        return Err(format!(
+            "an empty max_wait_ms=0 Fetch takes {round_trip:?}: too slow to tell an immediate \
+             answer from the {safety_net:?} safety-net re-check of a waiting fetch; rerun on \
+             a less loaded host"
+        )
+        .into());
+    }
+    Ok(bound)
+}
+
+/// `pg_kafka.fetch_poll_interval_ms`, the safety-net re-check interval of a long poll.
+async fn safety_net_interval(ctx: &TestContext) -> DynResult<Duration> {
+    let ms: u64 = ctx
+        .db()
+        .query_one("SHOW pg_kafka.fetch_poll_interval_ms", &[])
+        .await?
+        .get::<_, String>(0)
+        .trim()
+        .trim_end_matches("ms")
+        .parse()?;
+    Ok(Duration::from_millis(ms))
+}
+
 /// How much earlier than its `max_wait_ms` an empty Fetch may be answered: the client's
 /// clock starts before the broker's, so a broker that waits `max_wait_ms` is never early by
 /// more than timer granularity.
@@ -59,29 +113,42 @@ pub(super) async fn timed_empty_fetch(
 ) -> DynResult<Duration> {
     let mut req = fetch_request(topic, 0, 0, max_wait_ms);
     req.min_bytes = min_bytes;
-    let started = Instant::now();
-    s.write_all(&request_frame(4, corr, &req)).await?;
-    let frame = read_frame_within(s, Duration::from_secs(30))
-        .await?
-        .ok_or("closed on fetch")?;
-    let took = started.elapsed();
-    let (c, resp) = decode_response::<FetchRequest>(4, &frame)?;
+    let (took, resp) = timed_fetch(s, corr, &req).await?;
     let partition = &resp.responses[0].partitions[0];
-    if c != corr
-        || partition.error_code != 0
+    if partition.error_code != 0
         || partition
             .records
             .as_ref()
             .is_some_and(|r: &Bytes| !r.is_empty())
     {
         return Err(format!(
-            "expected an empty success for correlation {corr}, got {c}: error {}, {} bytes",
+            "expected an empty success for correlation {corr}: error {}, {} bytes",
             partition.error_code,
             partition.records.as_ref().map_or(0, Bytes::len)
         )
         .into());
     }
     Ok(took)
+}
+
+/// Send the Fetch (v4) `req` with correlation `corr` on `s`: how long its answer took, and
+/// the answer. Fails unless the answer carries `corr`.
+async fn timed_fetch(
+    s: &mut TcpStream,
+    corr: i32,
+    req: &FetchRequest,
+) -> DynResult<(Duration, FetchResponse)> {
+    let started = Instant::now();
+    s.write_all(&request_frame(4, corr, req)).await?;
+    let frame = read_frame_within(s, Duration::from_secs(30))
+        .await?
+        .ok_or("closed on fetch")?;
+    let took = started.elapsed();
+    let (c, resp) = decode_response::<FetchRequest>(4, &frame)?;
+    if c != corr {
+        return Err(format!("expected the answer to correlation {corr}, got {c}").into());
+    }
+    Ok((took, resp))
 }
 
 /// An empty Fetch with `max_wait_ms = 0` is answered at once, and so is one with
@@ -95,17 +162,59 @@ pub async fn test_long_poll_immediate_return() -> TestResult {
     println!("Step 1: empty topic {topic}");
 
     for (corr, max_wait_ms, min_bytes) in [(1, 0, 1), (2, 0, 1_000_000), (3, 5_000, 0)] {
-        let slack = late_slack(&mut s, 100 + corr, &topic).await?;
+        let bound = immediate_bound(&ctx, &mut s, 100 * corr, &topic).await?;
         let took = timed_empty_fetch(&mut s, corr, &topic, max_wait_ms, min_bytes).await?;
         println!("  max_wait_ms={max_wait_ms}, min_bytes={min_bytes}: answered in {took:?}");
         assert!(
-            took < slack,
+            took < bound,
             "an empty Fetch with max_wait_ms={max_wait_ms} and min_bytes={min_bytes} is answered \
              at once, took {took:?}"
         );
     }
     ctx.cleanup().await?;
     println!("\n✅ Long poll immediate return test PASSED\n");
+    Ok(())
+}
+
+/// A waiting Fetch (`max_wait_ms = 5000`, `min_bytes = 1`) that names no partition, with no
+/// topics or only topics with empty partition lists, has nothing to wait for and is
+/// answered at once, as Kafka 3.7 answers it, not after `max_wait_ms` or at a safety-net
+/// re-check.
+pub async fn test_long_poll_of_no_partitions_returns_at_once() -> TestResult {
+    println!("=== Test: Long Poll of No Partitions Returns At Once ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = empty_topic(&ctx, "longpoll-nopart").await?;
+    let mut s = TcpStream::connect(("127.0.0.1", crate::common::broker_port())).await?;
+    println!("Step 1: empty topic {topic}");
+
+    for (corr, with_topics) in [(1, false), (2, true)] {
+        let mut req = fetch_request(&topic, 0, 0, 5_000);
+        if with_topics {
+            let mut other = req.topics[0].clone();
+            other.topic = TopicName(StrBytes::from_string(format!("{topic}-absent")));
+            req.topics.push(other);
+            for t in &mut req.topics {
+                t.partitions.clear();
+            }
+        } else {
+            req.topics.clear();
+        }
+        let bound = immediate_bound(&ctx, &mut s, 100 * corr, &topic).await?;
+        let (took, resp) = timed_fetch(&mut s, corr, &req).await?;
+        let partitions: usize = resp.responses.iter().map(|t| t.partitions.len()).sum();
+        println!(
+            "  {} topics, no partitions: answered in {took:?} ({partitions} partition entries)",
+            req.topics.len()
+        );
+        assert_eq!(partitions, 0, "a Fetch of no partitions answers none");
+        assert!(
+            took < bound,
+            "a waiting Fetch of {} topics and no partitions is answered at once, took {took:?}",
+            req.topics.len()
+        );
+    }
+    ctx.cleanup().await?;
+    println!("\n✅ Long poll of no partitions test PASSED\n");
     Ok(())
 }
 

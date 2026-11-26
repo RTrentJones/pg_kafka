@@ -636,7 +636,9 @@ algorithm; see "Server-side sticky assignment" below)
   end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
   signals new data, at `max_wait_ms`, or at the slow safety-net interval
   `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
-  generate repeated fetch work on the DB thread
+  generate repeated fetch work on the DB thread. A fetch that names no partition (no
+  topics, or only empty partition lists) has nothing to wait for and is answered at
+  once, as in Kafka 3.7
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
