@@ -74,6 +74,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         // Replay test
         replay::test_replay_historical_messages: sequential,
         replay::test_replay_skips_aborted_records: sequential,
+        replay::test_replay_held_open_does_not_stall_the_db_thread: sequential,
         // Sync forwarding happens only after the local commit
         rollback::test_sync_forward_skips_rolled_back_request: sequential,
         pipelined::test_shadow_forward_throughput: sequential,

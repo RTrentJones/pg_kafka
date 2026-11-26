@@ -128,12 +128,34 @@ pub(super) fn reload_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     });
 }
 
+/// The `lock_timeout` of an outbox tick's statements, far below
+/// `pg_kafka.worker_lock_timeout_ms` (5 s by default).
+const OUTBOX_TICK_LOCK_TIMEOUT_MS: i32 = 50;
+
 /// SH-9: one tick of the durable shadow outbox: apply the forward acks the network
 /// thread returned, then dispatch the next due batch, in one transaction; the applied
 /// acks are made final after its commit. Failures (for example a dropped schema) pause
 /// the tick exponentially and are logged sparsely (`note_outbox_tick`).
+///
+/// Lock waits: the tick's statements update outbox rows, which other sessions hold
+/// across statements: `kafka.replay_shadow_messages` holds every row it re-queues until
+/// its caller commits (seconds, or as long as an operator keeps the transaction open),
+/// and an on-demand retention sweep holds the rows it reaped until its pass commits. A
+/// tick waiting for one stopped every client of the DB thread for up to
+/// `pg_kafka.worker_lock_timeout_ms`, at every tick while the holder lasted, and its
+/// ack batch (rows held) followed by the claim (waiting) could close a cycle with a
+/// replay locking the same rows in another order. So the tick runs with a
+/// transaction-local `lock_timeout` of [`OUTBOX_TICK_LOCK_TIMEOUT_MS`] (or the worker's,
+/// if lower): a wait that runs out fails the ack subtransaction or the poll like any
+/// ERROR, the tick backs off (`note_outbox_tick`), and the next one retries. A failed
+/// ack application keeps its acks (they stay in `unapplied_acks` until a tick that
+/// applied them commits) and their rows in flight, so nothing is lost or sent twice. A
+/// cycle cannot outlast the timeout: the tick's wait ends within it, long before the
+/// other session's deadlock check (deadlock_timeout, 1 s by default) for a wait it began
+/// after the tick took its rows.
 pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
     let outcome = worker_transaction(|| {
+        bound_tick_lock_waits();
         // The acks are applied first (marking delivered rows done so the poll does not
         // re-dispatch them), in a subtransaction of their own, so a Postgres ERROR in
         // the poll does not roll their application back with it.
@@ -179,6 +201,26 @@ pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
         // back, and the next tick applies them again).
         Ok(()) => shadow_store.commit_applied_acks(),
         Err(e) => log_txn_error("Shadow outbox poll", &e),
+    }
+}
+
+/// Set this transaction's `lock_timeout` to [`OUTBOX_TICK_LOCK_TIMEOUT_MS`], or to
+/// `pg_kafka.worker_lock_timeout_ms` when that is lower (0 there means no timeout).
+fn bound_tick_lock_waits() {
+    let ms = tick_lock_timeout_ms(crate::config::WORKER_LOCK_TIMEOUT_MS.get());
+    if let Err(e) = Spi::run(&format!(
+        "SELECT set_config('lock_timeout', '{ms}ms', true)"
+    )) {
+        pg_warning!("Shadow outbox: could not bound the tick's lock waits: {e}");
+    }
+}
+
+/// The tick's lock_timeout for a worker lock_timeout of `worker_ms` (0: none).
+fn tick_lock_timeout_ms(worker_ms: i32) -> i32 {
+    if worker_ms > 0 {
+        worker_ms.min(OUTBOX_TICK_LOCK_TIMEOUT_MS)
+    } else {
+        OUTBOX_TICK_LOCK_TIMEOUT_MS
     }
 }
 
@@ -286,5 +328,18 @@ pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) 
     };
     if let Some(msg) = flusher.finish(batch, written) {
         pg_warning!("{}", msg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tick_lock_timeout_ms, OUTBOX_TICK_LOCK_TIMEOUT_MS};
+
+    #[test]
+    fn tick_lock_timeout_is_the_lower_bound_and_never_unbounded() {
+        assert_eq!(tick_lock_timeout_ms(5000), OUTBOX_TICK_LOCK_TIMEOUT_MS);
+        assert_eq!(tick_lock_timeout_ms(0), OUTBOX_TICK_LOCK_TIMEOUT_MS);
+        assert_eq!(tick_lock_timeout_ms(-1), OUTBOX_TICK_LOCK_TIMEOUT_MS);
+        assert_eq!(tick_lock_timeout_ms(10), 10);
     }
 }

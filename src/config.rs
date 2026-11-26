@@ -320,6 +320,21 @@ gucs! {
         range: (-1, 1500),
     }
 
+    /// TEST ONLY: a pause (milliseconds) inside the retention sweep's stale-producer
+    /// prune statement, after its snapshot and before it locks its victims, so an E2E
+    /// test can commit a producer's revival in between and check that the lock re-checks
+    /// the idle window on the committed row. 0 (default): no pause, and the statement is
+    /// the production one. Never set in production.
+    pub(crate) int TEST_PRODUCER_PRUNE_PAUSE_MS = 0 => c"pg_kafka.test_producer_prune_pause_ms" {
+        short: c"TEST ONLY: pause inside the sweep's producer prune before it locks (ms)",
+        long: c"Fault-injection knob for the retention-sweep E2E tests: the stale-producer \
+          prune statement sleeps this long after taking its snapshot and before locking \
+          the producers it deletes. 0 (default) means no pause. Do not set in \
+          production. Superuser SET.",
+        context: Suset,
+        range: (0, 10000),
+    }
+
     /// Let a FetchRequest wait up to its max_wait_ms for data.
     bool ENABLE_LONG_POLLING = true => c"pg_kafka.enable_long_polling" {
         short: c"Enable long polling for FetchRequest",

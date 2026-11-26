@@ -337,6 +337,14 @@ inserts (or resets to pending, closing any open attempt) a `kafka.shadow_trackin
 committed or non-transactional message of that topic in `[p_from_offset, p_to_offset)` (`NULL` = to
 the end), across all partitions, and returns the number of rows re-queued.
 
+The re-queued rows stay locked until the caller's transaction ends. The outbox tick runs with a
+transaction-local `lock_timeout` of 50 ms (or `pg_kafka.worker_lock_timeout_ms`, if lower), so an
+ack or a claim that reaches a row an open replay holds gives up within it: the tick fails, its acks
+stay queued (their rows in flight), it backs off like any failed tick, and the next one retries.
+The DB thread is never stopped for longer than that, and the tick cannot stay in a lock cycle with
+a replay that locks the same rows in another order. Commit a replay promptly: the topic is not
+forwarded until it does.
+
 ```sql
 SELECT kafka.replay_shadow_messages(
     (SELECT id FROM kafka.topics WHERE name = 'orders'), 0, NULL);

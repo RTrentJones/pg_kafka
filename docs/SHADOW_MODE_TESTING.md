@@ -227,6 +227,7 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_external_primary_dead_letter_serves_local` | Once a forward is dead-lettered (`retry_count >= pg_kafka.shadow_max_retries`), an external-primary topic serves the record locally |
 | `test_replay_historical_messages` | `kafka.replay_shadow_messages()` re-queues stored messages and they are forwarded |
 | `test_replay_skips_aborted_records` | Replay never re-queues aborted transactional records |
+| `test_replay_held_open_does_not_stall_the_db_thread` | A replay held open in another session (holding 200 re-queued rows while the outbox tick reaches them): Produce requests to another topic are still answered within 1 s, and the rows are forwarded once it ends |
 | `test_sync_forward_skips_rolled_back_request` | A sync-mode Produce whose request rolls back (a test trigger raises on its second partition) leaves no copy on the external broker; a clean produce afterwards is still delivered |
 | `test_shadow_forward_throughput` | 20 000 records forwarded end to end at ≥ 2000 msg/s with no failed attempts (pipelined forwarder) |
 | `test_shadow_forwards_headers_and_timestamps` | Record headers (in order, binary values) and the producer's CreateTime reach the external topic |
