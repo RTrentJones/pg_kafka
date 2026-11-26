@@ -754,6 +754,9 @@ honored; producer CreateTime timestamps are preserved).
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
   (`read_committed`: the LSO) is offset -1
+- ✅ The leader epoch (v4+) is 0 with every offset found and -1 when none is, as Kafka 3.7
+  answers for a partition whose leader never changed: pg_kafka is one broker that leads every
+  partition in epoch 0 (the record batches it returns carry partition leader epoch 0)
 - ⚠️ **Deviation:** aborted records are never a match of a timestamp or MAX_TIMESTAMP
   lookup, at either isolation level; the answer is the next record that matches. Kafka 3.7
   (`FileRecords.searchForTimestamp`, `LogSegment.findOffsetByTimestamp`) searches the batches

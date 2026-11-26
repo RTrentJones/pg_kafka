@@ -358,6 +358,10 @@ fn test_handle_list_offsets_latest() {
     let partition_response = &response.topics[0].partitions[0];
     assert_eq!(partition_response.error_code, ERROR_NONE);
     assert_eq!(partition_response.offset, 100);
+    assert_eq!(
+        partition_response.leader_epoch, 0,
+        "Kafka 3.7 reports the epoch of a found offset"
+    );
 }
 
 #[test]
@@ -432,6 +436,14 @@ fn list_one(partition: i32, timestamp: i64, isolation: IsolationLevel) -> (i16, 
     }];
     let r = fetch::handle_list_offsets(&ctx, topics, isolation).unwrap();
     let p = &r.topics[0].partitions[0];
+    // The epoch of a found offset is 0 (one leader, from the partition's creation on); none
+    // found, or an error, -1.
+    let epoch = if p.error_code == ERROR_NONE && p.offset >= 0 {
+        0
+    } else {
+        -1
+    };
+    assert_eq!(p.leader_epoch, epoch, "leader epoch of {p:?}");
     (p.error_code, p.offset, p.timestamp)
 }
 

@@ -231,6 +231,20 @@ impl ApiSchema for ListOffsetsApi {
             .flat_map(|t| t.partitions.iter())
             .any(|p| p.error_code != 0)
     }
+
+    /// The leader epoch is a field from v4 on: an older response leaves it unset (the
+    /// kafka-protocol encoder refuses a set field a version lacks). O(partitions).
+    fn for_version(response: &mut ListOffsetsResponse, version: i16) {
+        if version < 4 {
+            for p in response
+                .topics
+                .iter_mut()
+                .flat_map(|t| t.partitions.iter_mut())
+            {
+                p.leader_epoch = -1;
+            }
+        }
+    }
 }
 
 impl KafkaApi for ListOffsetsApi {

@@ -232,4 +232,33 @@ mod tests {
             );
         }
     }
+
+    /// A ListOffsets leader epoch reaches a v4+ client and is left out below v4, where the
+    /// response has no such field (setting it there would fail the encode).
+    #[test]
+    fn list_offsets_leader_epoch_is_encoded_from_v4() {
+        use bytes::Buf;
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::protocol::{Decodable, HeaderVersion, StrBytes};
+        for version in [1i16, 3, 4, 7] {
+            let mut partition = ListOffsetsPartitionResponse::default();
+            partition.offset = 5;
+            partition.leader_epoch = 0;
+            let mut topic = ListOffsetsTopicResponse::default();
+            topic.name = TopicName(StrBytes::from_static_str("t"));
+            topic.partitions = vec![partition];
+            let mut response = ListOffsetsResponse::default();
+            response.topics = vec![topic];
+            let mut frame = encode(1, version, ResponseBody::ListOffsets(response)).freeze();
+            frame.advance(4);
+            if ListOffsetsResponse::header_version(version) > 0 {
+                frame.advance(1);
+            }
+            let decoded = ListOffsetsResponse::decode(&mut frame, version).unwrap();
+            let epoch = decoded.topics[0].partitions[0].leader_epoch;
+            assert_eq!(epoch, if version >= 4 { 0 } else { -1 }, "v{version}");
+        }
+    }
 }
