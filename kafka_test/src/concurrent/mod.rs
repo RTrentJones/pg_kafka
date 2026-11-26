@@ -14,6 +14,7 @@ mod race_conditions;
 pub fn tests() -> Vec<crate::registry::TestDef> {
     crate::test_defs!["concurrent";
         liveness_lane::test_heartbeat_bypasses_produce_backlog: sequential,
+        liveness_lane::test_heartbeat_answered_at_once_on_an_idle_broker: sequential,
         multi_producer::test_concurrent_producers_same_topic: sequential,
         multi_producer::test_concurrent_producers_different_partitions: sequential,
         multi_consumer::test_multiple_consumer_groups: sequential,

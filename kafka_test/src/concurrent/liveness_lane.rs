@@ -134,3 +134,52 @@ pub async fn test_heartbeat_bypasses_produce_backlog() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Heartbeats the idle-broker test sends.
+const IDLE_PROBES: usize = 20;
+
+/// On an idle broker the worker waits for main-lane requests up to its receive timeout
+/// (100 ms); a Heartbeat arriving meanwhile must wake it, not wait for the timeout and
+/// the next loop's liveness check: a 100 ms delay on every heartbeat of an idle group
+/// eats into session timeouts for nothing.
+///
+/// Asserts: 20 Heartbeats (to a group that does not exist: the error answer takes the
+/// same lane and path), sent at spacings that do not line up with the 100 ms wait, have
+/// a median round trip below 20 ms (it was about 50 ms: half the receive timeout).
+pub async fn test_heartbeat_answered_at_once_on_an_idle_broker() -> TestResult {
+    println!("=== Test: a Heartbeat on an idle broker is answered at once ===\n");
+    let group = format!("liveness-idle-{}", Uuid::new_v4());
+    let mut stream = TcpStream::connect(crate::common::get_bootstrap_servers()).await?;
+    stream.set_nodelay(true)?;
+    let mut heartbeat = HeartbeatRequest::default();
+    heartbeat.group_id = GroupId(StrBytes::from_string(group));
+    heartbeat.generation_id = 1;
+    heartbeat.member_id = StrBytes::from_static_str("liveness-idle-member");
+    let mut rtts = Vec::with_capacity(IDLE_PROBES);
+    for probe in 0..IDLE_PROBES {
+        // 37 ms plus a varying part: the probes land anywhere in the worker's wait.
+        tokio::time::sleep(Duration::from_millis(37 + 13 * (probe as u64 % 7))).await;
+        let started = Instant::now();
+        stream
+            .write_all(&request_frame(0, 100 + to_i32(probe), &heartbeat))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream))
+            .await
+            .map_err(|_| "heartbeat response timed out")?
+            .map_err(|e| format!("heartbeat read failed: {e}"))?;
+        rtts.push(started.elapsed());
+    }
+    rtts.sort();
+    let median = rtts[IDLE_PROBES / 2];
+    println!(
+        "  Heartbeat RTTs: min {:?}, median {median:?}, max {:?}",
+        rtts[0],
+        rtts[IDLE_PROBES - 1]
+    );
+    assert!(
+        median < Duration::from_millis(20),
+        "idle-broker Heartbeats waited {median:?} (median): the worker does not wake for the liveness lane"
+    );
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

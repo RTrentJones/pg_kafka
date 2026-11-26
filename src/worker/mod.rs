@@ -358,8 +358,8 @@ impl MainLoop<'_> {
     /// DR-12: the liveness lane is drained before the next main-lane request.
     /// Heartbeats are served from the in-memory coordinator in microseconds, and those
     /// that arrive while a main-lane batch runs are answered between its requests, so
-    /// a heartbeat waits behind at most one in-flight request (plus RECV_TIMEOUT when
-    /// idle), never behind the main queue. One liveness batch per iteration, not "until
+    /// a heartbeat waits behind at most one in-flight request, never behind the main
+    /// queue; one arriving while the worker waits wakes it. One liveness batch per iteration, not "until
     /// empty", so a flood of heartbeats cannot starve the main lane.
     fn serve_requests(&self) {
         let inbox = &self.network.inbox;
@@ -376,6 +376,15 @@ impl MainLoop<'_> {
         let wait = requested.map_or(RECV_TIMEOUT, |w| w.min(RECV_TIMEOUT));
         let received = crossbeam_channel::select! {
             recv(inbox.requests) -> r => r.map_err(|_| RecvTimeoutError::Disconnected),
+            // A Heartbeat arriving during the wait is served at once, not after the
+            // wait and the next iteration's liveness check (up to RECV_TIMEOUT late on
+            // an idle broker).
+            recv(inbox.liveness) -> h => {
+                if let Ok(first) = h {
+                    execute_batch(first, &inbox.liveness, None, self.env);
+                }
+                Err(RecvTimeoutError::Timeout)
+            },
             recv(inbox.credentials) -> c => {
                 if let Ok(first) = c {
                     serve_credential_requests(first, &inbox.credentials);
