@@ -513,8 +513,8 @@ impl GroupCoordinator {
 
         pg_log!(
             "JoinGroup: group_id={}, member_id={}, state={:?}",
-            group.group_id,
-            member_id,
+            shown(&group.group_id),
+            shown(&member_id),
             group.state
         );
         let disposition = Self::apply_join(&mut group, member_id, params, unchanged, out);
@@ -568,7 +568,7 @@ impl GroupCoordinator {
         let held = groups.total_held();
         crate::pg_warning!(
             "JoinGroup for group '{}' refused: its member state ({} bytes) does not fit the {} bytes groups hold of pg_kafka.max_group_memory ({} bytes)",
-            params.group_id,
+            shown(&params.group_id),
             after,
             held,
             max_memory
@@ -611,7 +611,7 @@ impl GroupCoordinator {
         }
         crate::pg_warning!(
             "JoinGroup for new group '{}' refused: {} groups in memory (pg_kafka.max_consumer_groups = {})",
-            group_id,
+            shown(group_id),
             groups.len(),
             max_groups
         );
@@ -853,8 +853,8 @@ impl GroupCoordinator {
         }
         pg_log!(
             "SyncGroup: group_id={}, member_id={}, is_leader={}, assignments={}, state={:?}",
-            group_id,
-            member_id,
+            shown(group_id),
+            shown(member_id),
             is_leader,
             assignments.len(),
             group.state
@@ -878,7 +878,7 @@ impl GroupCoordinator {
                 if after > group.held_bytes && held_elsewhere.saturating_add(after) > max_memory {
                     crate::pg_warning!(
                         "SyncGroup for group '{}' refused: its assignments bring the group to {} bytes, which with the {} bytes other groups hold exceeds pg_kafka.max_group_memory ({} bytes)",
-                        group_id,
+                        shown(group_id),
                         after,
                         held_elsewhere,
                         max_memory
@@ -1132,7 +1132,7 @@ impl GroupCoordinator {
                             "LeaveGroup: {} of {} member(s) left group {}",
                             removed,
                             codes.len(),
-                            group_id
+                            shown(group_id)
                         );
                         group.settle_removals();
                         group.on_members_removed(&mut deliveries);
@@ -1200,8 +1200,8 @@ impl GroupCoordinator {
                 for member_id in &timed_out {
                     pg_log!(
                         "Member {} timed out in group {} (session_timeout exceeded)",
-                        member_id,
-                        group_id
+                        shown(member_id),
+                        shown(group_id)
                     );
                     group.remove_member(member_id, &mut deliveries);
                     removed.push((group_id.to_string(), member_id.clone()));
@@ -1307,7 +1307,7 @@ impl GroupCoordinator {
 
         pg_log!(
             "Computed assignments for group {} using strategy {}: {} members",
-            group_id,
+            shown(group_id),
             strategy_name,
             encoded.len()
         );
@@ -1377,7 +1377,7 @@ impl GroupCoordinator {
         let mut orphaned_syncs: Vec<(String, SyncResponder)> = Vec::new();
         if let Ok(mut groups) = self.groups.write() {
             groups.remove(group_id);
-            pg_log!("Removed group '{}' from coordinator", group_id);
+            pg_log!("Removed group '{}' from coordinator", shown(group_id));
             let mut pending = self.lock_pending();
             let keys: Vec<(String, String)> = pending
                 .keys()
@@ -1434,7 +1434,7 @@ fn member_subscriptions(group: &ConsumerGroup) -> HashMap<String, MemberSubscrip
                     MemberSubscription::parse_topics(metadata).unwrap_or_else(|e| {
                         pg_log!(
                             "Failed to parse subscription for member {}: {}",
-                            member_id,
+                            shown(member_id),
                             e
                         );
                         MemberSubscription::default()
@@ -1503,7 +1503,7 @@ fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {
     if entries > max {
         crate::pg_warning!(
             "SyncGroup for group '{}' refused: computing its assignments takes {} entries (subscriptions, previous assignments and partitions), above the limit of {}",
-            group_id,
+            shown(group_id),
             entries,
             max
         );
@@ -1534,7 +1534,7 @@ fn run_assignor(
             .map_err(|exceeded| {
                 crate::pg_warning!(
                     "SyncGroup for group '{}' refused: its sticky assignment takes more than {} steps",
-                    group_id,
+                    shown(group_id),
                     exceeded.budget
                 );
                 KafkaError::PolicyViolation {
@@ -1680,6 +1680,33 @@ fn current_member<'a>(
         ));
     }
     Ok(group)
+}
+
+/// The most bytes of a client string (a group or member id) a log line carries.
+const SHOWN_ID_BYTES: usize = 64;
+
+/// A client string as log lines show it: whole up to [`SHOWN_ID_BYTES`], otherwise its first
+/// bytes up to that many (at a character boundary) and its length. Group and member ids are up
+/// to 32 KB each, and the coordinator logs per request (a refused JoinGroup, a SyncGroup at
+/// LOG): whole ids let one client write 32 KB of log per request. O(1).
+pub(crate) fn shown(id: &str) -> Shown<'_> {
+    Shown(id)
+}
+
+/// See [`shown`].
+pub(crate) struct Shown<'a>(&'a str);
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.len() <= SHOWN_ID_BYTES {
+            return f.write_str(self.0);
+        }
+        let mut end = SHOWN_ID_BYTES;
+        while !self.0.is_char_boundary(end) {
+            end -= 1;
+        }
+        write!(f, "{}...({} bytes)", &self.0[..end], self.0.len())
+    }
 }
 
 /// INCONSISTENT_GROUP_PROTOCOL for a JoinGroup whose protocol type or protocols do not fit the

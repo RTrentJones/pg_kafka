@@ -2502,3 +2502,21 @@ fn test_running_totals_stay_exact_under_random_operations() {
         drop(slots);
     }
 }
+
+#[test]
+fn test_logged_ids_are_bounded() {
+    assert_eq!(shown("g").to_string(), "g");
+    let exact = "x".repeat(SHOWN_ID_BYTES);
+    assert_eq!(shown(&exact).to_string(), exact);
+    let long = "y".repeat(32 * 1024);
+    let logged = shown(&long).to_string();
+    assert_eq!(logged, format!("{}...(32768 bytes)", "y".repeat(64)));
+    // Cut at a character boundary: 'é' is two bytes, so 64 bytes would split the 33rd.
+    let accented = format!("a{}", "é".repeat(100));
+    let logged = shown(&accented).to_string();
+    assert!(
+        logged.starts_with(&format!("a{}...", "é".repeat(31))),
+        "{logged}"
+    );
+    assert!(logged.ends_with("(201 bytes)"));
+}

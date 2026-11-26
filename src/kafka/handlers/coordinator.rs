@@ -537,7 +537,7 @@ pub fn handle_sync_group<F>(
                 // (docs/PROTOCOL_DEVIATIONS.md).
                 crate::pg_warning!(
                     "SyncGroup: the server-side assignment of group {} at generation {} failed: {}",
-                    group_id,
+                    crate::kafka::coordinator::shown(group_id),
                     generation_id,
                     e
                 );
