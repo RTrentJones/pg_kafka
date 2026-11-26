@@ -584,7 +584,7 @@ impl ConsumerGroup {
         self.rebalance_started_at = Some(Instant::now());
         pg_log!(
             "Group {} preparing rebalance (current generation {})",
-            self.group_id,
+            super::shown(&self.group_id),
             self.generation_id
         );
     }
@@ -639,7 +639,7 @@ impl ConsumerGroup {
         }
         pg_log!(
             "Group {} completed join phase (generation {}, {} member(s))",
-            self.group_id,
+            super::shown(&self.group_id),
             self.generation_id,
             self.members.len()
         );
@@ -839,7 +839,7 @@ impl ConsumerGroup {
             }
             pg_log!(
                 "Group {} generation {}: evicting {} member(s) that did not sync within the rebalance timeout",
-                self.group_id,
+                super::shown(&self.group_id),
                 self.generation_id,
                 unsynced.len()
             );
@@ -859,7 +859,7 @@ impl ConsumerGroup {
         stragglers.sort();
         pg_log!(
             "Group {} join phase timed out after {}ms; evicting {} member(s) that did not rejoin",
-            self.group_id,
+            super::shown(&self.group_id),
             started.elapsed().as_millis(),
             stragglers.len()
         );
@@ -906,7 +906,7 @@ impl ConsumerGroup {
         self.last_activity = Instant::now();
         pg_log!(
             "Group {} completed sync phase (generation {})",
-            self.group_id,
+            super::shown(&self.group_id),
             self.generation_id
         );
     }

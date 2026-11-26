@@ -170,7 +170,7 @@ fn age_member(c: &GroupCoordinator, group: &str, member: &str, d: Duration) {
 /// Pretend the group's current rebalance phase started `d` ago.
 fn age_rebalance(c: &GroupCoordinator, group: &str, d: Duration) {
     let mut groups = c.groups.write().unwrap();
-    let group = groups.get_mut(group).unwrap();
+    let mut group = groups.get_mut(group).unwrap();
     group.rebalance_started_at = Some(ago(d));
     // The sync deadline runs from the same join completion.
     if group.sync_started_at.is_some() {
@@ -1154,7 +1154,7 @@ fn test_sweep_rebalance_timeout_evicts_stragglers_and_completes_join() {
 #[test]
 fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
     // The timeout is the largest rebalance_timeout_ms the members advertise,
-    // not a hardcoded 5 minutes. join_group also runs it (over every group).
+    // not a hardcoded 5 minutes. The sweep runs it; a JoinGroup only for the group it names.
     let c = GroupCoordinator::new();
     let mut p = params("g", None, &[("range", b"sub")]);
     p.rebalance_timeout_ms = 20;
@@ -1165,10 +1165,13 @@ fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
     let b = join(&c, "g", None);
     // `b` advertises 60s, so the group's timeout is 60s, not `a`'s 20ms.
     age_rebalance(&c, "g", Duration::from_millis(100));
-    let _ = join(&c, "other", None);
+    c.check_and_remove_timed_out_members();
     assert!(is_pending(&b));
     age_rebalance(&c, "g", Duration::from_secs(61));
-    let _ = join(&c, "other2", None);
+    // Another group's JoinGroup leaves this group's timeout to the sweep.
+    let _ = join(&c, "other", None);
+    assert!(is_pending(&b));
+    c.check_and_remove_timed_out_members();
     let b = joined(&b);
     assert!(b.is_leader());
     assert!(!c.get_group_state("g").unwrap().members.contains_key(&a));
@@ -1255,7 +1258,7 @@ fn test_members_that_never_sync_are_evicted_after_the_rebalance_timeout() {
         .unwrap();
     {
         let mut groups = c.groups.write().unwrap();
-        let g = groups.get_mut("g").unwrap();
+        let mut g = groups.get_mut("g").unwrap();
         assert!(g.sync_started_at.is_none());
         g.rebalance_started_at = Some(ago(Duration::from_secs(600)));
     }
@@ -2322,4 +2325,198 @@ fn test_assignment_input_keeps_no_user_data() {
         assert_eq!(subscription.topics, ["t"]);
         assert!(subscription.user_data.is_none(), "user data copied");
     }
+}
+
+// ----- request cost independent of the number of groups -----
+
+/// The time of `ops` JoinGroups naming an unknown member of an existing group (answered
+/// UNKNOWN_MEMBER_ID) and `ops` that create a group and leave it, on a coordinator that holds
+/// `groups` Stable groups besides.
+fn join_cost(groups: usize, ops: usize) -> Duration {
+    let c = GroupCoordinator::new();
+    c.set_limits(groups + ops + 10, 10);
+    for i in 0..groups {
+        stable_single(&c, &format!("g{i}"));
+    }
+    let started = Instant::now();
+    for i in 0..ops {
+        assert_eq!(
+            join_error_code(&join(&c, "g0", Some("bogus"))),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        let group = format!("new{i}");
+        let member = joined(&join(&c, &group, None)).member_id;
+        c.leave_group(&group, &member).unwrap();
+    }
+    started.elapsed()
+}
+
+#[test]
+fn test_join_cost_is_independent_of_the_number_of_groups() {
+    // The review's reproduction: every JoinGroup, also one answered UNKNOWN_MEMBER_ID, ran the
+    // TTL and rebalance timeouts of every group and summed what all of them hold (27 ms per
+    // JoinGroup at 85 000 groups). Only the named group's state is visited now, so 500 times
+    // more groups cost about the same.
+    let small = join_cost(100, 500);
+    let large = join_cost(50_000, 500);
+    println!("100 groups: {small:?}; 50 000 groups: {large:?}");
+    assert!(
+        large < small * 5 + Duration::from_millis(20),
+        "1000 JoinGroups took {large:?} beside 50 000 groups and {small:?} beside 100"
+    );
+}
+
+/// A small deterministic generator for the randomized sequences below.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(n.max(1)).unwrap()).unwrap()
+    }
+}
+
+/// The running totals and Empty-group index agree with a recount from every group.
+fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
+    let groups = c.groups.read().unwrap();
+    let (running, running_empty) = groups.running();
+    let (counted, counted_empty) = groups.recounted();
+    assert_eq!(running, counted, "totals after step {step} (op {op})");
+    assert_eq!(
+        running_empty, counted_empty,
+        "Empty index after step {step} (op {op})"
+    );
+}
+
+#[test]
+fn test_running_totals_stay_exact_under_random_operations() {
+    for seed in 1..=6_u64 {
+        let mut rng = Rng(seed * 0x9E37_79B9_7F4A_7C15);
+        let c = GroupCoordinator::new();
+        let ids: Vec<String> = (0..8)
+            .map(|i| format!("g{i}-{}", "x".repeat(i * 7)))
+            .collect();
+        let mut slots: Vec<Slot> = Vec::new();
+        for step in 0..1_500 {
+            let group = ids[rng.below(ids.len())].clone();
+            let snapshot = c.get_group_state(&group);
+            let members: Vec<String> = snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |g| g.members.keys().cloned().collect());
+            let member = (!members.is_empty()).then(|| members[rng.below(members.len())].clone());
+            let op = rng.below(11);
+            match op {
+                0 | 1 => {
+                    let metadata = vec![7_u8; rng.below(300)];
+                    let protocol = ["range", "roundrobin"][rng.below(2)];
+                    slots.push(join_with(
+                        &c,
+                        &params(&group, None, &[(protocol, &metadata)]),
+                    ));
+                }
+                2 => {
+                    if let Some(m) = &member {
+                        let metadata = vec![1_u8; rng.below(50)];
+                        slots.push(join_with(
+                            &c,
+                            &params(&group, Some(m), &[("range", &metadata)]),
+                        ));
+                    }
+                }
+                3 => {
+                    if let Some(m) = &member {
+                        let _ = c.leave_group(&group, m);
+                    }
+                }
+                4 => {
+                    if let Some(g) = &snapshot {
+                        if let Some(leader) = g.leader.clone() {
+                            let assignments = g
+                                .members
+                                .keys()
+                                .map(|m| (m.clone(), vec![3_u8; rng.below(400)]))
+                                .collect();
+                            c.sync_park(group.clone(), leader, g.generation_id, assignments);
+                        }
+                    }
+                }
+                5 => {
+                    if let (Some(m), Some(g)) = (&member, &snapshot) {
+                        let _ = c.heartbeat(&group, m, g.generation_id);
+                        c.sync_park(group.clone(), m.clone(), g.generation_id, Vec::new());
+                    }
+                }
+                6 => {
+                    if let Some(m) = &member {
+                        age_member(&c, &group, m, Duration::from_secs(31));
+                    }
+                    c.check_and_remove_timed_out_members();
+                }
+                7 => {
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|g| g.state == GroupState::Empty)
+                    {
+                        c.groups
+                            .write()
+                            .unwrap()
+                            .get_mut(&group)
+                            .unwrap()
+                            .last_activity = ago(Duration::from_secs(EMPTY_GROUP_TTL_SECS + 1));
+                        if rng.below(2) == 0 {
+                            c.check_and_remove_timed_out_members();
+                        } else {
+                            join(&c, &group, None);
+                        }
+                    }
+                }
+                8 => {
+                    // A tight memory budget, so the join forgets Empty groups to fit.
+                    let held = c.held_bytes();
+                    c.set_memory_limit(held.saturating_sub(rng.below(3_000)) + 1_500);
+                    slots.push(join(&c, &format!("mem{step}"), None));
+                    c.set_memory_limit(crate::kafka::limits::DEFAULT_MAX_GROUP_MEMORY_BYTES);
+                }
+                9 => {
+                    // A lowered group cap, so a new group forgets Empty groups.
+                    c.set_limits(1 + rng.below(6), 10);
+                    slots.push(join(&c, &format!("cap{step}"), None));
+                    c.set_limits(100, 10);
+                }
+                _ => {
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|g| g.rebalance_started_at.is_some())
+                    {
+                        age_rebalance(&c, &group, Duration::from_secs(61));
+                        c.check_and_remove_timed_out_members();
+                    } else if rng.below(4) == 0 {
+                        c.remove_group(&group);
+                    }
+                }
+            }
+            assert_totals_exact(&c, step, op);
+        }
+        drop(slots);
+    }
+}
+
+#[test]
+fn test_logged_ids_are_bounded() {
+    assert_eq!(shown("g").to_string(), "g");
+    let exact = "x".repeat(SHOWN_ID_BYTES);
+    assert_eq!(shown(&exact).to_string(), exact);
+    let long = "y".repeat(32 * 1024);
+    let logged = shown(&long).to_string();
+    assert_eq!(logged, format!("{}...(32768 bytes)", "y".repeat(64)));
+    // Cut at a character boundary: 'é' is two bytes, so 64 bytes would split the 33rd.
+    let accented = format!("a{}", "é".repeat(100));
+    let logged = shown(&accented).to_string();
+    assert!(
+        logged.starts_with(&format!("a{}...", "é".repeat(31))),
+        "{logged}"
+    );
+    assert!(logged.ends_with("(201 bytes)"));
 }

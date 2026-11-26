@@ -3,7 +3,7 @@
 
 use super::{internal, PostgresStore};
 use crate::kafka::error::Result;
-use crate::kafka::storage::{CommittedOffset, GroupTopicOffsets};
+use crate::kafka::storage::{CommittedOffset, GroupTopicOffsets, OffsetGroupPage};
 use pgrx::prelude::*;
 use std::collections::HashSet;
 
@@ -163,34 +163,64 @@ impl PostgresStore {
         .map_err(internal("delete_consumer_group_offsets"))
     }
 
-    /// Every group with a committed offset or a pending transactional offset, sorted.
-    /// The ids of the groups with offsets, sorted, as long as their running total of
-    /// `octet_length + LISTED_GROUP_OVERHEAD` stays within `max_bytes`, and the first id past
-    /// it (see [`OffsetStore::list_offset_groups`]). The other ids past the budget never
-    /// leave the executor.
+    /// The groups with offsets a ListGroups may list (see [`OffsetStore::list_offset_groups`]):
+    /// their ids in byte order while the running total of `octet_length + LISTED_GROUP_OVERHEAD`
+    /// before each stays within `max_bytes`, and whether another follows.
+    ///
+    /// A loose index scan: each step takes the next distinct id after the last one from the
+    /// primary key of kafka.consumer_offsets and from idx_txn_pending_offsets_group (both lead
+    /// with group_id, collated "C") and keeps the lower, so a group of many partitions costs
+    /// two index probes like a group of one, and the walk stops one id past the budget. Cost:
+    /// O(g log n) for the `g` ids returned (at most about `max_bytes / LISTED_GROUP_OVERHEAD`)
+    /// over `n` offset rows, whatever the tables hold past them; memory: those ids. (Every
+    /// row of both tables was read and sorted before: 504 ms for a million rows, on every
+    /// ListGroups.) The order is byte order (`COLLATE "C"`, the columns' own collation) to
+    /// agree with the handler's sort of the ids; under the database's collation the cut kept
+    /// another set of groups than the handler then listed in byte order. The statement takes
+    /// only ACCESS SHARE locks and reads no row lock, so it waits only for DDL on the tables.
     ///
     /// [`OffsetStore::list_offset_groups`]: crate::kafka::storage::OffsetStore::list_offset_groups
-    pub(super) fn list_offset_groups(max_bytes: usize) -> Result<Vec<String>> {
+    pub(super) fn list_offset_groups(max_bytes: usize) -> Result<OffsetGroupPage> {
         let budget = i64::try_from(max_bytes).unwrap_or(i64::MAX);
         let overhead = i64::try_from(crate::kafka::storage::LISTED_GROUP_OVERHEAD).unwrap_or(0);
-        read_in_chunks(
-            "SELECT group_id
-             FROM (SELECT group_id,
-                          sum(octet_length(group_id) + $2) OVER w AS listed_bytes
-                   FROM (SELECT group_id FROM kafka.consumer_offsets
-                         UNION
-                         SELECT group_id FROM kafka.txn_pending_offsets) g
-                   WINDOW w AS (ORDER BY group_id ROWS UNBOUNDED PRECEDING)) s
-             WHERE listed_bytes - (octet_length(group_id) + $2) <= $1
-             ORDER BY group_id",
+        let rows = read_in_chunks(
+            r#"WITH RECURSIVE g(group_id, before) AS (
+                 SELECT LEAST((SELECT o.group_id COLLATE "C" FROM kafka.consumer_offsets o
+                               ORDER BY o.group_id COLLATE "C" LIMIT 1),
+                              (SELECT p.group_id COLLATE "C" FROM kafka.txn_pending_offsets p
+                               ORDER BY p.group_id COLLATE "C" LIMIT 1)),
+                        0::bigint
+                 UNION ALL
+                 SELECT LEAST((SELECT o.group_id COLLATE "C" FROM kafka.consumer_offsets o
+                               WHERE o.group_id COLLATE "C" > g.group_id
+                               ORDER BY o.group_id COLLATE "C" LIMIT 1),
+                              (SELECT p.group_id COLLATE "C" FROM kafka.txn_pending_offsets p
+                               WHERE p.group_id COLLATE "C" > g.group_id
+                               ORDER BY p.group_id COLLATE "C" LIMIT 1)),
+                        g.before + octet_length(g.group_id) + $2
+                 FROM g
+                 WHERE g.group_id IS NOT NULL AND g.before <= $1
+               )
+               SELECT group_id, before <= $1 AS listed FROM g WHERE group_id IS NOT NULL"#,
             &[budget.into(), overhead.into()],
             |row| {
-                Ok(row
-                    .get_by_name::<String, _>("group_id")?
-                    .unwrap_or_default())
+                Ok((
+                    row.get_by_name::<String, _>("group_id")?
+                        .unwrap_or_default(),
+                    row.get_by_name::<bool, _>("listed")?.unwrap_or(false),
+                ))
             },
         )
-        .map_err(internal("list_offset_groups"))
+        .map_err(internal("list_offset_groups"))?;
+        let mut page = OffsetGroupPage::default();
+        for (group_id, listed) in rows {
+            if listed {
+                page.ids.push(group_id);
+            } else {
+                page.more = true;
+            }
+        }
+        Ok(page)
     }
 
     pub(super) fn groups_with_offsets(group_ids: &[String]) -> Result<HashSet<String>> {

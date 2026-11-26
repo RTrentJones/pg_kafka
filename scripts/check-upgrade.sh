@@ -9,8 +9,9 @@
 #   3. creates database B at 0.0.0, writes some data, runs
 #      `ALTER EXTENSION pg_kafka UPDATE`;
 #   4. fails unless B reports the current version, kept its data, and its kafka
-#      schema (columns, indexes, CHECK/foreign-key constraints, table/column/schema/function
-#      ACLs, function bodies, views, comments, roles, the partitioning of kafka.messages) is
+#      schema (columns with their collations, indexes, CHECK/foreign-key constraints,
+#      table/column/schema/function ACLs, function bodies, views, comments, roles, the
+#      partitioning of kafka.messages) is
 #      identical to A's (function arguments with their defaults, strictness and owner;
 #      relation storage parameters, persistence and owner; sequence parameters);
 #   5. checks the time partitions work on both (ADR-001): maintenance creates leaves,
@@ -89,6 +90,7 @@ SELECT 'default-leaf ' || c.relname FROM pg_class c
 WHERE c.oid IN (SELECT oid FROM leaves) AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT';
 SELECT 'column ' || table_name || '.' || column_name || ' ' || data_type || ' '
        || is_nullable || ' ' || coalesce(column_default, '')
+       || coalesce(' collate ' || collation_name, '')
 FROM information_schema.columns WHERE table_schema = 'kafka'
   AND table_name NOT IN (SELECT relname FROM leaves)
 ORDER BY 1;

@@ -101,6 +101,11 @@ REVOKE ALL ON kafka.messages_legacy FROM PUBLIC;
 DROP VIEW kafka.shadow_status;
 DROP VIEW kafka.metrics;
 
+-- Group ids sort by their bytes (see bootstrap.sql), as ListGroups lists them. kafka.metrics,
+-- which reads consumer_offsets.group_id, was dropped just above, so the column can change.
+ALTER TABLE kafka.consumer_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+ALTER TABLE kafka.txn_pending_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+
 -- Time-partitioned (ADR-001): RANGE on created_at, the broker insert time.
 -- Each leaf ("time partition", like a Kafka log segment) covers
 -- pg_kafka.message_partition_minutes (default one day, aligned to UTC). The worker

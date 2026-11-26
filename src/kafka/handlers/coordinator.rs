@@ -86,10 +86,28 @@ pub struct JoinGroupRequestData {
     pub protocols: Vec<crate::kafka::messages::JoinGroupProtocol>,
 }
 
+/// The error a JoinGroup or SyncGroup reply dropped unsent answers: COORDINATOR_NOT_AVAILABLE.
+///
+/// A reply is dropped unsent when its request unwinds (a Postgres ERROR, which pgrx raises as a
+/// panic: a lock timeout on kafka.topics while the leader's SyncGroup reads its subscribed
+/// topics for the server-side assignment, or a bug) or when the worker exits with held
+/// JoinGroups and parked SyncGroups. Either way the broker failed, not the request: neither
+/// API writes to the database, the coordinator keeps the group as it was before the request
+/// (the unwinding request changed nothing, or the coordinator is gone), and what the client
+/// should do is look the coordinator up again and rejoin, which COORDINATOR_NOT_AVAILABLE
+/// tells the Java consumer and librdkafka (a leader rejoining with unchanged metadata during
+/// the sync phase keeps its generation and syncs again). Kafka 3.7 answers a group request
+/// whose group state it could not store the same way. UNKNOWN_SERVER_ERROR is fatal to the
+/// Java consumer's JoinGroup and SyncGroup.
+///
+/// A rule for every dropped reply, rather than a subtransaction around the assignment's
+/// topic read: the read is not the only way a reply goes unsent, and every way has the same
+/// right answer.
+const DROPPED_REPLY_ERROR: i16 = crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE;
+
 /// The client's side of one JoinGroup: sends the (possibly deferred) response to the
-/// connection that asked. If it is dropped without having sent anything (a bug or a
-/// panic between accepting the request and answering it), it answers
-/// UNKNOWN_SERVER_ERROR instead, so the client is never left waiting for a response
+/// connection that asked. If it is dropped without having sent anything, it answers
+/// [`DROPPED_REPLY_ERROR`] instead, so the client is never left waiting for a response
 /// that cannot come.
 pub struct JoinGroupReply {
     correlation_id: i32,
@@ -156,7 +174,7 @@ impl Drop for JoinGroupReply {
         if self.response_tx.is_some() {
             self.send_inner(
                 crate::kafka::response_builders::build_join_group_error_response(
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                    DROPPED_REPLY_ERROR,
                 ),
             );
         }
@@ -358,7 +376,7 @@ fn build_join_group_response(
 
 /// The client's side of one SyncGroup: sends the (possibly deferred) response to the
 /// connection that asked, exactly once. Like [`JoinGroupReply`], if it is dropped
-/// without having sent anything it answers UNKNOWN_SERVER_ERROR.
+/// without having sent anything it answers [`DROPPED_REPLY_ERROR`].
 pub struct SyncGroupReply {
     correlation_id: i32,
     api_version: i16,
@@ -409,7 +427,7 @@ impl Drop for SyncGroupReply {
         if self.response_tx.is_some() {
             self.send_inner(
                 crate::kafka::response_builders::build_sync_group_error_response(
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                    DROPPED_REPLY_ERROR,
                 ),
             );
         }
@@ -510,11 +528,16 @@ pub fn handle_sync_group<F>(
                 // member assigned nothing until the next rebalance. COORDINATOR_NOT_AVAILABLE
                 // is what Kafka 3.7 answers a SyncGroup whose assignment it failed to store;
                 // the Java client and librdkafka look the coordinator up again and rejoin,
-                // which starts a new generation that computes the assignment again
-                // (UNKNOWN_SERVER_ERROR would be fatal to the Java client's SyncGroup).
+                // and the leader's rejoin with unchanged metadata keeps the generation, so its
+                // next SyncGroup computes the assignment again (UNKNOWN_SERVER_ERROR would be
+                // fatal to the Java client's SyncGroup). A Postgres ERROR in the read unwinds
+                // instead of returning here; the dropped reply answers the same code
+                // (DROPPED_REPLY_ERROR). Unlike Kafka, the parked followers keep waiting and
+                // the group is not sent back to its join phase
+                // (docs/PROTOCOL_DEVIATIONS.md).
                 crate::pg_warning!(
                     "SyncGroup: the server-side assignment of group {} at generation {} failed: {}",
-                    group_id,
+                    crate::kafka::coordinator::shown(group_id),
                     generation_id,
                     e
                 );
@@ -729,7 +752,7 @@ pub fn describe_groups(
     // an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = groups
         .iter()
-        .filter(|g| !coordinator_groups.contains_key(*g))
+        .filter(|g| !coordinator_groups.contains_key(g.as_str()))
         .cloned()
         .collect();
     let with_offsets = if unheld.is_empty() {
@@ -746,7 +769,7 @@ pub fn describe_groups(
         .groups
         .reserve(groups.len().min(MAX_PREALLOC_ELEMENTS));
     for group_id in groups {
-        let described_group = match coordinator_groups.get(&group_id) {
+        let described_group = match coordinator_groups.get(group_id.as_str()) {
             Some(group) => {
                 let (bytes, entry) = sized
                     .entry(group_id)
@@ -926,26 +949,52 @@ pub fn handle_list_groups(
 /// ListGroups of the groups in `states_filter` (all if empty) in a response of at most about
 /// `max_bytes`.
 ///
-/// The groups are listed in the order of their ids: the groups the coordinator holds, and the
-/// groups known only by their offsets (committed, or pending in an open transaction) as Empty
-/// "consumer" groups (see [`describe_unheld_group`]), so `kafka-consumer-groups --list` keeps
-/// showing them after a worker restart. Group ids are client strings of up to 32 KB and the
-/// offset-only groups are bounded only by the database, so the list is cut where its entries
-/// ([`listed_group_bytes`]) would take the response past `max_bytes`; the first group is always
-/// listed. ListGroups has no per-group error, and an error code would make the Java admin
-/// client drop the whole list, so the cut list is answered NONE and the server logs a WARNING
-/// (docs/PROTOCOL_DEVIATIONS.md). With a state filter the offset-only groups read are counted
-/// as if none were filtered out, so the list may be cut a little earlier than `max_bytes`.
+/// The groups are listed in the byte order of their ids: the groups the coordinator holds, and
+/// the groups known only by their offsets (committed, or pending in an open transaction) as
+/// Empty "consumer" groups (see [`describe_unheld_group`]), so `kafka-consumer-groups --list`
+/// keeps showing them after a worker restart. Group ids are client strings of up to 32 KB and
+/// the offset-only groups are bounded only by the database, so the list is cut where its
+/// entries ([`listed_group_bytes`]) would take the response past `max_bytes`; the first group
+/// is always listed. ListGroups has no per-group error, and an error code would make the Java
+/// admin client drop the whole list, so the cut list is answered NONE and the server logs a
+/// WARNING (docs/PROTOCOL_DEVIATIONS.md).
 ///
-/// Cost, for `h` held groups and `o` offset-only groups read: the offset-only ids past
-/// `max_bytes` are never read ([`crate::kafka::storage::OffsetStore::list_offset_groups`]);
-/// time O((h + o) log(h + o)) to sort references to them; memory O(h + o) references, the ids
+/// The list is always a prefix, in id order, of the groups the filter selects: the store reads
+/// the offset groups in id order up to `max_bytes` ([`OffsetStore::list_offset_groups`]), and
+/// when more follow, nothing past the last id it read is listed (a held group further on
+/// would skip the unread offset-only groups before it). Its budget counts the offset groups
+/// the coordinator holds as well, also those in a state the filter removes, so with a filter
+/// the list may stop short of `max_bytes`; it is then reported as cut all the same.
+///
+/// Cost, for `h` held groups and `o` offset-only groups read: the store reads O(o) index
+/// entries, at most about `max_bytes / LISTED_GROUP_OVERHEAD` groups; time O(h + (h + o)
+/// log(h + o)) to filter and sort references to them; memory O(h + o) references, the ids
 /// read (at most about `max_bytes`) and a response of at most about `max_bytes`.
+///
+/// [`OffsetStore::list_offset_groups`]: crate::kafka::storage::OffsetStore::list_offset_groups
 pub fn list_groups(
     ctx: &HandlerContext,
     states_filter: &[String],
     max_bytes: usize,
 ) -> Result<ListGroupsResponse> {
+    let (response, cut) = list_groups_cut(ctx, states_filter, max_bytes)?;
+    if cut {
+        crate::pg_warning!(
+            "ListGroups: {} group(s) listed; the groups after them are left out, as listing them would take the response past pg_kafka.fetch_max_bytes ({} bytes)",
+            response.groups.len(),
+            max_bytes
+        );
+    }
+    Ok(response)
+}
+
+/// [`list_groups`] without its WARNING: the response, and whether groups the filter selects
+/// were left out.
+fn list_groups_cut(
+    ctx: &HandlerContext,
+    states_filter: &[String],
+    max_bytes: usize,
+) -> Result<(ListGroupsResponse, bool)> {
     let coordinator = ctx.coordinator;
 
     let mut response = ListGroupsResponse::default();
@@ -971,14 +1020,20 @@ pub fn list_groups(
     let offset_groups = if wanted("Empty") {
         ctx.store.list_offset_groups(max_bytes)?
     } else {
-        Vec::new()
+        crate::kafka::storage::OffsetGroupPage::default()
     };
+    // Past the last id read, the offset-only groups are unknown: nothing there is listed.
+    let horizon: Option<&[u8]> = offset_groups
+        .more
+        .then(|| offset_groups.ids.last().map(String::as_bytes))
+        .flatten();
+    let within = |group_id: &str| horizon.is_none_or(|last| group_id.as_bytes() <= last);
     let mut listed: Vec<(&str, &str, &'static str)> = coordinator_groups
         .iter()
-        .filter(|(_, group)| wanted(group.state.as_str()))
+        .filter(|(group_id, group)| wanted(group.state.as_str()) && within(group_id))
         .map(|(group_id, group)| {
             (
-                group_id.as_str(),
+                &**group_id,
                 group.protocol_type.as_deref().unwrap_or("consumer"),
                 group.state.as_str(),
             )
@@ -986,14 +1041,16 @@ pub fn list_groups(
         .collect();
     listed.extend(
         offset_groups
+            .ids
             .iter()
-            .filter(|group_id| !coordinator_groups.contains_key(*group_id))
+            .filter(|group_id| !coordinator_groups.contains_key(group_id.as_str()))
             .map(|group_id| (group_id.as_str(), "consumer", "Empty")),
     );
+    // Byte order (`str`'s), the order the store reads the offset groups in.
     listed.sort_unstable();
 
     let mut listed_bytes = 0_usize;
-    let mut cut = false;
+    let mut cut = offset_groups.more;
     for (group_id, protocol_type, state) in listed {
         let bytes = listed_group_bytes(group_id, protocol_type, state);
         if listed_bytes > 0 && listed_bytes.saturating_add(bytes) > max_bytes {
@@ -1008,15 +1065,8 @@ pub fn list_groups(
         listed_group.group_state = StrBytes::from_static_str(state);
         response.groups.push(listed_group);
     }
-    if cut {
-        crate::pg_warning!(
-            "ListGroups: {} group(s) listed; the groups after them are left out, as listing them would take the response past pg_kafka.fetch_max_bytes ({} bytes)",
-            response.groups.len(),
-            max_bytes
-        );
-    }
 
-    Ok(response)
+    Ok((response, cut))
 }
 
 /// What a ListGroups entry takes when encoded: its id, protocol type and state, and
@@ -1057,7 +1107,9 @@ mod tests {
             store
                 .expect_groups_with_offsets()
                 .returning(|_| Ok(std::collections::HashSet::new()));
-            store.expect_list_offset_groups().returning(|_| Ok(vec![]));
+            store
+                .expect_list_offset_groups()
+                .returning(|_| Ok(crate::kafka::storage::OffsetGroupPage::default()));
             Self {
                 store,
                 coordinator: GroupCoordinator::new(),
@@ -1532,7 +1584,7 @@ mod tests {
                 assert_eq!(correlation_id, 8);
                 assert_eq!(
                     response.error_code,
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
                 );
             }
             other => panic!("unexpected response {other:?}"),
@@ -1588,6 +1640,61 @@ mod tests {
         let again = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
         assert_eq!(again.error_code, ERROR_NONE);
         assert_eq!(again.assignment, synced.assignment);
+    }
+
+    /// A Postgres ERROR while the leader's SyncGroup reads its subscribed topics (a lock
+    /// timeout on kafka.topics) unwinds through the handler as a panic and drops the reply
+    /// unsent: it answers the retriable COORDINATOR_NOT_AVAILABLE, not UNKNOWN_SERVER_ERROR
+    /// (fatal to the Java consumer). The group stays in its sync phase, its leader and
+    /// generation unchanged, so the leader's next SyncGroup computes the assignment.
+    #[test]
+    fn test_sync_group_unwinding_in_the_topic_read_is_retriable() {
+        let mut f = Fixture::new();
+        f.store
+            .expect_get_topic_metadata()
+            .times(1)
+            .returning(|_| panic!("canceling statement due to lock timeout"));
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let reply = SyncGroupReply::new(11, 3, tx);
+            handle_sync_group(
+                &f.ctx(),
+                "g",
+                &member,
+                join.generation_id,
+                vec![],
+                move |response| reply.send(response),
+            );
+        }));
+        assert!(
+            unwound.is_err(),
+            "the ERROR unwinds to the request's subtransaction"
+        );
+        match rx.try_recv().unwrap() {
+            crate::kafka::KafkaResponse {
+                correlation_id,
+                body: crate::kafka::api::ResponseBody::SyncGroup(response),
+                ..
+            } => {
+                assert_eq!(correlation_id, 11);
+                assert_eq!(
+                    response.error_code,
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+                );
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+        let group = f.coordinator.get_group_state("g").unwrap();
+        assert_eq!(
+            group.state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+        assert_eq!(group.generation_id, join.generation_id);
     }
 
     /// A server-side assignment over the work limit is refused with POLICY_VIOLATION
@@ -1886,7 +1993,7 @@ mod tests {
                 assert_eq!(correlation_id, 8);
                 assert_eq!(
                     response.error_code,
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
                 );
             }
             other => panic!("unexpected response {other:?}"),
@@ -2032,7 +2139,9 @@ mod tests {
         store
             .expect_groups_with_offsets()
             .returning(|_| Ok(std::collections::HashSet::new()));
-        store.expect_list_offset_groups().returning(|_| Ok(vec![]));
+        store
+            .expect_list_offset_groups()
+            .returning(|_| Ok(crate::kafka::storage::OffsetGroupPage::default()));
         let broker = BrokerMetadata::new("localhost".to_string(), 9092);
         let ctx = HandlerContext::new(
             &store,
@@ -2057,9 +2166,12 @@ mod tests {
                 .cloned()
                 .collect())
         });
-        store
-            .expect_list_offset_groups()
-            .returning(move |_| Ok(groups.iter().map(ToString::to_string).collect()));
+        store.expect_list_offset_groups().returning(move |_| {
+            Ok(crate::kafka::storage::OffsetGroupPage {
+                ids: groups.iter().map(ToString::to_string).collect(),
+                more: false,
+            })
+        });
         store
     }
 
@@ -2145,9 +2257,12 @@ mod tests {
         let growth = crate::testing::growth(3_000, |n| {
             let groups: Vec<String> = (0..n).map(|i| format!("g{i:07}")).collect();
             let mut store = MockKafkaStore::new();
-            store
-                .expect_list_offset_groups()
-                .returning(move |_| Ok(groups.clone()));
+            store.expect_list_offset_groups().returning(move |_| {
+                Ok(crate::kafka::storage::OffsetGroupPage {
+                    ids: groups.clone(),
+                    more: false,
+                })
+            });
             let env = TestEnv::new();
             let filter: Vec<String> = (0..n)
                 .map(|i| format!("NotAState{i}"))
@@ -2160,6 +2275,67 @@ mod tests {
             growth < 8.0,
             "4x the groups and filter took {growth:.1}x the time"
         );
+    }
+
+    /// What the store answers for offset-only groups `ids` (sorted) and a budget of `max`
+    /// bytes: the ids while the total before each stays within `max`, and whether more follow.
+    fn offset_page(ids: &[String], max: usize) -> crate::kafka::storage::OffsetGroupPage {
+        let mut page = crate::kafka::storage::OffsetGroupPage::default();
+        let mut total = 0;
+        for id in ids {
+            if total > max {
+                page.more = true;
+                break;
+            }
+            total += id.len() + crate::kafka::storage::LISTED_GROUP_OVERHEAD;
+            page.ids.push(id.clone());
+        }
+        page
+    }
+
+    /// ListGroups with a state filter lists an id-order prefix of the groups the filter
+    /// selects. The store's budget also counts offset groups the coordinator holds in a state
+    /// the filter removes, so its page can end before the response's bound: the groups past
+    /// the page's last id were not read, and the list stops there (and reports the cut)
+    /// instead of going on with a held group further on and leaving out the offset-only
+    /// groups between.
+    #[test]
+    fn test_list_groups_with_a_state_filter_lists_a_prefix() {
+        let mut f = Fixture::new();
+        let id = |name: &str| format!("{name}-{}", "x".repeat(1000));
+        let busy: Vec<String> = ["a0", "a1", "a2"].iter().map(|n| id(n)).collect();
+        let offset_only: Vec<String> = ["b", "c", "d", "e"].iter().map(|n| id(n)).collect();
+        let mut with_offsets: Vec<String> = busy.iter().chain(&offset_only).cloned().collect();
+        with_offsets.sort();
+        let max_bytes = 4_500;
+        f.store.checkpoint();
+        f.store
+            .expect_list_offset_groups()
+            .returning(move |max| Ok(offset_page(&with_offsets, max)));
+        for group in &busy {
+            // Held in their sync phase, so the Empty filter removes them.
+            assert_eq!(f.join_now(group, "").error_code, ERROR_NONE);
+        }
+        let empty = id("z");
+        let member = f.join_now(&empty, "").member_id.to_string();
+        assert!(f.coordinator.leave_group(&empty, &member).is_ok());
+
+        // The store's page: a0 a1 a2 b c (the total before c is 4,043 bytes); d is not read.
+        let (listed, cut) = list_groups_cut(&f.ctx(), &["Empty".to_string()], max_bytes).unwrap();
+        let ids: Vec<&str> = listed.groups.iter().map(|g| g.group_id.as_str()).collect();
+        assert_eq!(ids, [offset_only[0].as_str(), offset_only[1].as_str()]);
+        assert!(cut, "the cut is reported");
+
+        // Without the filter: the bound cuts at a0 a1 a2 b.
+        let (all, cut) = list_groups_cut(&f.ctx(), &[], max_bytes).unwrap();
+        assert_eq!(all.groups.len(), 4);
+        assert!(cut);
+
+        // A page of every offset group: nothing is cut, the held Empty group comes last.
+        let (every, cut) = list_groups_cut(&f.ctx(), &["Empty".to_string()], 1 << 20).unwrap();
+        assert_eq!(every.groups.len(), 5);
+        assert_eq!(every.groups[4].group_id.as_str(), empty);
+        assert!(!cut);
     }
 
     /// ListGroups is bounded by `max_bytes` whatever the group ids weigh: 40 held groups and
@@ -2176,19 +2352,7 @@ mod tests {
         f.store
             .expect_list_offset_groups()
             .withf(move |&bytes| bytes == max_bytes || bytes == 1024)
-            .returning(move |max| {
-                // As the store does: the ids within `max`, and the first past it.
-                let mut total = 0;
-                Ok(offset_only
-                    .iter()
-                    .take_while(|g| {
-                        let within = total <= max;
-                        total += g.len() + crate::kafka::storage::LISTED_GROUP_OVERHEAD;
-                        within
-                    })
-                    .cloned()
-                    .collect())
-            });
+            .returning(move |max| Ok(offset_page(&offset_only, max)));
         for i in 0..40 {
             assert_eq!(f.join_now(&id('h', i), "").error_code, ERROR_NONE);
         }

@@ -83,7 +83,7 @@ mod store {
             fn fetch_all_offsets<'a>(&self, group_id: &'a str, max_metadata_bytes: usize) -> Result<Vec<crate::kafka::storage::GroupTopicOffsets>>;
             fn fetch_offsets<'a>(&self, group_id: &'a str, partitions: &'a [(i32, i32)], max_metadata_bytes: usize) -> Result<Vec<(i32, i32, Option<CommittedOffset>)>>;
             fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
-                fn list_offset_groups(&self, max_bytes: usize) -> Result<Vec<String>>;
+            fn list_offset_groups(&self, max_bytes: usize) -> Result<crate::kafka::storage::OffsetGroupPage>;
             fn groups_with_offsets<'a>(&self, group_ids: &'a [String]) -> Result<std::collections::HashSet<String>>;
             fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str, partitions: Option<&'a [(i32, i32)]>) -> Result<Vec<(String, i32)>>;
         }
