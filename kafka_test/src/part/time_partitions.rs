@@ -176,6 +176,7 @@ pub async fn test_time_partition_retention_drops_whole_partitions() -> TestResul
     println!("=== Test: Time-Partition Retention Drops Whole Partitions ===\n");
     let ctx = TestContext::new().await?;
     let db = ctx.db();
+    super::drain_droppable_leaves(db).await?;
     let topic = ctx.unique_topic("part-retention").await;
     let keeper = ctx.unique_topic("part-infinite").await;
     let w = width_ms(db).await?;
@@ -275,6 +276,7 @@ pub async fn test_time_partition_retention_waits_for_pending_transaction() -> Te
     println!("=== Test: Time-Partition Retention Waits For a Pending Transaction ===\n");
     let ctx = TestContext::new().await?;
     let db = ctx.db();
+    super::drain_droppable_leaves(db).await?;
     let topic = ctx.unique_topic("part-txn").await;
     let txn_id = format!("part-txn-{}", uuid::Uuid::new_v4());
     let w = width_ms(db).await?;
@@ -449,6 +451,7 @@ pub async fn test_retention_without_offset_counter_keeps_offsets() -> TestResult
     println!("=== Test: Retention Without an Offset Counter Keeps Offsets ===\n");
     let ctx = TestContext::new().await?;
     let db = ctx.db();
+    super::drain_droppable_leaves(db).await?;
     let dropped = ctx.unique_topic("part-nocounter-drop").await;
     let deleted = ctx.unique_topic("part-nocounter-del").await;
     let keeper = ctx.unique_topic("part-nocounter-keep").await;

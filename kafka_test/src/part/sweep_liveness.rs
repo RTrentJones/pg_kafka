@@ -5,6 +5,7 @@
 //! All sequential: they create, fill and drop leaves of kafka.messages and run the
 //! retention sweep.
 
+use super::drain_droppable_leaves;
 use super::sweep_budget::{create_topic, fill_leaf, hour_leaf};
 use crate::common::TestResult;
 use crate::worker::{boxed, into_test_result, session, unique, SendResult};
@@ -109,6 +110,7 @@ async fn writer_waits_for_drop() -> SendResult<()> {
     db.batch_execute("SET statement_timeout = '120s'")
         .await
         .map_err(boxed)?;
+    drain_droppable_leaves(&db).await?;
     let expired = create_topic(&db, &unique("drop-wait-expired"), 1000).await?;
     let forever = create_topic(&db, &unique("drop-wait-forever"), -1).await?;
     let hour = random_hour(&db).await?;
@@ -348,6 +350,7 @@ async fn fresh_session_drops() -> SendResult<()> {
     db.batch_execute("SET statement_timeout = '60s'")
         .await
         .map_err(boxed)?;
+    drain_droppable_leaves(&db).await?;
     let expired = create_topic(&db, &unique("fresh-expired"), 1000).await?;
     let forever = create_topic(&db, &unique("fresh-forever"), -1).await?;
     let hour = random_hour(&db).await?;

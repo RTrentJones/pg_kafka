@@ -14,6 +14,28 @@ mod sweep_liveness;
 mod sweep_races;
 pub mod time_partitions;
 
+/// Run sweeps until one drops no leaf (at most 20), before a test makes the leaves it
+/// expects one sweep to drop. Other tests and earlier runs can leave droppable leaves
+/// behind, older than the test's, and a pass ends once a session (any Produce or Fetch)
+/// has waited 100 ms behind its drops: under traffic one call drops a few leaves, oldest
+/// first, and may not reach the test's own.
+pub(crate) async fn drain_droppable_leaves(db: &tokio_postgres::Client) -> Result<(), String> {
+    for _ in 0..20 {
+        let rows = db
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(|e| format!("draining droppable leaves: {e}"))?;
+        let dropped = rows
+            .iter()
+            .find(|r| r.get::<_, String>(0) == "dropped_partitions")
+            .map_or(0, |r| r.get::<_, i64>(1));
+        if dropped == 0 {
+            return Ok(());
+        }
+    }
+    Err("leftover droppable leaves were not drained in 20 sweeps".to_string())
+}
+
 /// The `part` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
     crate::test_defs!["part";

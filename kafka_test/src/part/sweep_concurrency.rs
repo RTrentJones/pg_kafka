@@ -37,6 +37,7 @@ pub async fn test_concurrent_sweeps_and_maintenance_do_not_deadlock() -> TestRes
 async fn concurrent_sweeps() -> SendResult<()> {
     println!("=== Test: concurrent retention sweeps and maintenance do not deadlock ===\n");
     let db = session().await?;
+    super::drain_droppable_leaves(&db).await?;
     let topic = unique("sweep-race");
     let topic_id: i32 = db
         .query_one(

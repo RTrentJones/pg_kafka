@@ -66,6 +66,7 @@ pub async fn test_sweep_reads_only_what_it_deletes() -> TestResult {
     println!("=== Test: The Retention Sweep Reads Only What It Deletes ===\n");
     let ctx = TestContext::new().await?;
     let db = ctx.db();
+    super::drain_droppable_leaves(db).await?;
     let topic = ctx.unique_topic("sweep-cost").await;
 
     println!(
@@ -227,6 +228,7 @@ pub async fn test_sweep_reaps_outbox_rows_of_removed_messages() -> TestResult {
     println!("=== Test: The Sweep Reaps Outbox Rows Of Removed Messages ===\n");
     let ctx = TestContext::new().await?;
     let db = ctx.db();
+    super::drain_droppable_leaves(db).await?;
     let truncated = ctx.unique_topic("orphan-delrec").await;
     let expired = ctx.unique_topic("orphan-retention").await;
 

@@ -125,6 +125,7 @@ pub async fn test_sweep_probe_rotation_reaches_every_leaf() -> TestResult {
 async fn probe_rotation() -> SendResult<()> {
     println!("=== Test: contents probes rotate over every leaf on a spent budget ===\n");
     let db = session().await?;
+    super::drain_droppable_leaves(&db).await?;
     db.batch_execute("SET statement_timeout = '30s'")
         .await
         .map_err(boxed)?;
@@ -218,6 +219,7 @@ pub async fn test_sweep_drops_bounded_behind_a_held_reader() -> TestResult {
 async fn blocked_drops() -> SendResult<()> {
     println!("=== Test: a sweep's leaf drops stay within its budget behind a reader ===\n");
     let db = session().await?;
+    super::drain_droppable_leaves(&db).await?;
     db.batch_execute("SET statement_timeout = '60s'")
         .await
         .map_err(boxed)?;
