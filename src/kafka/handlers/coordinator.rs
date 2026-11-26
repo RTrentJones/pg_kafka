@@ -86,10 +86,28 @@ pub struct JoinGroupRequestData {
     pub protocols: Vec<crate::kafka::messages::JoinGroupProtocol>,
 }
 
+/// The error a JoinGroup or SyncGroup reply dropped unsent answers: COORDINATOR_NOT_AVAILABLE.
+///
+/// A reply is dropped unsent when its request unwinds (a Postgres ERROR, which pgrx raises as a
+/// panic: a lock timeout on kafka.topics while the leader's SyncGroup reads its subscribed
+/// topics for the server-side assignment, or a bug) or when the worker exits with held
+/// JoinGroups and parked SyncGroups. Either way the broker failed, not the request: neither
+/// API writes to the database, the coordinator keeps the group as it was before the request
+/// (the unwinding request changed nothing, or the coordinator is gone), and what the client
+/// should do is look the coordinator up again and rejoin, which COORDINATOR_NOT_AVAILABLE
+/// tells the Java consumer and librdkafka (a leader rejoining with unchanged metadata during
+/// the sync phase keeps its generation and syncs again). Kafka 3.7 answers a group request
+/// whose group state it could not store the same way. UNKNOWN_SERVER_ERROR is fatal to the
+/// Java consumer's JoinGroup and SyncGroup.
+///
+/// A rule for every dropped reply, rather than a subtransaction around the assignment's
+/// topic read: the read is not the only way a reply goes unsent, and every way has the same
+/// right answer.
+const DROPPED_REPLY_ERROR: i16 = crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE;
+
 /// The client's side of one JoinGroup: sends the (possibly deferred) response to the
-/// connection that asked. If it is dropped without having sent anything (a bug or a
-/// panic between accepting the request and answering it), it answers
-/// UNKNOWN_SERVER_ERROR instead, so the client is never left waiting for a response
+/// connection that asked. If it is dropped without having sent anything, it answers
+/// [`DROPPED_REPLY_ERROR`] instead, so the client is never left waiting for a response
 /// that cannot come.
 pub struct JoinGroupReply {
     correlation_id: i32,
@@ -156,7 +174,7 @@ impl Drop for JoinGroupReply {
         if self.response_tx.is_some() {
             self.send_inner(
                 crate::kafka::response_builders::build_join_group_error_response(
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                    DROPPED_REPLY_ERROR,
                 ),
             );
         }
@@ -358,7 +376,7 @@ fn build_join_group_response(
 
 /// The client's side of one SyncGroup: sends the (possibly deferred) response to the
 /// connection that asked, exactly once. Like [`JoinGroupReply`], if it is dropped
-/// without having sent anything it answers UNKNOWN_SERVER_ERROR.
+/// without having sent anything it answers [`DROPPED_REPLY_ERROR`].
 pub struct SyncGroupReply {
     correlation_id: i32,
     api_version: i16,
@@ -409,7 +427,7 @@ impl Drop for SyncGroupReply {
         if self.response_tx.is_some() {
             self.send_inner(
                 crate::kafka::response_builders::build_sync_group_error_response(
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR,
+                    DROPPED_REPLY_ERROR,
                 ),
             );
         }
@@ -510,8 +528,13 @@ pub fn handle_sync_group<F>(
                 // member assigned nothing until the next rebalance. COORDINATOR_NOT_AVAILABLE
                 // is what Kafka 3.7 answers a SyncGroup whose assignment it failed to store;
                 // the Java client and librdkafka look the coordinator up again and rejoin,
-                // which starts a new generation that computes the assignment again
-                // (UNKNOWN_SERVER_ERROR would be fatal to the Java client's SyncGroup).
+                // and the leader's rejoin with unchanged metadata keeps the generation, so its
+                // next SyncGroup computes the assignment again (UNKNOWN_SERVER_ERROR would be
+                // fatal to the Java client's SyncGroup). A Postgres ERROR in the read unwinds
+                // instead of returning here; the dropped reply answers the same code
+                // (DROPPED_REPLY_ERROR). Unlike Kafka, the parked followers keep waiting and
+                // the group is not sent back to its join phase
+                // (docs/PROTOCOL_DEVIATIONS.md).
                 crate::pg_warning!(
                     "SyncGroup: the server-side assignment of group {} at generation {} failed: {}",
                     group_id,
@@ -1532,7 +1555,7 @@ mod tests {
                 assert_eq!(correlation_id, 8);
                 assert_eq!(
                     response.error_code,
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
                 );
             }
             other => panic!("unexpected response {other:?}"),
@@ -1588,6 +1611,61 @@ mod tests {
         let again = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
         assert_eq!(again.error_code, ERROR_NONE);
         assert_eq!(again.assignment, synced.assignment);
+    }
+
+    /// A Postgres ERROR while the leader's SyncGroup reads its subscribed topics (a lock
+    /// timeout on kafka.topics) unwinds through the handler as a panic and drops the reply
+    /// unsent: it answers the retriable COORDINATOR_NOT_AVAILABLE, not UNKNOWN_SERVER_ERROR
+    /// (fatal to the Java consumer). The group stays in its sync phase, its leader and
+    /// generation unchanged, so the leader's next SyncGroup computes the assignment.
+    #[test]
+    fn test_sync_group_unwinding_in_the_topic_read_is_retriable() {
+        let mut f = Fixture::new();
+        f.store
+            .expect_get_topic_metadata()
+            .times(1)
+            .returning(|_| panic!("canceling statement due to lock timeout"));
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let reply = SyncGroupReply::new(11, 3, tx);
+            handle_sync_group(
+                &f.ctx(),
+                "g",
+                &member,
+                join.generation_id,
+                vec![],
+                move |response| reply.send(response),
+            );
+        }));
+        assert!(
+            unwound.is_err(),
+            "the ERROR unwinds to the request's subtransaction"
+        );
+        match rx.try_recv().unwrap() {
+            crate::kafka::KafkaResponse {
+                correlation_id,
+                body: crate::kafka::api::ResponseBody::SyncGroup(response),
+                ..
+            } => {
+                assert_eq!(correlation_id, 11);
+                assert_eq!(
+                    response.error_code,
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+                );
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+        let group = f.coordinator.get_group_state("g").unwrap();
+        assert_eq!(
+            group.state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+        assert_eq!(group.generation_id, join.generation_id);
     }
 
     /// A server-side assignment over the work limit is refused with POLICY_VIOLATION
@@ -1886,7 +1964,7 @@ mod tests {
                 assert_eq!(correlation_id, 8);
                 assert_eq!(
                     response.error_code,
-                    crate::kafka::constants::ERROR_UNKNOWN_SERVER_ERROR
+                    crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
                 );
             }
             other => panic!("unexpected response {other:?}"),

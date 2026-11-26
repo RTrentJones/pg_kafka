@@ -56,5 +56,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sync_assignment::test_server_side_assignment_is_bounded: sequential, // timed; stalls the DB thread when it fails
         sync_assignment::test_sticky_rebalance_of_nested_subscriptions_is_bounded: sequential, // timed; stalls the DB thread when it fails
         sync_assignment::test_refused_sticky_assignment_is_not_recomputed,
+        sync_assignment::test_assignment_read_failure_is_retriable: sequential, // locks kafka.topics
     ]
 }

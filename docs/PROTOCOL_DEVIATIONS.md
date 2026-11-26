@@ -475,9 +475,18 @@ algorithm; see "Server-side sticky assignment" below)
   the next entry. The server logs one line per LeaveGroup that removes members, not one per
   entry.
 - ✅ A leader whose server-side assignment cannot be computed for a transient reason (the
-  subscribed topics could not be read) gets COORDINATOR_NOT_AVAILABLE, retriable, and the group
-  stays in its sync phase, as Kafka 3.7 answers a SyncGroup whose assignment it failed to
-  store; clients rejoin, and the new generation computes the assignment again.
+  subscribed topics could not be read, also when the read ends in a Postgres ERROR such as a
+  lock timeout on `kafka.topics`) gets COORDINATOR_NOT_AVAILABLE (15), retriable, as Kafka 3.7
+  answers a SyncGroup whose assignment it failed to store. Any JoinGroup or SyncGroup the
+  broker fails to answer (its request unwound, or the worker exited while it was held) gets the
+  same code, never UNKNOWN_SERVER_ERROR, which is fatal to the Java consumer. Clients look the
+  coordinator up again and rejoin; a leader that rejoins with unchanged metadata during the
+  sync phase keeps the generation, and its next SyncGroup computes the assignment again.
+  **Deviation:** the group stays in its sync phase and only the leader is answered: the
+  followers' parked SyncGroups keep waiting for the leader's retry (or the rebalance timeout).
+  Kafka 3.7 (`resetAndPropagateAssignmentError`) answers every parked member with the error and
+  starts a new join phase, so every member rejoins and the generation moves; here the leader's
+  retry completes the same generation without a rebalance.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 

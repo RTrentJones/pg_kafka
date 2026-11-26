@@ -167,7 +167,7 @@ impl KafkaApi for JoinGroupApi {
 
     /// The response may come from a later JoinGroup, a LeaveGroup or the timeout sweep, so
     /// it answers on the client's own sender through a `JoinGroupReply` (which answers
-    /// UNKNOWN_SERVER_ERROR if dropped unsent). JoinGroup writes nothing to the database.
+    /// COORDINATOR_NOT_AVAILABLE if dropped unsent). JoinGroup writes nothing to the database.
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         let (header, response_tx) = call.into_parts();
         let reply =

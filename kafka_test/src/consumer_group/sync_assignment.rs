@@ -442,3 +442,67 @@ pub async fn test_refused_sticky_assignment_is_not_recomputed() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// The review's reproduction: while another session holds kafka.topics in ACCESS EXCLUSIVE
+/// mode, the leader's empty SyncGroup cannot read its subscribed topics, and the read ends in
+/// a Postgres lock-timeout ERROR (`pg_kafka.worker_lock_timeout_ms`). The ERROR unwound
+/// through the handler, which dropped the SyncGroup's reply unsent, and a dropped reply
+/// answered UNKNOWN_SERVER_ERROR (-1), which the Java consumer's SyncGroup treats as fatal.
+/// It is answered the retriable COORDINATOR_NOT_AVAILABLE now; the group stays in its sync
+/// phase, so the leader's rejoin with unchanged metadata keeps the generation and its next
+/// SyncGroup, once the lock is gone, is assigned.
+pub async fn test_assignment_read_failure_is_retriable() -> TestResult {
+    println!("=== Test: a failed server-side assignment read is retriable ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("assign-lock").await;
+    let group = ctx.unique_group("assign-lock").await;
+    let created = create_topics_raw(vec![creatable(&topic, 2, 1)]).await?;
+    assert_eq!(created[0].error_code, error_codes::NONE, "{created:?}");
+
+    println!("Step 1: the leader joins, subscribed to the topic...");
+    let mut c = conn().await?;
+    let mut join = join_req(&group, "", "consumer", &["range"]);
+    join.session_timeout_ms = 60_000;
+    join.rebalance_timeout_ms = 60_000;
+    join.protocols[0].metadata = subscription(std::iter::once(topic.clone()));
+    let (e, generation, member, _) = join_now(&mut c, &join).await?;
+    assert_eq!(e, error_codes::NONE);
+
+    println!("Step 2: another session locks kafka.topics; the leader's empty SyncGroup...");
+    let locker = crate::common::create_db_client().await?;
+    locker
+        .batch_execute("BEGIN; LOCK TABLE kafka.topics IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    // A `String` error, so the future stays `Send` across the unlock.
+    let answered = pipelined(&mut c, &empty_sync(&group, generation, &member), 1)
+        .await
+        .map_err(|e| e.to_string());
+    locker.batch_execute("ROLLBACK").await?;
+    let (codes, _, took) = answered?;
+    println!("  answered {codes:?} in {took:?}");
+    assert_eq!(
+        codes,
+        [error_codes::COORDINATOR_NOT_AVAILABLE],
+        "a failed read of the subscribed topics must be retriable"
+    );
+
+    println!("Step 3: the leader rejoins unchanged: same generation, and is assigned...");
+    let mut rejoin = join.clone();
+    rejoin.member_id = s(&member);
+    let (e, again, same, _) = join_now(&mut c, &rejoin).await?;
+    assert_eq!(e, error_codes::NONE);
+    assert_eq!(same, member);
+    assert_eq!(
+        again, generation,
+        "an unchanged rejoin keeps the generation"
+    );
+    let (codes, assignment, _) =
+        pipelined(&mut c, &empty_sync(&group, generation, &member), 1).await?;
+    assert_eq!(codes, [error_codes::NONE]);
+    assert_eq!(assigned_partitions(&assignment, &topic), 2);
+
+    assert_eq!(leave(&mut c, &group, &member).await?, error_codes::NONE);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

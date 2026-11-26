@@ -240,8 +240,9 @@ or the rest left or timed out), as in Kafka; the generation moves when the join 
 `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately, or later
 from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members`
 sweep). JoinGroup and SyncGroup answer on the client's own sender (`KafkaApi::DEFERRED_REPLY`),
-wrapped in `handlers::JoinGroupReply` / `SyncGroupReply`, which answer UNKNOWN_SERVER_ERROR if
-dropped unsent; a follower's SyncGroup waits (`pending_syncs`) until the leader's delivers the
+wrapped in `handlers::JoinGroupReply` / `SyncGroupReply`, which answer the retriable
+COORDINATOR_NOT_AVAILABLE if dropped unsent (a Postgres ERROR in the request, the worker
+exiting); a follower's SyncGroup waits (`pending_syncs`) until the leader's delivers the
 assignment. JoinGroup follows Kafka 3.7's checks (INCONSISTENT_GROUP_PROTOCOL, UNKNOWN_MEMBER_ID for
 an unknown non-empty member id, protocol chosen by member vote) and OffsetCommit its rules
 (`validate_offset_commit`: generation -1 only for an unknown or Empty group). Groups with
