@@ -690,8 +690,10 @@ pub fn handle_describe_groups(
 /// Cost, for `n` entries naming `d` distinct held groups of `m` members in all: time
 /// O(n + m) to size and build them plus O(members) per entry described in full, which the
 /// bound limits to O(`max_bytes` / [`DESCRIBED_MEMBER_OVERHEAD`]); memory: one copy of
-/// each distinct group described, plus a response of at most the larger of `max_bytes`
-/// and the first held group's description, plus O(request) for the other entries.
+/// what each distinct group's entry reports ([`described_group_bytes`]: for a group that is
+/// not Stable, its members' ids, client ids and hosts, not their metadata or assignments),
+/// which the repeats share, plus O(request) for the other entries; so the response holds at
+/// most the larger of `max_bytes` and the first held group's description.
 pub fn describe_groups(
     ctx: &HandlerContext,
     groups: Vec<String>,
@@ -827,40 +829,43 @@ fn describe_held_group(group_id: &str, group: &ConsumerGroup) -> DescribedGroup 
     } else {
         StrBytes::default()
     };
+    // Only a Stable group's members carry their metadata and assignment: in any other
+    // state they are not copied at all.
     described_group.members = group
         .members
         .values()
-        .map(|member| {
-            let mut described = describe_member(member, group.protocol_name.as_ref());
-            if !stable {
-                described.member_metadata = bytes::Bytes::default();
-                described.member_assignment = bytes::Bytes::default();
-            }
-            described
-        })
+        .map(|member| describe_member(member, stable, group.protocol_name.as_ref()))
         .collect();
     described_group
 }
 
-/// One member's DescribeGroups entry.
-fn describe_member(member: &GroupMember, protocol_name: Option<&String>) -> DescribedGroupMember {
+/// One member's DescribeGroups entry: with its metadata for `protocol_name` and its
+/// assignment when `payload`, without them otherwise. O(what the entry holds) time and
+/// memory: the metadata and assignment are copied only when reported.
+fn describe_member(
+    member: &GroupMember,
+    payload: bool,
+    protocol_name: Option<&String>,
+) -> DescribedGroupMember {
     let mut described_member = DescribedGroupMember::default();
     described_member.member_id = StrBytes::from_string(member.member_id.clone());
     described_member.client_id = StrBytes::from_string(member.client_id.clone());
     described_member.client_host = StrBytes::from_string(member.client_host.clone());
 
-    // Member metadata for the group's selected protocol, as Kafka reports it (the first
-    // protocol before a protocol has been selected).
-    if let Some((_, metadata)) = member
-        .protocols
-        .iter()
-        .find(|(n, _)| Some(n) == protocol_name)
-        .or_else(|| member.protocols.first())
-    {
-        described_member.member_metadata = metadata.clone().into();
-    }
-    if let Some(assignment) = &member.assignment {
-        described_member.member_assignment = assignment.clone().into();
+    if payload {
+        // Member metadata for the group's selected protocol, as Kafka reports it (the first
+        // protocol before a protocol has been selected).
+        if let Some((_, metadata)) = member
+            .protocols
+            .iter()
+            .find(|(n, _)| Some(n) == protocol_name)
+            .or_else(|| member.protocols.first())
+        {
+            described_member.member_metadata = metadata.clone().into();
+        }
+        if let Some(assignment) = &member.assignment {
+            described_member.member_assignment = assignment.clone().into();
+        }
     }
     // Static group instance ID (KIP-345)
     if let Some(instance_id) = &member.group_instance_id {
@@ -1724,6 +1729,28 @@ mod tests {
         assert_eq!(
             f.coordinator.get_group_state("g").unwrap().state,
             crate::kafka::coordinator::GroupState::Stable
+        );
+    }
+
+    /// DescribeGroups of a group that is not Stable copies none of its members' metadata or
+    /// assignments (it reports them empty, as Kafka 3.7 does): describing a group in its sync
+    /// phase whose member holds 512 kB of metadata allocates a few hundred bytes, where it
+    /// used to copy the metadata into the entry and then discard it.
+    #[test]
+    fn test_describe_groups_copies_no_payload_of_a_group_that_is_not_stable() {
+        let f = Fixture::new();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", vec![1; 512 << 10])).unwrap();
+        assert_eq!(join.error_code, ERROR_NONE);
+        let (response, allocated) = crate::testing::heap_allocated(|| {
+            describe_groups(&f.ctx(), vec!["g".to_string()], usize::MAX)
+        });
+        let group = &response.groups[0];
+        assert_eq!(group.group_state.as_str(), "CompletingRebalance");
+        assert_eq!(group.members.len(), 1);
+        assert!(group.members[0].member_metadata.is_empty());
+        assert!(
+            allocated < 16 << 10,
+            "describing the group allocated {allocated} bytes"
         );
     }
 
