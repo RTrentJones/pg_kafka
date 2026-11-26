@@ -726,11 +726,33 @@ pub async fn test_gap_batches_count_against_max_bytes() -> TestResult {
             .filter(|&&(_, code, len)| code == 0 && len > 0)
             .map(|&(p, _, _)| p)
             .collect();
-        assert_eq!(
-            returned,
-            (0..gaps).collect::<Vec<_>>(),
-            "max_bytes {max_bytes}: the partitions with a gap batch, {answer:?}"
-        );
+        if returned != (0..gaps).collect::<Vec<_>>() {
+            // What the partitions held when the answer was wrong: their rows and counters.
+            let state: Vec<String> = ctx
+                .db()
+                .query(
+                    "SELECT format('p%s o%s %s %s %s', m.partition_id, m.partition_offset,
+                                   COALESCE(m.txn_state, 'committed'), m.tableoid::regclass,
+                                   m.created_at)
+                     FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+                     WHERE t.name = $1
+                     UNION ALL
+                     SELECT format('counter p%s next %s log_start %s', po.partition_id,
+                                   po.next_offset, po.log_start_offset)
+                     FROM kafka.partition_offsets po JOIN kafka.topics t ON t.id = po.topic_id
+                     WHERE t.name = $1",
+                    &[&topic],
+                )
+                .await?
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            return Err(format!(
+                "max_bytes {max_bytes}: the partitions with a gap batch, {answer:?}; \
+                 the topic's rows and counters: {state:?}"
+            )
+            .into());
+        }
         println!("  max_bytes {max_bytes}: gap batches from partitions {returned:?}");
     }
     ctx.cleanup().await?;
