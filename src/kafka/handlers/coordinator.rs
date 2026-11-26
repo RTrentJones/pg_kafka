@@ -459,9 +459,9 @@ pub fn handle_sync_group<F>(
         coord_assignments.is_empty() || coord_assignments.iter().all(|(_, bytes)| bytes.is_empty());
 
     if assignments_empty && coordinator.awaits_leader_sync(group_id, member_id, generation_id) {
-        // A refused assignment is not computed again in its generation: the leader's
-        // retries get the refusal at the cost of a lookup (see
-        // `GroupCoordinator::refuse_assignment`).
+        // A refused assignment is not computed again while its refusal holds (for size, the
+        // generation; for memory, until it would fit): the leader's retries get the refusal
+        // at the cost of a lookup (see `GroupCoordinator::assignment_refused`).
         if let Some(why) = coordinator.assignment_refused(group_id, generation_id) {
             crate::pg_debug!(
                 "SyncGroup: the server-side assignment of group {} at generation {} was refused before",
@@ -474,7 +474,7 @@ pub fn handle_sync_group<F>(
                         "the server-side assignment of group '{group_id}' at generation {generation_id} was refused as too large"
                     ),
                 },
-                AssignmentRefusal::OverMemory => {
+                AssignmentRefusal::OverMemory { .. } => {
                     crate::kafka::error::KafkaError::CoordinatorNotAvailable {
                         group_id: group_id.to_string(),
                     }
@@ -484,8 +484,8 @@ pub fn handle_sync_group<F>(
         }
         match server_side_assignments(ctx, group_id) {
             Ok(Some(computed)) => {
-                // A refusal by the memory budget is remembered for the generation, like one
-                // for size.
+                // A refusal by the memory budget is remembered until the assignments would
+                // fit.
                 coordinator.sync_group_computed(
                     group_id,
                     member_id,
@@ -1673,6 +1673,57 @@ mod tests {
         assert_eq!(
             f.coordinator.get_group_state("g").unwrap().state,
             crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+    }
+
+    /// A refusal by the memory budget holds only while the assignments would not fit: once
+    /// another group frees what it held, the leader's next retry computes the assignment and
+    /// the group goes Stable, instead of being refused until the rebalance timeout evicts
+    /// the leader. Another group's member holds 400 kB of metadata against a 1 MiB budget, so
+    /// the 400 kB assignment (held twice: as the assignment, and as the previous assignment
+    /// the sticky assignor reads) is refused, and fits once that member leaves.
+    #[test]
+    fn test_sync_group_retry_computes_once_the_memory_budget_frees() {
+        crate::kafka::limits::test_max_group_memory::set(1 << 20);
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(2).returning(|_| {
+            Ok(vec![crate::kafka::storage::TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: crate::kafka::limits::HARD_MAX_PARTITIONS,
+            }])
+        });
+        let other =
+            take(&f.join_protocol("other", "", 30_000, "range", vec![1; 400 << 10])).unwrap();
+        assert_eq!(other.error_code, ERROR_NONE);
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        for attempt in 0..2 {
+            let refused = f.sync("g", &member, join.generation_id, vec![]);
+            assert_eq!(
+                take_sync(&refused).unwrap().error_code,
+                crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE,
+                "attempt {attempt}: the budget is still full"
+            );
+        }
+        handle_leave_group(
+            &f.ctx(),
+            "other",
+            LeavingMembers::Single(other.member_id.to_string()),
+        )
+        .unwrap();
+        let synced = take_sync(&f.sync("g", &member, join.generation_id, vec![])).unwrap();
+        assert_eq!(
+            synced.error_code, ERROR_NONE,
+            "computed once the budget freed"
+        );
+        assert!(synced.assignment.len() > 100_000);
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::Stable
         );
     }
 

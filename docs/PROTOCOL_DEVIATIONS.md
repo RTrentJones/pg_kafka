@@ -556,10 +556,12 @@ algorithm; see "Server-side sticky assignment" below)
   24 hours.) The budget is the broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
   the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
   nothing and the group stays in its sync phase. When the server computed the refused
-  assignments (the leader sent empty ones), the refusal holds for the generation: the leader's
-  retries get COORDINATOR_NOT_AVAILABLE without the assignment being computed again, as for one
-  refused for its size, until the generation moves. A rejoin that holds no more than before is
-  always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
+  assignments (the leader sent empty ones), the refusal is remembered with the bytes the
+  assignments need: the leader's retries get COORDINATOR_NOT_AVAILABLE without the assignment
+  being computed again while it would still not fit, and the first retry after enough memory
+  frees (another group's members leave or time out, `pg_kafka.max_group_memory` is raised)
+  computes it again; one refused for its size holds until the generation moves. A rejoin that
+  holds no more than before is always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
