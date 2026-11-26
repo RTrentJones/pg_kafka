@@ -148,6 +148,15 @@ async fn extension_ddl_loop() -> SendResult<()> {
     set_guc(&db, "pg_kafka.shadow_bootstrap_servers", None).await?;
     set_guc(&db, "pg_kafka.shadow_security_protocol", None).await?;
     set_guc(&db, "pg_kafka.config_reload_interval_ms", None).await?;
+    // The last round upgraded a 0.0.0 schema, which leaves the upgrade's
+    // kafka.messages_legacy leaf covering [MINVALUE, upgrade time): until a sweep drops
+    // it (up to a minute), every later test that makes a leaf of a past date fails with
+    // "would overlap partition messages_legacy". Leave a fresh schema behind instead,
+    // as the other old-schema tests do.
+    db.batch_execute("DROP EXTENSION IF EXISTS pg_kafka CASCADE; CREATE EXTENSION pg_kafka;")
+        .await
+        .map_err(boxed)?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
     result?;
 
     if let Some(log) = &log {
