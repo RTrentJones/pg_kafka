@@ -58,6 +58,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_races::test_sweep_never_deadlocks_with_a_batch_writing_two_rows: sequential,
         sweep_races::test_sweep_never_deadlocks_with_a_batch_holding_a_counter: sequential,
         sweep_races::test_sweep_reaper_never_deadlocks_with_an_ack_batch: sequential,
+        sweep_liveness::test_sweep_pass_ends_when_a_writer_waits_for_its_drop: sequential,
         sweep_liveness::test_partition_ddl_ignores_locks_on_other_leaves: sequential,
     ]
 }

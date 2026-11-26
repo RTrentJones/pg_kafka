@@ -76,7 +76,8 @@ transactions too and can hold the lock for seconds: a retention sweep starts no
 statement past the first one per step (10,000 rows, one leaf, one probe or one drop) once
 the pass has used its 1.5 s budget, and of its leaf drops, each of which can wait up to 2 s
 for its lock, it stops after the first that times out, so a pass holds the lock for about
-1.5 s plus one statement per step plus one 2 s drop wait at worst; partition
+1.5 s plus one statement per step plus one 2 s drop wait at worst (a pass that has deleted
+rows or dropped a leaf ends after its current statement once the script waits for it); partition
 maintenance moves rows out of the DEFAULT leaf in one transaction. The
 upgrade itself holds the lock for as long as it runs (see step 1 of 0.0.0 -> 0.1.0), so
 on a large `kafka.messages` requests fail retriably for most of it.

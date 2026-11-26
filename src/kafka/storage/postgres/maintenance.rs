@@ -240,7 +240,8 @@ impl PostgresStore {
     /// EXCLUSIVE too, waits for those rows or for the lock: a deadlock. `lock` says
     /// whether to queue for the lock or, if another session holds it, skip the pass
     /// (`Ok(None)`). A drop's ACCESS EXCLUSIVE lock on kafka.messages is held until the
-    /// pass commits, at most the rest of the pass.
+    /// pass commits: once a session waits for it (or for any lock the pass holds), the
+    /// pass ends after the turn in progress ([`SweepPass::after_turn`]).
     ///
     /// Lock waits: the pass is one transaction, which holds every row it deleted or
     /// locked until it commits, and `pg_kafka_run_retention_sweep()` runs it in a session
@@ -258,10 +259,19 @@ impl PostgresStore {
     /// locks, runs only while the pass holds no row ([`DropStep`]). A turn that finds a
     /// counter still held, or a session waiting for this transaction, rolls back its own
     /// statements and ends the pass ([`PassClock::ended`]), whose commit then frees the
-    /// rows that session waits for; what it left goes to the next pass. A worker
-    /// statement can still wait for a row the pass holds, until the pass commits (at
-    /// most the budget plus one turn per step, and the poll of one counter), as for any
-    /// transaction; it can no longer be the end of a cycle through the pass.
+    /// rows that session waits for; what it left goes to the next pass. A session that
+    /// starts waiting for a lock of the pass (a row it deleted or locked, kafka.messages
+    /// after a drop) ends the pass the same way, after the turn in progress
+    /// ([`SweepPass::after_turn`]): a worker statement waits for the pass at most one
+    /// turn (one bounded statement, or one drop) plus the poll of one counter, not the
+    /// rest of the budget, and it can no longer be the end of a cycle through the pass.
+    /// Relation locks are taken as by any statement: a delete's ROW EXCLUSIVE on
+    /// kafka.messages and its leaf can queue behind a session that waits for a stronger
+    /// lock on them (DDL such as ALTER TABLE, or LOCK TABLE), until that session's
+    /// lock_timeout or the holder it waits for ends. With a worker batch also waiting for
+    /// a row of the pass, that DDL closes a three-way cycle (pass, DDL, batch), which
+    /// deadlock detection breaks by failing one of them: run such DDL as the ADR-001
+    /// section "Your own DDL on kafka.messages" says, with a lock_timeout.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
@@ -645,6 +655,10 @@ struct SweepPass<'p, 'conn> {
     log_start_moved: bool,
     /// A turn gave up on a row another transaction holds: the pass ends.
     contended: bool,
+    /// The pass dropped a leaf: it holds ACCESS EXCLUSIVE on kafka.messages.
+    dropped: bool,
+    /// A session waits for a lock the pass holds: the pass ends.
+    waited_for: bool,
     stats: RetentionSweepStats,
 }
 
@@ -663,6 +677,8 @@ impl<'p, 'conn> SweepPass<'p, 'conn> {
             holds_rows: false,
             log_start_moved: false,
             contended: false,
+            dropped: false,
+            waited_for: false,
             stats: RetentionSweepStats::default(),
         }
     }
@@ -702,8 +718,47 @@ impl PassClock for SweepPass<'_, '_> {
     }
 
     fn ended(&self) -> bool {
-        self.contended
+        self.contended || self.waited_for
     }
+
+    /// End the pass once another session waits for a lock it holds: the rows it
+    /// deleted or locked, or kafka.messages after a drop (every write and read through
+    /// the parent, the worker's Produce and Fetch among them, then waits until this
+    /// transaction ends). The pass commits at once instead of running the rest of its
+    /// budget while they wait; what it left goes to the next pass. Checked only once
+    /// the pass holds something (a pass that has deleted nothing and dropped nothing
+    /// holds no lock a client statement needs). Cost: one read of pg_locks per turn
+    /// ([`session_waits_for_pass`]), against a turn of one bounded statement.
+    fn after_turn(&mut self) {
+        if self.waited_for || !(self.holds_rows || self.dropped) {
+            return;
+        }
+        // A failed check ends the pass too: committing early is always safe.
+        self.waited_for = session_waits_for_pass(self.client).unwrap_or(true);
+    }
+}
+
+/// Whether another session waits for a lock this transaction holds, other than the
+/// partition-maintenance lock ([`MAINTENANCE_LOCK_KEY`]): a sweep or a maintenance pass
+/// queued for that one waits for the whole pass by design, and ending the pass for it
+/// would only hand the work to it. One read of pg_locks, and `pg_blocking_pids` for each
+/// waiting session only.
+fn session_waits_for_pass(client: &SpiClient<'_>) -> Result<bool> {
+    Ok(client
+        .select(
+            "SELECT EXISTS (
+                 SELECT 1 FROM (SELECT DISTINCT l.pid FROM pg_locks l
+                                WHERE NOT l.granted AND l.pid IS NOT NULL
+                                  AND l.pid <> pg_backend_pid()
+                                  AND NOT (l.locktype = 'advisory' AND l.objsubid = 1
+                                           AND ((l.classid::int8 << 32) | l.objid::int8) = $1)) w
+                 WHERE pg_backend_pid() = ANY (pg_blocking_pids(w.pid))) AS waits",
+            Some(1),
+            &[MAINTENANCE_LOCK_KEY.into()],
+        )?
+        .first()
+        .get_by_name::<bool, _>("waits")?
+        .unwrap_or(false))
 }
 
 /// Run `f` in an internal subtransaction (the sequence PL/pgSQL's exception blocks
@@ -1174,6 +1229,7 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
         };
         if dropped {
             ctx.stats.dropped_partitions += 1;
+            ctx.dropped = true;
         }
         if lock_timed_out {
             self.lap.served(false);

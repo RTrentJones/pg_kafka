@@ -82,6 +82,118 @@ async fn delete_topics(db: &Client, ids: &[i32]) -> SendResult<()> {
     Ok(())
 }
 
+/// Aborted rows that keep an on-demand pass busy for its whole budget after its drop.
+const BUSY_ABORTED_ROWS: i64 = 1_000_000;
+/// The longest a write through kafka.messages may wait for an on-demand pass that
+/// dropped a leaf: the drop itself and one more turn (a 10 000-row delete), not the
+/// rest of the 1.5 s pass.
+const WRITER_WAIT_CEILING: Duration = Duration::from_millis(700);
+
+/// A drop takes ACCESS EXCLUSIVE on kafka.messages, held until the pass commits. An
+/// on-demand pass (`pg_kafka_run_retention_sweep()`, its own session) that dropped a
+/// leaf first and then had other work kept that lock for the rest of its budget, and
+/// every write through kafka.messages (the worker's Produce, so every client of the DB
+/// thread) waited for it.
+///
+/// Asserts: with an expired leaf to drop and 1 000 000 aborted rows to delete in another,
+/// a session's INSERT into kafka.messages issued 300 ms into an on-demand pass finishes
+/// within 700 ms (the pass ends at its next turn once someone waits), the pass dropped
+/// the leaf, and a later pass deletes the rest of the aborted rows.
+pub async fn test_sweep_pass_ends_when_a_writer_waits_for_its_drop() -> TestResult {
+    into_test_result(writer_waits_for_drop().await)
+}
+
+async fn writer_waits_for_drop() -> SendResult<()> {
+    println!("=== Test: an on-demand pass that dropped a leaf ends when a writer waits ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '120s'")
+        .await
+        .map_err(boxed)?;
+    let expired = create_topic(&db, &unique("drop-wait-expired"), 1000).await?;
+    let forever = create_topic(&db, &unique("drop-wait-forever"), -1).await?;
+    let hour = random_hour(&db).await?;
+    let droppable = hour_leaf(&db, hour).await?;
+    let busy = hour_leaf(&db, hour + 1).await?;
+    let outcome = async {
+        fill_leaf(&db, expired, hour, 0, 10).await?;
+        fill_leaf_dense(&db, forever, hour + 1, 0, 1, false).await?;
+        fill_leaf_dense(&db, forever, hour + 1, 1, BUSY_ABORTED_ROWS, true).await?;
+        db.batch_execute("ANALYZE kafka.messages")
+            .await
+            .map_err(boxed)?;
+        println!("Step 1: {droppable} to drop, {BUSY_ABORTED_ROWS} aborted rows in {busy}");
+
+        let sweeper = session().await?;
+        let sweep = tokio::spawn(async move {
+            let t = Instant::now();
+            let rows = sweeper
+                .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+                .await
+                .map_err(boxed)?;
+            SendResult::Ok((rows, t.elapsed()))
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let writer = session().await?;
+        let t = Instant::now();
+        writer
+            .execute(
+                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
+                 VALUES ($1, 0, $2, 'w')",
+                &[&forever, &(BUSY_ABORTED_ROWS + 10)],
+            )
+            .await
+            .map_err(boxed)?;
+        let waited = t.elapsed();
+        let (rows, took) = sweep.await.map_err(boxed)??;
+        let dropped = category(&rows, "dropped_partitions");
+        let aborted = category(&rows, "aborted_messages");
+        println!(
+            "Step 2: the INSERT waited {waited:?}; the pass took {took:?}, dropped {dropped} \
+             leaf(s) and deleted {aborted} aborted row(s)"
+        );
+        if leaf_exists(&db, &droppable).await? {
+            return Err(format!("the pass did not drop {droppable}").into());
+        }
+        if waited >= WRITER_WAIT_CEILING {
+            return Err(format!(
+                "an INSERT into kafka.messages waited {waited:?} for an on-demand pass \
+                 holding the lock of its drop"
+            )
+            .into());
+        }
+        let mut left = BUSY_ABORTED_ROWS;
+        for _ in 0..60 {
+            db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+                .await
+                .map_err(boxed)?;
+            left = db
+                .query_one(
+                    "SELECT count(*) FROM kafka.messages
+                     WHERE topic_id = $1 AND txn_state = 'aborted'",
+                    &[&forever],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            if left == 0 {
+                break;
+            }
+        }
+        if left != 0 {
+            return Err(format!("{left} aborted rows left after the later passes").into());
+        }
+        println!("Step 3: later passes deleted the remaining aborted rows");
+        SendResult::Ok(())
+    }
+    .await;
+    force_drop(&db, &droppable).await?;
+    force_drop(&db, &busy).await?;
+    delete_topics(&db, &[expired, forever]).await?;
+    outcome?;
+    println!("✅ the writer waited for one turn, not for the rest of the pass");
+    Ok(())
+}
+
 /// The longest leaf DDL may take beside a lock on a leaf it does not touch.
 const UNRELATED_LOCK_CEILING: Duration = Duration::from_millis(1000);
 

@@ -143,6 +143,10 @@ pub trait PassClock {
     fn ended(&self) -> bool {
         false
     }
+    /// Called after every turn, before the next [`ended`](PassClock::ended): the
+    /// context may look at what the turn left (`PostgresStore::run_retention_sweep`
+    /// ends the pass when another session waits for a lock it holds).
+    fn after_turn(&mut self) {}
 }
 
 /// One step of a sweep pass, as [`run_pass`] schedules it. `C` is the pass's shared
@@ -204,6 +208,7 @@ fn take_turn<C: PassClock, E>(
 ) -> Result<(), E> {
     let before = ctx.elapsed();
     steps[i].turn(ctx)?;
+    ctx.after_turn();
     report.service[i] += ctx.elapsed().saturating_sub(before);
     report.turns[i] += 1;
     Ok(())
