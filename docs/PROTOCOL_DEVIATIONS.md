@@ -457,6 +457,14 @@ algorithm; see "Server-side sticky assignment" below)
   "/127.0.0.1"). The DB-thread handler is not given the connection's peer address.
 - ✅ ListGroups' `states_filter` (v4) matches state names case-sensitively, as Kafka 3.7
   does (`kafka-consumer-groups --state` sends the canonical names).
+- ✅ LeaveGroup v3+ answers every entry of `members` in order, as Kafka 3.7 does: NONE for a
+  member removed, UNKNOWN_MEMBER_ID for one the group does not have, a repeat of an entry
+  already removed included. **Deviation:** the group reacts once to all the members a request
+  removes (a new leader, a rebalance, a join phase completed by the leavers), where Kafka
+  reacts after each entry; a join phase that the first leavers of a request complete is
+  completed once with the members that remain, instead of being completed and restarted by
+  the next entry. The server logs one line per LeaveGroup that removes members, not one per
+  entry.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 

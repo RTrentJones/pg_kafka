@@ -625,23 +625,23 @@ pub fn handle_leave_group(
             // members are batched in `members`. Remove each and report a per-member result;
             // an empty batch removes nothing and is NONE, known group or not, as in Kafka
             // 3.7. Without this the member is never removed and the group stays non-empty,
-            // so DeleteGroups keeps returning NON_EMPTY_GROUP after a clean leave.
-            for m in members {
-                crate::pg_debug!(
-                    "LeaveGroup(v3+): group_id={}, member_id={}",
-                    group_id,
-                    m.member_id
-                );
-                let error_code = match coordinator.leave_group(group_id, &m.member_id) {
-                    Ok(()) => ERROR_NONE,
-                    Err(e) => e.to_kafka_error_code(),
-                };
-                let mut member_response = MemberResponse::default();
-                member_response.member_id = StrBytes::from_string(m.member_id);
-                member_response.group_instance_id = m.group_instance_id.map(StrBytes::from_string);
-                member_response.error_code = error_code;
-                response.members.push(member_response);
-            }
+            // so DeleteGroups keeps returning NON_EMPTY_GROUP after a clean leave. One
+            // coordinator call answers every entry (see `GroupCoordinator::leave_members`
+            // for its cost): nothing here is logged or copied per entry.
+            let codes = coordinator
+                .leave_members(group_id, members.iter().map(|m| m.member_id.as_str()))?;
+            response.members = members
+                .into_iter()
+                .zip(codes)
+                .map(|(m, error_code)| {
+                    let mut member_response = MemberResponse::default();
+                    member_response.member_id = StrBytes::from_string(m.member_id);
+                    member_response.group_instance_id =
+                        m.group_instance_id.map(StrBytes::from_string);
+                    member_response.error_code = error_code;
+                    member_response
+                })
+                .collect();
         }
     }
 
@@ -2008,5 +2008,55 @@ mod tests {
             crate::kafka::constants::ERROR_INVALID_REQUEST
         );
         assert!(f.coordinator.get_group_state("big").is_none());
+    }
+
+    /// A LeaveGroup v3+ batch costs about its request, not the group id once per entry:
+    /// 500 entries naming a 30 KB group id (a held group, then one the coordinator does not
+    /// hold) allocate a few copies of the id plus a few hundred bytes per entry, log lines
+    /// and errors included (unit tests format every log line). Each entry used to format the
+    /// group id into a DEBUG line, for a held group also into a LOG line, and copy it into
+    /// an UNKNOWN_MEMBER_ID error: 45 MB for this request of 34 KB, 3.3 GB of server log for
+    /// one of 430 KB.
+    #[test]
+    fn test_leave_group_batch_does_not_copy_the_group_id_per_entry() {
+        use crate::kafka::messages::MemberIdentity;
+        let f = Fixture::new();
+        let held = "g".repeat(30 * 1024);
+        let member = f.join_now(&held, "").member_id.to_string();
+        let entries = 500;
+        for (group_id, known) in [(held.clone(), Some(member)), ("h".repeat(30 * 1024), None)] {
+            let members: Vec<MemberIdentity> = (0..entries)
+                .map(|i| MemberIdentity {
+                    member_id: match &known {
+                        Some(m) if i == entries / 2 => m.clone(),
+                        _ => format!("m{i}"),
+                    },
+                    group_instance_id: None,
+                })
+                .collect();
+            let (leave, allocated) = crate::testing::heap_allocated(|| {
+                handle_leave_group(&f.ctx(), &group_id, LeavingMembers::Batch(members))
+            });
+            let leave = leave.unwrap();
+            let codes: Vec<i16> = leave.members.iter().map(|m| m.error_code).collect();
+            assert_eq!(codes.len(), entries);
+            for (i, &code) in codes.iter().enumerate() {
+                let removed = known.is_some() && i == entries / 2;
+                let expected = if removed {
+                    ERROR_NONE
+                } else {
+                    ERROR_UNKNOWN_MEMBER_ID
+                };
+                assert_eq!(code, expected, "entry {i}");
+            }
+            let bound = 4 * group_id.len() + entries * 256;
+            assert!(
+                allocated <= bound,
+                "a {entries}-entry LeaveGroup of a {} byte group id (held: {}) allocated {allocated} bytes, over {bound}",
+                group_id.len(),
+                known.is_some()
+            );
+        }
+        assert_eq!(f.coordinator.group_is_empty(&held), Some(true));
     }
 }

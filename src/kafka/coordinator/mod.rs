@@ -1055,34 +1055,74 @@ impl GroupCoordinator {
         Ok(())
     }
 
-    /// Handle LeaveGroup request
-    ///
-    /// Removes the member from the group. Remaining members of a Stable or
-    /// CompletingRebalance group rebalance; a join phase in progress completes if the
-    /// leaver was the last member that had not rejoined.
+    /// Handle a LeaveGroup v0-2 request: [`Self::leave_members`] of the one member,
+    /// UNKNOWN_MEMBER_ID if the group does not have it.
     pub fn leave_group(&self, group_id: &str, member_id: &str) -> Result<()> {
+        match self.leave_members(group_id, [member_id])?.first() {
+            Some(&code) if code == crate::kafka::constants::ERROR_NONE => Ok(()),
+            _ => Err(KafkaError::unknown_member(group_id, member_id)),
+        }
+    }
+
+    /// Handle the members of a LeaveGroup request: remove each named member of `group_id`
+    /// and return each entry's error code, in order, as Kafka 3.7 answers every entry: NONE
+    /// for a member removed, UNKNOWN_MEMBER_ID for one the group does not have (a group the
+    /// coordinator does not hold, or a repeat of an entry already removed). Remaining
+    /// members of a Stable or CompletingRebalance group rebalance; a join phase in progress
+    /// completes if the leavers were the last members that had not rejoined.
+    ///
+    /// The members are removed together and the group reacts once, after the last: a new
+    /// leader is chosen, the state moves and the group is recounted once per request, not
+    /// once per entry. (Kafka reacts after each entry, so a join phase that the first
+    /// leavers complete is completed and then restarted by the next; here it completes
+    /// once, with the members that remain.)
+    ///
+    /// Cost, for `n` entries naming members of a group of `m`: one groups lock and one
+    /// lookup; time O(n) plus O(m) once for the reaction; memory O(n) for the codes, plus
+    /// the answers of the removed members' held requests. One LOG line per request that
+    /// removes a member (none otherwise), never a copy of the group id per entry.
+    pub fn leave_members<'a>(
+        &self,
+        group_id: &str,
+        member_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<i16>> {
+        use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID};
         let mut deliveries = Vec::new();
-        let result = {
+        let codes = {
             let mut groups = self.groups.write().map_err(|e| {
                 KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
             })?;
-
+            let member_ids = member_ids.into_iter();
             match groups.get_mut(group_id) {
-                None => Err(KafkaError::unknown_member(group_id, member_id)),
+                None => member_ids.map(|_| ERROR_UNKNOWN_MEMBER_ID).collect(),
                 Some(group) => {
-                    pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
-                    if group.remove_member(member_id, &mut deliveries) {
+                    let codes: Vec<i16> = member_ids
+                        .map(|member_id| {
+                            if group.take_member(member_id, &mut deliveries) {
+                                ERROR_NONE
+                            } else {
+                                ERROR_UNKNOWN_MEMBER_ID
+                            }
+                        })
+                        .collect();
+                    let removed = codes.iter().filter(|&&c| c == ERROR_NONE).count();
+                    if removed > 0 {
+                        pg_log!(
+                            "LeaveGroup: {} of {} member(s) left group {}",
+                            removed,
+                            codes.len(),
+                            group_id
+                        );
+                        group.settle_removals();
                         group.on_members_removed(&mut deliveries);
                         group.recount();
-                        Ok(())
-                    } else {
-                        Err(KafkaError::unknown_member(group_id, member_id))
                     }
+                    codes
                 }
             }
         };
         self.deliver(deliveries);
-        result
+        Ok(codes)
     }
 
     /// Run the periodic group timeouts: rebalance timeouts (evicting members that did
