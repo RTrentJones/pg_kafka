@@ -2393,7 +2393,7 @@ fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
 #[test]
 fn test_running_totals_stay_exact_under_random_operations() {
     for seed in 1..=6_u64 {
-        let mut rng = Rng(seed * 0x9E37_79B9_7F4A_7C15);
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let c = GroupCoordinator::new();
         let ids: Vec<String> = (0..8)
             .map(|i| format!("g{i}-{}", "x".repeat(i * 7)))
