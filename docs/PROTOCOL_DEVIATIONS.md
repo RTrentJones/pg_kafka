@@ -921,6 +921,11 @@ one and on every requested topic/partition/group/resource it echoes:
 | Handler returns `Err`, or panics (a Postgres ERROR) | the error's code / UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 | The batch's commit fails | UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 
+A Fetch below v6 cannot carry KAFKA_STORAGE_ERROR (56): wherever a Fetch response would hold
+it, a v4 or v5 client gets NOT_LEADER_OR_FOLLOWER (6), which it retries after refreshing its
+metadata, as Kafka 3.7's `KafkaApis.handleFetchRequest` down-converts it
+(`ApiSchema::for_version`, applied to every response just before it is encoded).
+
 Remaining deviations: a body that does not decode has no entries to echo, so APIs without
 a top-level error code (Produce, ListOffsets, DescribeGroups, CreateTopics, ...) answer with
 an empty but well-formed response. A version kafka-protocol cannot encode a response in

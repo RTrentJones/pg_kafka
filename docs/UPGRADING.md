@@ -32,7 +32,8 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    missing objects as `sql/bootstrap.sql` defines them. Until step 3, clients see what they see while the extension is
    dropped: the Kafka port accepts connections and every request the worker serves
    (ApiVersions and Metadata included) is answered with the retriable
-   `KAFKA_STORAGE_ERROR` (56). On a SASL listener the network thread still answers
+   `KAFKA_STORAGE_ERROR` (56; a Fetch below v6 gets `NOT_LEADER_OR_FOLLOWER`, 6, in its place,
+   as from Kafka 3.7). On a SASL listener the network thread still answers
    ApiVersions and SaslHandshake, but the credential lookup of the SaslAuthenticate is
    refused, and the broker then closes the connection without answering it: the
    credentials were not checked, so it is not reported as `SASL_AUTHENTICATION_FAILED`
