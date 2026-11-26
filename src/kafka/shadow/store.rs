@@ -56,7 +56,7 @@ use crate::kafka::storage::{
     delegate_topic_store, FetchedMessage, FetchedRecords, IsolationLevel, KafkaStore, LogStore,
     MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionState, TransactionStore,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -192,7 +192,8 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
 /// and nothing is counted or logged (a rolled-back tick would count twice).
 #[derive(Debug, Default)]
 struct StagedAcks {
-    /// The acks whose statement failed: still to apply after the commit.
+    /// The acks whose statement failed, or whose row another transaction holds
+    /// (`AcksApplied::held`): still to apply after the commit.
     retry: Vec<ForwardAck>,
     /// Rows whose ack was applied: they leave the in-flight set.
     resolved: Vec<RowKey>,
@@ -211,8 +212,25 @@ struct StagedAcks {
 struct TickFailures {
     /// Failed ticks in a row.
     consecutive: u32,
+    /// Ticks in a row that gave up a lock wait (see [`TickOutcome::LockTimedOut`]).
+    lock_timeouts: u32,
     /// No tick runs before this instant.
     paused_until: Option<Instant>,
+}
+
+/// How an outbox tick ended ([`ShadowStore::note_outbox_tick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    Ok,
+    /// A statement ran out of the tick's short lock_timeout: another session holds a
+    /// lock the tick needs (an open transaction's row of kafka.shadow_metrics, DDL on
+    /// an outbox table). That is no fault of the outbox, and it ends as soon as the
+    /// holder commits, so the next tick comes after the usual interval instead of an
+    /// exponential backoff, which kept forwarding stopped up to 30 s after the holder
+    /// was gone.
+    LockTimedOut,
+    /// Any other failure (a dropped schema, a failed statement): exponential backoff.
+    Failed,
 }
 
 /// One sync-mode outbox row waiting for its request's commit.
@@ -605,20 +623,32 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     }
 
     /// Record how an outbox tick ended. A failure pauses the tick exponentially
-    /// (up to `OUTBOX_FAILURE_BACKOFF_MAX`); returns whether this failure should
-    /// be logged (the first, then at the 2nd, 4th, 8th... in a row).
-    pub fn note_outbox_tick(&self, ok: bool) -> bool {
+    /// (up to `OUTBOX_FAILURE_BACKOFF_MAX`); a lock timeout pauses it one
+    /// `OUTBOX_POLL_INTERVAL` and leaves the failure count alone
+    /// ([`TickOutcome::LockTimedOut`]). Returns whether this outcome should be logged
+    /// (the first failure or lock timeout, then at the 2nd, 4th, 8th... in a row).
+    pub fn note_outbox_tick(&self, outcome: TickOutcome) -> bool {
         let mut failures = lock(&self.outbox_failures);
-        if ok {
-            *failures = TickFailures::default();
-            return false;
-        }
-        failures.consecutive = failures.consecutive.saturating_add(1);
-        let n = failures.consecutive;
-        let pause = OUTBOX_POLL_INTERVAL
-            .saturating_mul(1u32 << (n - 1).min(10))
-            .min(OUTBOX_FAILURE_BACKOFF_MAX);
-        failures.paused_until = Some(Instant::now() + pause);
+        let n = match outcome {
+            TickOutcome::Ok => {
+                *failures = TickFailures::default();
+                return false;
+            }
+            TickOutcome::LockTimedOut => {
+                failures.lock_timeouts = failures.lock_timeouts.saturating_add(1);
+                failures.paused_until = Some(Instant::now() + OUTBOX_POLL_INTERVAL);
+                failures.lock_timeouts
+            }
+            TickOutcome::Failed => {
+                failures.consecutive = failures.consecutive.saturating_add(1);
+                let n = failures.consecutive;
+                let pause = OUTBOX_POLL_INTERVAL
+                    .saturating_mul(1u32 << (n - 1).min(10))
+                    .min(OUTBOX_FAILURE_BACKOFF_MAX);
+                failures.paused_until = Some(Instant::now() + pause);
+                n
+            }
+        };
         self.poll_requested.store(false, Ordering::Relaxed);
         n.is_power_of_two()
     }
@@ -700,6 +730,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 "Shadow: forward channel unavailable, {} row(s) left pending",
                 not_sent.len()
             );
+            // These rows were claimed (and locked) by this transaction: none is held.
             self.db
                 .apply_not_attempted(&not_sent)
                 .map_err(|e| super::error::ShadowError::DatabaseError(e.to_string()))?;
@@ -886,12 +917,18 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
 
+        // Rows another transaction holds: their acks were skipped, not applied, and
+        // stay queued with their rows in flight until a later tick applies them.
+        let mut held: HashSet<RowKey> = HashSet::new();
         let mut delivered_ok = true;
         match self
             .db
             .apply_delivered(&delivered, settings.metrics_enabled)
         {
-            Ok(n) => staged.forwarded = n as u64,
+            Ok(applied) => {
+                staged.forwarded = applied.transitioned as u64;
+                held.extend(applied.held);
+            }
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply delivery acks (retried): {:?}", e);
                 delivered_ok = false;
@@ -913,6 +950,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             Ok(applied) => {
                 staged.failed = applied.transitioned as u64;
                 staged.dead_lettered = applied.dead_lettered;
+                held.extend(applied.held);
             }
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply failure acks (retried): {:?}", e);
@@ -920,12 +958,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
         let mut not_attempted_ok = true;
-        if let Err(e) = self.db.apply_not_attempted(&not_attempted) {
-            tracing::warn!(
-                "Shadow: failed to apply not-attempted acks (retried): {:?}",
-                e
-            );
-            not_attempted_ok = false;
+        match self.db.apply_not_attempted(&not_attempted) {
+            Ok(applied) => held.extend(applied.held),
+            Err(e) => {
+                tracing::warn!(
+                    "Shadow: failed to apply not-attempted acks (retried): {:?}",
+                    e
+                );
+                not_attempted_ok = false;
+            }
         }
 
         for ack in acks {
@@ -934,7 +975,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 ForwardOutcome::Failed(_) => failed_ok,
                 ForwardOutcome::NotAttempted(_) => not_attempted_ok,
             };
-            if applied {
+            if applied && !held.contains(&ack.row) {
                 staged.resolved.push(ack.row);
             } else {
                 staged.retry.push(ack.clone());

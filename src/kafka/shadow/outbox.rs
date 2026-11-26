@@ -152,6 +152,48 @@ pub struct FailedApplied {
     pub transitioned: usize,
     /// Rows that reached the dead-letter cap with this failure, with the error.
     pub dead_lettered: Vec<(RowKey, String)>,
+    /// Pending rows another transaction holds: their acks were not applied (see
+    /// [`AcksApplied::held`]).
+    pub held: Vec<RowKey>,
+}
+
+/// What one batch of delivery or not-attempted acks did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AcksApplied {
+    /// Rows the acks finalized.
+    pub transitioned: usize,
+    /// Pending rows another transaction holds (`kafka.replay_shadow_messages` until its
+    /// caller commits, an operator's UPDATE): the ack statements skip them instead of
+    /// waiting, so these acks were not applied and are applied again by a later tick.
+    pub held: Vec<RowKey>,
+}
+
+/// The ack statements' rows: the acks' keys (`$1`-`$3`), each locked unless another
+/// transaction holds it (`lk`, one primary-key probe per ack), and the acks of pending
+/// rows it could not lock (`held`). An ack statement never waits for a row: the tick
+/// waiting for one stopped the DB thread, and a held row failed the whole batch of acks,
+/// every topic's. Ends with the `held` CTE's closing parenthesis; the statement goes on
+/// with its own CTEs over `lk`.
+macro_rules! ack_rows {
+    ($columns:literal) => {
+        concat!(
+            "WITH a AS (SELECT * FROM unnest(", $columns, ")), \
+             lk AS MATERIALIZED ( \
+                 SELECT k.* FROM a CROSS JOIN LATERAL ( \
+                     SELECT a.*, st.ctid AS row_ctid FROM kafka.shadow_tracking st \
+                     WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
+                       AND st.external_offset IS NULL \
+                     FOR UPDATE OF st SKIP LOCKED) k \
+             ), \
+             held AS ( \
+                 SELECT a.t, a.p, a.o FROM a \
+                 WHERE EXISTS (SELECT 1 FROM kafka.shadow_tracking st \
+                               WHERE st.topic_id = a.t AND st.partition_id = a.p \
+                                 AND st.local_offset = a.o AND st.external_offset IS NULL) \
+                   AND (a.t, a.p, a.o) NOT IN (SELECT lk.t, lk.p, lk.o FROM lk) \
+             )"
+        )
+    };
 }
 
 /// Every database/GUC access shadow mode makes.
@@ -220,13 +262,15 @@ pub trait ShadowDb {
 
     /// Mark pending rows delivered at their external offsets (and count them in
     /// `kafka.shadow_metrics` when `metrics`). Returns how many transitioned (a
-    /// duplicate ack or an unknown row does not).
-    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize>;
+    /// duplicate ack or an unknown row does not) and the rows another transaction
+    /// holds, whose acks were not applied ([`AcksApplied::held`]).
+    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<AcksApplied>;
 
     /// Record failed attempts: `retry_count + 1`, the error, attempt closed,
     /// `forwarded_at` = now (start of the backoff), `dead` = the new `retry_count`
     /// at `max_retries` or above (see `DEAD_LETTER_SYNC_SQL`); counted in
-    /// `kafka.shadow_metrics.messages_failed` when `metrics`.
+    /// `kafka.shadow_metrics.messages_failed` when `metrics`. Rows another transaction
+    /// holds are skipped and returned ([`FailedApplied::held`]).
     fn apply_failed(
         &self,
         rows: &[(RowKey, String)],
@@ -234,8 +278,9 @@ pub trait ShadowDb {
         metrics: bool,
     ) -> Result<FailedApplied>;
 
-    /// Close attempts that never reached the broker (no retry counted).
-    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<()>;
+    /// Close attempts that never reached the broker (no retry counted). Returns the
+    /// rows another transaction holds, whose acks were not applied.
+    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<AcksApplied>;
 
     /// Every row of `kafka.shadow_config`, parsed. `None` if the query failed.
     fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>>;
@@ -354,14 +399,20 @@ macro_rules! pending_partitions {
 ///
 /// It reads only the rows it changes, found by two index ranges per partition of
 /// idx_shadow_tracking_retrying (`topic_id, partition_id, dead, retry_count, ...`),
-/// whatever the number of dead letters. The rows are updated by ctid (a TID scan),
-/// never by a join the planner could turn into a scan of the table.
+/// whatever the number of dead letters. The rows are locked and updated by ctid (TID
+/// scans), never by a join the planner could turn into a scan of the table.
+///
+/// It skips the stale rows another transaction holds and returns how many it skipped
+/// (`skipped`); a sync that skipped any does not count as done, so the next claim runs
+/// it again. Until then such a row is only delayed: a stale `dead = true` keeps a live
+/// row out of the claim, and a stale `dead = false` row at the cap is still filtered by
+/// the claim's `retry_count` test.
 const DEAD_LETTER_SYNC_SQL: &str = concat!(
     r"
         WITH RECURSIVE",
     pending_partitions!(),
     r",
-        stale AS (
+        stale AS MATERIALIZED (
             SELECT s.ctid
             FROM parts p
             CROSS JOIN LATERAL (
@@ -382,12 +433,25 @@ const DEAD_LETTER_SYNC_SQL: &str = concat!(
                   AND st.retry_count > 0
                   AND st.retry_count >= $1
             ) s
+        ),
+        -- The stale rows no other transaction holds (a replay re-queuing them, an
+        -- operator's UPDATE): the sync never waits for a row; one it skips keeps its
+        -- flag, which only delays the row (see below), and the sync runs again.
+        locked AS MATERIALIZED (
+            SELECT st.ctid
+            FROM kafka.shadow_tracking st
+            WHERE st.ctid = ANY (ARRAY(SELECT stale.ctid FROM stale))
+            FOR UPDATE OF st SKIP LOCKED
+        ),
+        synced AS (
+            UPDATE kafka.shadow_tracking st
+            SET dead = st.retry_count >= $1
+            WHERE st.ctid = ANY (ARRAY(SELECT locked.ctid FROM locked))
+              AND st.external_offset IS NULL
+              AND st.dead IS DISTINCT FROM (st.retry_count >= $1)
+            RETURNING 1
         )
-        UPDATE kafka.shadow_tracking st
-        SET dead = st.retry_count >= $1
-        WHERE st.ctid = ANY (ARRAY(SELECT stale.ctid FROM stale))
-          AND st.external_offset IS NULL
-          AND st.dead IS DISTINCT FROM (st.retry_count >= $1)
+        SELECT (SELECT COUNT(*) FROM stale) - (SELECT COUNT(*) FROM locked) AS skipped
         "
 );
 
@@ -516,7 +580,7 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
         -- O(partitions + limit), not O(backlog)), then taken round-robin
         -- across partitions up to the limit, so one partition's backlog
         -- cannot fill every claim while the others wait.
-        due AS (
+        cand AS MATERIALIZED (
             SELECT d.topic_id, d.partition_id, d.local_offset
             FROM due_parts p
             CROSS JOIN share
@@ -533,6 +597,41 @@ const CLAIM_DUE_OUTBOX_ROWS_SQL: &str = concat!(
             ) d
             ORDER BY d.rn, d.topic_id, d.partition_id
             LIMIT $1
+        ),
+        -- The candidates no other transaction holds, locked now: one primary-key
+        -- probe each, skipping a held row instead of waiting for it. Another
+        -- session holds outbox rows across statements (kafka.replay_shadow_messages
+        -- until its caller commits, an operator's UPDATE), and the claim waiting
+        -- for one stopped forwarding for every partition, the DB thread with it.
+        locked AS MATERIALIZED (
+            SELECT k.topic_id, k.partition_id, k.local_offset
+            FROM cand c
+            CROSS JOIN LATERAL (
+                SELECT st.topic_id, st.partition_id, st.local_offset
+                FROM kafka.shadow_tracking st
+                WHERE st.topic_id = c.topic_id
+                  AND st.partition_id = c.partition_id
+                  AND st.local_offset = c.local_offset
+                FOR UPDATE OF st SKIP LOCKED
+            ) k
+        ),
+        -- Each partition's first held candidate: the claim takes the partition's
+        -- candidates below it only, so its records still go out in offset order;
+        -- the held row and the rows after it wait for a later claim. The other
+        -- partitions are claimed as if nothing were held.
+        held AS MATERIALIZED (
+            SELECT c.topic_id, c.partition_id, MIN(c.local_offset) AS first_held
+            FROM cand c
+            WHERE (c.topic_id, c.partition_id, c.local_offset)
+                  NOT IN (SELECT l.topic_id, l.partition_id, l.local_offset FROM locked l)
+            GROUP BY c.topic_id, c.partition_id
+        ),
+        due AS (
+            SELECT c.topic_id, c.partition_id, c.local_offset
+            FROM cand c
+            LEFT JOIN held h
+              ON h.topic_id = c.topic_id AND h.partition_id = c.partition_id
+            WHERE c.local_offset < COALESCE(h.first_held, 9223372036854775807)
         ),
         -- Each due partition's head: its lowest pending, non-dead row whose
         -- message exists. A claimed row restarts its partition when nothing
@@ -658,10 +757,16 @@ impl SpiShadowDb {
         backoff_base_ms: f64,
         backoff_max_ms: f64,
     ) -> Result<ClaimedRows> {
+        let mut synced = false;
         if claim.sync_dead_flags {
             // A statement of its own: the claim's CTEs would read `dead` as it was
             // before an UPDATE in the same statement.
-            client.update(DEAD_LETTER_SYNC_SQL, None, &[claim.max_retries.into()])?;
+            let skipped: i64 = client
+                .update(DEAD_LETTER_SYNC_SQL, Some(1), &[claim.max_retries.into()])?
+                .first()
+                .get_by_name("skipped")?
+                .unwrap_or(0);
+            synced = skipped == 0;
         }
         let table = client.update(
             CLAIM_DUE_OUTBOX_ROWS_SQL,
@@ -678,7 +783,7 @@ impl SpiShadowDb {
         )?;
 
         let mut claimed = ClaimedRows {
-            dead_flags_synced: claim.sync_dead_flags,
+            dead_flags_synced: synced,
             ..ClaimedRows::default()
         };
         for row in table {
@@ -916,10 +1021,10 @@ impl ShadowDb for SpiShadowDb {
         })
     }
 
-    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize> {
+    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<AcksApplied> {
         use pgrx::prelude::*;
         if rows.is_empty() {
-            return Ok(0);
+            return Ok(AcksApplied::default());
         }
         let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
         let external_offsets: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
@@ -929,15 +1034,16 @@ impl ShadowDb for SpiShadowDb {
         // the whole batch of acks.
         Spi::connect_mut(|client| {
             let table = client.update(
-                "WITH a AS ( \
-                     SELECT * FROM unnest($1::int4[], $2::int4[], $3::int8[], $4::int8[]) AS a(t, p, o, x) \
-                 ), \
+                concat!(
+                    ack_rows!("$1::int4[], $2::int4[], $3::int8[], $4::int8[]) AS a(t, p, o, x"),
+                    ", \
                  done AS ( \
                      UPDATE kafka.shadow_tracking st \
-                     SET external_offset = a.x, forwarded_at = NOW(), error_message = NULL, \
+                     SET external_offset = lk.x, forwarded_at = NOW(), error_message = NULL, \
                          attempt_open = false \
-                     FROM a \
-                     WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
+                     FROM lk \
+                     WHERE st.ctid = lk.row_ctid \
+                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
                        AND st.external_offset IS NULL \
                      RETURNING st.topic_id, st.partition_id, st.local_offset \
                  ), \
@@ -952,8 +1058,11 @@ impl ShadowDb for SpiShadowDb {
                         last_forwarded_offset = GREATEST(kafka.shadow_metrics.last_forwarded_offset, EXCLUDED.last_forwarded_offset), \
                         last_forwarded_at = NOW() \
                  ) \
-                 SELECT COUNT(*)::int8 AS n FROM done",
-                None,
+                 SELECT (SELECT COUNT(*) FROM done)::int8 AS n, \
+                        ARRAY(SELECT t FROM held) AS held_t, ARRAY(SELECT p FROM held) AS held_p, \
+                        ARRAY(SELECT o FROM held) AS held_o"
+                ),
+                Some(1),
                 &[
                     keys.topic_ids.into(),
                     keys.partition_ids.into(),
@@ -962,11 +1071,12 @@ impl ShadowDb for SpiShadowDb {
                     metrics.into(),
                 ],
             )?;
-            let mut n = 0i64;
-            for row in table {
-                n = row.get_by_name::<i64, _>("n")?.unwrap_or(0);
-            }
-            Ok(usize::try_from(n).unwrap_or(0))
+            let row = table.first();
+            Ok(AcksApplied {
+                transitioned: usize::try_from(row.get_by_name::<i64, _>("n")?.unwrap_or(0))
+                    .unwrap_or(0),
+                held: held_keys(&row)?,
+            })
         })
     }
 
@@ -984,16 +1094,17 @@ impl ShadowDb for SpiShadowDb {
         let errors: Vec<&str> = rows.iter().map(|(_, e)| e.as_str()).collect();
         Spi::connect_mut(|client| {
             let table = client.update(
-                "WITH a AS ( \
-                     SELECT * FROM unnest($1::int4[], $2::int4[], $3::int8[], $4::text[]) AS a(t, p, o, e) \
-                 ), \
+                concat!(
+                    ack_rows!("$1::int4[], $2::int4[], $3::int8[], $4::text[]) AS a(t, p, o, e"),
+                    ", \
                  failed AS ( \
                      UPDATE kafka.shadow_tracking st \
-                     SET retry_count = st.retry_count + 1, error_message = a.e, \
+                     SET retry_count = st.retry_count + 1, error_message = lk.e, \
                          forwarded_at = NOW(), attempt_open = false, \
                          dead = st.retry_count + 1 >= $6 \
-                     FROM a \
-                     WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
+                     FROM lk \
+                     WHERE st.ctid = lk.row_ctid \
+                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
                        AND st.external_offset IS NULL \
                      RETURNING st.topic_id, st.partition_id, st.local_offset, st.retry_count, \
                                st.error_message \
@@ -1006,7 +1117,12 @@ impl ShadowDb for SpiShadowDb {
                      ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
                         messages_failed = kafka.shadow_metrics.messages_failed + EXCLUDED.messages_failed \
                  ) \
-                 SELECT topic_id, partition_id, local_offset, retry_count, error_message FROM failed",
+                 SELECT f.topic_id, f.partition_id, f.local_offset, f.retry_count, f.error_message, \
+                        false AS is_held \
+                 FROM failed f \
+                 UNION ALL \
+                 SELECT h.t, h.p, h.o, NULL, NULL, true FROM held h"
+                ),
                 None,
                 &[
                     keys.topic_ids.into(),
@@ -1019,43 +1135,62 @@ impl ShadowDb for SpiShadowDb {
             )?;
             let mut out = FailedApplied::default();
             for row in table {
+                let key = RowKey::new(
+                    row.get_by_name("topic_id")?.unwrap_or(0),
+                    row.get_by_name("partition_id")?.unwrap_or(0),
+                    row.get_by_name("local_offset")?.unwrap_or(0),
+                );
+                if row.get_by_name::<bool, _>("is_held")?.unwrap_or(false) {
+                    out.held.push(key);
+                    continue;
+                }
                 out.transitioned += 1;
                 let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
                 if i64::from(retry_count) >= max_retries {
-                    out.dead_lettered.push((
-                        RowKey::new(
-                            row.get_by_name("topic_id")?.unwrap_or(0),
-                            row.get_by_name("partition_id")?.unwrap_or(0),
-                            row.get_by_name("local_offset")?.unwrap_or(0),
-                        ),
-                        row.get_by_name("error_message")?.unwrap_or_default(),
-                    ));
+                    out.dead_lettered
+                        .push((key, row.get_by_name("error_message")?.unwrap_or_default()));
                 }
             }
             Ok(out)
         })
     }
 
-    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<()> {
+    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<AcksApplied> {
         use pgrx::prelude::*;
         if rows.is_empty() {
-            return Ok(());
+            return Ok(AcksApplied::default());
         }
         let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
-            client.update(
-                "UPDATE kafka.shadow_tracking st SET attempt_open = false \
-                 FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(t, p, o) \
-                 WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
-                   AND st.external_offset IS NULL",
-                None,
+            let table = client.update(
+                concat!(
+                    ack_rows!("$1::int4[], $2::int4[], $3::int8[]) AS a(t, p, o"),
+                    ", \
+                 closed AS ( \
+                     UPDATE kafka.shadow_tracking st SET attempt_open = false \
+                     FROM lk \
+                     WHERE st.ctid = lk.row_ctid \
+                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
+                       AND st.external_offset IS NULL \
+                     RETURNING 1 \
+                 ) \
+                 SELECT (SELECT COUNT(*) FROM closed)::int8 AS n, \
+                        ARRAY(SELECT t FROM held) AS held_t, ARRAY(SELECT p FROM held) AS held_p, \
+                        ARRAY(SELECT o FROM held) AS held_o"
+                ),
+                Some(1),
                 &[
                     keys.topic_ids.into(),
                     keys.partition_ids.into(),
                     keys.local_offsets.into(),
                 ],
             )?;
-            Ok(())
+            let row = table.first();
+            Ok(AcksApplied {
+                transitioned: usize::try_from(row.get_by_name::<i64, _>("n")?.unwrap_or(0))
+                    .unwrap_or(0),
+                held: held_keys(&row)?,
+            })
         })
     }
 
@@ -1099,6 +1234,18 @@ impl ShadowDb for SpiShadowDb {
             pgrx::pg_sys::TransactionIdDidCommit(pgrx::pg_sys::TransactionId::from_inner(xid))
         }
     }
+}
+
+/// The `held_t`, `held_p`, `held_o` columns of an ack statement's result row.
+fn held_keys(row: &pgrx::spi::SpiTupleTable<'_>) -> Result<Vec<RowKey>> {
+    let t: Vec<Option<i32>> = row.get_by_name("held_t")?.unwrap_or_default();
+    let p: Vec<Option<i32>> = row.get_by_name("held_p")?.unwrap_or_default();
+    let o: Vec<Option<i64>> = row.get_by_name("held_o")?.unwrap_or_default();
+    Ok(t.into_iter()
+        .zip(p)
+        .zip(o)
+        .map(|((t, p), o)| RowKey::new(t.unwrap_or(0), p.unwrap_or(0), o.unwrap_or(0)))
+        .collect())
 }
 
 #[cfg(test)]

@@ -337,13 +337,27 @@ inserts (or resets to pending, closing any open attempt) a `kafka.shadow_trackin
 committed or non-transactional message of that topic in `[p_from_offset, p_to_offset)` (`NULL` = to
 the end), across all partitions, and returns the number of rows re-queued.
 
-The re-queued rows stay locked until the caller's transaction ends. The outbox tick runs with a
-transaction-local `lock_timeout` of 50 ms (or `pg_kafka.worker_lock_timeout_ms`, if lower), so an
-ack or a claim that reaches a row an open replay holds gives up within it: the tick fails, its acks
-stay queued (their rows in flight), it backs off like any failed tick, and the next one retries.
-The DB thread is never stopped for longer than that, and the tick cannot stay in a lock cycle with
-a replay that locks the same rows in another order. Commit a replay promptly: the topic is not
-forwarded until it does.
+The re-queued rows stay locked until the caller's transaction ends. The outbox tick never waits
+for such a row: the claim locks its candidates `FOR UPDATE SKIP LOCKED` (one primary-key probe
+each) and takes, in each partition, only the candidates below that partition's first row another
+transaction holds, so a held row stops its own partition at that row (its records still go out in
+offset order) and every other partition is claimed as usual; the ack statements skip held rows too,
+and an ack they skip stays queued, its row in flight, until a tick after the replay ends applies it.
+The dead-flag sync skips held rows and runs again at the next claim. So an open replay delays the
+partitions whose rows it holds, from their first held row on, and nothing else; once it commits
+or rolls back, the next tick (within about 250 ms) forwards them.
+
+The tick runs with a transaction-local `lock_timeout` of 50 ms (or `pg_kafka.worker_lock_timeout_ms`,
+if lower) for the waits that remain: a relation lock (DDL on an outbox table, or a `LOCK TABLE`) or
+a `kafka.shadow_metrics` row another session holds. Each of the tick's statements waits at most
+that long; a wait that runs out ends its subtransaction (the acks, or the poll), and the tick runs
+those two, so a tick stops the DB thread for at most about 2 x 50 ms of lock waits (plus a wait
+that ended just short of the timeout in an earlier statement of the same subtransaction). A tick
+that ran out of a lock wait keeps its acks (their rows in flight) and is followed by the next one
+after the usual 250 ms: it does not back off, since the wait ends when its holder commits, not
+when the outbox recovers. The tick cannot stay in a lock cycle with a session that locks the
+same rows in another order: its wait ends within the timeout, long before that session's deadlock
+check.
 
 ```sql
 SELECT kafka.replay_shadow_messages(
@@ -362,7 +376,7 @@ SELECT kafka.replay_shadow_messages(
   `last_forwarded_offset`, `last_forwarded_at`, written only while `shadow_metrics_enabled`.
 - `kafka.metrics`, category `shadow`: `forwarded`, `failed`, `lag` (all pending rows, dead letters
   included).
-- Logs: no per-produce lines; a failing outbox tick (for example after `DROP EXTENSION`) pauses up to 30 s and logs at the
+- Logs: no per-produce lines; a failing outbox tick (for example after `DROP EXTENSION`; not a lock wait that ran out, which retries every tick) pauses up to 30 s and logs at the
   1st, 2nd, 4th, 8th... failure in a row.
 
 ## E2E Test Setup Sequence
