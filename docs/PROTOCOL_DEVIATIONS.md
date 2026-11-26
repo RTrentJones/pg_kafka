@@ -666,14 +666,22 @@ algorithm; see "Server-side sticky assignment" below)
   the bytes it returned; one cut short or not read counts its whole `partition_max_bytes`). `max_wait_ms` is not capped, as in
   Kafka; a connection waiting on one is closed by the idle timeout once responses behind it
   wait unread (Network Security Posture)
-- ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
-  when a Produce to one of its partitions (or, for `read_committed`, any transaction
-  end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
-  signals new data, at `max_wait_ms`, or at the slow safety-net interval
-  `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
-  generate repeated fetch work on the DB thread. A fetch that names no partition (no
-  topics, or only empty partition lists) has nothing to wait for and is answered at
-  once, as in Kafka 3.7
+- ✅ Long polling (max_wait_ms/min_bytes support), as Kafka's `DelayedFetch`: a waiting
+  fetch is re-checked when a partition it watches changes, and only that partition is
+  re-read: a Produce to it, DeleteRecords of it, DeleteTopics of its topic, or, for
+  `read_committed`, any transaction end (EndTxn, an abort by fencing InitProducerId or by
+  the transaction timeout; every partition is re-read, the end not naming its partitions).
+  Once the bytes available reach `min_bytes`, or a re-read partition has an error, the
+  whole fetch is read once more and answered. At `max_wait_ms` it is read once more, or,
+  when nothing changed since a read that returned no records, that read is answered. A
+  re-check no notification asks for (the safety-net interval `pg_kafka.fetch_poll_interval_ms`,
+  default 1000 ms; a retention sweep that removed records; a dropped notification) reads
+  every partition and runs only within an allowance of 256 partitions per interval shared
+  by all long polls, so a long poll of more partitions sees such a change (an on-demand
+  `pg_kafka_run_retention_sweep()` in another session, say) at `max_wait_ms` only. An idle
+  long poll therefore costs one read of its partitions per request, as an immediate fetch
+  does. A fetch that names no partition (no topics, or only empty partition lists) has
+  nothing to wait for and is answered at once, as in Kafka 3.7
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)

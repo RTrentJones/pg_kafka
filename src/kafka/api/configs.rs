@@ -19,6 +19,7 @@ use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPa
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::AlterConfigsResources;
+use crate::kafka::notifications::{send_best_effort, InternalNotification};
 
 /// Requested `(resource_type, resource_name)` pairs, the echo of the config APIs.
 pub type ConfigResources = Vec<(i8, String)>;
@@ -116,7 +117,28 @@ impl KafkaApi for DeleteRecordsApi {
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
             handlers::handle_delete_records(&env.ctx, r.topics)
+                .inspect(|response| emit_log_start_notifications(response, env.notify_tx))
         })
+    }
+}
+
+/// Wake the long polls of every partition DeleteRecords moved the log start of: one fetching
+/// from below the new start is answered OFFSET_OUT_OF_RANGE now rather than at its deadline.
+/// One notification per partition answered without error, O(the response).
+fn emit_log_start_notifications(
+    response: &DeleteRecordsResponse,
+    notify_tx: &crossbeam_channel::Sender<InternalNotification>,
+) {
+    for topic in &response.topics {
+        for partition in topic.partitions.iter().filter(|p| p.error_code == 0) {
+            send_best_effort(
+                notify_tx,
+                InternalNotification::LogStartMoved {
+                    topic_name: topic.name.0.to_string(),
+                    partition_id: partition.partition_index,
+                },
+            );
+        }
     }
 }
 

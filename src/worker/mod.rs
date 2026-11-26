@@ -411,7 +411,7 @@ impl MainLoop<'_> {
             self.txn_timeouts.ran();
         }
         if self.retention_sweep.is_due() {
-            run_retention_sweep();
+            run_retention_sweep(self.env.notify_tx);
             self.retention_sweep.ran();
         }
         flush_broker_metrics(&mut self.metrics_flusher, &self.network.inbox);

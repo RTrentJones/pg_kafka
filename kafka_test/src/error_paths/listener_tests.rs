@@ -5,6 +5,8 @@
 //!   (`pg_kafka.fetch_poll_interval_ms`, default 1000 ms).
 //! - A produce still wakes a waiting fetch at once.
 //! - EndTxn wakes `read_committed` long polls, so a commit is seen promptly.
+//! - DeleteRecords and DeleteTopics wake the long polls they make an error of, so the
+//!   consumer learns OFFSET_OUT_OF_RANGE or UNKNOWN_TOPIC_OR_PARTITION promptly.
 //! - Per-connection in-flight requests are bounded with read-side backpressure; a client
 //!   that pipelines far beyond the bound still gets every response, in order.
 //!
@@ -16,9 +18,10 @@
 use crate::common::{
     create_producer, create_transactional_producer, get_bootstrap_servers, TestResult,
 };
+use crate::error_codes;
 use crate::setup::TestContext;
 use crate::wire::requests::fetch_request;
-use crate::wire::{raw_frame, read_raw_response, roundtrip};
+use crate::wire::{raw_frame, read_raw_response, roundtrip, Wire};
 use rdkafka::producer::{FutureRecord, Producer};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -167,8 +170,8 @@ pub async fn test_listener_idle_long_poll_does_not_refetch() -> TestResult {
 /// A produce must wake a waiting long poll at once, not at the next safety-net tick.
 ///
 /// The fetch waits at the log end (max_wait_ms = 10 s); the produce is sent 0.5 s later.
-/// The fetch's first safety-net re-run is at least 1 s after it was sent (the re-run
-/// interval starts once its first attempt has run, and restarts after every attempt), so a
+/// The fetch's first safety-net re-run is at least 1 s after it was sent (the interval
+/// starts when the long poll does, and again each time it elapses), so a
 /// response that arrives within 1 s of sending the fetch was woken by the produce; one that
 /// arrives later cannot be told from the safety net (a slow runner, or no wake-up), and the
 /// attempt is repeated (3 attempts: a produce that wakes nothing fails them all). The
@@ -269,7 +272,7 @@ pub async fn test_listener_produce_wakes_long_poll_promptly() -> TestResult {
 /// waiters, so the record must arrive within 300 ms of the commit's return. As in
 /// `test_listener_produce_wakes_long_poll_promptly`, a response that arrives 1 s or more
 /// after the fetch was sent cannot be told from the fetch's first safety-net re-run (the
-/// re-run interval restarts after every attempt, so it is never earlier), and the attempt
+/// interval starts when the long poll does, so it is never earlier), and the attempt
 /// is repeated (3 attempts: a commit that wakes nothing fails them all).
 pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestResult {
     println!("=== Test: read_committed Long Poll Wakes On Commit (listener) ===\n");
@@ -339,6 +342,165 @@ pub async fn test_listener_read_committed_long_poll_wakes_on_commit() -> TestRes
          every attempt was stalled that long)"
     )
     .into())
+}
+
+/// Start one raw long-poll Fetch (v4) of partition 0 of `topic` from `offset`, waiting for
+/// `min_bytes`, on its own connection. Resolves to the time from just before the request was
+/// sent until its response arrived, the partition's error code, and the instant the response
+/// arrived.
+fn spawn_waiting_fetch(
+    topic: String,
+    offset: i64,
+    min_bytes: i32,
+) -> tokio::task::JoinHandle<Result<(Duration, i16, Instant), String>> {
+    tokio::spawn(async move {
+        let mut stream = TcpStream::connect(get_bootstrap_servers())
+            .await
+            .map_err(|e| format!("connect failed: {e}"))?;
+        let mut request = fetch_request(&topic, 0, offset, 10_000);
+        request.min_bytes = min_bytes;
+        let sent = Instant::now();
+        let response = roundtrip(&mut stream, 4, 7, &request)
+            .await
+            .map_err(|e| format!("fetch failed: {e}"))?;
+        let received = Instant::now();
+        let code = response
+            .responses
+            .first()
+            .and_then(|t| t.partitions.first())
+            .map_or(-1, |p| p.error_code);
+        Ok((received.duration_since(sent), code, received))
+    })
+}
+
+/// Whether a waiting fetch answered `expected` within `PROMPT` of `changed` (the change's
+/// return): `None` when it answered at or after its first possible safety-net re-run, which
+/// cannot be told from a wake-up (the attempt is inconclusive).
+fn woken_promptly(
+    answer: (Duration, i16, Instant),
+    changed: Instant,
+    expected: i16,
+) -> Option<Duration> {
+    let (elapsed, code, received) = answer;
+    let after = received.saturating_duration_since(changed);
+    println!("   answered {code} {after:?} after the change (fetch waited {elapsed:?})");
+    assert_eq!(code, expected, "the woken fetch's error code");
+    if elapsed >= Duration::from_millis(DEFAULT_SAFETY_NET_MS) {
+        println!("   not before its first possible safety-net re-run; retrying");
+        return None;
+    }
+    Some(after)
+}
+
+/// DeleteRecords past a waiting fetch's offset must answer it OFFSET_OUT_OF_RANGE at once.
+///
+/// Each attempt produces three records and starts a fetch from the first of them waiting for
+/// 1 MiB (max_wait_ms = 10 s), so it waits although they are there; 0.5 s later DeleteRecords
+/// moves the log start past them. The fetch must be answered within 300 ms of the
+/// DeleteRecords' return; one answered 1 s or more after it was sent cannot be told from its
+/// safety-net re-run, and the attempt is repeated.
+pub async fn test_listener_delete_records_wakes_long_poll() -> TestResult {
+    println!("=== Test: DeleteRecords Wakes A Long Poll (listener) ===\n");
+
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("listener-dr-lp").await;
+    produce_seed(&topic).await?;
+    let producer = create_producer()?;
+    let mut wire = Wire::connect().await?;
+    for attempt in 1..=ATTEMPTS {
+        let start = high_watermark(&ctx, &topic).await?;
+        for i in 0..3 {
+            producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .key(&format!("k{i}"))
+                        .payload("v")
+                        .partition(0),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map_err(|(e, _)| e)?;
+        }
+        println!("Step 1 (attempt {attempt}/{ATTEMPTS}): fetch from {start}, waiting for 1 MiB...");
+        let fetch = spawn_waiting_fetch(topic.clone(), start, 1 << 20);
+        tokio::time::sleep(PRODUCE_AT).await;
+        println!("Step 2: DeleteRecords before offset {}...", start + 3);
+        let (code, low_watermark) = wire.delete_records(&topic, 0, start + 3).await?;
+        let deleted = Instant::now();
+        assert_eq!(code, error_codes::NONE, "DeleteRecords");
+        assert_eq!(low_watermark, start + 3);
+        if let Some(after) =
+            woken_promptly(fetch.await??, deleted, error_codes::OFFSET_OUT_OF_RANGE)
+        {
+            assert!(
+                after < PROMPT,
+                "DeleteRecords must wake the waiting fetch at once; it answered {after:?} after"
+            );
+            ctx.cleanup().await?;
+            println!("✅ Test PASSED\n");
+            return Ok(());
+        }
+    }
+    Err(
+        "no attempt's fetch was answered before its first possible safety-net re-run: \
+         DeleteRecords woke no waiting fetch (or every attempt was stalled that long)"
+            .into(),
+    )
+}
+
+/// DeleteTopics must answer a fetch waiting on the topic UNKNOWN_TOPIC_OR_PARTITION at once.
+///
+/// Each attempt starts a fetch at the log end of a new topic (max_wait_ms = 10 s) and
+/// deletes the topic 0.5 s later; the fetch must be answered within 300 ms of the
+/// DeleteTopics' return (retried as in `test_listener_delete_records_wakes_long_poll`).
+pub async fn test_listener_delete_topics_wakes_long_poll() -> TestResult {
+    use kafka_protocol::messages::delete_topics_request::DeleteTopicsRequest;
+    use kafka_protocol::messages::TopicName;
+    use kafka_protocol::protocol::StrBytes;
+
+    println!("=== Test: DeleteTopics Wakes A Long Poll (listener) ===\n");
+
+    let ctx = TestContext::new().await?;
+    let mut wire = Wire::connect().await?;
+    for attempt in 1..=ATTEMPTS {
+        let topic = ctx.unique_topic("listener-dt-lp").await;
+        produce_seed(&topic).await?;
+        let hwm = high_watermark(&ctx, &topic).await?;
+        println!(
+            "Step 1 (attempt {attempt}/{ATTEMPTS}): fetch at the log end ({hwm}) of {topic}..."
+        );
+        let fetch = spawn_waiting_fetch(topic.clone(), hwm, 1);
+        tokio::time::sleep(PRODUCE_AT).await;
+        println!("Step 2: DeleteTopics...");
+        let mut request = DeleteTopicsRequest::default();
+        request.topic_names = vec![TopicName(StrBytes::from_string(topic.clone()))];
+        request.timeout_ms = 10_000;
+        let response = wire.call(1, &request).await?;
+        let deleted = Instant::now();
+        assert_eq!(
+            response.responses.first().map(|t| t.error_code),
+            Some(error_codes::NONE),
+            "DeleteTopics"
+        );
+        if let Some(after) = woken_promptly(
+            fetch.await??,
+            deleted,
+            error_codes::UNKNOWN_TOPIC_OR_PARTITION,
+        ) {
+            assert!(
+                after < PROMPT,
+                "DeleteTopics must wake the waiting fetch at once; it answered {after:?} after"
+            );
+            ctx.cleanup().await?;
+            println!("✅ Test PASSED\n");
+            return Ok(());
+        }
+    }
+    Err(
+        "no attempt's fetch was answered before its first possible safety-net re-run: \
+         DeleteTopics woke no waiting fetch (or every attempt was stalled that long)"
+            .into(),
+    )
 }
 
 /// Pipelining far beyond the per-connection in-flight bound (128) without reading must

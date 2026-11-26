@@ -407,7 +407,7 @@ impl KafkaApi for EndTxnApi {
 }
 
 /// Wake `read_committed` long-poll consumers after a successful EndTxn (commit or abort).
-/// Best effort: a dropped wake-up only delays delivery to the fallback poll.
+/// Best effort (see [`notify_best_effort`]).
 pub(crate) fn emit_txn_end_notification(
     notify_tx: &crossbeam_channel::Sender<InternalNotification>,
 ) {

@@ -242,8 +242,8 @@ pub async fn test_long_poll_consumer_disconnect() -> TestResult {
 /// `error_paths::listener_tests::test_listener_produce_wakes_long_poll_promptly` measures
 /// one waiter: the three Fetches (max_wait_ms 10 000) are sent together and the record is
 /// produced 0.5 s later. A Fetch's first safety-net re-check is at least 1 s after it was
-/// sent (the interval starts once its first attempt has run and restarts after every
-/// attempt), so Fetches all answered within 1 s of being sent were woken by the Produce;
+/// sent (the interval starts when the long poll does), so Fetches all answered within 1 s
+/// of being sent were woken by the Produce;
 /// an attempt with any later answer cannot be told from the safety net (a slow runner, or
 /// no wake-up) and is repeated (3 attempts: a Produce that wakes nothing fails them all).
 ///

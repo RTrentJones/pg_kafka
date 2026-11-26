@@ -46,6 +46,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         listener_tests::test_listener_idle_long_poll_does_not_refetch: sequential,
         listener_tests::test_listener_produce_wakes_long_poll_promptly: sequential,
         listener_tests::test_listener_read_committed_long_poll_wakes_on_commit: sequential,
+        listener_tests::test_listener_delete_records_wakes_long_poll: sequential,
+        listener_tests::test_listener_delete_topics_wakes_long_poll: sequential,
         listener_tests::test_listener_pipelined_requests_beyond_in_flight_cap: sequential,
         lifecycle_tests::test_worker_restarts_after_terminate: sequential, // takes the broker down for ~5 s
         lifecycle_tests::test_failed_request_rolls_back_alone,

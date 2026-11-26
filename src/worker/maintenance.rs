@@ -270,13 +270,18 @@ pub(super) fn check_transaction_timeouts(
 /// schema lock, which a manual maintenance pass holding that lock may be waiting for):
 /// while another session holds it, this pass is skipped. Any ERROR in the pass (a lock
 /// timeout, a deadlock) rolls back its subtransaction only; the next interval retries.
-pub(super) fn run_retention_sweep() {
+///
+/// A pass that removed records (expired rows or dropped leaves) sends one
+/// `RecordsExpired` notification: a long poll fetching below a partition's new log start
+/// then learns it is out of range within the safety net's allowance, else at its deadline.
+pub(super) fn run_retention_sweep(notify_tx: &Sender<InternalNotification>) {
     run_partition_maintenance();
     let names = TaskNames {
         task: "Retention sweep",
         panic: "Retention-sweep maintenance",
     };
-    run_maintenance_task(names, || {
+    let mut removed_records = false;
+    let ran = run_maintenance_task(names, || {
         let store = PostgresStore::new();
         match store.run_retention_sweep(
             crate::config::MESSAGE_RETENTION_HOURS.get(),
@@ -287,23 +292,32 @@ pub(super) fn run_retention_sweep() {
             Ok(None) => pg_warning!(
                 "Retention sweep skipped: another session holds the maintenance lock; will retry"
             ),
-            Ok(Some(stats)) if stats.total() > 0 => pg_log!(
-                "Retention sweep: {} aborted msg(s), {} expired msg(s), \
+            Ok(Some(stats)) if stats.total() > 0 => {
+                removed_records = stats.expired_messages > 0 || stats.dropped_partitions > 0;
+                pg_log!(
+                    "Retention sweep: {} aborted msg(s), {} expired msg(s), \
                  {} time partition(s) dropped, \
                  {} stale producer(s), {} terminal txn(s), \
                  {} delivered and {} orphaned shadow row(s) reclaimed",
-                stats.aborted_messages,
-                stats.expired_messages,
-                stats.dropped_partitions,
-                stats.stale_producers,
-                stats.terminal_transactions,
-                stats.shadow_delivered_rows,
-                stats.shadow_orphaned_rows
-            ),
+                    stats.aborted_messages,
+                    stats.expired_messages,
+                    stats.dropped_partitions,
+                    stats.stale_producers,
+                    stats.terminal_transactions,
+                    stats.shadow_delivered_rows,
+                    stats.shadow_orphaned_rows
+                );
+            }
             Ok(Some(_)) => {}
             Err(e) => pg_warning!("Retention sweep failed: {e}"),
         }
     });
+    if ran && removed_records {
+        crate::kafka::notifications::send_best_effort(
+            notify_tx,
+            InternalNotification::RecordsExpired,
+        );
+    }
 }
 
 /// Publish the broker request metrics to kafka.broker_api_stats / kafka.broker_gauges:

@@ -200,6 +200,13 @@ fn spawn_notifier(
                     return;
                 }
             }
+            // A notification dropped on the full channel named partitions no long poll
+            // learns of: wake them all coarsely (at most once per receive, so at most every
+            // NOTIFY_RECV_TIMEOUT while the channel keeps overflowing).
+            if crate::kafka::notifications::take_dropped() {
+                debug!("Notifications were dropped; waking every long poll");
+                registry.notify_coarse().await;
+            }
         }
     })
 }
@@ -225,6 +232,18 @@ async fn wake_waiters(registry: &PendingFetchRegistry, notification: InternalNot
                 .notify_new_data(&topic_name, partition_id, high_watermark)
                 .await;
         }
+        InternalNotification::LogStartMoved {
+            topic_name,
+            partition_id,
+        } => {
+            registry
+                .notify_partition_changed(&topic_name, partition_id)
+                .await;
+        }
+        InternalNotification::TopicDeleted { topic_name } => {
+            registry.notify_topic_changed(&topic_name).await;
+        }
+        InternalNotification::RecordsExpired => registry.notify_coarse().await,
     }
 }
 

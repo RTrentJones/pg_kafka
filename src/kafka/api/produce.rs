@@ -1087,17 +1087,16 @@ pub(crate) fn extract_producer_metadata(
 }
 
 /// Send a best-effort notification to the network thread without blocking the single DB
-/// thread: the notify channel is bounded and `try_send` drops on full. Waiting
-/// fetches fall back to their poll interval, so a dropped wake-up only adds latency.
+/// thread (see [`crate::kafka::notifications::send_best_effort`]).
 pub(crate) fn notify_best_effort(
     tx: &crossbeam_channel::Sender<InternalNotification>,
     notification: InternalNotification,
 ) {
-    let _ = tx.try_send(notification);
+    crate::kafka::notifications::send_best_effort(tx, notification);
 }
 
 /// Wake long-poll consumers for every partition a produce appended to. A missing topic id,
-/// a failed high-watermark read or a full notify channel skips that wake-up.
+/// a failed high-watermark read skips that wake-up.
 fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
     response: &ProduceResponse,
     store: &S,

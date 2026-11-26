@@ -22,7 +22,7 @@ const FULL_CHANNEL_BACKOFF: Duration = Duration::from_millis(1);
 pub(super) struct Dispatcher {
     pub(super) request_lanes: RequestLanes,
     pub(super) registry: Arc<PendingFetchRegistry>,
-    /// The safety-net re-fetch interval of a long poll (`pg_kafka.fetch_poll_interval_ms`),
+    /// The safety-net re-check interval of a long poll (`pg_kafka.fetch_poll_interval_ms`),
     /// or `None` when long polling is disabled.
     pub(super) long_poll_interval: Option<Duration>,
     /// The configuration snapshot: `pg_kafka.fetch_max_bytes` is read from it per Fetch, so a
