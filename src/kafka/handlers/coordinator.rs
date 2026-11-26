@@ -263,7 +263,7 @@ fn session_timeout_refusal(session_timeout_ms: i32) -> Option<i16> {
     if range.contains(&session_timeout_ms) {
         return None;
     }
-    crate::pg_warning!(
+    crate::pg_debug!(
         "JoinGroup rejected: session_timeout_ms {} outside accepted range [{}, {}]",
         session_timeout_ms,
         crate::kafka::coordinator::MIN_SESSION_TIMEOUT_MS,
@@ -282,7 +282,7 @@ fn protocols_refusal(protocols: &[(String, Vec<u8>)]) -> Option<i16> {
     {
         return None;
     }
-    crate::pg_warning!(
+    crate::pg_debug!(
         "JoinGroup rejected: {} protocols / {} bytes of protocol metadata exceed the limit ({} / {})",
         protocols.len(),
         protocol_bytes,
@@ -290,6 +290,19 @@ fn protocols_refusal(protocols: &[(String, Vec<u8>)]) -> Option<i16> {
         crate::kafka::limits::MAX_MEMBER_PROTOCOL_BYTES
     );
     Some(crate::kafka::constants::ERROR_INVALID_REQUEST)
+}
+
+/// Log the error a JoinGroup or SyncGroup is answered with, at the level
+/// [`crate::kafka::dispatch::failure_log_level`] gives it (a client's own error at DEBUG1).
+fn log_group_failure(api: &str, e: &crate::kafka::error::KafkaError) {
+    match crate::kafka::dispatch::failure_log_level(e) {
+        crate::kafka::dispatch::FailureLogLevel::Warning => {
+            crate::pg_warning!("Failed to handle {} request: {}", api, e);
+        }
+        crate::kafka::dispatch::FailureLogLevel::Debug => {
+            crate::pg_debug!("{} answered with an error: {}", api, e);
+        }
+    }
 }
 
 /// A JoinGroup error response carrying the request's `member_id`, as Kafka 3.7 answers
@@ -316,7 +329,7 @@ fn build_join_group_response(
     let result = match outcome {
         Ok(result) => result,
         Err(e) => {
-            crate::pg_warning!("Failed to handle JoinGroup request: {}", e);
+            log_group_failure("JoinGroup", &e);
             return join_group_error_response(e.to_kafka_error_code(), member_id);
         }
     };
@@ -560,7 +573,7 @@ fn build_sync_group_response(outcome: crate::kafka::coordinator::SyncOutcome) ->
             response
         }
         Err(e) => {
-            crate::pg_warning!("Failed to handle SyncGroup request: {}", e);
+            log_group_failure("SyncGroup", &e);
             crate::kafka::response_builders::build_sync_group_error_response(
                 e.to_kafka_error_code(),
             )
