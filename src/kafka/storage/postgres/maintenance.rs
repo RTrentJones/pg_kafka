@@ -1086,8 +1086,17 @@ enum DeleteTarget<'a> {
 /// The batch skips the rows another transaction holds (a DeleteRecords or an EndTxn of
 /// the worker's open batch, a session's own DML): it never waits for them (see "Lock
 /// waits" on [`PostgresStore::run_retention_sweep`]). A skipped row stays, so the log
-/// start stops at it, and a later batch or pass takes it. The lock costs one tuple lock
-/// per row the batch deletes and no read beyond the ones the delete makes.
+/// start stops at it, and a later batch or pass takes it.
+///
+/// Two statements: the first finds and locks the batch's rows (`FOR UPDATE SKIP
+/// LOCKED`, through the indexes the predicate names) and returns their ctids; the
+/// second deletes exactly those, by TID ([`TID_DELETE_SETTINGS_SQL`]). In one statement
+/// (`ctid = ANY (ARRAY(subquery))`) the planner did not know the array and was free to
+/// read the leaf another way and test every row against it: under stale statistics it
+/// chose a BRIN bitmap scan of the whole leaf (47 s for one batch on a 990 000-row
+/// leaf). Cost: the first statement's index reads, then one heap fetch per row deleted;
+/// the ctids travel as one text array of at most [`RETENTION_DELETE_BATCH`] entries
+/// (about 15 bytes each).
 fn delete_batch(
     client: &mut SpiClient<'_>,
     filter: BatchFilter,
@@ -1096,58 +1105,90 @@ fn delete_batch(
 ) -> Result<u64> {
     let predicate = filter.predicate();
     let (topic_id, age_ms) = filter.args();
-    let table = match target {
+    let leaf = match target {
+        DeleteTarget::Leaf(leaf) => Some(leaf),
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => None,
+    };
+    let lower = leaf.flatten().and_then(|l| l.lower);
+    let upper = leaf.flatten().and_then(|l| l.upper);
+    let oid = leaf.flatten().map_or(0, |l| i64::from(l.partition.oid));
+    let (lock_sql, delete_sql) = match target {
         DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
             let table = if matches!(target, DeleteTarget::Unpartitioned) {
                 "kafka.messages"
             } else {
                 "kafka.messages_default"
             };
-            client.update(
-                &format!(
-                    "DELETE FROM {table}
-                     WHERE ctid IN (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3
-                                    FOR UPDATE OF m SKIP LOCKED)
+            (
+                format!(
+                    "SELECT COALESCE(array_agg(s.ctid::text), '{{}}') AS ctids
+                     FROM (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3
+                           FOR UPDATE OF m SKIP LOCKED) s"
+                ),
+                format!(
+                    "DELETE FROM {table} WHERE ctid = ANY ($1::text[]::tid[])
                      RETURNING topic_id, partition_id, partition_offset"
                 ),
-                None,
-                &[
-                    topic_id.into(),
-                    age_ms.into(),
-                    RETENTION_DELETE_BATCH.into(),
-                ],
-            )?
+            )
         }
-        DeleteTarget::Leaf(leaf) => {
-            let lower = leaf.and_then(|l| l.lower);
-            let upper = leaf.and_then(|l| l.upper);
-            let oid = leaf.map_or(0, |l| i64::from(l.partition.oid));
-            client.update(
-                &format!(
-                    "DELETE FROM kafka.messages
-                     WHERE created_at >= COALESCE($4::timestamptz, '-infinity')
-                       AND created_at < COALESCE($5::timestamptz, 'infinity')
-                       AND tableoid = $6::bigint::oid
-                       AND ctid = ANY (ARRAY(
-                           SELECT m.ctid FROM kafka.messages m
-                           WHERE m.created_at >= COALESCE($4::timestamptz, '-infinity')
-                             AND m.created_at < COALESCE($5::timestamptz, 'infinity')
-                             AND m.tableoid = $6::bigint::oid
-                             AND {predicate}
-                           LIMIT $3
-                           FOR UPDATE OF m SKIP LOCKED))
-                     RETURNING topic_id, partition_id, partition_offset"
-                ),
-                None,
-                &[
-                    topic_id.into(),
-                    age_ms.into(),
-                    RETENTION_DELETE_BATCH.into(),
-                    lower.into(),
-                    upper.into(),
-                    oid.into(),
-                ],
-            )?
+        DeleteTarget::Leaf(_) => (
+            format!(
+                "SELECT COALESCE(array_agg(s.ctid::text), '{{}}') AS ctids
+                 FROM (SELECT m.ctid FROM kafka.messages m
+                       WHERE m.created_at >= COALESCE($4::timestamptz, '-infinity')
+                         AND m.created_at < COALESCE($5::timestamptz, 'infinity')
+                         AND m.tableoid = $6::bigint::oid
+                         AND {predicate}
+                       LIMIT $3
+                       FOR UPDATE OF m SKIP LOCKED) s"
+            ),
+            "DELETE FROM kafka.messages
+             WHERE created_at >= COALESCE($2::timestamptz, '-infinity')
+               AND created_at < COALESCE($3::timestamptz, 'infinity')
+               AND tableoid = $4::bigint::oid
+               AND ctid = ANY ($1::text[]::tid[])
+             RETURNING topic_id, partition_id, partition_offset"
+                .to_string(),
+        ),
+    };
+    let lock_args: Vec<pgrx::datum::DatumWithOid> = match target {
+        DeleteTarget::Leaf(_) => vec![
+            topic_id.into(),
+            age_ms.into(),
+            RETENTION_DELETE_BATCH.into(),
+            lower.into(),
+            upper.into(),
+            oid.into(),
+        ],
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
+            vec![
+                topic_id.into(),
+                age_ms.into(),
+                RETENTION_DELETE_BATCH.into(),
+            ]
+        }
+    };
+    let ctids: Vec<Option<String>> = client
+        .update(&lock_sql, Some(1), &lock_args)?
+        .first()
+        .get_by_name("ctids")?
+        .unwrap_or_default();
+    if ctids.is_empty() {
+        return Ok(0);
+    }
+    let saved: Vec<Option<String>> = client
+        .update(TID_DELETE_SETTINGS_SQL, Some(1), &[])?
+        .first()
+        .get_by_name("saved")?
+        .unwrap_or_default();
+    let table = match target {
+        DeleteTarget::Leaf(_) => client.update(
+            &delete_sql,
+            None,
+            &[ctids.into(), lower.into(), upper.into(), oid.into()],
+        )?,
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
+            client.update(&delete_sql, None, &[ctids.into()])?
         }
     };
     let mut deleted = 0u64;
@@ -1161,8 +1202,37 @@ fn delete_batch(
             affected.removed(topic_id, partition_id, offset.saturating_add(1));
         }
     }
+    client.update(RESTORE_TID_DELETE_SETTINGS_SQL, None, &[saved.into()])?;
     Ok(deleted)
 }
+
+/// The planner settings under which [`delete_batch`]'s delete can only be a TID scan
+/// (every other scan disabled, TID scans enabled whatever the session says), set
+/// transaction-locally; returns the five settings as they were (`saved`), in the order
+/// [`RESTORE_TID_DELETE_SETTINGS_SQL`] puts them back. The delete names the rows by
+/// ctid, so a TID scan reads exactly them; the settings make that the plan whatever
+/// the statistics say about the leaf.
+const TID_DELETE_SETTINGS_SQL: &str = "
+    SELECT ARRAY[o.tid, o.seq, o.bitmap, o.idx, o.ios] AS saved,
+           set_config('enable_tidscan', 'on', true),
+           set_config('enable_seqscan', 'off', true),
+           set_config('enable_bitmapscan', 'off', true),
+           set_config('enable_indexscan', 'off', true),
+           set_config('enable_indexonlyscan', 'off', true)
+    FROM (SELECT current_setting('enable_tidscan') AS tid,
+                 current_setting('enable_seqscan') AS seq,
+                 current_setting('enable_bitmapscan') AS bitmap,
+                 current_setting('enable_indexscan') AS idx,
+                 current_setting('enable_indexonlyscan') AS ios
+          OFFSET 0) o";
+
+/// Put back what [`TID_DELETE_SETTINGS_SQL`] read (`$1`, in its order).
+const RESTORE_TID_DELETE_SETTINGS_SQL: &str = "
+    SELECT set_config('enable_tidscan', $1[1], true),
+           set_config('enable_seqscan', $1[2], true),
+           set_config('enable_bitmapscan', $1[3], true),
+           set_config('enable_indexscan', $1[4], true),
+           set_config('enable_indexonlyscan', $1[5], true)";
 
 /// Drop the found leaves (each re-checked under its lock by
 /// `kafka.drop_message_partition`), one a turn, at most

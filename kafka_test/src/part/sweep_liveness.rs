@@ -396,3 +396,81 @@ async fn fresh_session_drops() -> SendResult<()> {
     Ok(())
 }
 
+/// Rows the plan test keeps in the leaf beside the expired ones.
+const KEPT_ROWS: i64 = 100_000;
+/// Expired rows the plan test deletes from the leaf.
+const EXPIRED_ROWS: i64 = 10_000;
+
+/// The row deletes of the sweep reach their rows by ctid. Written as one statement,
+/// `ctid = ANY (ARRAY(subquery))` left the planner free to read the leaf another way
+/// and filter every row against the array: under stale statistics it chose a BRIN
+/// bitmap scan of the whole leaf (47 s for one batch on a 990 000-row leaf). The test
+/// stands in for such a misjudgement by turning TID scans off in the sweeping session
+/// (`enable_tidscan = off`), and counts the tuples the sweep reads from the leaf.
+///
+/// Asserts: a sweep that deletes 10 000 expired rows from a leaf that keeps 100 000
+/// others reads fewer than 3 x 10 000 tuples of it (a scan of the leaf is 110 000 per
+/// batch).
+pub async fn test_sweep_row_deletes_read_only_their_rows_whatever_the_plan() -> TestResult {
+    into_test_result(row_deletes_by_tid().await)
+}
+
+async fn row_deletes_by_tid() -> SendResult<()> {
+    println!("=== Test: the sweep's row deletes read only their rows, whatever the plan ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '120s'")
+        .await
+        .map_err(boxed)?;
+    let expired = create_topic(&db, &unique("tid-expired"), 1000).await?;
+    let forever = create_topic(&db, &unique("tid-forever"), -1).await?;
+    let hour = random_hour(&db).await?;
+    let leaf = hour_leaf(&db, hour).await?;
+    let outcome = async {
+        fill_leaf_dense(&db, forever, hour, 0, KEPT_ROWS, false).await?;
+        fill_leaf_dense(&db, expired, hour, 0, EXPIRED_ROWS, false).await?;
+        db.batch_execute(&format!("ANALYZE {leaf}"))
+            .await
+            .map_err(boxed)?;
+        println!("Step 1: {leaf} holds {KEPT_ROWS} kept and {EXPIRED_ROWS} expired rows");
+        db.batch_execute("SET enable_tidscan = off; BEGIN")
+            .await
+            .map_err(boxed)?;
+        let rows = db
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        let read: i64 = db
+            .query_one(
+                "SELECT COALESCE(SUM(seq_tup_read + COALESCE(idx_tup_fetch, 0)), 0)::bigint
+                 FROM pg_stat_xact_user_tables WHERE relid = $1::text::regclass",
+                &[&leaf],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        db.batch_execute("COMMIT; RESET enable_tidscan")
+            .await
+            .map_err(boxed)?;
+        let deleted = category(&rows, "expired_messages");
+        println!("Step 2: the sweep deleted {deleted} row(s) and read {read} tuple(s) of {leaf}");
+        if deleted < EXPIRED_ROWS {
+            return Err(format!("only {deleted} of {EXPIRED_ROWS} expired rows deleted").into());
+        }
+        if read >= 3 * EXPIRED_ROWS {
+            return Err(format!(
+                "deleting {deleted} rows read {read} tuples of the leaf: it was scanned"
+            )
+            .into());
+        }
+        SendResult::Ok(())
+    }
+    .await;
+    db.batch_execute("ROLLBACK; RESET enable_tidscan")
+        .await
+        .ok();
+    force_drop(&db, &leaf).await?;
+    delete_topics(&db, &[expired, forever]).await?;
+    outcome?;
+    println!("✅ the deletes went by ctid");
+    Ok(())
+}

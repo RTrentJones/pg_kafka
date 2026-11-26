@@ -61,5 +61,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_liveness::test_sweep_pass_ends_when_a_writer_waits_for_its_drop: sequential,
         sweep_liveness::test_partition_ddl_ignores_locks_on_other_leaves: sequential,
         sweep_liveness::test_fresh_session_sweep_drops_what_its_probes_find: sequential,
+        sweep_liveness::test_sweep_row_deletes_read_only_their_rows_whatever_the_plan: sequential,
     ]
 }
