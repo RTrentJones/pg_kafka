@@ -40,15 +40,40 @@ macro_rules! pg_warning {
 }
 
 /// Log at DEBUG1 through `pgrx::debug1!` (only formatted in unit tests, see
-/// [`pg_log!`]).
+/// [`pg_log!`]). The message is formatted only when DEBUG1 goes anywhere
+/// ([`debug1_is_logged`]): `pgrx::debug1!` formats it before Postgres decides to drop it, and
+/// with the default `log_min_messages` (WARNING) every call would otherwise cost the
+/// formatting of arguments that may hold client strings of up to 32 KB.
 #[macro_export]
 macro_rules! pg_debug {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
-        pgrx::debug1!($($arg)*);
+        if $crate::debug1_is_logged() {
+            pgrx::debug1!($($arg)*);
+        }
         #[cfg(test)]
         let _ = ::std::format!($($arg)*);
     }};
+}
+
+/// Whether a DEBUG1 message would be written to the server log or sent to a client (the
+/// test [`pg_debug!`] runs first). Two comparisons of GUC values; like every `pg_debug!`, it
+/// runs on the backend's main thread.
+#[doc(hidden)]
+#[cfg(not(test))]
+pub fn debug1_is_logged() -> bool {
+    #[cfg(not(feature = "pg13"))]
+    {
+        // SAFETY: reads the log_min_messages / client_min_messages globals and the output
+        // destination; no allocation and no error path. pg_debug! runs only on the main
+        // thread (pgrx refuses Postgres calls from others, debug1! included).
+        unsafe {
+            pg_sys::message_level_is_interesting(i32::try_from(pg_sys::DEBUG1).unwrap_or(i32::MAX))
+        }
+    }
+    // PostgreSQL 13 has no message_level_is_interesting: format as before.
+    #[cfg(feature = "pg13")]
+    true
 }
 
 ::pgrx::pg_module_magic!();
