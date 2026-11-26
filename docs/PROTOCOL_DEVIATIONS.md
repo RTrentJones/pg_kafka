@@ -474,6 +474,10 @@ algorithm; see "Server-side sticky assignment" below)
   completed once with the members that remain, instead of being completed and restarted by
   the next entry. The server logs one line per LeaveGroup that removes members, not one per
   entry.
+- ✅ A leader whose server-side assignment cannot be computed for a transient reason (the
+  subscribed topics could not be read) gets COORDINATOR_NOT_AVAILABLE, retriable, and the group
+  stays in its sync phase, as Kafka 3.7 answers a SyncGroup whose assignment it failed to
+  store; clients rejoin, and the new generation computes the assignment again.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 

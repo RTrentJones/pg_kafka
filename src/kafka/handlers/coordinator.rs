@@ -496,11 +496,33 @@ pub fn handle_sync_group<F>(
                 return;
             }
             Ok(None) => {}
-            Err(e) => {
+            Err(e @ crate::kafka::error::KafkaError::PolicyViolation { .. }) => {
                 // Too large to compute: nothing is stored and the group stays in its sync
                 // phase (the rebalance timeout evicts a leader that cannot sync).
                 coordinator.refuse_assignment(group_id, generation_id);
                 respond(build_sync_group_response(Err(e)));
+                return;
+            }
+            Err(e) => {
+                // A transient failure (the topics could not be read): the leader is told to
+                // retry, nothing is stored or remembered, and the group stays in its sync
+                // phase. Going on with no assignments would make the group Stable with every
+                // member assigned nothing until the next rebalance. COORDINATOR_NOT_AVAILABLE
+                // is what Kafka 3.7 answers a SyncGroup whose assignment it failed to store;
+                // the Java client and librdkafka look the coordinator up again and rejoin,
+                // which starts a new generation that computes the assignment again
+                // (UNKNOWN_SERVER_ERROR would be fatal to the Java client's SyncGroup).
+                crate::pg_warning!(
+                    "SyncGroup: the server-side assignment of group {} at generation {} failed: {}",
+                    group_id,
+                    generation_id,
+                    e
+                );
+                respond(build_sync_group_response(Err(
+                    crate::kafka::error::KafkaError::CoordinatorNotAvailable {
+                        group_id: group_id.to_string(),
+                    },
+                )));
                 return;
             }
         }
@@ -521,26 +543,22 @@ pub fn handle_sync_group<F>(
 type MemberAssignmentBytes = (String, Vec<u8>);
 
 /// The assignments the server computes for `group_id` with the group's assignor over the
-/// topics its members subscribe to, `None` when there is nothing to assign (no subscribed
-/// topic exists) or the topics cannot be read, and a `PolicyViolation` when the
-/// computation would exceed [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`].
+/// topics its members subscribe to: `None` when there is nothing to assign (no member
+/// subscribes to a topic, or no subscribed topic exists); a `PolicyViolation` when the
+/// computation would exceed [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`]; any other `Err`
+/// when it failed (the topics could not be read, the assignments not encoded), which the
+/// caller answers as retriable.
 fn server_side_assignments(
     ctx: &HandlerContext,
     group_id: &str,
 ) -> Result<Option<Vec<MemberAssignmentBytes>>> {
     let coordinator = ctx.coordinator;
-    let topics = match coordinator.get_subscribed_topics(group_id) {
-        Ok(topics) => topics,
-        Err(e @ crate::kafka::error::KafkaError::PolicyViolation { .. }) => return Err(e),
-        Err(_) => return Ok(None),
-    };
+    let topics = coordinator.get_subscribed_topics(group_id)?;
     if topics.is_empty() {
         return Ok(None);
     }
     // Partition counts for all topics in a single query (avoid N+1)
-    let Ok(metadata) = ctx.store.get_topic_metadata(Some(&topics)) else {
-        return Ok(None);
-    };
+    let metadata = ctx.store.get_topic_metadata(Some(&topics))?;
     let topic_partitions: HashMap<String, i32> = metadata
         .into_iter()
         .map(|tm| (tm.name, tm.partition_count))
@@ -548,18 +566,13 @@ fn server_side_assignments(
     if topic_partitions.is_empty() {
         return Ok(None);
     }
-    match coordinator.compute_assignments(group_id, &topic_partitions) {
-        Ok(computed) => {
-            crate::pg_debug!(
-                "SyncGroup: computed {} assignments server-side for group {}",
-                computed.len(),
-                group_id
-            );
-            Ok(Some(computed.into_iter().collect()))
-        }
-        Err(e @ crate::kafka::error::KafkaError::PolicyViolation { .. }) => Err(e),
-        Err(_) => Ok(None),
-    }
+    let computed = coordinator.compute_assignments(group_id, &topic_partitions)?;
+    crate::pg_debug!(
+        "SyncGroup: computed {} assignments server-side for group {}",
+        computed.len(),
+        group_id
+    );
+    Ok(Some(computed.into_iter().collect()))
 }
 
 /// Build the SyncGroup response for a coordinator outcome.
@@ -1730,6 +1743,49 @@ mod tests {
             f.coordinator.get_group_state("g").unwrap().state,
             crate::kafka::coordinator::GroupState::Stable
         );
+    }
+
+    /// A transient storage failure while computing the server-side assignment is answered
+    /// COORDINATOR_NOT_AVAILABLE (retriable) to the leader and leaves the group in its sync
+    /// phase, not remembered: the retry computes the assignment. It used to be taken as
+    /// "nothing to assign", and the group went Stable with every member assigned nothing.
+    #[test]
+    fn test_sync_group_storage_failure_in_server_side_assignment_is_retriable() {
+        let mut f = Fixture::new();
+        let mut calls = 0;
+        f.store
+            .expect_get_topic_metadata()
+            .times(2)
+            .returning(move |_| {
+                calls += 1;
+                if calls == 1 {
+                    return Err(KafkaError::database("connection lost"));
+                }
+                Ok(vec![crate::kafka::storage::TopicMetadata {
+                    name: "t".to_string(),
+                    id: 1,
+                    partition_count: 3,
+                }])
+            });
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let join = take(&f.join_protocol("g", "", 30_000, "range", metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let failed = take_sync(&f.sync("g", &member, join.generation_id, vec![])).unwrap();
+        assert_eq!(
+            failed.error_code,
+            crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+        );
+        assert_eq!(
+            f.coordinator.get_group_state("g").unwrap().state,
+            crate::kafka::coordinator::GroupState::CompletingRebalance
+        );
+        let synced = take_sync(&f.sync("g", &member, join.generation_id, vec![])).unwrap();
+        assert_eq!(synced.error_code, ERROR_NONE);
+        let assignment =
+            crate::kafka::assignment::MemberAssignment::parse(synced.assignment.as_ref()).unwrap();
+        assert_eq!(assignment.partitions("t"), vec![0, 1, 2]);
     }
 
     /// DescribeGroups of a group that is not Stable copies none of its members' metadata or
