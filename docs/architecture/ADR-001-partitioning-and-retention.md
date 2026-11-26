@@ -335,7 +335,7 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   them (it inserts its records, then advances the counter, and commits), and only then
   reads the oldest surviving offset with a new snapshot, so the log start never passes a
   record the sweep did not delete (`kafka_test/src/part/sweep_races.rs`).
-* **A manual sweep never waits in the lock manager once it holds a row.** The pass is one
+* **A manual sweep never waits for a row lock once it holds a row.** The pass is one
   transaction and holds every row it deleted or locked until it commits, while the worker's
   group commit holds the rows of every request of a batch until one commit and the shadow
   forwarder's acks update outbox rows in arrival order. A sweep statement that waited for

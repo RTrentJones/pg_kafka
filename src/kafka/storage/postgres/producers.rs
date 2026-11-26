@@ -238,7 +238,7 @@ const PRODUCER_ACTIVITY_REFRESH: Duration =
 /// an uncommitted prune deleted it waits for the prune, finds no row (None), and the
 /// batch starts the producer afresh ([`adopt_unknown_producer`]), so what it acks is
 /// recorded under a producer row. That wait cannot close a lock cycle: the sweep never
-/// waits in the lock manager for a row once it holds one (`run_retention_sweep`, "Lock
+/// waits for a row lock once it holds a row (`run_retention_sweep`, "Lock
 /// waits"), so the counter or rows of this batch's earlier requests are never what the
 /// sweep is waiting for.
 ///

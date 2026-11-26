@@ -247,8 +247,8 @@ impl PostgresStore {
     /// locked until it commits, and `pg_kafka_run_retention_sweep()` runs it in a session
     /// of its own beside the worker, whose group commit holds the rows of every request
     /// of a batch until one commit (and beside the shadow forwarder's acks, operators'
-    /// SQL). So once a pass holds a row, none of its statements waits in the lock manager
-    /// for a row another transaction holds: waiting for one while holding a row the other
+    /// SQL). So once a pass holds a row, none of its statements waits for a row lock
+    /// another transaction holds: waiting for one while holding a row the other
     /// transaction then writes (a Produce that upserts a counter the pass needs and then
     /// refreshes a producer the pass pruned; an ack batch that updates an outbox row the
     /// reaper waits for and then one it deleted) closed a cycle, and the deadlock detector
