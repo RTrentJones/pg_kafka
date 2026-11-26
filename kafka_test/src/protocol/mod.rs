@@ -135,10 +135,11 @@ pub async fn test_unknown_api_key_handling() -> TestResult {
 }
 
 /// Test: an API key that kafka-protocol knows but pg_kafka does not serve (29,
-/// DescribeAcls) is answered with the generic error frame under the request's correlation
-/// id: UNSUPPORTED_VERSION and a null error message. The connection stays usable.
-pub async fn test_unserved_api_key_gets_generic_error_frame() -> TestResult {
-    println!("=== Test: Unserved API Key Gets The Generic Error Frame ===\n");
+/// DescribeAcls, not advertised in ApiVersions) closes the connection unanswered, as Kafka
+/// 3.7 closes it for an API that is not enabled. A response or a connection left open fails
+/// the test.
+pub async fn test_unserved_api_key_closes_connection() -> TestResult {
+    println!("=== Test: Unserved API Key Closes The Connection ===\n");
 
     let mut stream = TcpStream::connect(crate::common::broker_addr()).await?;
     stream.set_nodelay(true)?;
@@ -148,32 +149,17 @@ pub async fn test_unserved_api_key_gets_generic_error_frame() -> TestResult {
     stream.write_all(&raw_frame(29, 1, 88888, &[])).await?;
     println!("Step 1: Sent DescribeAcls v1 (API key 29)\n");
 
-    let (correlation_id, body) =
-        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
-    assert_eq!(
-        correlation_id, 88888,
-        "the frame answers the request's correlation id"
-    );
-    let mut expected = crate::error_codes::UNSUPPORTED_VERSION
-        .to_be_bytes()
-        .to_vec();
-    expected.extend_from_slice(&(-1i16).to_be_bytes());
-    assert_eq!(
-        body, expected,
-        "UNSUPPORTED_VERSION and a null error message"
-    );
-    println!("✅ Generic error frame received\n");
-
-    stream.write_all(&raw_frame(18, 0, 88889, &[])).await?;
-    let (correlation_id, body) =
-        tokio::time::timeout(Duration::from_secs(10), read_raw_response(&mut stream)).await??;
-    assert_eq!(correlation_id, 88889);
-    assert_eq!(
-        body.get(..2),
-        Some(&[0u8, 0][..]),
-        "ApiVersions succeeds afterwards"
-    );
-    println!("✅ Connection still serves requests\n");
+    let read = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut stream))
+        .await
+        .map_err(|_| "the broker neither answered nor closed the connection within 10 s")??;
+    if let Some(frame) = read {
+        return Err(format!(
+            "expected the connection closed, got a {}-byte frame",
+            frame.len()
+        )
+        .into());
+    }
+    println!("✅ Connection closed\n");
 
     println!("✅ Test PASSED\n");
     Ok(())
@@ -344,7 +330,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_api_versions_negotiation,
         test_correlation_id_preserved,
         test_unknown_api_key_handling,
-        test_unserved_api_key_gets_generic_error_frame,
+        test_unserved_api_key_closes_connection,
         test_protocol_request_pipelining,
         test_response_ordering_with_long_poll: sequential, // timing-sensitive: asserts long-poll wait duration
     ]

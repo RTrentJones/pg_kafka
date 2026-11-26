@@ -7,7 +7,8 @@ use kafka_protocol::protocol::{Encodable, Request, StrBytes};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::*;
-use crate::kafka::api::RequestBody;
+use crate::kafka::api::{RequestBody, ResponseBody};
+use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
 use crate::kafka::constants::{
     API_KEY_DELETE_RECORDS, API_KEY_DESCRIBE_CONFIGS, API_KEY_FETCH,
     API_KEY_INCREMENTAL_ALTER_CONFIGS, ERROR_CORRUPT_MESSAGE,
@@ -565,22 +566,14 @@ fn test_client_id_none() {
 
 // ========== Version enforcement and unknown APIs ==========
 
-/// An API key the crate knows but pg_kafka does not serve (29 = DescribeAcls) is answered
-/// with the generic error frame.
+/// An API key the crate knows but pg_kafka does not serve (29 = DescribeAcls) closes the
+/// connection unanswered, as Kafka 3.7 does for an API that is not enabled.
 #[test]
 fn test_parse_unsupported_api_key() {
     let (tx, mut rx) = channel();
     let request = DescribeAclsRequest::default();
-    assert!(parse_request(frame(&request, 1, 9999), tx)
-        .unwrap()
-        .is_none());
-    match rx.try_recv() {
-        Ok(KafkaResponse {
-            body: ResponseBody::UnknownApi { error_code },
-            ..
-        }) => assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION),
-        other => panic!("expected the generic error frame, got {other:?}"),
-    }
+    assert!(parse_request(frame(&request, 1, 9999), tx).is_err());
+    assert!(rx.try_recv().is_err(), "nothing is answered");
 }
 
 /// A version above the advertised maximum (Metadata v11; max 10) is rejected before the

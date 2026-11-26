@@ -537,8 +537,10 @@ macro_rules! kafka_apis {
                 #[doc = concat!("A ", stringify!($net_variant), " response.")]
                 $net_variant(ResponseOf<$net_api>),
             )*
-            /// The generic error frame for an API key pg_kafka does not serve (there is no
-            /// response schema to answer in): correlation id, error code, null message.
+            /// A schema-less frame: correlation id, error code, null message. No request is
+            /// answered with it (a request for an API key pg_kafka does not serve closes the
+            /// connection, as in Kafka 3.7); it is the response of no API, which the tests of
+            /// the request plumbing use.
             UnknownApi {
                 /// Kafka error code.
                 error_code: i16,
@@ -704,9 +706,8 @@ macro_rules! kafka_apis {
     };
 }
 
-/// The generic error frame for an unknown API key: response header v0, error code, null
-/// error message. Strict clients cannot parse it, but there is no schema to answer an
-/// unknown API in; a client that sends one is not negotiating through ApiVersions.
+/// The schema-less frame of [`ResponseBody::UnknownApi`]: response header v0, error code,
+/// null error message.
 fn encode_unknown_api_frame(
     correlation_id: i32,
     error_code: i16,

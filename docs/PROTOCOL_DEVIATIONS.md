@@ -931,9 +931,9 @@ a top-level error code (Produce, ListOffsets, DescribeGroups, CreateTopics, ...)
 an empty but well-formed response. A version kafka-protocol cannot encode a response in
 (below the advertised minimum, which is the crate's own minimum, or above the crate's
 maximum) closes the connection, as Kafka does for an unsupported version. A frame whose
-header cannot be parsed closes the connection. An API key pg_kafka does not serve gets the
-generic error frame (correlation id, UNSUPPORTED_VERSION, null message), since there is no
-response schema to answer in. An acks=0 Produce never gets a response.
+header cannot be parsed closes the connection, and so does an API key pg_kafka does not
+serve (it is not advertised in ApiVersions), as Kafka 3.7 closes the connection of a request
+for an API that is not enabled. An acks=0 Produce never gets a response.
 
 ### Notable Missing APIs
 

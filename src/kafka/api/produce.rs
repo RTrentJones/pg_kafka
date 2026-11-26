@@ -186,7 +186,8 @@ impl KafkaApi for ProduceApi {
         // INVALID_REQUIRED_ACKS and nothing is written, once the checks Kafka makes before
         // the log append passed (`invalid_acks_answers`).
         if !valid_acks(acks) {
-            warn!("Rejecting Produce with invalid acks={acks}");
+            // A client error, answered in the response: not worth a WARNING per request.
+            debug!("Rejecting Produce with invalid acks={acks}");
             let refused = with_refused_entries(
                 invalid_acks_answers(&wire.topic_data, zstd_allowed),
                 refused_entries,
@@ -613,14 +614,14 @@ fn check_first_batches(
             match first_batch_is_transactional(batch) {
                 Ok(true) if has_transactional_id => return Ok(()),
                 Ok(true) => {
-                    warn!("Refusing a transactional Produce request without a transactional id");
+                    debug!("Refusing a transactional Produce request without a transactional id");
                     return Err(DecodeFailure::Rejected(
                         ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
                     ));
                 }
                 Ok(false) => {}
                 Err(code) => {
-                    warn!(
+                    debug!(
                         "Refusing a Produce request: the first batch of topic={}, partition={} cannot be sized",
                         log_name(topic.name.0.as_str()),
                         partition.index
