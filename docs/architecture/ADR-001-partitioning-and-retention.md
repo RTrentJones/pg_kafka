@@ -349,19 +349,22 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   later pass. The offset counters cannot be skipped once a turn deleted rows of their
   partitions: each turn locks them right after its delete, in the same subtransaction, the
   free ones `SKIP LOCKED` and each held one by polling `FOR UPDATE NOWAIT` (every 20 ms, for
-  at most 1 s), every attempt after checking that no session waits for the sweep. If the
+  at most 1 s), every attempt after checking that no session waits for the sweep (a sweep
+  queued for the maintenance lock does not count). If the
   counter stays held, or a session waits for the sweep (it may hold the counter until it
   gets a row the sweep holds), the turn's delete is rolled back with it and the pass ends,
   so its commit frees what that session waits for. Drops queue for their table locks
-  (above), so a pass drops leaves only before it holds any row: the contents probes and the
-  drops run first, in a pass of their own (so the drops the probes find are done in the
-  same call, which matters for an on-demand call from a fresh session: what a pass found
-  dies with its session), and once a turn has deleted a row the remaining drops wait for
-  the next pass. After every turn that left the pass holding rows or a dropped leaf's
-  ACCESS EXCLUSIVE lock on `kafka.messages`, the pass checks `pg_locks` and ends (commits)
-  as soon as another session waits for one of its locks (other than the maintenance lock):
-  a worker statement waits for the sweep at most one turn (one bounded statement or one
-  drop) plus one counter poll, not the rest of the pass budget, and never as the closing
+  (above): once the pass holds a row, a drop runs only when no session waits for the pass,
+  with a `lock_timeout` of 50 ms (one attempt, far below `deadlock_timeout`), so it cannot
+  close a cycle with a session that holds `kafka.messages` and waits for that row; the
+  drops the probes find are done in the same call (which matters for an on-demand call
+  from a fresh session: what a pass found dies with its session). The drops come last in
+  a pass's first round of turns. After every turn that left the pass holding rows or a
+  dropped leaf's ACCESS EXCLUSIVE lock on `kafka.messages`, the pass checks `pg_locks` and
+  ends (commits) once another session has waited 100 ms for one of its locks (other than
+  the maintenance lock, which a queued sweep waits for by design): a worker statement
+  waits for the sweep at most that plus one turn (one bounded statement or one drop) and
+  one counter poll, not the rest of the pass budget, and never as the closing
   edge of a cycle. Relation locks are taken as by any statement: a turn's ROW EXCLUSIVE on
   `kafka.messages` can queue behind DDL waiting for a stronger lock on it, and with a
   worker batch also waiting for a row of the pass that is a three-way cycle, which the

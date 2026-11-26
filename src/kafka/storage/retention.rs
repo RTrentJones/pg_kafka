@@ -24,13 +24,11 @@
 //! hold for the passes no other transaction cuts short this way, and a cut pass leaves
 //! every step's items and cursor where they were, so it only delays them by one pass.
 //!
-//! `PostgresStore::run_retention_sweep` runs two such passes back to back in one
-//! transaction, on one budget clock: first the contents probes and the leaf drops alone
-//! (a drop runs only while the pass holds no row, so the drops the probes find must come
-//! before any row delete, or a pass whose found work dies with it, an on-demand pass in
-//! a fresh session, never does them), then every step. Each is scheduled as below, so
-//! a sweep costs at most the budget plus one turn per step plus one probe and one drop.
-//!
+//! In `PostgresStore::run_retention_sweep` the other transaction is a session that has
+//! waited 100 ms for a lock of the pass, and the leaf drops come last in phase 1: a drop
+//! holds kafka.messages until the pass commits, so under steady traffic a pass ends soon
+//! after its first drop, and every other step takes its phase 1 turn before that.
+
 //! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
 //! through a [`Lap`]: the items in key order, starting after the key of the last item
 //! the step served ([`KeyCursor`]), wrapping, each item served until caught up. Probes
