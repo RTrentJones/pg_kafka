@@ -101,7 +101,7 @@ fn upgrade_script_converts_the_populated_table_into_a_leaf() {
 }
 
 #[test]
-fn security_definer_partition_functions_pin_search_path_and_lock_timeout() {
+fn security_definer_partition_functions_pin_search_path_and_bound_lock_waits() {
     for (name, body) in partition_functions(BOOTSTRAP_SQL) {
         let b = body.to_lowercase();
         if b.contains("security definer") {
@@ -110,10 +110,18 @@ fn security_definer_partition_functions_pin_search_path_and_lock_timeout() {
                 "{name} lacks a fixed search_path"
             );
         }
+        // DDL waits at most 2 s per lock, or the caller's lower lock_timeout: set in the
+        // body, and reverted on return by the function's SET clause (search_path).
         if b.contains("create table") || b.contains("drop table") {
             assert!(
-                b.contains("set lock_timeout"),
-                "{name} DDL without lock_timeout"
+                b.contains("perform set_config('lock_timeout',")
+                    && b.contains("< interval '2s'")
+                    && b.contains("else '2s' end, true);"),
+                "{name} DDL without its bounded lock_timeout"
+            );
+            assert!(
+                b.contains("\nset search_path"),
+                "{name} sets lock_timeout without a SET clause to revert it"
             );
         }
     }

@@ -1324,10 +1324,35 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
 }
 
 /// How long [`advance_log_start`] polls for a counter row another transaction holds
-/// before it gives up and the pass ends. A worker batch holds one for its group commit
-/// (tens of milliseconds); the poll outlasts that, but not a session that holds the row
-/// on purpose.
+/// before it gives up and the pass ends, or the session's `lock_timeout` when that is
+/// lower ([`held_counter_poll`]). A worker batch holds one for its group commit (tens of
+/// milliseconds); the poll outlasts that, but not a session that holds the row on
+/// purpose.
 const HELD_COUNTER_POLL: Duration = Duration::from_secs(1);
+
+/// [`HELD_COUNTER_POLL`], or the session's `lock_timeout` when that is set and lower.
+/// The worker's own pass runs with a short one: no worker request runs during it (one
+/// DB thread), so a counter it finds held is held by another session (an operator's
+/// transaction), and every client waits while the pass polls.
+fn held_counter_poll(client: &SpiClient<'_>) -> Result<Duration> {
+    let ms: i64 = client
+        .select(
+            "SELECT COALESCE((EXTRACT(EPOCH FROM
+                        NULLIF(current_setting('lock_timeout'), '0')::interval) * 1000)::int8,
+                    0) AS ms",
+            Some(1),
+            &[],
+        )?
+        .first()
+        .get_by_name("ms")?
+        .unwrap_or(0);
+    Ok(u64::try_from(ms)
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map_or(HELD_COUNTER_POLL, |ms| {
+            HELD_COUNTER_POLL.min(Duration::from_millis(ms))
+        }))
+}
 
 /// The pause between two attempts of the poll, in seconds (`pg_sleep`).
 const HELD_COUNTER_RETRY_PAUSE_S: f64 = 0.02;
@@ -1358,7 +1383,7 @@ const HELD_COUNTER_RETRY_PAUSE_S: f64 = 0.02;
 /// The locks never wait in the lock manager (see "Lock waits" on
 /// [`PostgresStore::run_retention_sweep`]): the free counters are locked `SKIP LOCKED`
 /// in one statement; each held one is polled with `FOR UPDATE NOWAIT`, one attempt every
-/// [`HELD_COUNTER_RETRY_PAUSE_S`] for at most [`HELD_COUNTER_POLL`], each attempt after
+/// [`HELD_COUNTER_RETRY_PAUSE_S`] for at most [`held_counter_poll`], each attempt after
 /// checking that no session waits for this transaction ([`someone_waits_for_us`]): a
 /// session that does may hold the counter until it gets a row of ours, so the poll stops
 /// and the pass commits. A partition without a counter row gets one from the upsert;
@@ -1395,7 +1420,13 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
         None,
         &[topic_ids.clone().into(), partition_ids.clone().into()],
     )?)?;
-    let deadline = Instant::now() + HELD_COUNTER_POLL;
+    let held = present.difference(&free).count() > 0;
+    let poll = if held || present.len() != topic_ids.len() {
+        held_counter_poll(client)?
+    } else {
+        HELD_COUNTER_POLL
+    };
+    let deadline = Instant::now() + poll;
     for &(topic_id, partition_id) in present.difference(&free) {
         let locked = poll_without_waiting(client, deadline, |client| {
             client.update(

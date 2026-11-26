@@ -387,8 +387,11 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
 
 The worker runs as `pgkafka_worker`, which has no DDL rights. All partition DDL runs inside
 SECURITY DEFINER functions owned by the extension owner, each with `SET search_path = pg_catalog,
-pg_temp`, schema-qualified names and `lock_timeout = 2s` around the DDL (a lock that cannot be had
-in time is a WARNING and a retry next pass, never a stalled worker). EXECUTE is revoked from PUBLIC
+pg_temp`, schema-qualified names and lock waits of at most 2 s around the DDL, or the caller's
+`lock_timeout` when that is lower (the worker runs its own maintenance and sweep with 200 ms: the
+single DB thread answers every client, and an operator's open transaction or a vacuum is all it
+would wait for). A lock that cannot be had in time is a WARNING and a retry next pass, never a
+stalled worker. EXECUTE is revoked from PUBLIC
 and granted to `pgkafka_worker` only for `ensure_message_partitions`, `message_partition_contents`
 and `drop_message_partition`; `create_message_partition` and the lock helpers
 `try_maintenance_lock` and `lock_message_tables` are internal. Each function refuses any

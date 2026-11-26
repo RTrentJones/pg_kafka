@@ -112,3 +112,121 @@ async fn metrics_flush_skips_held_rows() -> SendResult<()> {
     println!("✅ the flush skipped the held rows and caught up afterwards");
     Ok(())
 }
+
+/// The slowest worker start the test accepts with two leaves to create behind a reader:
+/// the start itself, two 200 ms lock waits and slack; at 2 s per leaf it took over 4 s.
+const START_CEILING: Duration = Duration::from_millis(2500);
+
+/// The worker's partition maintenance (at start, and before every retention sweep) and
+/// its sweep run on the DB thread, so a lock they wait for stops every client. They
+/// wait only for other sessions (no worker request runs meanwhile): here an operator's
+/// transaction that read kafka.messages and stayed open, which holds ACCESS SHARE on it
+/// and so blocks the ACCESS EXCLUSIVE lock a new leaf needs. The partition functions
+/// waited 2 s per leaf for it (two leaves ahead: 4 s before the worker served anyone).
+/// The worker now runs them with a 200 ms lock_timeout, which the functions honour when
+/// it is lower than their 2 s.
+///
+/// Asserts: with the two future leaves dropped and a reader holding ACCESS SHARE on
+/// kafka.messages, a restarted worker answers its first Produce within 2.5 s of
+/// starting; once the reader ends, maintenance makes the leaves again.
+pub async fn test_worker_maintenance_waits_briefly_behind_a_reader() -> TestResult {
+    into_test_result(maintenance_behind_reader().await)
+}
+
+async fn maintenance_behind_reader() -> SendResult<()> {
+    use crate::worker::{listener_pid, quick_producer};
+    use rdkafka::producer::FutureRecord;
+    println!("=== Test: the worker's maintenance waits briefly behind a reader ===\n");
+    let db = session().await?;
+    let minutes: String = db
+        .query_one("SHOW pg_kafka.message_partition_minutes", &[])
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let minutes: i32 = minutes.parse().map_err(boxed)?;
+    let future: Vec<String> = db
+        .query(
+            "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
+             WHERE NOT is_default AND lower_bound > now()",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    for leaf in &future {
+        db.query(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[]::int4[])",
+            &[leaf],
+        )
+        .await
+        .map_err(boxed)?;
+    }
+    println!("Step 1: dropped the future leaves {future:?}");
+    let reader = session().await?;
+    reader
+        .batch_execute("BEGIN; SELECT 1 FROM kafka.messages LIMIT 1")
+        .await
+        .map_err(boxed)?;
+    let outcome = async {
+        let old = listener_pid(&db).await?;
+        db.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE backend_type = 'pg_kafka_listener'",
+            &[],
+        )
+        .await
+        .map_err(boxed)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = loop {
+            match listener_pid(&db).await? {
+                Some(pid) if Some(pid) != old => break Instant::now(),
+                _ if Instant::now() >= deadline => {
+                    return Err("no new pg_kafka_listener within 30 s".into());
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        let producer = quick_producer("20000")?;
+        producer
+            .send(
+                FutureRecord::<(), _>::to(&format!("worker-start-probe-{}", std::process::id()))
+                    .payload("probe")
+                    .partition(0),
+                Duration::from_secs(20),
+            )
+            .await
+            .map_err(|(e, _)| boxed(e))?;
+        let took = started.elapsed();
+        println!("Step 2: the restarted worker answered its first Produce {took:?} after starting");
+        if took >= START_CEILING {
+            return Err(format!(
+                "the worker took {took:?} to serve after starting behind an open reader"
+            )
+            .into());
+        }
+        SendResult::Ok(())
+    }
+    .await;
+    reader.batch_execute("ROLLBACK").await.map_err(boxed)?;
+    db.execute("SELECT pg_kafka_run_partition_maintenance($1)", &[&minutes])
+        .await
+        .map_err(boxed)?;
+    let missing: i64 = db
+        .query_one(
+            "SELECT count(*) FROM unnest($1::text[]) l WHERE to_regclass(l) IS NULL",
+            &[&future],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    outcome?;
+    if missing != 0 {
+        return Err(format!("{missing} future leaves not made again").into());
+    }
+    println!(
+        "✅ the worker gave up its leaf creation quickly and maintenance made the leaves later"
+    );
+    Ok(())
+}

@@ -345,7 +345,6 @@ RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 SET datestyle = 'ISO, YMD'
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     -- messages_pYYYYMMDD_HHMMSS (UTC lower bound), plus _microseconds for a bound
@@ -356,6 +355,12 @@ DECLARE
     v_moved BIGINT := 0;
     v_move BOOLEAN;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     IF p_lower IS NULL OR p_upper IS NULL OR p_lower >= p_upper THEN
         RAISE EXCEPTION 'invalid partition range [%, %)', p_lower, p_upper;
     END IF;
@@ -452,7 +457,6 @@ CREATE FUNCTION kafka.ensure_message_partitions(p_width_minutes INT, p_ahead INT
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     v_width_s BIGINT;
@@ -463,6 +467,12 @@ DECLARE
     v_ov RECORD;
     v_created INT := 0;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     IF p_width_minutes IS NULL OR p_width_minutes < 1 THEN
         RAISE EXCEPTION 'partition width must be at least 1 minute, got %', p_width_minutes;
     END IF;
@@ -565,11 +575,16 @@ CREATE FUNCTION kafka.drop_message_partition(
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     v_contents RECORD;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     dropped := false;
     lock_timed_out := false;
     -- Already gone (a concurrent sweep dropped it): nothing to do, not an error.

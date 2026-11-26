@@ -208,6 +208,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         same_version::test_same_version_schema_warning_names_recreation: sequential,
         lifecycle::test_extension_ddl_loop_under_load: sequential,
         background_waits::test_metrics_flush_skips_held_rows: sequential,
+        background_waits::test_worker_maintenance_waits_briefly_behind_a_reader: sequential,
     ]
 }
 

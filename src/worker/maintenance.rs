@@ -72,6 +72,21 @@ impl Periodic {
     }
 }
 
+/// The `lock_timeout` of the worker's partition maintenance and retention sweep.
+///
+/// Lock waits: both run on the DB thread, so no worker request runs meanwhile and
+/// whatever they wait for is held by another session: the maintenance lock (an
+/// on-demand sweep or maintenance call, for as long as its caller's transaction stays
+/// open), a lock on kafka.messages or a leaf (an operator's open transaction that read
+/// kafka.messages, a long query, autovacuum on the leaf being dropped or on the DEFAULT
+/// leaf), an offset counter row (an operator's UPDATE). The partition functions wait
+/// up to 2 s for each of them by default, the counter poll 1 s, and every client waited
+/// with them; with this `lock_timeout` the functions and the poll wait at most this long
+/// (both take the caller's lock_timeout when it is lower), give up (a WARNING; the leaf
+/// is made or dropped by a later pass, and leaves are made two widths ahead), and the
+/// sweep's other statements fail its subtransaction instead of waiting 5 s.
+const MAINTENANCE_LOCK_TIMEOUT_MS: i32 = 200;
+
 /// ADR-001: one time-partition maintenance pass (`PostgresStore::ensure_time_partitions`):
 /// leaves for now and the next widths, and rows caught by kafka.messages_default moved
 /// into their leaf.
@@ -83,6 +98,7 @@ pub(super) fn run_partition_maintenance() {
         panic: "Partition maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(MAINTENANCE_LOCK_TIMEOUT_MS, "Partition maintenance");
         let store = PostgresStore::new();
         match store.ensure_time_partitions(crate::config::MESSAGE_PARTITION_MINUTES.get()) {
             Ok(created) if created > 0 => {
@@ -106,14 +122,26 @@ pub(super) fn load_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     }
 }
 
+/// The `lock_timeout` of the shadow part of a configuration reload.
+const SHADOW_RELOAD_LOCK_TIMEOUT_MS: i32 = 100;
+
 /// The shadow part of a configuration reload: the per-topic configuration, the
 /// primary/standby status, and the metrics flush.
+///
+/// Lock waits: the reload reads kafka.shadow_config and kafka.topics, every
+/// `pg_kafka.config_reload_interval_ms`, so it waits only for a session holding or
+/// queued for ACCESS EXCLUSIVE on them (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK TABLE,
+/// for as long as that session's transaction lasts). It runs with a transaction-local
+/// `lock_timeout` of [`SHADOW_RELOAD_LOCK_TIMEOUT_MS`] instead of waiting the worker's
+/// 5 s: such a lock rolls this reload back (a WARNING; the cache keeps the previous
+/// configuration) and the next one retries.
 pub(super) fn reload_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     let names = TaskNames {
         task: "Shadow config reload",
         panic: "Shadow config-reload/metrics maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(SHADOW_RELOAD_LOCK_TIMEOUT_MS, "Shadow config reload");
         match shadow_store.load_topic_config_from_db() {
             Ok(count) => pg_log!("Reloaded {count} shadow topic configurations"),
             Err(e) => pg_warning!("Failed to reload shadow config: {e:?}"),
@@ -251,11 +279,23 @@ pub(super) fn check_member_timeouts(coordinator: &GroupCoordinator) {
     }
 }
 
+/// The `lock_timeout` of a transaction-timeout check.
+const TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS: i32 = 100;
+
 /// Abort transactions that outlived their timeout. An abort ends transactions, so
 /// parked read_committed fetches are woken now (their LSO moved) rather than on the
 /// long-poll safety net. The shadow store keeps nothing for an open transaction (a
 /// commit enqueues its records into the outbox from kafka.messages), so an abort
 /// leaves it nothing to undo.
+///
+/// Lock waits: the abort updates the transaction's pending rows of kafka.messages, its
+/// producer and transaction rows and deletes its pending offsets; no worker request
+/// runs meanwhile (one DB thread), so only another session can hold them: an operator's
+/// open transaction, or an on-demand retention sweep (which never holds a pending
+/// message row, and holds producer or transaction rows only of producers idle for a
+/// week). The check runs with a transaction-local `lock_timeout` of
+/// [`TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS`], not the worker's 5 s: a wait that runs out
+/// rolls the whole check back (WARNING), and the next check, 10 s later, retries.
 pub(super) fn check_transaction_timeouts(
     shadow_store: &ShadowStore<PostgresStore>,
     notify_tx: &Sender<InternalNotification>,
@@ -266,6 +306,10 @@ pub(super) fn check_transaction_timeouts(
     };
     let mut aborted_any = false;
     let ran = run_maintenance_task(names, || {
+        bound_lock_waits(
+            TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
+            "Transaction-timeout check",
+        );
         match shadow_store.abort_timed_out_transactions(DEFAULT_TRANSACTION_TIMEOUT) {
             Ok(aborted) => {
                 aborted_any = !aborted.is_empty();
@@ -297,6 +341,7 @@ pub(super) fn run_retention_sweep() {
         panic: "Retention-sweep maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(MAINTENANCE_LOCK_TIMEOUT_MS, "Retention sweep");
         let store = PostgresStore::new();
         match store.run_retention_sweep(
             crate::config::MESSAGE_RETENTION_HOURS.get(),
@@ -367,12 +412,20 @@ pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) 
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_lock_timeout_ms, METRICS_FLUSH_LOCK_TIMEOUT_MS, OUTBOX_TICK_LOCK_TIMEOUT_MS,
+        bounded_lock_timeout_ms, MAINTENANCE_LOCK_TIMEOUT_MS, METRICS_FLUSH_LOCK_TIMEOUT_MS,
+        OUTBOX_TICK_LOCK_TIMEOUT_MS, SHADOW_RELOAD_LOCK_TIMEOUT_MS,
+        TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
     };
 
     #[test]
     fn background_lock_timeouts_are_the_lower_bound_and_never_unbounded() {
-        for bound in [OUTBOX_TICK_LOCK_TIMEOUT_MS, METRICS_FLUSH_LOCK_TIMEOUT_MS] {
+        for bound in [
+            OUTBOX_TICK_LOCK_TIMEOUT_MS,
+            METRICS_FLUSH_LOCK_TIMEOUT_MS,
+            TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
+            MAINTENANCE_LOCK_TIMEOUT_MS,
+            SHADOW_RELOAD_LOCK_TIMEOUT_MS,
+        ] {
             assert_eq!(bounded_lock_timeout_ms(5000, bound), bound);
             assert_eq!(bounded_lock_timeout_ms(0, bound), bound);
             assert_eq!(bounded_lock_timeout_ms(-1, bound), bound);
