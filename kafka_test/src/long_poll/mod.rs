@@ -16,6 +16,7 @@ mod wakeup;
 pub fn tests() -> Vec<crate::registry::TestDef> {
     crate::test_defs!["long_poll";
         timeout::test_long_poll_immediate_return: sequential, // Timing-sensitive
+        timeout::test_long_poll_of_no_partitions_returns_at_once: sequential, // Timing-sensitive
         task_cap::test_long_poll_per_connection_task_cap: sequential, // Floods one connection; sensitive to concurrent produce wakeups
         timeout::test_long_poll_timeout: sequential, // Timing-sensitive
         wakeup::test_long_poll_consumer_receives_before_max_wait: sequential, // Tests timing-sensitive behavior

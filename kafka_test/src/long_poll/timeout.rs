@@ -10,7 +10,8 @@ use crate::setup::TestContext;
 use crate::wire::requests::{creatable, create_topics_raw, fetch_request};
 use crate::wire::{decode_response, read_frame_within, request_frame};
 use bytes::Bytes;
-use kafka_protocol::messages::{FetchRequest, FetchResponse};
+use kafka_protocol::messages::{FetchRequest, FetchResponse, TopicName};
+use kafka_protocol::protocol::StrBytes;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -172,6 +173,48 @@ pub async fn test_long_poll_immediate_return() -> TestResult {
     }
     ctx.cleanup().await?;
     println!("\n✅ Long poll immediate return test PASSED\n");
+    Ok(())
+}
+
+/// A waiting Fetch (`max_wait_ms = 5000`, `min_bytes = 1`) that names no partition, with no
+/// topics or only topics with empty partition lists, has nothing to wait for and is
+/// answered at once, as Kafka 3.7 answers it, not after `max_wait_ms` or at a safety-net
+/// re-check.
+pub async fn test_long_poll_of_no_partitions_returns_at_once() -> TestResult {
+    println!("=== Test: Long Poll of No Partitions Returns At Once ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = empty_topic(&ctx, "longpoll-nopart").await?;
+    let mut s = TcpStream::connect(("127.0.0.1", crate::common::broker_port())).await?;
+    println!("Step 1: empty topic {topic}");
+
+    for (corr, with_topics) in [(1, false), (2, true)] {
+        let mut req = fetch_request(&topic, 0, 0, 5_000);
+        if with_topics {
+            let mut other = req.topics[0].clone();
+            other.topic = TopicName(StrBytes::from_string(format!("{topic}-absent")));
+            req.topics.push(other);
+            for t in &mut req.topics {
+                t.partitions.clear();
+            }
+        } else {
+            req.topics.clear();
+        }
+        let bound = immediate_bound(&ctx, &mut s, 100 * corr, &topic).await?;
+        let (took, resp) = timed_fetch(&mut s, corr, &req).await?;
+        let partitions: usize = resp.responses.iter().map(|t| t.partitions.len()).sum();
+        println!(
+            "  {} topics, no partitions: answered in {took:?} ({partitions} partition entries)",
+            req.topics.len()
+        );
+        assert_eq!(partitions, 0, "a Fetch of no partitions answers none");
+        assert!(
+            took < bound,
+            "a waiting Fetch of {} topics and no partitions is answered at once, took {took:?}",
+            req.topics.len()
+        );
+    }
+    ctx.cleanup().await?;
+    println!("\n✅ Long poll of no partitions test PASSED\n");
     Ok(())
 }
 
