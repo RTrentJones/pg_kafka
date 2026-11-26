@@ -616,10 +616,16 @@ algorithm; see "Server-side sticky assignment" below)
   COORDINATOR_NOT_AVAILABLE (15) with offset -1, at partition level, and the first offset is
   always answered, so any one partition can be read. A partition committed without metadata
   is always answered. COORDINATOR_NOT_AVAILABLE is what DescribeGroups answers at the same
-  bound; at partition level the Java admin client (`kafka-consumer-groups --describe`) skips
-  such a partition with a warning, the Java consumer fails the fetch, and librdkafka reports
-  the partition's error and does not consume it: none of them takes it for a partition without
-  an offset and resets its position.
+  bound. At partition level none of the clients takes it for a partition without an offset
+  and resets its position, but they do not retry it either: the Java consumer's `poll()` (or
+  `committed()`) throws a `KafkaException` ("Unexpected error in fetch offset response for
+  partition ...") for a consumer assigned such a partition, so a group whose committed
+  metadata does not fit cannot be consumed by the Java client until the metadata is
+  committed shorter or `pg_kafka.fetch_max_bytes` is raised; librdkafka reports the
+  partition's error and does not consume it; the Java admin client (`kafka-consumer-groups
+  --describe`) skips the partition with a warning, and `kafka-consumer-groups --reset-offsets`
+  leaves the partitions it was not answered out of the reset without saying so (check the
+  result with `--describe`).
 
 **Difference:**
 - PostgreSQL table instead of Kafka's compacted topic
