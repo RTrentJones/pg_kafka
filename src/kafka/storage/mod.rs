@@ -111,6 +111,15 @@ pub struct TransactionalProducer {
     pub previous_epoch: Option<i16>,
 }
 
+/// What one ListGroups entry takes besides its group id, at least: the length prefixes of its
+/// id, protocol type and state, and its tagged fields. The bytes [`OffsetStore::list_offset_groups`]
+/// counts per group, which an entry of a held group never undercuts.
+pub const LISTED_GROUP_OVERHEAD: usize = 8;
+
+/// One topic's committed offsets of a group, as [`OffsetStore::fetch_all_offsets`] reads
+/// them: the topic's name and its `(partition, offset)` pairs, an offset left out as `None`.
+pub type GroupTopicOffsets = (String, Vec<(i32, Option<CommittedOffset>)>);
+
 /// Committed offset information (internal representation)
 #[derive(Debug, Clone)]
 pub struct CommittedOffset {
@@ -569,24 +578,30 @@ pub trait OffsetStore {
         metadata: Option<&str>,
     ) -> Result<()>;
 
-    /// Fetch all committed offsets for a consumer group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    ///
-    /// # Returns
-    /// Map of (topic_name, partition_id) -> CommittedOffset
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+    /// Every committed offset of `group_id` by topic, as `(topic name, [(partition,
+    /// offset)])`, sorted by topic and partition. The offsets whose metadata would take the running total of
+    /// metadata bytes past `max_metadata_bytes` are `None` (read without their offset or
+    /// metadata), except the first: an offset without metadata is always read. So what is
+    /// read is bounded by `max_metadata_bytes` plus one offset's metadata (4096 UTF-16 code
+    /// units, at most 12 KB) plus O(1) per committed partition.
+    fn fetch_all_offsets(
+        &self,
+        group_id: &str,
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<GroupTopicOffsets>>;
 
     /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`
     /// pairs), as `(topic_id, partition_id, offset)` in no particular order; a partition
-    /// without one is left out. One statement, reading only the requested partitions, so
-    /// OffsetFetch of a few partitions costs the same however many offsets the group has.
+    /// without one is left out, and one past `max_metadata_bytes` (counted in the order of
+    /// `partitions`, as [`Self::fetch_all_offsets`] counts) is `None`. One statement,
+    /// reading only the requested partitions, so OffsetFetch of a few partitions costs the
+    /// same however many offsets the group has.
     fn fetch_offsets(
         &self,
         group_id: &str,
         partitions: &[(i32, i32)],
-    ) -> Result<Vec<(i32, i32, CommittedOffset)>>;
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<(i32, i32, Option<CommittedOffset>)>>;
 
     /// Delete a consumer group's offsets: the committed ones and those pending in open
     /// transactions (a transaction's commit then stores none for the group).
@@ -598,12 +613,14 @@ pub trait OffsetStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    /// The ids of every group that has at least one committed offset or pending
-    /// transactional offset (sorted). These groups exist for DescribeGroups / ListGroups /
-    /// DeleteGroups even when the in-memory coordinator does not know them (e.g. after a
-    /// worker restart, or a group only a TxnOffsetCommit named), as Kafka reports them as
-    /// Empty groups.
-    fn list_offset_groups(&self) -> Result<Vec<String>>;
+    /// The ids of the groups that have at least one committed offset or pending
+    /// transactional offset, sorted, as long as the running total of their lengths plus
+    /// [`LISTED_GROUP_OVERHEAD`] each stays within `max_bytes`, and the first id past that
+    /// (so the caller sees the list goes on): what ListGroups may list (see
+    /// `handlers::coordinator::list_groups`). The other ids past it are not read. These groups exist for DescribeGroups / ListGroups / DeleteGroups even
+    /// when the in-memory coordinator does not know them (e.g. after a worker restart, or a
+    /// group only a TxnOffsetCommit named), as Kafka reports them as Empty groups.
+    fn list_offset_groups(&self, max_bytes: usize) -> Result<Vec<String>>;
 
     /// Which of `group_ids` have at least one committed offset or pending transactional
     /// offset, in one statement.

@@ -347,40 +347,27 @@ fn test_mock_commit_offset() {
 fn test_mock_fetch_all_offsets() {
     let mut mock = MockKafkaStore::new();
 
-    mock.expect_fetch_all_offsets().returning(|_| {
+    mock.expect_fetch_all_offsets().returning(|_, _| {
+        let offset = |offset, metadata: Option<&str>| {
+            Some(CommittedOffset {
+                offset,
+                metadata: metadata.map(ToString::to_string),
+            })
+        };
         Ok(vec![
             (
                 "topic1".to_string(),
-                0,
-                CommittedOffset {
-                    offset: 10,
-                    metadata: None,
-                },
+                vec![(0, offset(10, None)), (1, offset(20, Some("meta")))],
             ),
-            (
-                "topic1".to_string(),
-                1,
-                CommittedOffset {
-                    offset: 20,
-                    metadata: Some("meta".to_string()),
-                },
-            ),
-            (
-                "topic2".to_string(),
-                0,
-                CommittedOffset {
-                    offset: 30,
-                    metadata: None,
-                },
-            ),
+            ("topic2".to_string(), vec![(0, offset(30, None))]),
         ])
     });
 
-    let result = mock.fetch_all_offsets("group").unwrap();
-    assert_eq!(result.len(), 3);
+    let result = mock.fetch_all_offsets("group", usize::MAX).unwrap();
+    assert_eq!(result.len(), 2);
     assert_eq!(result[0].0, "topic1");
-    assert_eq!(result[0].1, 0);
-    assert_eq!(result[0].2.offset, 10);
+    assert_eq!(result[0].1[0].0, 0);
+    assert_eq!(result[0].1[0].1.as_ref().map(|c| c.offset), Some(10));
 }
 
 // ========== KafkaStore Trait Contract Tests ==========

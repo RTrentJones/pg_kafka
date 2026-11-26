@@ -700,6 +700,17 @@ impl ConsumerGroup {
     /// start a rebalance: callers follow up with
     /// `on_members_removed`.
     pub(super) fn remove_member(&mut self, member_id: &str, out: &mut Vec<Delivery>) -> bool {
+        let removed = self.take_member(member_id, out);
+        if removed {
+            self.settle_removals();
+        }
+        removed
+    }
+
+    /// [`Self::remove_member`] without choosing a new leader or emptying the group: the
+    /// caller removing several members follows the last with [`Self::settle_removals`].
+    /// O(1) time.
+    pub(super) fn take_member(&mut self, member_id: &str, out: &mut Vec<Delivery>) -> bool {
         let Some(removed) = self.members.remove(member_id) else {
             return false;
         };
@@ -720,9 +731,17 @@ impl ConsumerGroup {
                 Err(KafkaError::unknown_member(&self.group_id, member_id)),
             ));
         }
+        true
+    }
 
-        // If the leader left, reassign leadership
-        if self.leader.as_deref() == Some(member_id) {
+    /// After members were taken out ([`Self::take_member`]): choose a new leader if the
+    /// leader left, and return the group to Empty if no member is left. O(members) time.
+    pub(super) fn settle_removals(&mut self) {
+        if self
+            .leader
+            .as_ref()
+            .is_some_and(|leader| !self.members.contains_key(leader))
+        {
             self.leader = self.members.keys().min().cloned();
         }
 
@@ -742,7 +761,6 @@ impl ConsumerGroup {
             self.sync_started_at = None;
             self.last_activity = Instant::now();
         }
-        true
     }
 
     /// React to members having been removed: a Stable or CompletingRebalance group

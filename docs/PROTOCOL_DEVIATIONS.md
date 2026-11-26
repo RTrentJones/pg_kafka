@@ -457,6 +457,27 @@ algorithm; see "Server-side sticky assignment" below)
   "/127.0.0.1"). The DB-thread handler is not given the connection's peer address.
 - ✅ ListGroups' `states_filter` (v4) matches state names case-sensitively, as Kafka 3.7
   does (`kafka-consumer-groups --state` sends the canonical names).
+- **Deviation:** a ListGroups response is bounded by `pg_kafka.fetch_max_bytes` (Kafka builds
+  the whole list). Group ids are client strings of up to 32 KB, and the groups known only by
+  their offsets are bounded only by the database, so 300 groups of 30 KB ids made a 9 MB
+  response and a few hundred thousand of them gigabytes. The groups are listed in the order of
+  their ids, the first always, while their entries fit; the rest are left out and the server
+  logs a WARNING. ListGroups has no per-group error code, and a top-level error makes the Java
+  admin client drop the whole list (librdkafka keeps the groups next to the error), so the
+  shortened list is answered NONE. Use the v4 state filter or DescribeGroups of the groups
+  wanted to see the others. With a state filter the list may stop a little short of the bound.
+- ✅ LeaveGroup v3+ answers every entry of `members` in order, as Kafka 3.7 does: NONE for a
+  member removed, UNKNOWN_MEMBER_ID for one the group does not have, a repeat of an entry
+  already removed included. **Deviation:** the group reacts once to all the members a request
+  removes (a new leader, a rebalance, a join phase completed by the leavers), where Kafka
+  reacts after each entry; a join phase that the first leavers of a request complete is
+  completed once with the members that remain, instead of being completed and restarted by
+  the next entry. The server logs one line per LeaveGroup that removes members, not one per
+  entry.
+- ✅ A leader whose server-side assignment cannot be computed for a transient reason (the
+  subscribed topics could not be read) gets COORDINATOR_NOT_AVAILABLE, retriable, and the group
+  stays in its sync phase, as Kafka 3.7 answers a SyncGroup whose assignment it failed to
+  store; clients rejoin, and the new generation computes the assignment again.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 
@@ -539,10 +560,12 @@ algorithm; see "Server-side sticky assignment" below)
   24 hours.) The budget is the broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
   the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
   nothing and the group stays in its sync phase. When the server computed the refused
-  assignments (the leader sent empty ones), the refusal holds for the generation: the leader's
-  retries get COORDINATOR_NOT_AVAILABLE without the assignment being computed again, as for one
-  refused for its size, until the generation moves. A rejoin that holds no more than before is
-  always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
+  assignments (the leader sent empty ones), the refusal is remembered with the bytes the
+  assignments need: the leader's retries get COORDINATOR_NOT_AVAILABLE without the assignment
+  being computed again while it would still not fit, and the first retry after enough memory
+  frees (another group's members leave or time out, `pg_kafka.max_group_memory` is raised)
+  computes it again; one refused for its size holds until the generation moves. A rejoin that
+  holds no more than before is always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
@@ -574,6 +597,18 @@ algorithm; see "Server-side sticky assignment" below)
   OffsetFetch v5+ answers `committed_leader_epoch` -1; Kafka echoes the committed one. A
   client that sees -1 skips its leader-epoch validation of the fetched position (KIP-320),
   which on a single broker whose leader epoch never changes validates nothing anyway.
+- **Deviation:** an OffsetFetch response's metadata is bounded by `pg_kafka.fetch_max_bytes`
+  (Kafka builds the whole response). Each committed offset may carry up to 12 KB of metadata,
+  so a fetch of every offset of a group of 200,000 partitions could take 2.4 GB. Offsets are
+  answered in order (by topic and partition for a fetch of all offsets, in request order
+  otherwise) while their metadata fits; each later partition with metadata is answered
+  COORDINATOR_NOT_AVAILABLE (15) with offset -1, at partition level, and the first offset is
+  always answered, so any one partition can be read. A partition committed without metadata
+  is always answered. COORDINATOR_NOT_AVAILABLE is what DescribeGroups answers at the same
+  bound; at partition level the Java admin client (`kafka-consumer-groups --describe`) skips
+  such a partition with a warning, the Java consumer fails the fetch, and librdkafka reports
+  the partition's error and does not consume it: none of them takes it for a partition without
+  an offset and resets its position.
 
 **Difference:**
 - PostgreSQL table instead of Kafka's compacted topic

@@ -3,7 +3,7 @@
 
 use super::{internal, PostgresStore};
 use crate::kafka::error::Result;
-use crate::kafka::storage::CommittedOffset;
+use crate::kafka::storage::{CommittedOffset, GroupTopicOffsets};
 use pgrx::prelude::*;
 use std::collections::HashSet;
 
@@ -48,68 +48,92 @@ impl PostgresStore {
         .map_err(internal("commit_offset"))
     }
 
-    /// Every committed offset of a group as `(topic name, partition, offset)`, sorted.
-    pub(super) fn fetch_all_offsets(group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>> {
-        Spi::connect(|client| {
-            let query = "SELECT t.name, co.partition_id, co.committed_offset, co.metadata
-                 FROM kafka.consumer_offsets co
-                 JOIN kafka.topics t ON co.topic_id = t.id
-                 WHERE co.group_id = $1
-                 ORDER BY t.name, co.partition_id";
-
-            let table = client.select(query, None, &[group_id.into()])?;
-            let mut results = Vec::new();
-
-            for row in table {
-                let topic_name: String = row.get_by_name("name")?.unwrap_or_default();
+    /// Every committed offset of a group by topic, sorted, the offsets past
+    /// `max_metadata_bytes` as `None` (see [`OffsetStore::fetch_all_offsets`]).
+    ///
+    /// The statement drops the metadata of the rows past the budget and sends each topic's
+    /// name once, on its first row, and its result is read a chunk at a time
+    /// ([`read_in_chunks`]), so the DB thread holds the metadata once, at most
+    /// `max_metadata_bytes` (plus the first row's), each name once, and O(1) per row for
+    /// the rest. The sort that orders the rows is the executor's (bounded by work_mem, then
+    /// spilled).
+    ///
+    /// [`OffsetStore::fetch_all_offsets`]: crate::kafka::storage::OffsetStore::fetch_all_offsets
+    pub(super) fn fetch_all_offsets(
+        group_id: &str,
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<GroupTopicOffsets>> {
+        let budget = i64::try_from(max_metadata_bytes).unwrap_or(i64::MAX);
+        let mut topics: Vec<GroupTopicOffsets> = Vec::new();
+        read_in_chunks(
+            "SELECT CASE WHEN first_of_topic THEN name END AS name, partition_id,
+                    committed_offset, CASE WHEN kept THEN metadata END AS metadata, kept
+             FROM (SELECT t.name, co.partition_id, co.committed_offset, co.metadata,
+                          lag(t.name) OVER w IS DISTINCT FROM t.name AS first_of_topic,
+                          coalesce(octet_length(co.metadata), 0) = 0
+                          OR row_number() OVER w = 1
+                          OR coalesce(sum(octet_length(co.metadata)) OVER w, 0) <= $2 AS kept
+                   FROM kafka.consumer_offsets co
+                   JOIN kafka.topics t ON co.topic_id = t.id
+                   WHERE co.group_id = $1
+                   WINDOW w AS (ORDER BY t.name, co.partition_id ROWS UNBOUNDED PRECEDING)) s
+             ORDER BY s.name, partition_id",
+            &[group_id.into(), budget.into()],
+            |row| {
+                if let Some(name) = row.get_by_name::<String, _>("name")? {
+                    topics.push((name, Vec::new()));
+                }
                 let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-                let offset: i64 = row.get_by_name("committed_offset")?.unwrap_or(-1);
-                let metadata: Option<String> = row.get_by_name("metadata")?;
-
-                results.push((
-                    topic_name,
-                    partition_id,
-                    CommittedOffset { offset, metadata },
-                ));
-            }
-
-            Ok(results)
-        })
-        .map_err(internal("fetch_all_offsets"))
+                let offset = kept_offset(row)?;
+                if let Some((_, partitions)) = topics.last_mut() {
+                    partitions.push((partition_id, offset));
+                }
+                Ok(())
+            },
+        )
+        .map_err(internal("fetch_all_offsets"))?;
+        Ok(topics)
     }
 
     /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`),
-    /// as `(topic_id, partition_id, offset)`: index lookups of the requested partitions
-    /// only, however many offsets the group has.
+    /// as `(topic_id, partition_id, offset)`, the offsets past `max_metadata_bytes` (counted
+    /// in the order of `partitions`) as `None`: index lookups of the requested partitions
+    /// only, however many offsets the group has, read as [`Self::fetch_all_offsets`] reads.
     pub(super) fn fetch_offsets(
         group_id: &str,
         partitions: &[(i32, i32)],
-    ) -> Result<Vec<(i32, i32, CommittedOffset)>> {
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<(i32, i32, Option<CommittedOffset>)>> {
         if partitions.is_empty() {
             return Ok(Vec::new());
         }
         let (topic_ids, partition_ids): (Vec<i32>, Vec<i32>) = partitions.iter().copied().unzip();
-        Spi::connect(|client| {
-            let table = client.select(
-                "SELECT co.topic_id, co.partition_id, co.committed_offset, co.metadata
-                 FROM unnest($2::int[], $3::int[]) AS r(topic_id, partition_id)
-                 JOIN kafka.consumer_offsets co
-                   ON co.group_id = $1
-                  AND co.topic_id = r.topic_id
-                  AND co.partition_id = r.partition_id",
-                None,
-                &[group_id.into(), topic_ids.into(), partition_ids.into()],
-            )?;
-            let mut results = Vec::with_capacity(table.len());
-            for row in table {
+        let budget = i64::try_from(max_metadata_bytes).unwrap_or(i64::MAX);
+        read_in_chunks(
+            "SELECT topic_id, partition_id, committed_offset,
+                    CASE WHEN kept THEN metadata END AS metadata, kept
+             FROM (SELECT co.topic_id, co.partition_id, co.committed_offset, co.metadata,
+                          coalesce(octet_length(co.metadata), 0) = 0
+                          OR row_number() OVER w = 1
+                          OR coalesce(sum(octet_length(co.metadata)) OVER w, 0) <= $4 AS kept
+                   FROM unnest($2::int[], $3::int[]) WITH ORDINALITY AS r(topic_id, partition_id, ord)
+                   JOIN kafka.consumer_offsets co
+                     ON co.group_id = $1
+                    AND co.topic_id = r.topic_id
+                    AND co.partition_id = r.partition_id
+                   WINDOW w AS (ORDER BY r.ord ROWS UNBOUNDED PRECEDING)) s",
+            &[
+                group_id.into(),
+                topic_ids.into(),
+                partition_ids.into(),
+                budget.into(),
+            ],
+            |row| {
                 let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
                 let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
-                let offset: i64 = row.get_by_name("committed_offset")?.unwrap_or(-1);
-                let metadata: Option<String> = row.get_by_name("metadata")?;
-                results.push((topic_id, partition_id, CommittedOffset { offset, metadata }));
-            }
-            Ok(results)
-        })
+                Ok((topic_id, partition_id, kept_offset(row)?))
+            },
+        )
         .map_err(internal("fetch_offsets"))
     }
 
@@ -141,24 +165,32 @@ impl PostgresStore {
     }
 
     /// Every group with a committed offset or a pending transactional offset, sorted.
-    pub(super) fn list_offset_groups() -> Result<Vec<String>> {
-        Spi::connect(|client| {
-            let table = client.select(
-                "SELECT group_id FROM kafka.consumer_offsets
-                 UNION
-                 SELECT group_id FROM kafka.txn_pending_offsets
-                 ORDER BY group_id",
-                None,
-                &[],
-            )?;
-            let mut groups = Vec::new();
-            for row in table {
-                if let Some(g) = row.get_by_name::<String, _>("group_id")? {
-                    groups.push(g);
-                }
-            }
-            Ok(groups)
-        })
+    /// The ids of the groups with offsets, sorted, as long as their running total of
+    /// `octet_length + LISTED_GROUP_OVERHEAD` stays within `max_bytes`, and the first id past
+    /// it (see [`OffsetStore::list_offset_groups`]). The other ids past the budget never
+    /// leave the executor.
+    ///
+    /// [`OffsetStore::list_offset_groups`]: crate::kafka::storage::OffsetStore::list_offset_groups
+    pub(super) fn list_offset_groups(max_bytes: usize) -> Result<Vec<String>> {
+        let budget = i64::try_from(max_bytes).unwrap_or(i64::MAX);
+        let overhead = i64::try_from(crate::kafka::storage::LISTED_GROUP_OVERHEAD).unwrap_or(0);
+        read_in_chunks(
+            "SELECT group_id
+             FROM (SELECT group_id,
+                          sum(octet_length(group_id) + $2) OVER w AS listed_bytes
+                   FROM (SELECT group_id FROM kafka.consumer_offsets
+                         UNION
+                         SELECT group_id FROM kafka.txn_pending_offsets) g
+                   WINDOW w AS (ORDER BY group_id ROWS UNBOUNDED PRECEDING)) s
+             WHERE listed_bytes - (octet_length(group_id) + $2) <= $1
+             ORDER BY group_id",
+            &[budget.into(), overhead.into()],
+            |row| {
+                Ok(row
+                    .get_by_name::<String, _>("group_id")?
+                    .unwrap_or_default())
+            },
+        )
         .map_err(internal("list_offset_groups"))
     }
 
@@ -240,4 +272,53 @@ impl PostgresStore {
         })
         .map_err(internal("pending_txn_offset_partitions"))
     }
+}
+
+/// Rows of a chunked read ([`read_in_chunks`]): how many a chunk holds.
+const READ_CHUNK_ROWS: i64 = 1024;
+
+/// The rows of `query` (with `args`), each mapped by `row`, read through a cursor
+/// [`READ_CHUNK_ROWS`] at a time, each chunk in its own SPI connection whose end frees that
+/// chunk's tuple table: the DB thread holds one chunk of the result besides what `row`
+/// keeps, where `select` would hold the whole result in SPI memory next to the copy made of
+/// it.
+fn read_in_chunks<T>(
+    query: &str,
+    args: &[pgrx::datum::DatumWithOid<'_>],
+    mut row: impl FnMut(&spi::SpiHeapTupleData<'_>) -> spi::Result<T>,
+) -> Result<Vec<T>> {
+    let cursor = Spi::connect(|client| {
+        Ok::<String, spi::SpiError>(client.try_open_cursor(query, args)?.detach_into_name())
+    })?;
+    let mut rows = Vec::new();
+    loop {
+        let fetched = Spi::connect(|client| {
+            let mut cursor = client.find_cursor(&cursor)?;
+            let mut fetched = 0_usize;
+            for tuple in cursor.fetch(READ_CHUNK_ROWS)? {
+                fetched += 1;
+                rows.push(row(&tuple)?);
+            }
+            if fetched > 0 {
+                // Keep the cursor open for the next chunk (dropping it closes it).
+                cursor.detach_into_name();
+            }
+            Ok::<usize, spi::SpiError>(fetched)
+        })?;
+        if fetched == 0 {
+            return Ok(rows);
+        }
+    }
+}
+
+/// The offset of a row with `committed_offset`, `metadata` and `kept` columns: `None` when
+/// the row is past its read's metadata budget.
+fn kept_offset(row: &spi::SpiHeapTupleData<'_>) -> spi::Result<Option<CommittedOffset>> {
+    if !row.get_by_name::<bool, _>("kept")?.unwrap_or(false) {
+        return Ok(None);
+    }
+    Ok(Some(CommittedOffset {
+        offset: row.get_by_name("committed_offset")?.unwrap_or(-1),
+        metadata: row.get_by_name("metadata")?,
+    }))
 }

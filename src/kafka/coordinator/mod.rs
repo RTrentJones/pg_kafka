@@ -333,7 +333,8 @@ impl GroupCoordinator {
     /// until the generation moves (a member joins, leaves or is evicted, or the leader rejoins
     /// with changed metadata, as a client does when its subscribed topics change); a change of
     /// the topics' partitions within the generation does not lift it. A computed assignment
-    /// refused by the memory budget is remembered the same way ([`Self::sync_group_computed`]).
+    /// refused by the memory budget is remembered too ([`Self::sync_group_computed`]), until
+    /// it would fit ([`Self::assignment_refused`]).
     pub fn refuse_assignment(&self, group_id: &str, generation_id: i32) {
         self.remember_refusal(group_id, generation_id, AssignmentRefusal::TooLarge);
     }
@@ -350,7 +351,14 @@ impl GroupCoordinator {
     }
 
     /// Why the server-side assignment of `group_id` at `generation_id`, its current
-    /// generation, was refused ([`Self::refuse_assignment`]), if it was.
+    /// generation, was refused ([`Self::refuse_assignment`]), if the refusal still holds. A
+    /// refusal for size holds for the generation. One by the memory budget holds only while
+    /// the assignments would still not fit: once other groups hold less (a member left, an
+    /// Empty group can be forgotten) or `pg_kafka.max_group_memory` was raised, the leader's
+    /// retry computes them again, instead of failing until the rebalance timeout evicts it.
+    ///
+    /// Cost: O(1), plus for a refusal by the memory budget O(groups) to sum what the other
+    /// groups hold, as the leader's SyncGroup does anyway ([`Self::sync_group`]).
     pub fn assignment_refused(
         &self,
         group_id: &str,
@@ -362,7 +370,15 @@ impl GroupCoordinator {
             Some((generation, why))
                 if generation == generation_id && group.generation_id == generation_id =>
             {
-                Some(why)
+                match why {
+                    AssignmentRefusal::TooLarge => Some(why),
+                    AssignmentRefusal::OverMemory { needed } => {
+                        let max_memory = self.max_group_memory.load(Ordering::Relaxed);
+                        (held_elsewhere_after_room(&groups, group_id).saturating_add(needed)
+                            > max_memory)
+                            .then_some(why)
+                    }
+                }
             }
             _ => None,
         }
@@ -702,8 +718,9 @@ impl GroupCoordinator {
 
     /// [`Self::sync_group`] for the leader's SyncGroup whose `assignments` the server computed:
     /// as there, and a refusal by the memory budget (COORDINATOR_NOT_AVAILABLE) is remembered
-    /// for the generation ([`Self::refuse_assignment`]), so the leader's retries do not compute
-    /// the assignment again only to be refused once more.
+    /// with what the assignments need, so the leader's retries do not compute the assignment
+    /// again only to be refused once more: they compute it once it would fit
+    /// ([`Self::assignment_refused`]).
     pub fn sync_group_computed(
         &self,
         group_id: &str,
@@ -865,8 +882,10 @@ impl GroupCoordinator {
                         max_memory
                     );
                     if computed {
-                        group.refused_assignment =
-                            Some((generation_id, AssignmentRefusal::OverMemory));
+                        group.refused_assignment = Some((
+                            generation_id,
+                            AssignmentRefusal::OverMemory { needed: after },
+                        ));
                     }
                     return Err(KafkaError::CoordinatorNotAvailable {
                         group_id: group_id.to_string(),
@@ -1055,34 +1074,74 @@ impl GroupCoordinator {
         Ok(())
     }
 
-    /// Handle LeaveGroup request
-    ///
-    /// Removes the member from the group. Remaining members of a Stable or
-    /// CompletingRebalance group rebalance; a join phase in progress completes if the
-    /// leaver was the last member that had not rejoined.
+    /// Handle a LeaveGroup v0-2 request: [`Self::leave_members`] of the one member,
+    /// UNKNOWN_MEMBER_ID if the group does not have it.
     pub fn leave_group(&self, group_id: &str, member_id: &str) -> Result<()> {
+        match self.leave_members(group_id, [member_id])?.first() {
+            Some(&code) if code == crate::kafka::constants::ERROR_NONE => Ok(()),
+            _ => Err(KafkaError::unknown_member(group_id, member_id)),
+        }
+    }
+
+    /// Handle the members of a LeaveGroup request: remove each named member of `group_id`
+    /// and return each entry's error code, in order, as Kafka 3.7 answers every entry: NONE
+    /// for a member removed, UNKNOWN_MEMBER_ID for one the group does not have (a group the
+    /// coordinator does not hold, or a repeat of an entry already removed). Remaining
+    /// members of a Stable or CompletingRebalance group rebalance; a join phase in progress
+    /// completes if the leavers were the last members that had not rejoined.
+    ///
+    /// The members are removed together and the group reacts once, after the last: a new
+    /// leader is chosen, the state moves and the group is recounted once per request, not
+    /// once per entry. (Kafka reacts after each entry, so a join phase that the first
+    /// leavers complete is completed and then restarted by the next; here it completes
+    /// once, with the members that remain.)
+    ///
+    /// Cost, for `n` entries naming members of a group of `m`: one groups lock and one
+    /// lookup; time O(n) plus O(m) once for the reaction; memory O(n) for the codes, plus
+    /// the answers of the removed members' held requests. One LOG line per request that
+    /// removes a member (none otherwise), never a copy of the group id per entry.
+    pub fn leave_members<'a>(
+        &self,
+        group_id: &str,
+        member_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<i16>> {
+        use crate::kafka::constants::{ERROR_NONE, ERROR_UNKNOWN_MEMBER_ID};
         let mut deliveries = Vec::new();
-        let result = {
+        let codes = {
             let mut groups = self.groups.write().map_err(|e| {
                 KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
             })?;
-
+            let member_ids = member_ids.into_iter();
             match groups.get_mut(group_id) {
-                None => Err(KafkaError::unknown_member(group_id, member_id)),
+                None => member_ids.map(|_| ERROR_UNKNOWN_MEMBER_ID).collect(),
                 Some(group) => {
-                    pg_log!("LeaveGroup: group_id={}, member_id={}", group_id, member_id);
-                    if group.remove_member(member_id, &mut deliveries) {
+                    let codes: Vec<i16> = member_ids
+                        .map(|member_id| {
+                            if group.take_member(member_id, &mut deliveries) {
+                                ERROR_NONE
+                            } else {
+                                ERROR_UNKNOWN_MEMBER_ID
+                            }
+                        })
+                        .collect();
+                    let removed = codes.iter().filter(|&&c| c == ERROR_NONE).count();
+                    if removed > 0 {
+                        pg_log!(
+                            "LeaveGroup: {} of {} member(s) left group {}",
+                            removed,
+                            codes.len(),
+                            group_id
+                        );
+                        group.settle_removals();
                         group.on_members_removed(&mut deliveries);
                         group.recount();
-                        Ok(())
-                    } else {
-                        Err(KafkaError::unknown_member(group_id, member_id))
                     }
+                    codes
                 }
             }
         };
         self.deliver(deliveries);
-        result
+        Ok(codes)
     }
 
     /// Run the periodic group timeouts: rebalance timeouts (evicting members that did
@@ -1510,8 +1569,21 @@ pub enum AssignmentRefusal {
     /// Over `limits::MAX_ASSIGNMENT_WORK` or `MAX_ASSIGNMENT_STEPS`: POLICY_VIOLATION.
     TooLarge,
     /// The computed assignments do not fit `pg_kafka.max_group_memory`:
-    /// COORDINATOR_NOT_AVAILABLE.
-    OverMemory,
+    /// COORDINATOR_NOT_AVAILABLE, until they would ([`GroupCoordinator::assignment_refused`]).
+    OverMemory {
+        /// What the group would hold with the refused assignments, in bytes.
+        needed: usize,
+    },
+}
+
+/// What the groups other than `group_id` would hold once `make_room` forgot every Empty
+/// one it may: the room a SyncGroup of `group_id` finds for its assignments. O(groups).
+fn held_elsewhere_after_room(groups: &HashMap<String, ConsumerGroup>, group_id: &str) -> usize {
+    groups
+        .values()
+        .filter(|g| g.group_id != group_id && g.state != GroupState::Empty)
+        .map(|g| g.held_bytes)
+        .sum()
 }
 
 /// What all groups hold in coordinator memory, as last counted.

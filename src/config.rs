@@ -220,9 +220,14 @@ gucs! {
           uncompressed key, value and header bytes plus 84 bytes per record and 10 per \
           header for its framing, or the encoded size of the record batches when \
           pg_kafka.compression_type encodes them larger. It is also each connection's budget for responses not yet written: past it the connection reads no \
-          further request until its client reads. It also bounds a DescribeGroups response: \
-          a group whose description would take the response past it is answered \
-          COORDINATOR_NOT_AVAILABLE (retriable), except the first group described. Default: \
+          further request until its client reads. It also bounds the responses that grow with \
+          server-side state: in DescribeGroups a group whose description would take the \
+          response past it is answered COORDINATOR_NOT_AVAILABLE (retriable), except the first \
+          group described; ListGroups lists the groups that fit, in id order and the first \
+          always, and leaves the rest out (with a WARNING in the server log); OffsetFetch \
+          returns offset metadata up to it and answers a partition past it \
+          COORDINATOR_NOT_AVAILABLE, except the first (a partition without metadata is always \
+          answered). Default: \
           57671680 (55 MiB). Reloadable via SIGHUP: the caps apply to requests read after \
           the reload, the budget to connections opened after it.",
         context: Sighup,
@@ -544,9 +549,9 @@ pub fn shadow_outbox_settings() -> crate::kafka::shadow::outbox::OutboxSettings 
 }
 
 /// `pg_kafka.fetch_max_bytes` read on the DB thread: also the bound of the responses whose
-/// size grows with server-side state rather than with the request (DescribeGroups), as it is
-/// each connection's budget for responses not yet written. Unit tests (no backend, many
-/// threads) see the default.
+/// size grows with server-side state rather than with the request (DescribeGroups, ListGroups,
+/// OffsetFetch's metadata), as it is each connection's budget for responses not yet written.
+/// Unit tests (no backend, many threads) see the default.
 pub fn response_max_bytes() -> usize {
     #[cfg(not(test))]
     let bytes = FETCH_MAX_BYTES.get();
