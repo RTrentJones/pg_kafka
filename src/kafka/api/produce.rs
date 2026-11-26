@@ -10,7 +10,7 @@ use kafka_protocol::messages::produce_request::{
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{
     ApiEnv, ApiSchema, Call, Decoded, KafkaApi, Rejection, RequestBody, RequestHeader,
@@ -572,7 +572,7 @@ impl<'a> Refusals<'a> {
 impl Drop for Refusals<'_> {
     fn drop(&mut self) {
         if let Some((partition, error_code)) = self.first_invalid {
-            warn!(
+            debug!(
                 "Refusing the records of {} partition(s) of topic={} (partition={partition}: error {error_code})",
                 self.invalid,
                 log_name(self.name)

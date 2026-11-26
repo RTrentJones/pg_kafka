@@ -16,8 +16,7 @@ impl PostgresStore {
         metadata: Option<&str>,
     ) -> Result<()> {
         crate::pg_debug!(
-            "PostgresStore::commit_offset: group_id={}, topic_id={}, partition_id={}, offset={}",
-            group_id,
+            "PostgresStore::commit_offset: topic_id={}, partition_id={}, offset={}",
             topic_id,
             partition_id,
             offset
