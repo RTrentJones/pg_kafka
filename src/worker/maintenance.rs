@@ -326,14 +326,27 @@ pub(super) fn run_retention_sweep() {
     });
 }
 
+/// The `lock_timeout` of a broker-metrics flush.
+const METRICS_FLUSH_LOCK_TIMEOUT_MS: i32 = 10;
+
 /// Publish the broker request metrics to kafka.broker_api_stats / kafka.broker_gauges:
 /// at most once per second and only when they changed (one upsert statement, no SQL at
 /// all otherwise).
+///
+/// Lock waits: another session can hold those rows (an operator's `SELECT ... FOR
+/// UPDATE` or UPDATE in an open transaction) or the tables (VACUUM FULL, ALTER,
+/// TRUNCATE, or DDL queued behind a reader), for as long as it likes. The flush waited
+/// `pg_kafka.worker_lock_timeout_ms` for them once per interval, and every client of
+/// the DB thread with it. So it runs with a transaction-local `lock_timeout` of
+/// [`METRICS_FLUSH_LOCK_TIMEOUT_MS`]: a wait that runs out skips this interval's
+/// write, and the counters (cumulative, kept in memory) go out with the next flush
+/// that gets its locks ([`MetricsFlusher::finish`] keeps the published baseline).
 pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) {
     let Some(batch) = flusher.poll(inbox.requests.len(), inbox.liveness.len()) else {
         return;
     };
     let written = worker_transaction(|| {
+        bound_lock_waits(METRICS_FLUSH_LOCK_TIMEOUT_MS, "Broker metrics flush");
         let mut written = Ok(());
         let guard = run_request_in_subtransaction(|| {
             written = crate::kafka::metrics::write_batch(&batch);
@@ -353,11 +366,13 @@ pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) 
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_lock_timeout_ms, OUTBOX_TICK_LOCK_TIMEOUT_MS};
+    use super::{
+        bounded_lock_timeout_ms, METRICS_FLUSH_LOCK_TIMEOUT_MS, OUTBOX_TICK_LOCK_TIMEOUT_MS,
+    };
 
     #[test]
     fn background_lock_timeouts_are_the_lower_bound_and_never_unbounded() {
-        for bound in [OUTBOX_TICK_LOCK_TIMEOUT_MS] {
+        for bound in [OUTBOX_TICK_LOCK_TIMEOUT_MS, METRICS_FLUSH_LOCK_TIMEOUT_MS] {
             assert_eq!(bounded_lock_timeout_ms(5000, bound), bound);
             assert_eq!(bounded_lock_timeout_ms(0, bound), bound);
             assert_eq!(bounded_lock_timeout_ms(-1, bound), bound);
