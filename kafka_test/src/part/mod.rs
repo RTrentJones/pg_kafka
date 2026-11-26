@@ -10,6 +10,7 @@ mod sweep_concurrency;
 mod sweep_cost;
 mod sweep_datestyle;
 mod sweep_isolation;
+mod sweep_liveness;
 mod sweep_races;
 pub mod time_partitions;
 
@@ -57,5 +58,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_races::test_sweep_never_deadlocks_with_a_batch_writing_two_rows: sequential,
         sweep_races::test_sweep_never_deadlocks_with_a_batch_holding_a_counter: sequential,
         sweep_races::test_sweep_reaper_never_deadlocks_with_an_ack_batch: sequential,
+        sweep_liveness::test_partition_ddl_ignores_locks_on_other_leaves: sequential,
     ]
 }

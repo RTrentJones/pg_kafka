@@ -282,14 +282,23 @@ BEGIN
 END;
 $$;
 
--- Lock kafka.topics in SHARE ROW EXCLUSIVE mode and then kafka.messages in ACCESS
--- EXCLUSIVE mode, what partition DDL needs (internal). Worker transactions lock these
--- tables in either order (a batch can fetch, then auto-create a topic), so a DDL that
--- waited for one while holding the other could deadlock with them. Each attempt
--- therefore waits at most 50 ms (well below deadlock_timeout), in a subtransaction
--- whose failure releases both locks, and the attempts repeat with a random pause
--- until the caller's lock_timeout has passed; then lock_not_available is raised.
-CREATE FUNCTION kafka.lock_message_tables()
+-- Lock what partition DDL on one leaf needs (internal): kafka.topics in SHARE ROW
+-- EXCLUSIVE mode (the leaf's foreign key), then ACCESS EXCLUSIVE on kafka.messages
+-- itself (ONLY), the leaf p_leaf (the one a DROP removes; NULL for a leaf being
+-- created) and kafka.messages_default (whose partition constraint every CREATE ...
+-- PARTITION OF and every DROP of another leaf changes). Exactly what CREATE TABLE ...
+-- PARTITION OF, ATTACH PARTITION and DROP TABLE of a leaf lock, parent first, the order
+-- every statement through the parent takes them in. Not the other leaves: a LOCK TABLE
+-- without ONLY locks every leaf too, and a SHARE UPDATE EXCLUSIVE holder on any leaf
+-- (autovacuum, VACUUM, ANALYZE) then made every leaf creation and drop time out. A
+-- session that reaches another leaf directly (by its name) holds only that leaf, which
+-- this DDL neither reads nor changes. Worker transactions lock these tables in either
+-- order (a batch can fetch, then auto-create a topic), so a DDL that waited for one
+-- while holding another could deadlock with them. Each attempt therefore waits at most
+-- 50 ms (well below deadlock_timeout), in a subtransaction whose failure releases every
+-- lock it took, and the attempts repeat with a random pause until the caller's
+-- lock_timeout has passed; then lock_not_available is raised.
+CREATE FUNCTION kafka.lock_message_tables(p_leaf REGCLASS DEFAULT NULL)
 RETURNS VOID
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -303,7 +312,11 @@ BEGIN
         BEGIN
             PERFORM set_config('lock_timeout', '50ms', true);
             LOCK TABLE kafka.topics IN SHARE ROW EXCLUSIVE MODE;
-            LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+            LOCK TABLE ONLY kafka.messages IN ACCESS EXCLUSIVE MODE;
+            IF p_leaf IS NOT NULL THEN
+                EXECUTE format('LOCK TABLE ONLY %s IN ACCESS EXCLUSIVE MODE', p_leaf);
+            END IF;
+            LOCK TABLE ONLY kafka.messages_default IN ACCESS EXCLUSIVE MODE;
             PERFORM set_config('lock_timeout', v_saved, true);
             RETURN;
         EXCEPTION WHEN lock_not_available THEN
@@ -362,9 +375,10 @@ BEGIN
             RAISE WARNING 'pg_kafka: could not create time partition kafka.% (rows of kafka.messages_default to move, schema lock taken); will retry', v_name;
             RETURN 0;
         END IF;
-        -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages and, to clone
-        -- the topic_id foreign key, kafka.topics: take both first, without ever
-        -- waiting long enough to deadlock with a worker transaction.
+        -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages, the DEFAULT
+        -- leaf (its partition constraint changes) and, to clone the topic_id foreign
+        -- key, kafka.topics: take them first, without ever waiting long enough to
+        -- deadlock with a worker transaction.
         PERFORM kafka.lock_message_tables();
         -- Rows can reach the DEFAULT leaf while lock_message_tables waits, and CREATE
         -- ... PARTITION OF fails (check_violation) on any of the new leaf's range. With
@@ -587,9 +601,12 @@ BEGIN
         -- Every lock wait is inside this block, so a lock timeout skips this leaf
         -- (the next sweep retries) instead of failing the caller's whole sweep.
         -- DROP takes ACCESS EXCLUSIVE on the parent and, to drop the leaf's foreign
-        -- key, SHARE ROW EXCLUSIVE on kafka.topics; take both first (parent, then leaf,
-        -- the order inserts use) so the contents check below cannot race a writer.
-        PERFORM kafka.lock_message_tables();
+        -- key, SHARE ROW EXCLUSIVE on kafka.topics, and ACCESS EXCLUSIVE on the leaf and
+        -- on kafka.messages_default (whose partition constraint the drop changes); take
+        -- them first (parent, then leaves, the order inserts use) so the contents check
+        -- below cannot race a writer, which reaches the leaf through the parent or by
+        -- its name.
+        PERFORM kafka.lock_message_tables(p_partition);
         -- Re-check under the locks: a concurrent drop of the same leaf may have
         -- committed while this call waited for them. Each statement here takes a new
         -- snapshot (READ COMMITTED, checked above), so the contents check sees every
@@ -637,7 +654,7 @@ $$;
 -- Functions are executable by PUBLIC by default: these are for the worker role only.
 REVOKE EXECUTE ON FUNCTION kafka.message_partition_contents(REGCLASS) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.try_maintenance_lock() FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION kafka.lock_message_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.lock_message_tables(REGCLASS) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.create_message_partition(TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.ensure_message_partitions(INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.drop_message_partition(REGCLASS, INT[]) FROM PUBLIC;

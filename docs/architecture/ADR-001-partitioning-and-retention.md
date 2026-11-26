@@ -291,12 +291,16 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   drop the leaf's `topic_id` foreign key, `kafka.topics` (`SHARE ROW EXCLUSIVE`). A worker
   transaction locks these two tables in either order (a group-commit batch can fetch from
   one topic and then auto-create another, whose produce upserts `kafka.topics`), so no fixed
-  order avoids a cycle with it. `kafka.lock_message_tables()` takes both (topics, then
-  messages) in attempts of at most 50 ms each, well below `deadlock_timeout`, in a
-  subtransaction whose failure releases both, and retries with a random pause until the
+  order avoids a cycle with it. `kafka.lock_message_tables(leaf)` takes them (topics, then
+  `ONLY kafka.messages`, then the leaf a drop removes and `kafka.messages_default`, whose
+  partition constraint both DDLs change) in attempts of at most 50 ms each, well below
+  `deadlock_timeout`, in a subtransaction whose failure releases them all, and retries with a random pause until the
   caller's `lock_timeout` (2 s in the partition functions) has passed. A worker transaction
   therefore waits at most one attempt, and one that holds a lock the DDL needs simply makes
-  it retry.
+  it retry. No other leaf is locked: a `LOCK TABLE` without `ONLY` locks every leaf, and a
+  `SHARE UPDATE EXCLUSIVE` holder on any of them (autovacuum, `VACUUM`, `ANALYZE`) made every
+  creation and drop time out while it ran. A vacuum of the leaf being dropped or of the
+  DEFAULT leaf still makes that DDL wait (and time out after its 2 s, retried next pass).
 * **Every lock wait in maintenance is bounded and handled.** A session that ran maintenance
   and stayed open makes the next pass skip with a WARNING instead of stalling it (and, for
   the worker, the whole broker). `drop_message_partition` takes its table locks inside a
