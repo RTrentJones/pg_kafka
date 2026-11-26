@@ -310,27 +310,49 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   return `dropped = false` (NULL contents) instead of erroring on the vanished OID.
 * **A manual sweep decides on committed rows, not on its snapshot.** The worker's own sweep
   runs on the DB thread between requests, but `pg_kafka_run_retention_sweep()` runs beside
-  the worker's transactions, at READ COMMITTED a fresh snapshot per statement. A DELETE or
-  UPDATE that waits for a row a worker transaction holds re-evaluates only its own WHERE
-  (and SET) on the committed version; its CTEs and subqueries keep the statement's
+  the worker's transactions, at READ COMMITTED a fresh snapshot per statement. A row lock
+  taken on a row updated since the statement's snapshot re-evaluates only the locking
+  query's own WHERE on the committed version; its CTEs and subqueries keep the statement's
   snapshot. So each such statement either names its rows by `ctid` (the terminal
   transaction, outbox and message batches: a concurrently updated row has a new `ctid`
   and is left for the next pass), or repeats on the row itself every condition a worker
-  write can change: the producer prune re-checks `last_active_at` against the window, so
-  a producer that InitProducerId or an epoch bump revived while the prune waited for it
-  is kept. An idempotent Produce writes the sequence and batch rows, which the prune's
-  subqueries read from their snapshot, so it also moves `last_active_at` whenever that is
-  more than half the window old (one UPDATE per producer per 3.5 days, under the row lock
-  the prune then waits for): a producer the prune can take is always one whose Produce
-  writes its row first. A Produce that commits while the prune waits keeps its producer;
-  one that reaches the row after the prune deleted it waits for the prune, finds no row
-  and starts the producer afresh (adopted at its batch's sequence, as a producer the
-  broker holds no state for), so the batch it acks is recorded and its retry is
-  deduplicated. The log-start update after a sweep's deletes first upserts the affected
-  `kafka.partition_offsets` rows, which waits for a Produce holding them (it inserts its
-  records, then advances the counter, and commits), and only then reads the oldest
-  surviving offset with a new snapshot, so the log start never passes a record the sweep
-  did not delete (`kafka_test/src/part/sweep_races.rs`).
+  write can change: the producer prune's lock re-checks `last_active_at` against the
+  window, so a producer that InitProducerId or an epoch bump revived and committed after
+  the prune's snapshot is kept. An idempotent Produce writes the sequence and batch rows,
+  which the prune's subqueries read from their snapshot, so it also moves
+  `last_active_at` whenever that is more than half the window old (one UPDATE per producer
+  per 3.5 days): a producer the prune can take is always one whose Produce writes its row
+  first. A Produce still open when the prune reaches its producer holds the row, which the
+  prune skips; one that reaches the row after the prune deleted it waits for the prune,
+  finds no row and starts the producer afresh (adopted at its batch's sequence, as a
+  producer the broker holds no state for), so the batch it acks is recorded and its retry
+  is deduplicated. The log-start update after a delete first locks the affected
+  `kafka.partition_offsets` rows, waiting (by polling, see below) for a Produce holding
+  them (it inserts its records, then advances the counter, and commits), and only then
+  reads the oldest surviving offset with a new snapshot, so the log start never passes a
+  record the sweep did not delete (`kafka_test/src/part/sweep_races.rs`).
+* **A manual sweep never waits in the lock manager once it holds a row.** The pass is one
+  transaction and holds every row it deleted or locked until it commits, while the worker's
+  group commit holds the rows of every request of a batch until one commit and the shadow
+  forwarder's acks update outbox rows in arrival order. A sweep statement that waited for
+  one of their rows while the sweep held a row they then needed closed a lock cycle, and
+  the deadlock detector failed a client's request or the sweep: the counter upsert at the
+  end of a pass waited for a Produce whose batch next refreshed a producer the prune had
+  deleted (or deleted rows the expiry had deleted, as DeleteRecords), and the orphaned-
+  outbox reaper waited for an ack batch whose next ack was a row it had reaped. So every
+  row delete and lock of a pass skips the rows others hold (`FOR UPDATE SKIP LOCKED`:
+  message and outbox batches, the producer and transaction prunes), and those rows go to a
+  later pass. The offset counters cannot be skipped once a turn deleted rows of their
+  partitions: each turn locks them right after its delete, in the same subtransaction, the
+  free ones `SKIP LOCKED` and each held one by polling `FOR UPDATE NOWAIT` (every 20 ms, for
+  at most 1 s), every attempt after checking that no session waits for the sweep. If the
+  counter stays held, or a session waits for the sweep (it may hold the counter until it
+  gets a row the sweep holds), the turn's delete is rolled back with it and the pass ends,
+  so its commit frees what that session waits for. Drops queue for their table locks
+  (above), so a pass drops leaves only before it holds any row: the drops come first in a
+  pass, and once a turn has deleted a row the remaining ones wait for the next pass. A
+  worker statement can still wait for a row the sweep holds until the sweep commits, as
+  for any transaction, but never as the closing edge of a cycle.
 * **Maintenance locks the parent before any leaf.** Every worker statement on
   `kafka.messages` locks the parent first and then its leaves in bound order, and
   `ensure_message_partitions` takes `ACCESS SHARE` on `kafka.messages` before it reads

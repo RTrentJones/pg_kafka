@@ -134,6 +134,71 @@ fn run_pass_turns_budget_and_fair_shares() {
     }
 }
 
+/// A pass context that ends the pass once a step's turn sets `end`.
+#[derive(Default)]
+struct EndingClock {
+    now: Duration,
+    end: bool,
+}
+
+impl PassClock for EndingClock {
+    fn elapsed(&self) -> Duration {
+        self.now
+    }
+
+    fn ended(&self) -> bool {
+        self.end
+    }
+}
+
+/// A step that counts its turns and ends the pass at its `ends_at`-th turn.
+struct EndingStep {
+    turns: u32,
+    ends_at: Option<u32>,
+}
+
+impl PassStep<EndingClock, ()> for EndingStep {
+    fn has_work(&self, _: &EndingClock) -> bool {
+        true
+    }
+
+    fn turn(&mut self, ctx: &mut EndingClock) -> Result<(), ()> {
+        self.turns += 1;
+        ctx.now += Duration::from_millis(1);
+        if self.ends_at == Some(self.turns) {
+            ctx.end = true;
+        }
+        Ok(())
+    }
+}
+
+/// A turn that ends the pass is its last one, in the first round (the later steps get
+/// no turn) and in the budgeted rounds alike.
+#[test]
+fn run_pass_stops_once_a_turn_ends_the_pass() {
+    for (ends_at_step, ends_at_turn, expected) in [
+        (0, 1, vec![1, 0, 0]),
+        (1, 1, vec![1, 1, 0]),
+        (2, 3, vec![3, 3, 3]),
+    ] {
+        let mut steps: Vec<EndingStep> = (0..3)
+            .map(|i| EndingStep {
+                turns: 0,
+                ends_at: (i == ends_at_step).then_some(ends_at_turn),
+            })
+            .collect();
+        let mut ctx = EndingClock::default();
+        let mut refs: Vec<&mut dyn PassStep<EndingClock, ()>> = steps
+            .iter_mut()
+            .map(|s| s as &mut dyn PassStep<EndingClock, ()>)
+            .collect();
+        let report = run_pass(&mut refs, &mut ctx, Duration::from_secs(1))
+            .unwrap_or_else(|()| unreachable!());
+        assert_eq!(report.turns, expected, "ending at step {ends_at_step}");
+        assert_eq!(steps.iter().map(|s| s.turns).collect::<Vec<_>>(), expected);
+    }
+}
+
 /// The documented promise at budget 0: one turn for every step with work, no more.
 #[test]
 fn run_pass_at_budget_zero_gives_each_busy_step_one_turn() {

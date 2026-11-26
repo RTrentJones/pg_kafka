@@ -231,12 +231,16 @@ const PRODUCER_ACTIVITY_REFRESH: Duration =
 /// committed version, after any wait for the row). The sweep's producer prune
 /// (`maintenance::producer_prune_sql`) takes only producers idle past twice that, and an
 /// on-demand prune runs beside the worker: it re-checks `last_active_at` on the row it
-/// deletes, but reads the sequence rows a Produce writes from its own snapshot. So a
+/// locks, but reads the sequence rows a Produce writes from its own snapshot. So a
 /// producer the prune can take is always one whose Produce writes its producer row
-/// first: a prune that reaches the row while that Produce is open waits for it and keeps
-/// the producer; a Produce that reaches it after an uncommitted prune deleted it waits
-/// for the prune, finds no row (None), and the batch starts the producer afresh
-/// ([`adopt_unknown_producer`]), so what it acks is recorded under a producer row.
+/// first: a prune that reaches the row while that Produce is open skips it (`FOR UPDATE
+/// SKIP LOCKED`, never a wait) and keeps the producer; a Produce that reaches it after
+/// an uncommitted prune deleted it waits for the prune, finds no row (None), and the
+/// batch starts the producer afresh ([`adopt_unknown_producer`]), so what it acks is
+/// recorded under a producer row. That wait cannot close a lock cycle: the sweep never
+/// waits in the lock manager for a row once it holds one (`run_retention_sweep`, "Lock
+/// waits"), so the counter or rows of this batch's earlier requests are never what the
+/// sweep is waiting for.
 ///
 /// Cost: one primary-key read per batch, plus one UPDATE of the row (and its
 /// idx_producer_ids_last_active entry) at most once per producer per

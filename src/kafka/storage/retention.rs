@@ -18,6 +18,11 @@
 //! 2. then, while the pass is within its budget and some step has work, the step with
 //!    work that has spent the least time this pass takes the next turn.
 //!
+//! A turn that finds a row another transaction keeps (an offset counter it cannot skip)
+//! ends the pass in either phase ([`PassClock::ended`]); the guarantees below hold for
+//! the passes no other transaction cuts short this way, and a cut pass leaves every
+//! step's items and cursor where they were, so it only delays them by one pass.
+//!
 //! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
 //! through a [`Lap`]: the items in key order, starting after the key of the last item
 //! the step served ([`KeyCursor`]), wrapping, each item served until caught up. Probes
@@ -47,8 +52,9 @@
 //!    [`RETENTION_DELETE_BATCH`] idle ids.
 //! 2. **A pass costs at most the budget plus one turn per step.** Phase 1 is one turn per
 //!    step; phase 2 starts a turn only within the budget, so a pass ends by
-//!    `max(budget + one turn, one turn per step)`. (Plus the pass's fixed setup reads and
-//!    its final log-start update, each one statement.) The planning between the
+//!    `max(budget + one turn, one turn per step)`. (Plus the pass's fixed setup reads, a
+//!    few statements; a turn that deletes rows includes their log-start update, which
+//!    polls a counter another transaction holds for at most 1 s.) The planning between the
 //!    statements is O(n log n) in what the pass reads and holds (topics, leaves, found
 //!    work), so no turn hides work the budget does not see: a lap's push is O(log n)
 //!    ([`Lap`]), a probe replaces only its own leaf's trims ([`FoundWork`]), and the
@@ -126,9 +132,17 @@ pub fn batch_was_full(deleted: u64, batch_size: i64) -> bool {
     u64::try_from(batch_size).is_ok_and(|size| size > 0 && deleted >= size)
 }
 
-/// The clock a pass is scheduled by: time since the pass started.
+/// The clock a pass is scheduled by: time since the pass started, and whether the pass
+/// must end now whatever its budget.
 pub trait PassClock {
     fn elapsed(&self) -> Duration;
+    /// Whether the pass ends before its next turn: a turn found a row another
+    /// transaction holds and gave up its wait for it (`PostgresStore::run_retention_sweep`,
+    /// "Lock waits"), so the pass commits now and frees the rows it holds for that
+    /// transaction instead of running more turns while it waits.
+    fn ended(&self) -> bool {
+        false
+    }
 }
 
 /// One step of a sweep pass, as [`run_pass`] schedules it. `C` is the pass's shared
@@ -152,7 +166,8 @@ pub struct PassReport {
 
 /// Run one pass of `steps` (see the module docs, "How a pass is scheduled"): one turn
 /// for every step with work, in order, then, within `budget`, turns for the steps with
-/// work, least time spent this pass first (ties in list order).
+/// work, least time spent this pass first (ties in list order). Once the context says
+/// the pass has [ended](PassClock::ended), no step takes another turn.
 pub fn run_pass<C: PassClock, E>(
     steps: &mut [&mut dyn PassStep<C, E>],
     ctx: &mut C,
@@ -163,11 +178,14 @@ pub fn run_pass<C: PassClock, E>(
         service: vec![Duration::ZERO; steps.len()],
     };
     for i in 0..steps.len() {
+        if ctx.ended() {
+            return Ok(report);
+        }
         if steps[i].has_work(ctx) {
             take_turn(i, steps, ctx, &mut report)?;
         }
     }
-    while ctx.elapsed() < budget {
+    while ctx.elapsed() < budget && !ctx.ended() {
         let next = (0..steps.len())
             .filter(|&i| steps[i].has_work(ctx))
             .min_by_key(|&i| (report.service[i], i));

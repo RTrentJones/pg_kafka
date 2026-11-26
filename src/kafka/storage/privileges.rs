@@ -38,8 +38,9 @@ pub const WORKER_TABLE_GRANTS: &[(&str, &[&str])] = &[
     ("kafka.topics", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     ("kafka.messages", &["SELECT", "INSERT", "UPDATE", "DELETE"]),
     // ADR-001: the retention sweep's row delete in the DEFAULT time partition (every
-    // other leaf is reached through kafka.messages).
-    ("kafka.messages_default", &["SELECT", "DELETE"]),
+    // other leaf is reached through kafka.messages), which locks its rows FOR UPDATE
+    // SKIP LOCKED first (that needs UPDATE).
+    ("kafka.messages_default", &["SELECT", "UPDATE", "DELETE"]),
     ("kafka.partition_offsets", &["SELECT", "INSERT", "UPDATE"]),
     (
         "kafka.consumer_offsets",

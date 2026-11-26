@@ -699,9 +699,11 @@ GRANT USAGE ON SEQUENCE kafka.topics_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.messages TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.messages_global_offset_seq TO pgkafka_worker;
 -- Time partitions (ADR-001): the worker reads and writes the leaves only through
--- kafka.messages, except the retention sweep's row delete in the DEFAULT leaf; all
--- partition DDL goes through these SECURITY DEFINER functions.
-GRANT SELECT, DELETE ON kafka.messages_default TO pgkafka_worker;
+-- kafka.messages, except the retention sweep's row delete in the DEFAULT leaf (UPDATE
+-- for the FOR UPDATE SKIP LOCKED it takes its rows with, no more than kafka.messages
+-- grants on the same rows); all partition DDL goes through these SECURITY DEFINER
+-- functions.
+GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.message_partition_contents(regclass) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.ensure_message_partitions(int, int) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkafka_worker;

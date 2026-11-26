@@ -4,7 +4,8 @@
 //! The sweep's decisions (which window applies, what to do with a leaf, when to stop)
 //! are pure functions in [`retention`]; this module runs the statements they call for.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant};
 
 use super::producers::{bump_producer_epoch, reset_producer_sequences};
@@ -15,8 +16,9 @@ use crate::kafka::storage::retention::{
     SweepClock, TimePartition, MAINTENANCE_LOCK_KEY, MAX_CONTENTS_PROBES_PER_PASS,
     MAX_PARTITION_DROPS_PER_PASS, MAX_RETENTION_WINDOW_MS, RETENTION_DELETE_BATCH, SWEEP_STATE,
 };
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::prelude::*;
-use pgrx::spi::SpiClient;
+use pgrx::spi::{SpiClient, SpiTupleTable};
 
 // Only the messages-table retention (the policy an operator tunes) is a GUC,
 // `pg_kafka.message_retention_hours`; the auxiliary windows below are constants that
@@ -239,6 +241,27 @@ impl PostgresStore {
     /// whether to queue for the lock or, if another session holds it, skip the pass
     /// (`Ok(None)`). A drop's ACCESS EXCLUSIVE lock on kafka.messages is held until the
     /// pass commits, at most the rest of the pass.
+    ///
+    /// Lock waits: the pass is one transaction, which holds every row it deleted or
+    /// locked until it commits, and `pg_kafka_run_retention_sweep()` runs it in a session
+    /// of its own beside the worker, whose group commit holds the rows of every request
+    /// of a batch until one commit (and beside the shadow forwarder's acks, operators'
+    /// SQL). So once a pass holds a row, none of its statements waits in the lock manager
+    /// for a row another transaction holds: waiting for one while holding a row the other
+    /// transaction then writes (a Produce that upserts a counter the pass needs and then
+    /// refreshes a producer the pass pruned; an ack batch that updates an outbox row the
+    /// reaper waits for and then one it deleted) closed a cycle, and the deadlock detector
+    /// failed a client's request or the sweep. Every row delete and lock of the pass
+    /// skips the rows other transactions hold (`FOR UPDATE SKIP LOCKED`), except the
+    /// offset counters whose log start it moves ([`advance_log_start`]), which it cannot
+    /// skip and polls for instead, never queueing; a drop, which queues for its table
+    /// locks, runs only while the pass holds no row ([`DropStep`]). A turn that finds a
+    /// counter still held, or a session waiting for this transaction, rolls back its own
+    /// statements and ends the pass ([`PassClock::ended`]), whose commit then frees the
+    /// rows that session waits for; what it left goes to the next pass. A worker
+    /// statement can still wait for a row the pass holds, until the pass commits (at
+    /// most the budget plus one turn per step, and the poll of one counter), as for any
+    /// transaction; it can no longer be the end of a cycle through the pass.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
@@ -322,17 +345,17 @@ impl PostgresStore {
             let mut orphaned = BatchStep::new(Batch::OrphanedShadowRows);
 
             let mut pass = SweepPass::new(client, pass_start, &mut found);
-            // Phase 1 order: drops after the deletes (a drop's ACCESS EXCLUSIVE lock is
-            // then held for less of the pass), terminal transactions before the producer
-            // prune (their foreign key on producer_ids keeps those producers), the
-            // orphaned outbox rows last (after the log start this pass's deletes and drops
-            // moved).
+            // Phase 1 order: the probes (reads only) and the drops first, as a drop runs
+            // only before the pass holds a row ([`DropStep`]); terminal transactions
+            // before the producer prune (their foreign key on producer_ids keeps those
+            // producers); the orphaned outbox rows last (after the log start this pass's
+            // deletes and drops moved).
             retention::run_pass(
                 &mut [
-                    &mut aborted,
                     &mut probes,
-                    &mut expiry,
                     &mut drops,
+                    &mut aborted,
+                    &mut expiry,
                     &mut terminal,
                     &mut producers,
                     &mut delivered,
@@ -341,7 +364,6 @@ impl PostgresStore {
                 &mut pass,
                 pass_budget(),
             )?;
-            pass.flush_log_start()?;
             Ok(Some(pass.stats))
         })
         .map_err(internal("run_retention_sweep"))
@@ -616,8 +638,13 @@ struct SweepPass<'p, 'conn> {
     /// in the same pass.
     new_trims: Vec<ExpiryItem>,
     new_drops: Vec<(i64, retention::FoundDrop)>,
-    /// Partitions whose log start must advance (rows deleted or leaves dropped).
-    affected: AffectedPartitions,
+    /// A turn deleted or locked a row: another transaction may now wait for this one,
+    /// so no drop (which queues for its table locks) runs in the rest of the pass.
+    holds_rows: bool,
+    /// A log start moved since the orphaned-outbox reaper's last turn.
+    log_start_moved: bool,
+    /// A turn gave up on a row another transaction holds: the pass ends.
+    contended: bool,
     stats: RetentionSweepStats,
 }
 
@@ -633,23 +660,101 @@ impl<'p, 'conn> SweepPass<'p, 'conn> {
             found,
             new_trims: Vec::new(),
             new_drops: Vec::new(),
-            affected: AffectedPartitions::default(),
+            holds_rows: false,
+            log_start_moved: false,
+            contended: false,
             stats: RetentionSweepStats::default(),
         }
     }
 
-    /// Advance the log start of the partitions removed from since the last call.
-    fn flush_log_start(&mut self) -> Result<()> {
-        if self.affected.is_empty() {
-            return Ok(());
+    /// Run a turn's removal `remove` (which records the partitions it removed from in
+    /// the [`AffectedPartitions`] it is given) and the log-start update of those
+    /// partitions ([`advance_log_start`]) in one subtransaction: if the update cannot
+    /// have a counter row, the removal is rolled back with it, the pass ends, and
+    /// `Ok(None)` is returned; nothing was removed whose log start did not move.
+    fn remove_and_advance<T>(
+        &mut self,
+        remove: impl FnOnce(&mut SpiClient<'conn>, &mut AffectedPartitions) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let client = &mut *self.client;
+        let done = in_subtransaction(|| {
+            let mut affected = AffectedPartitions::default();
+            let removed = remove(client, &mut affected)?;
+            let moved = !affected.is_empty();
+            if !advance_log_start(client, affected)? {
+                return Ok(None);
+            }
+            Ok(Some((removed, moved)))
+        })?;
+        if let Some((removed, moved)) = done {
+            self.log_start_moved |= moved;
+            Ok(Some(removed))
+        } else {
+            self.contended = true;
+            Ok(None)
         }
-        advance_log_start(self.client, std::mem::take(&mut self.affected))
     }
 }
 
 impl PassClock for SweepPass<'_, '_> {
     fn elapsed(&self) -> Duration {
         self.pass_start.elapsed()
+    }
+
+    fn ended(&self) -> bool {
+        self.contended
+    }
+}
+
+/// Run `f` in an internal subtransaction (the sequence PL/pgSQL's exception blocks
+/// use): `Ok(Some(_))` releases it into the pass, `Ok(None)` and `Err(_)` roll it back.
+/// A lock-not-available ERROR inside it (`FOR UPDATE NOWAIT`, a `lock_timeout`) is
+/// caught and rolled back as `Ok(None)`; any other ERROR is rolled back and raised
+/// again.
+fn in_subtransaction<T>(f: impl FnOnce() -> Result<Option<T>>) -> Result<Option<T>> {
+    // SAFETY: called inside a transaction on the backend's main thread; every path
+    // releases or rolls back the subtransaction begun here and restores the memory
+    // context and resource owner saved first, as PL/pgSQL's exception blocks do.
+    let outcome = unsafe {
+        let old_context = pg_sys::CurrentMemoryContext;
+        let old_owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        pg_sys::MemoryContextSwitchTo(old_context);
+        let outcome = match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(Ok(Some(value))) => {
+                pg_sys::ReleaseCurrentSubTransaction();
+                Ok(Ok(Some(value)))
+            }
+            Ok(other) => {
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                Ok(other)
+            }
+            Err(payload) => {
+                pg_sys::FlushErrorState();
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                Err(payload)
+            }
+        };
+        pg_sys::MemoryContextSwitchTo(old_context);
+        pg_sys::CurrentResourceOwner = old_owner;
+        outcome
+    };
+    match outcome {
+        Ok(result) => result,
+        Err(payload) if is_lock_not_available(payload.as_ref()) => Ok(None),
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
+/// Whether a caught panic payload is a Postgres lock-not-available ERROR (55P03).
+fn is_lock_not_available(payload: &(dyn std::any::Any + Send)) -> bool {
+    match payload.downcast_ref::<CaughtError>() {
+        Some(
+            CaughtError::PostgresError(r)
+            | CaughtError::ErrorReport(r)
+            | CaughtError::RustPanic { ereport: r, .. },
+        ) => r.sql_error_code() == PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE,
+        None => false,
     }
 }
 
@@ -707,6 +812,7 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for AbortedStep<'_> {
             delete_target(leaf, self.partitioned),
             None,
         )?;
+        ctx.holds_rows |= n > 0;
         ctx.stats.aborted_messages += n;
         self.lap
             .served(!retention::batch_was_full(n, RETENTION_DELETE_BATCH));
@@ -880,7 +986,15 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for ExpiryStep<'_> {
             topic_id: item.topic_id,
             window_ms: item.window_ms,
         };
-        let n = delete_batch(ctx.client, filter, target, Some(&mut ctx.affected))?;
+        let Some(n) = ctx.remove_and_advance(|client, affected| {
+            delete_batch(client, filter, target, Some(affected))
+        })?
+        else {
+            // A counter stayed held: the batch is rolled back and the pass ends; this
+            // item stays current for the next pass.
+            return Ok(());
+        };
+        ctx.holds_rows |= n > 0;
         ctx.stats.expired_messages += n;
         let caught_up = !retention::batch_was_full(n, RETENTION_DELETE_BATCH);
         if caught_up {
@@ -906,6 +1020,12 @@ enum DeleteTarget<'a> {
 /// Delete one batch of at most [`RETENTION_DELETE_BATCH`] rows matching `filter`
 /// from `target`, record the partitions they came from in `affected` (when given), and
 /// return how many were deleted.
+///
+/// The batch skips the rows another transaction holds (a DeleteRecords or an EndTxn of
+/// the worker's open batch, a session's own DML): it never waits for them (see "Lock
+/// waits" on [`PostgresStore::run_retention_sweep`]). A skipped row stays, so the log
+/// start stops at it, and a later batch or pass takes it. The lock costs one tuple lock
+/// per row the batch deletes and no read beyond the ones the delete makes.
 fn delete_batch(
     client: &mut SpiClient<'_>,
     filter: BatchFilter,
@@ -924,7 +1044,8 @@ fn delete_batch(
             client.update(
                 &format!(
                     "DELETE FROM {table}
-                     WHERE ctid IN (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3)
+                     WHERE ctid IN (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3
+                                    FOR UPDATE OF m SKIP LOCKED)
                      RETURNING topic_id, partition_id, partition_offset"
                 ),
                 None,
@@ -951,7 +1072,8 @@ fn delete_batch(
                              AND m.created_at < COALESCE($5::timestamptz, 'infinity')
                              AND m.tableoid = $6::bigint::oid
                              AND {predicate}
-                           LIMIT $3))
+                           LIMIT $3
+                           FOR UPDATE OF m SKIP LOCKED))
                      RETURNING topic_id, partition_id, partition_offset"
                 ),
                 None,
@@ -990,6 +1112,17 @@ fn delete_batch(
 /// continuing would only stall the DB thread. That leaf stays found, and the next pass
 /// starts after it; a leaf the re-check refuses is forgotten until a probe finds it
 /// droppable again.
+///
+/// A drop queues for its table locks (in attempts of 50 ms, `kafka.lock_message_tables`),
+/// so it runs only while the pass holds no row another transaction could be waiting for
+/// ([`SweepPass::holds_rows`]): a transaction that holds ROW EXCLUSIVE on kafka.messages
+/// and waits for a row the pass deleted would otherwise close a cycle with it. The drops
+/// therefore come first in a pass; once a turn has deleted a row, the rest wait for the
+/// next pass. After the first drop the pass holds kafka.messages itself, so later drops
+/// of the pass do not wait for other sessions' locks on it. The log start of the dropped
+/// leaf's partitions moves in the drop's own subtransaction
+/// ([`SweepPass::remove_and_advance`]): if a counter stays held, the drop is rolled back
+/// and the pass ends.
 struct DropStep {
     lap: Lap<'static, i64, retention::FoundDrop>,
     blocked: bool,
@@ -997,7 +1130,7 @@ struct DropStep {
 
 impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
     fn has_work(&self, ctx: &SweepPass<'_, '_>) -> bool {
-        !self.blocked && (!self.lap.is_done() || !ctx.new_drops.is_empty())
+        !self.blocked && !ctx.holds_rows && (!self.lap.is_done() || !ctx.new_drops.is_empty())
     }
 
     fn turn(&mut self, ctx: &mut SweepPass<'_, '_>) -> Result<()> {
@@ -1007,28 +1140,40 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
         let Some((key, found)) = self.lap.current().cloned() else {
             return Ok(());
         };
-        let row = ctx.client.update(
-            "SELECT dropped, topic_ids, partition_ids, next_offsets, lock_timed_out
-             FROM kafka.drop_message_partition($1::bigint::oid::regclass, $2::int4[])",
-            None,
-            &[i64::from(found.oid).into(), found.expired_topics.into()],
-        )?;
-        let row = row.first();
-        let lock_timed_out = row
-            .get_by_name::<bool, _>("lock_timed_out")?
-            .unwrap_or(false);
-        if row.get_by_name::<bool, _>("dropped")?.unwrap_or(false) {
-            ctx.stats.dropped_partitions += 1;
-            let topic_ids: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();
-            let partition_ids: Vec<Option<i32>> =
-                row.get_by_name("partition_ids")?.unwrap_or_default();
-            let next_offsets: Vec<Option<i64>> =
-                row.get_by_name("next_offsets")?.unwrap_or_default();
-            for ((t, p), next) in topic_ids.into_iter().zip(partition_ids).zip(next_offsets) {
-                if let (Some(t), Some(p), Some(next)) = (t, p, next) {
-                    ctx.affected.removed(t, p, next);
+        let expired_topics = found.expired_topics;
+        let Some((dropped, lock_timed_out)) = ctx.remove_and_advance(|client, affected| {
+            let row = client.update(
+                "SELECT dropped, topic_ids, partition_ids, next_offsets, lock_timed_out
+                 FROM kafka.drop_message_partition($1::bigint::oid::regclass, $2::int4[])",
+                None,
+                &[i64::from(found.oid).into(), expired_topics.into()],
+            )?;
+            let row = row.first();
+            let lock_timed_out = row
+                .get_by_name::<bool, _>("lock_timed_out")?
+                .unwrap_or(false);
+            let dropped = row.get_by_name::<bool, _>("dropped")?.unwrap_or(false);
+            if dropped {
+                let topic_ids: Vec<Option<i32>> = row.get_by_name("topic_ids")?.unwrap_or_default();
+                let partition_ids: Vec<Option<i32>> =
+                    row.get_by_name("partition_ids")?.unwrap_or_default();
+                let next_offsets: Vec<Option<i64>> =
+                    row.get_by_name("next_offsets")?.unwrap_or_default();
+                for ((t, p), next) in topic_ids.into_iter().zip(partition_ids).zip(next_offsets) {
+                    if let (Some(t), Some(p), Some(next)) = (t, p, next) {
+                        affected.removed(t, p, next);
+                    }
                 }
             }
+            Ok((dropped, lock_timed_out))
+        })?
+        else {
+            // A counter stayed held: the drop is rolled back and the pass ends; the leaf
+            // stays found.
+            return Ok(());
+        };
+        if dropped {
+            ctx.stats.dropped_partitions += 1;
         }
         if lock_timed_out {
             self.lap.served(false);
@@ -1042,47 +1187,141 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
     }
 }
 
-/// Advance the durable log start of every partition the deletes or drops touched:
-/// like DeleteRecords, retention must move `partition_offsets.log_start_offset`, or a
+/// How long [`advance_log_start`] polls for a counter row another transaction holds
+/// before it gives up and the pass ends. A worker batch holds one for its group commit
+/// (tens of milliseconds); the poll outlasts that, but not a session that holds the row
+/// on purpose.
+const HELD_COUNTER_POLL: Duration = Duration::from_secs(1);
+
+/// The pause between two attempts of the poll, in seconds (`pg_sleep`).
+const HELD_COUNTER_RETRY_PAUSE_S: f64 = 0.02;
+
+/// Advance the durable log start of every partition a delete or drop touched: like
+/// DeleteRecords, retention must move `partition_offsets.log_start_offset`, or a
 /// partition emptied by retention reports EARLIEST = 0 and a consumer resets to offsets
 /// retention already removed. Offsets grow with created_at, so retention removes an
 /// offset-contiguous prefix; the new log start is the oldest surviving offset, or
-/// next_offset (the high watermark) when the partition is now empty.
+/// next_offset (the high watermark) when the partition is now empty. Returns false when
+/// a counter row stays held by another transaction (or a session waits for this one):
+/// the caller rolls back its removal ([`SweepPass::remove_and_advance`]).
 ///
 /// Concurrency: `pg_kafka_run_retention_sweep()` runs this in its own session while the
 /// worker produces. A Produce inserts its records and then upserts the counter row,
-/// holding both until it commits. The first statement's upsert locks every affected
-/// counter row, waiting for such a Produce, and the second statement runs with a
-/// snapshot taken after that (READ COMMITTED: a fresh snapshot per statement), so its
-/// MIN sees the committed records whose offsets its next_offset counts, and it updates
-/// rows this transaction already holds, so nothing re-evaluates it against a newer
-/// counter. A Produce that reaches the counter after the first statement waits for the
-/// sweep's commit, and its records are at or past the next_offset the sweep read. Keep
-/// the two statements in this order: an UPDATE alone that waited for the Produce would
-/// re-read next_offset from the committed counter while its MIN kept the old snapshot,
-/// and move the log start past the new record. Under REPEATABLE READ or SERIALIZABLE
-/// the upsert fails with a serialization error instead.
-fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -> Result<()> {
+/// holding both until it commits. So every affected counter row is locked first, and
+/// the log-start UPDATE runs after, with a snapshot taken once all are held (READ
+/// COMMITTED: a fresh snapshot per statement): its MIN sees the committed records whose
+/// offsets its next_offset counts, and it updates rows this transaction already holds,
+/// so nothing re-evaluates it against a newer counter. A Produce that reaches a counter
+/// after it is locked waits for the sweep's commit, and its records are at or past the
+/// next_offset the sweep read. Keep the lock before the UPDATE: an UPDATE that waited
+/// for the Produce itself would re-read next_offset from the committed counter while its
+/// MIN kept the old snapshot, and move the log start past the new record. Under
+/// REPEATABLE READ or SERIALIZABLE a counter updated since the snapshot fails the lock
+/// with a serialization error instead.
+///
+/// The locks never wait in the lock manager (see "Lock waits" on
+/// [`PostgresStore::run_retention_sweep`]): the free counters are locked `SKIP LOCKED`
+/// in one statement; each held one is polled with `FOR UPDATE NOWAIT`, one attempt every
+/// [`HELD_COUNTER_RETRY_PAUSE_S`] for at most [`HELD_COUNTER_POLL`], each attempt after
+/// checking that no session waits for this transaction ([`someone_waits_for_us`]): a
+/// session that does may hold the counter until it gets a row of ours, so the poll stops
+/// and the pass commits. A partition without a counter row gets one from the upsert;
+/// that INSERT can only meet another transaction inserting the same row (a Produce of
+/// a partition first written by direct SQL), so it runs under a 1 ms lock_timeout, once
+/// no session waits for this one: a transaction that starts waiting for it afterwards
+/// has the sweep's wait ended long before its deadlock check (deadlock_timeout, 1 s by
+/// default), so the wait cannot close a cycle that check would see.
+///
+/// Cost: two statements for the affected partitions (at most the rows the turn
+/// removed), the upsert and the UPDATE; a held counter adds at most
+/// `HELD_COUNTER_POLL / HELD_COUNTER_RETRY_PAUSE_S` attempts of two small statements
+/// each (the waiter check reads pg_locks), and there are no more held counters than
+/// transactions holding them.
+fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -> Result<bool> {
     if affected.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let (topic_ids, partition_ids, next_offsets) = affected.into_columns();
+    let free: HashSet<(i32, i32)> = keys_of(client.update(
+        "SELECT po.topic_id, po.partition_id
+         FROM kafka.partition_offsets po
+         JOIN unnest($1::int4[], $2::int4[]) AS a(topic_id, partition_id)
+           ON po.topic_id = a.topic_id AND po.partition_id = a.partition_id
+         FOR UPDATE OF po SKIP LOCKED",
+        None,
+        &[topic_ids.clone().into(), partition_ids.clone().into()],
+    )?)?;
+    let present: HashSet<(i32, i32)> = keys_of(client.select(
+        "SELECT po.topic_id, po.partition_id
+         FROM kafka.partition_offsets po
+         JOIN unnest($1::int4[], $2::int4[]) AS a(topic_id, partition_id)
+           ON po.topic_id = a.topic_id AND po.partition_id = a.partition_id",
+        None,
+        &[topic_ids.clone().into(), partition_ids.clone().into()],
+    )?)?;
+    let deadline = Instant::now() + HELD_COUNTER_POLL;
+    for &(topic_id, partition_id) in present.difference(&free) {
+        let locked = poll_without_waiting(client, deadline, |client| {
+            client.update(
+                "SELECT 1 FROM kafka.partition_offsets
+                 WHERE topic_id = $1 AND partition_id = $2
+                 FOR UPDATE NOWAIT",
+                None,
+                &[topic_id.into(), partition_id.into()],
+            )?;
+            Ok(())
+        })?;
+        if !locked {
+            return Ok(false);
+        }
+    }
     // A partition written without a counter row (direct SQL, rows older than the
     // counter) gets one now: once its rows are gone nothing else remembers its log end.
-    client.update(
-        "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
-         SELECT a.topic_id, a.partition_id, a.next_offset
-         FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(topic_id, partition_id, next_offset)
-         ON CONFLICT (topic_id, partition_id) DO UPDATE
-             SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
-                                        EXCLUDED.next_offset)",
-        None,
-        &[
-            topic_ids.clone().into(),
-            partition_ids.clone().into(),
-            next_offsets.into(),
-        ],
-    )?;
+    let upsert = |client: &mut SpiClient<'_>| -> Result<()> {
+        client.update(
+            "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+             SELECT a.topic_id, a.partition_id, a.next_offset
+             FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(topic_id, partition_id, next_offset)
+             ON CONFLICT (topic_id, partition_id) DO UPDATE
+                 SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                            EXCLUDED.next_offset)",
+            None,
+            &[
+                topic_ids.clone().into(),
+                partition_ids.clone().into(),
+                next_offsets.clone().into(),
+            ],
+        )?;
+        Ok(())
+    };
+    if present.len() == topic_ids.len() {
+        // Every row is held by this transaction: the upsert updates them only.
+        upsert(client)?;
+    } else {
+        let inserted = poll_without_waiting(client, deadline, |client| {
+            // Set back below on success; a failed attempt's rollback restores it.
+            let saved: String = client
+                .update(
+                    "SELECT current_setting('lock_timeout') AS saved,
+                            set_config('lock_timeout', '1ms', true)",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get_by_name("saved")?
+                .unwrap_or_default();
+            upsert(client)?;
+            client.update(
+                "SELECT set_config('lock_timeout', $1, true)",
+                None,
+                &[saved.into()],
+            )?;
+            Ok(())
+        })?;
+        if !inserted {
+            return Ok(false);
+        }
+    }
     client.update(
         "UPDATE kafka.partition_offsets po
          SET log_start_offset = GREATEST(
@@ -1095,7 +1334,65 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
         None,
         &[topic_ids.into(), partition_ids.into()],
     )?;
-    Ok(())
+    Ok(true)
+}
+
+/// The `(topic_id, partition_id)` pairs of a result.
+fn keys_of(table: SpiTupleTable<'_>) -> Result<HashSet<(i32, i32)>> {
+    let mut keys = HashSet::new();
+    for row in table {
+        let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+        let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+        keys.insert((topic_id, partition_id));
+    }
+    Ok(keys)
+}
+
+/// Run `attempt` (which must not wait in the lock manager beyond a lock_timeout of a
+/// few milliseconds) in a subtransaction until it takes its lock, pausing
+/// [`HELD_COUNTER_RETRY_PAUSE_S`] between attempts; gives up (false) at `deadline` or
+/// as soon as a session waits for this transaction. Every attempt is made after that
+/// check, so an attempt's own wait, if any, never closes a cycle another session's
+/// deadlock check could see (see [`advance_log_start`]).
+fn poll_without_waiting(
+    client: &mut SpiClient<'_>,
+    deadline: Instant,
+    mut attempt: impl FnMut(&mut SpiClient<'_>) -> Result<()>,
+) -> Result<bool> {
+    loop {
+        if someone_waits_for_us(client)? {
+            return Ok(false);
+        }
+        if in_subtransaction(|| attempt(client).map(Some))?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        client.update(
+            "SELECT pg_sleep($1)",
+            None,
+            &[HELD_COUNTER_RETRY_PAUSE_S.into()],
+        )?;
+    }
+}
+
+/// Whether another session waits for a lock this transaction holds. One read of
+/// pg_locks, and `pg_blocking_pids` for each waiting session only.
+fn someone_waits_for_us(client: &SpiClient<'_>) -> Result<bool> {
+    Ok(client
+        .select(
+            "SELECT EXISTS (
+                 SELECT 1 FROM (SELECT DISTINCT l.pid FROM pg_locks l
+                                WHERE NOT l.granted AND l.pid IS NOT NULL
+                                  AND l.pid <> pg_backend_pid()) w
+                 WHERE pg_backend_pid() = ANY (pg_blocking_pids(w.pid))) AS waits",
+            Some(1),
+            &[],
+        )?
+        .first()
+        .get_by_name::<bool, _>("waits")?
+        .unwrap_or(false))
 }
 
 /// The steps that delete one batch of an auxiliary table's due rows a turn.
@@ -1114,7 +1411,8 @@ enum Batch {
 /// A [`Batch`] step: it has work until a batch comes back short (the producer prune:
 /// until its cursor reaches the end of the candidates); the orphaned-row reaper also
 /// whenever this pass has moved a log start since its last turn, so the outbox rows of
-/// the messages this pass removed go in the same pass when the budget allows.
+/// the messages this pass removed go in the same pass when the budget allows. Every
+/// batch skips the rows other transactions hold, so a turn never waits.
 struct BatchStep {
     batch: Batch,
     caught_up: bool,
@@ -1131,16 +1429,16 @@ impl BatchStep {
 
 impl PassStep<SweepPass<'_, '_>, KafkaError> for BatchStep {
     fn has_work(&self, ctx: &SweepPass<'_, '_>) -> bool {
-        !self.caught_up || (self.batch == Batch::OrphanedShadowRows && !ctx.affected.is_empty())
+        !self.caught_up || (self.batch == Batch::OrphanedShadowRows && ctx.log_start_moved)
     }
 
     fn turn(&mut self, ctx: &mut SweepPass<'_, '_>) -> Result<()> {
         let full = |n| retention::batch_was_full(n, RETENTION_DELETE_BATCH);
-        self.caught_up = match self.batch {
+        let (n, caught_up) = match self.batch {
             Batch::TerminalTransactions => {
                 let n = terminal_transactions_batch(ctx.client)?;
                 ctx.stats.terminal_transactions += n;
-                !full(n)
+                (n, !full(n))
             }
             Batch::StaleProducers => {
                 let (n, next) =
@@ -1148,20 +1446,23 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for BatchStep {
                 SWEEP_STATE.producer_prune.set(next);
                 ctx.stats.stale_producers += n;
                 // A short batch reached the end of the candidates.
-                next.is_none()
+                (n, next.is_none())
             }
             Batch::DeliveredShadowRows => {
                 let n = delivered_shadow_rows_batch(ctx.client)?;
                 ctx.stats.shadow_delivered_rows += n;
-                !full(n)
+                (n, !full(n))
             }
             Batch::OrphanedShadowRows => {
-                ctx.flush_log_start()?;
+                // It reads the log starts the turns before it moved.
+                ctx.log_start_moved = false;
                 let n = orphaned_shadow_rows_batch(ctx.client)?;
                 ctx.stats.shadow_orphaned_rows += n;
-                !full(n)
+                (n, !full(n))
             }
         };
+        ctx.holds_rows |= n > 0;
+        self.caught_up = caught_up;
         Ok(())
     }
 }
@@ -1183,7 +1484,10 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for BatchStep {
 /// AddPartitionsToTxn update or reference them) are skipped, not waited for, and taken
 /// by a later batch: the worker's group commit holds the rows of every request in its
 /// batch until one commit, so an on-demand sweep that waited for one of them while
-/// holding another the batch then needs was a deadlock.
+/// holding another the batch then needs was a deadlock. Skipping keeps only this
+/// statement out of such a cycle: the rows it deletes stay held to the end of the pass,
+/// which is why no later statement of the pass waits for a row either ("Lock waits" on
+/// [`PostgresStore::run_retention_sweep`]).
 fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
     let table = client.update(
         "DELETE FROM kafka.transactions
@@ -1224,8 +1528,10 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// candidates it would delete with `FOR UPDATE SKIP LOCKED` and leaves a row another
 /// transaction holds to the next lap. Waiting for one row while holding another, in
 /// whatever order its index scan met them, closed a cycle with such a batch (or with
-/// any session writing producer rows in another order): a deadlock. Locking re-checks
-/// the lock query's own WHERE on the newest version of a row updated since the
+/// any session writing producer rows in another order): a deadlock. (The producers it
+/// deletes stay held to the end of the pass, so no later statement of the pass may wait
+/// for a row either: "Lock waits" on [`PostgresStore::run_retention_sweep`].) Locking
+/// re-checks the lock query's own WHERE on the newest version of a row updated since the
 /// statement's snapshot (the CTEs and subqueries keep the snapshot), so the idle
 /// condition on producer_ids itself is repeated there: InitProducerId and an epoch bump
 /// (KIP-360, a transactional re-init) set last_active_at, and the producer they revived
@@ -1374,6 +1680,9 @@ fn stale_producers_batch(
 /// UPDATE changes and its predicate column (external_offset) already keys the pending
 /// indexes, so it costs the outbox's hot UPDATEs nothing but one index entry per ack:
 /// claims stay HOT. One batch of [`RETENTION_DELETE_BATCH`] rows.
+///
+/// Rows another transaction holds (a `kafka.replay_shadow_messages` re-queueing them)
+/// are skipped, not waited for: one TID-scan lock per row the batch deletes.
 fn delivered_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
     let table = client.update(
         "WITH RECURSIVE parts AS (
@@ -1412,8 +1721,11 @@ fn delivered_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
                AND w.depth < $2
          )
          DELETE FROM kafka.shadow_tracking
-         WHERE ctid = ANY (ARRAY(SELECT row_id FROM walk LIMIT $2))
-           AND external_offset IS NOT NULL
+         WHERE ctid = ANY (ARRAY(
+             SELECT s.ctid FROM kafka.shadow_tracking s
+             WHERE s.ctid = ANY (ARRAY(SELECT row_id FROM walk LIMIT $2))
+               AND s.external_offset IS NOT NULL
+             FOR UPDATE OF s SKIP LOCKED))
          RETURNING 1",
         None,
         &[
@@ -1434,18 +1746,26 @@ fn delivered_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 /// [`BatchStep`]), so the rows of messages this pass removed go in the same pass when
 /// the budget allows, else at the next, and DeleteRecords' (which advances the log
 /// start itself) at the next pass.
+///
+/// Rows another transaction holds (the forwarder's ack batch of the worker's outbox
+/// tick, which updates its rows in arrival order, or a replay) are skipped, not waited
+/// for: one TID-scan lock per row the batch deletes. Waiting for one while holding a row
+/// an earlier turn deleted closed a cycle with an ack batch that then updated that row.
 fn orphaned_shadow_rows_batch(client: &mut SpiClient<'_>) -> Result<u64> {
     let table = client.update(
         "DELETE FROM kafka.shadow_tracking
          WHERE ctid = ANY (ARRAY(
-             SELECT o.row_id FROM kafka.partition_offsets po
-             CROSS JOIN LATERAL (
-                 SELECT s.ctid AS row_id FROM kafka.shadow_tracking s
-                 WHERE s.topic_id = po.topic_id AND s.partition_id = po.partition_id
-                   AND s.local_offset < po.log_start_offset
-                 ORDER BY s.local_offset LIMIT $1) o
-             WHERE po.log_start_offset > 0
-             LIMIT $1))
+             SELECT s.ctid FROM kafka.shadow_tracking s
+             WHERE s.ctid = ANY (ARRAY(
+                 SELECT o.row_id FROM kafka.partition_offsets po
+                 CROSS JOIN LATERAL (
+                     SELECT s.ctid AS row_id FROM kafka.shadow_tracking s
+                     WHERE s.topic_id = po.topic_id AND s.partition_id = po.partition_id
+                       AND s.local_offset < po.log_start_offset
+                     ORDER BY s.local_offset LIMIT $1) o
+                 WHERE po.log_start_offset > 0
+                 LIMIT $1))
+             FOR UPDATE OF s SKIP LOCKED))
          RETURNING 1",
         None,
         &[RETENTION_DELETE_BATCH.into()],

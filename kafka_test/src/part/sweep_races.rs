@@ -1,10 +1,13 @@
 //! An on-demand sweep (`pg_kafka_run_retention_sweep()` in its own session) racing a
 //! worker transaction on the rows it deletes or updates: the sweep must decide on the
-//! row the other transaction committed, never on its own statement snapshot.
+//! row the other transaction committed, never on its own statement snapshot, and must
+//! never close a lock cycle with it.
 //!
 //! The worker's side is played by a second session running the worker's statements,
-//! so the test controls when it commits: after the sweep is seen waiting for its row
-//! lock (a `transactionid` lock wait in pg_stat_activity).
+//! so the test controls when it commits or runs its next statement: once the sweep is
+//! seen waiting for one of its rows (a `transactionid` lock wait, or the sweep's poll
+//! for a held offset counter, a `PgSleep` in pg_stat_activity), or once the sweep
+//! returned.
 
 use super::drop_extension::MAINTENANCE_LOCK_KEY;
 use super::sweep_budget::create_topic;
@@ -12,17 +15,22 @@ use crate::common::TestResult;
 use crate::wire::records::batch;
 use crate::wire::Wire;
 use crate::worker::{boxed, into_test_result, session, unique, SendResult};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio_postgres::Client;
 
-/// How long the writer waits for the sweep to block on its row lock.
+/// How long the writer waits for the sweep to block on (or poll for) its row.
 const BLOCK_WAIT: Duration = Duration::from_secs(10);
 
-/// Whether backend `pid` is waiting for another transaction (a row lock).
+/// Whether backend `pid` waits for a row another transaction holds: in the lock
+/// manager, or in the sweep's poll for a held counter (or the producer prune's test
+/// pause, `pg_kafka.test_producer_prune_pause_ms`), both a `pg_sleep`.
 async fn waits_for_a_row(db: &Client, pid: i32) -> SendResult<bool> {
     Ok(db
         .query_one(
-            "SELECT COALESCE(wait_event_type = 'Lock' AND wait_event = 'transactionid', false)
+            "SELECT COALESCE((wait_event_type = 'Lock' AND wait_event = 'transactionid')
+                             OR (wait_event_type = 'Timeout' AND wait_event = 'PgSleep'),
+                             false)
              FROM pg_stat_activity WHERE pid = $1",
             &[&pid],
         )
@@ -31,47 +39,57 @@ async fn waits_for_a_row(db: &Client, pid: i32) -> SendResult<bool> {
         .get(0))
 }
 
-/// Run `sweep` on `sweeper` while `writer` holds an open transaction: once the sweep
-/// waits for one of the writer's rows, commit the writer. Returns the sweep's count of
-/// `category` and whether the sweep waited (the writer is committed either way).
+/// Poll until backend `pid` waits for a row ([`waits_for_a_row`]) or `done` is set,
+/// at most `within`; returns whether it waited.
+async fn wait_for_row_wait_or_done(
+    db: &Client,
+    pid: i32,
+    done: &AtomicBool,
+    within: Duration,
+) -> SendResult<bool> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline && !done.load(Ordering::SeqCst) {
+        if waits_for_a_row(db, pid).await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(false)
+}
+
+async fn backend_pid(db: &Client) -> SendResult<i32> {
+    Ok(db
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Run a sweep on `sweeper` while `writer` holds an open transaction, and commit the
+/// writer as soon as the sweep waits for one of its rows (or once the sweep returned,
+/// if it never does). Returns the sweep's count of `category` and whether the sweep
+/// waited.
 async fn sweep_against_writer(
     sweeper: &Client,
     observer: &Client,
     writer: &Client,
     category: &str,
 ) -> SendResult<(i64, bool)> {
-    let pid: i32 = sweeper
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .map_err(boxed)?
-        .get(0);
+    let pid = backend_pid(sweeper).await?;
+    let done = AtomicBool::new(false);
     let sweep = async {
-        Ok::<i64, Box<dyn std::error::Error + Send + Sync>>(
-            sweeper
-                .query_one(
-                    "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
-                     WHERE category = $1",
-                    &[&category],
-                )
-                .await
-                .map_err(boxed)?
-                .get(0),
-        )
+        let swept = sweeper
+            .query_one(
+                "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
+                 WHERE category = $1",
+                &[&category],
+            )
+            .await;
+        done.store(true, Ordering::SeqCst);
+        Ok::<i64, Box<dyn std::error::Error + Send + Sync>>(swept.map_err(boxed)?.get(0))
     };
     let commit = async {
-        let deadline = Instant::now() + BLOCK_WAIT;
-        let mut waited = false;
-        while Instant::now() < deadline {
-            if waits_for_a_row(observer, pid).await? {
-                waited = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        if waited {
-            // Let the wait settle into the lock queue before the commit wakes it.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        let waited = wait_for_row_wait_or_done(observer, pid, &done, BLOCK_WAIT).await?;
         writer.batch_execute("COMMIT").await.map_err(boxed)?;
         Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(waited)
     };
@@ -219,9 +237,9 @@ async fn revived_producer() -> SendResult<()> {
 
 /// The log start a sweep sets after removing every visible row of a partition is the
 /// partition's next offset, which a Produce committing during the sweep advances past
-/// a record the sweep never saw. The sweep's counter upsert locks the counter rows
-/// first, so it waits for that Produce and the log-start update reads a snapshot that
-/// holds its record: the log start never passes a record the sweep did not delete.
+/// a record the sweep never saw. The sweep locks the counter rows first, so it waits
+/// (polls) for that Produce and the log-start update reads a snapshot that holds its
+/// record: the log start never passes a record the sweep did not delete.
 ///
 /// Asserts: a partition with offsets 0-4 expired (rows in the DEFAULT leaf) and a
 /// writer holding a Produce of offset 5 (the worker's statements: append lock, insert,
@@ -698,38 +716,45 @@ async fn produce_after_prune() -> SendResult<()> {
     Ok(())
 }
 
+/// What [`sweep_against_two_writes`] saw: the sweep's rows (category, deleted) or its
+/// error, the writer's error, and whether the sweep waited for (or polled for) one of
+/// the writer's rows.
+type TwoWrites = (Result<Vec<(String, i64)>, String>, Option<String>, bool);
+
 /// Run an on-demand sweep on `sweeper` (autocommit) against `writer`, which holds an
-/// open transaction that has run `hold`: if the sweep waits for one of the writer's
-/// rows, the writer then runs `then`, a write of a row the sweep already deleted (the
-/// order of two requests in one group-commit batch). Returns the sweep's and the
-/// writer's outcomes (an error text, or None) and whether the sweep waited; the
-/// writer's transaction ends either way.
+/// open transaction that has run `hold`: once the sweep waits for one of the writer's
+/// rows (or polls for it, or returned), the writer runs `then`, a write of a row the
+/// sweep may already have deleted (the order of two requests in one group-commit
+/// batch), and commits. Returns what both saw ([`TwoWrites`]); the writer's
+/// transaction ends either way.
 async fn sweep_against_two_writes(
     sweeper: &Client,
     observer: &Client,
     writer: &Client,
     hold: &str,
     then: &str,
-) -> SendResult<(Option<String>, Option<String>, bool)> {
-    let pid: i32 = sweeper
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .map_err(boxed)?
-        .get(0);
+) -> SendResult<TwoWrites> {
+    let pid = backend_pid(sweeper).await?;
     writer
         .batch_execute(&format!("BEGIN; {hold}"))
         .await
         .map_err(boxed)?;
+    let done = AtomicBool::new(false);
     let sweep = async {
-        sweeper
+        let swept = sweeper
             .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
             .await
-            .err()
-            .map(|e| format!("{e:?}"))
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| format!("{e:?}"));
+        done.store(true, Ordering::SeqCst);
+        swept
     };
     let write = async {
-        let waited =
-            wait_until_waiting(observer, pid, "transactionid", Duration::from_secs(3)).await?;
+        let waited = wait_for_row_wait_or_done(observer, pid, &done, BLOCK_WAIT).await?;
         let failed = writer
             .batch_execute(then)
             .await
@@ -823,7 +848,7 @@ async fn two_row_batch() -> SendResult<()> {
             "Step 2: sweep error {swept:?}, writer error {written:?}, the sweep waited: \
              {waited}; producers left {left:?}"
         );
-        if swept.is_some() || written.is_some() || waited || left != [hi] {
+        if swept.is_err() || written.is_some() || waited || left != [hi] {
             return Err("the producer prune waited for a batch's row (deadlock)".into());
         }
 
@@ -875,7 +900,7 @@ async fn two_row_batch() -> SendResult<()> {
             "Step 4: sweep error {swept:?}, writer error {written:?}, the sweep waited: \
              {waited}; transactions left {left:?}"
         );
-        if swept.is_some() || written.is_some() || waited || left != [txn_hi.clone()] {
+        if swept.is_err() || written.is_some() || waited || left != [txn_hi.clone()] {
             return Err("the terminal-transaction delete waited for a batch's row".into());
         }
         Ok(())
@@ -898,5 +923,340 @@ async fn two_row_batch() -> SendResult<()> {
     release(&sweeper).await?;
     result?;
     println!("✅ the sweep skipped the batch's rows and neither side failed");
+    Ok(())
+}
+
+/// The count of `category` in a sweep's rows (0 when absent).
+fn count_of(rows: &[(String, i64)], category: &str) -> i64 {
+    rows.iter()
+        .find(|(c, _)| c == category)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// A topic with retention.ms 1 h and offsets 0-4 dated 1990 in partition 0 (older than
+/// every leaf: they are in kafka.messages_default), with its counter at 5.
+async fn expired_partition(db: &Client, base: &str) -> SendResult<i32> {
+    let topic = create_topic(db, &unique(base), 3_600_000).await?;
+    db.execute(
+        "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
+                                     created_at)
+         SELECT $1, 0, g, 'old'::bytea,
+                timestamptz '1990-01-01 00:00+00' + g * INTERVAL '1 second'
+         FROM generate_series(0::bigint, 4) AS g",
+        &[&topic],
+    )
+    .await
+    .map_err(boxed)?;
+    db.execute(
+        "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+         VALUES ($1, 0, 5)",
+        &[&topic],
+    )
+    .await
+    .map_err(boxed)?;
+    Ok(topic)
+}
+
+/// Offsets of partition 0 of `topic`, and its (next offset, log start).
+async fn partition_state(db: &Client, topic: i32) -> SendResult<(Vec<i64>, i64, i64)> {
+    let offsets: Vec<i64> = db
+        .query(
+            "SELECT partition_offset FROM kafka.messages
+             WHERE topic_id = $1 AND partition_id = 0 ORDER BY 1",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let row = db
+        .query_one(
+            "SELECT next_offset, log_start_offset FROM kafka.partition_offsets
+             WHERE topic_id = $1 AND partition_id = 0",
+            &[&topic],
+        )
+        .await
+        .map_err(boxed)?;
+    Ok((offsets, row.get(0), row.get(1)))
+}
+
+async fn drop_topics(db: &Client, topics: &[i32]) -> SendResult<()> {
+    for sql in [
+        "DELETE FROM kafka.shadow_tracking WHERE topic_id = ANY ($1)",
+        "DELETE FROM kafka.messages WHERE topic_id = ANY ($1)",
+        "DELETE FROM kafka.partition_offsets WHERE topic_id = ANY ($1)",
+        "DELETE FROM kafka.topics WHERE id = ANY ($1)",
+    ] {
+        db.execute(sql, &[&topics]).await.map_err(boxed)?;
+    }
+    Ok(())
+}
+
+/// An on-demand sweep is one transaction, holding every row it deleted until it
+/// commits, beside the worker's group commit, which holds the rows of every request
+/// of a batch until one commit. The sweep's log-start update locked the offset
+/// counters of the partitions it expired, waiting for any a batch held, at the end of
+/// the pass: after the producer prune had deleted an idle producer, and after the
+/// expiry had deleted other partitions' rows. A batch holding a counter (a Produce's
+/// advance_next_offset) whose next request then wrote that producer (an idempotent
+/// Produce refreshing an idle producer, `read_producer_state`) or those rows (a
+/// DeleteRecords) closed a cycle with it: "deadlock detected" failed the request or the
+/// sweep.
+///
+/// Asserts, in two rounds, with a writer playing the batch: (1) an expired partition
+/// and a producer idle for 30 years; the writer upserts the partition's counter and
+/// holds it; a sweep runs; once it waits for (polls for) the counter, the writer
+/// refreshes the producer and commits. (2) two expired partitions, A and B; the writer
+/// upserts B's counter and holds it; once the sweep waits for it, the writer deletes
+/// A's rows (DeleteRecords) and commits. In both, neither the sweep nor the writer
+/// fails; the log start never moves for a partition whose rows stay; every row the
+/// sweep did not remove is still there.
+pub async fn test_sweep_never_deadlocks_with_a_batch_holding_a_counter() -> TestResult {
+    into_test_result(counter_cycles().await)
+}
+
+async fn counter_cycles() -> SendResult<()> {
+    println!("=== Test: the sweep never deadlocks with a batch holding an offset counter ===\n");
+    let sweeper = sweeper_session().await?;
+    let observer = session().await?;
+    let writer = session().await?;
+    writer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let producer: i64 = sweeper
+        .query_one(
+            "INSERT INTO kafka.producer_ids (producer_id, created_at, last_active_at)
+             VALUES (-(floor(random() * 1000000)::bigint + 1) * 1000000 - 11,
+                     now() - INTERVAL '30 years', now() - INTERVAL '30 years')
+             RETURNING producer_id",
+            &[],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let mut topics = Vec::new();
+    let result: SendResult<()> = async {
+        let t = expired_partition(&sweeper, "counter-cycle").await?;
+        topics.push(t);
+        println!("Round 1: partition ({t}, 0) expired, producer {producer} idle for 30 years");
+        let (swept, written, waited) = sweep_against_two_writes(
+            &sweeper,
+            &observer,
+            &writer,
+            &format!(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                 VALUES ({t}, 0, 6)
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE
+                     SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                                EXCLUDED.next_offset)"
+            ),
+            &format!(
+                "UPDATE kafka.producer_ids SET last_active_at = NOW()
+                 WHERE producer_id = {producer}"
+            ),
+        )
+        .await?;
+        let (offsets, next, log_start) = partition_state(&sweeper, t).await?;
+        println!(
+            "   sweep {swept:?}, writer error {written:?}, the sweep waited: {waited}; \
+             offsets {offsets:?}, next {next}, log start {log_start}"
+        );
+        let swept = swept.map_err(|e| format!("round 1: the sweep failed: {e}"))?;
+        if let Some(e) = written {
+            return Err(format!("round 1: the writer failed: {e}").into());
+        }
+        let expired = count_of(&swept, "expired_messages");
+        let rows_ok = (expired == 5 && offsets.is_empty() && log_start == next)
+            || (expired == 0 && offsets.len() == 5 && log_start == 0);
+        if !rows_ok {
+            return Err(format!(
+                "round 1: rows and log start disagree (expired {expired}, offsets \
+                 {offsets:?}, log start {log_start})"
+            )
+            .into());
+        }
+
+        let a = expired_partition(&sweeper, "counter-cycle-a").await?;
+        topics.push(a);
+        let b = expired_partition(&sweeper, "counter-cycle-b").await?;
+        topics.push(b);
+        println!("Round 2: partitions ({a}, 0) and ({b}, 0) expired");
+        let (swept, written, waited) = sweep_against_two_writes(
+            &sweeper,
+            &observer,
+            &writer,
+            &format!(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
+                 VALUES ({b}, 0, 6)
+                 ON CONFLICT (topic_id, partition_id) DO UPDATE
+                     SET next_offset = GREATEST(kafka.partition_offsets.next_offset,
+                                                EXCLUDED.next_offset)"
+            ),
+            &format!(
+                "DELETE FROM kafka.messages
+                 WHERE topic_id = {a} AND partition_id = 0 AND partition_offset < 2"
+            ),
+        )
+        .await?;
+        let (a_offsets, a_next, a_start) = partition_state(&sweeper, a).await?;
+        let (b_offsets, b_next, b_start) = partition_state(&sweeper, b).await?;
+        println!(
+            "   sweep {swept:?}, writer error {written:?}, the sweep waited: {waited}; \
+             A offsets {a_offsets:?} log start {a_start} (next {a_next}), \
+             B offsets {b_offsets:?} log start {b_start} (next {b_next})"
+        );
+        swept.map_err(|e| format!("round 2: the sweep failed: {e}"))?;
+        if let Some(e) = written {
+            return Err(format!("round 2: the writer failed: {e}").into());
+        }
+        for (name, offsets, next, start) in [
+            ("A", &a_offsets, a_next, a_start),
+            ("B", &b_offsets, b_next, b_start),
+        ] {
+            let lowest = offsets.first().copied().unwrap_or(next);
+            if start > lowest {
+                return Err(format!(
+                    "round 2: partition {name}'s log start {start} passed its row {lowest}"
+                )
+                .into());
+            }
+        }
+        if !waited {
+            return Err("round 2: the sweep never reached the held counter".into());
+        }
+        Ok(())
+    }
+    .await;
+    drop_topics(&sweeper, &topics).await?;
+    sweeper
+        .execute(
+            "DELETE FROM kafka.producer_ids WHERE producer_id = $1",
+            &[&producer],
+        )
+        .await
+        .map_err(boxed)?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ neither the sweep nor the batch failed, and the log starts hold");
+    Ok(())
+}
+
+/// The sweep's orphaned-outbox reaper deleted the rows below their partition's log
+/// start in one statement, waiting for any a transaction held, in the sweep's one
+/// transaction: the forwarder's ack batch (the worker's outbox tick, `apply_delivered`)
+/// updates its rows in arrival order, so an ack batch holding one partition's row whose
+/// next ack was a row the reaper already deleted closed a cycle with it: "deadlock
+/// detected" failed the tick or the sweep.
+///
+/// Asserts: a two-partition topic with its log starts at 10 and an outbox row below
+/// each, (p0, 5) stored first; a writer updates (p1, 7) as an ack would and holds it; a
+/// sweep runs; once it waits for the row, or returned, the writer updates (p0, 5) and
+/// commits. Neither fails, the sweep does not wait for the writer, it reaped (p0, 5)
+/// and left (p1, 7), and the next sweep reaps (p1, 7).
+pub async fn test_sweep_reaper_never_deadlocks_with_an_ack_batch() -> TestResult {
+    into_test_result(reaper_cycle().await)
+}
+
+async fn reaper_cycle() -> SendResult<()> {
+    println!("=== Test: the orphaned-outbox reaper never deadlocks with an ack batch ===\n");
+    let sweeper = sweeper_session().await?;
+    let observer = session().await?;
+    let writer = session().await?;
+    writer
+        .batch_execute("SET statement_timeout = '30s'")
+        .await
+        .map_err(boxed)?;
+    let name = unique("reaper-cycle");
+    let topic: i32 = sweeper
+        .query_one(
+            "INSERT INTO kafka.topics (name, partitions, retention_ms) VALUES ($1, 2, -1)
+             RETURNING id",
+            &[&name],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0);
+    let result: SendResult<()> = async {
+        sweeper
+            .execute(
+                "INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset,
+                                                      log_start_offset)
+                 VALUES ($1, 0, 10, 10), ($1, 1, 10, 10)",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?;
+        for (partition, offset) in [(0, 5i64), (1, 7i64)] {
+            sweeper
+                .execute(
+                    "INSERT INTO kafka.shadow_tracking (topic_id, partition_id, local_offset,
+                                                        external_offset, forwarded_at)
+                     VALUES ($1, $2, $3, $3::bigint * 10, now())",
+                    &[&topic, &partition, &offset],
+                )
+                .await
+                .map_err(boxed)?;
+        }
+        println!("Step 1: outbox rows ({topic}, 0, 5) and ({topic}, 1, 7) below log start 10");
+        let ack = |partition: i32, offset: i64| {
+            format!(
+                "UPDATE kafka.shadow_tracking SET forwarded_at = NOW(), attempt_open = false
+                 WHERE topic_id = {topic} AND partition_id = {partition}
+                   AND local_offset = {offset}"
+            )
+        };
+        let (swept, written, waited) =
+            sweep_against_two_writes(&sweeper, &observer, &writer, &ack(1, 7), &ack(0, 5)).await?;
+        let left: Vec<i64> = sweeper
+            .query(
+                "SELECT local_offset FROM kafka.shadow_tracking WHERE topic_id = $1
+                 ORDER BY 1",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        println!(
+            "Step 2: sweep {swept:?}, writer error {written:?}, the sweep waited: {waited}; \
+             rows left {left:?}"
+        );
+        let swept = swept.map_err(|e| format!("the sweep failed: {e}"))?;
+        if let Some(e) = written {
+            return Err(format!("the ack batch failed: {e}").into());
+        }
+        if waited || left != [7] || count_of(&swept, "shadow_orphaned_rows") < 1 {
+            return Err("the reaper waited for the ack batch's row".into());
+        }
+        let rows = sweeper
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 60)", &[])
+            .await
+            .map_err(boxed)?;
+        let left: i64 = sweeper
+            .query_one(
+                "SELECT count(*) FROM kafka.shadow_tracking WHERE topic_id = $1",
+                &[&topic],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        let reaped = rows
+            .iter()
+            .find(|r| r.get::<_, String>(0) == "shadow_orphaned_rows")
+            .map_or(0, |r| r.get::<_, i64>(1));
+        println!("Step 3: the next sweep reaped {reaped} row(s); {left} left");
+        if left != 0 {
+            return Err("the next sweep left the skipped row".into());
+        }
+        Ok(())
+    }
+    .await;
+    drop_topics(&sweeper, &[topic]).await?;
+    release(&sweeper).await?;
+    result?;
+    println!("✅ the reaper skipped the held row and took it at the next pass");
     Ok(())
 }

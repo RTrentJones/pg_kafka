@@ -970,7 +970,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.topics TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.topics_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.messages TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.messages_global_offset_seq TO pgkafka_worker;
-GRANT SELECT, DELETE ON kafka.messages_default TO pgkafka_worker;
+GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.message_partition_contents(regclass) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.ensure_message_partitions(int, int) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkafka_worker;
