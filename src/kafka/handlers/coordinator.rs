@@ -729,7 +729,7 @@ pub fn describe_groups(
     // an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = groups
         .iter()
-        .filter(|g| !coordinator_groups.contains_key(*g))
+        .filter(|g| !coordinator_groups.contains_key(g.as_str()))
         .cloned()
         .collect();
     let with_offsets = if unheld.is_empty() {
@@ -746,7 +746,7 @@ pub fn describe_groups(
         .groups
         .reserve(groups.len().min(MAX_PREALLOC_ELEMENTS));
     for group_id in groups {
-        let described_group = match coordinator_groups.get(&group_id) {
+        let described_group = match coordinator_groups.get(group_id.as_str()) {
             Some(group) => {
                 let (bytes, entry) = sized
                     .entry(group_id)
@@ -978,7 +978,7 @@ pub fn list_groups(
         .filter(|(_, group)| wanted(group.state.as_str()))
         .map(|(group_id, group)| {
             (
-                group_id.as_str(),
+                &**group_id,
                 group.protocol_type.as_deref().unwrap_or("consumer"),
                 group.state.as_str(),
             )
@@ -987,7 +987,7 @@ pub fn list_groups(
     listed.extend(
         offset_groups
             .iter()
-            .filter(|group_id| !coordinator_groups.contains_key(*group_id))
+            .filter(|group_id| !coordinator_groups.contains_key(group_id.as_str()))
             .map(|group_id| (group_id.as_str(), "consumer", "Empty")),
     );
     listed.sort_unstable();

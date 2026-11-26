@@ -87,11 +87,13 @@ use super::error::{KafkaError, Result};
 use crate::pg_log;
 
 mod group;
+mod groups;
 #[cfg(test)]
 mod tests;
 
 pub use group::{ConsumerGroup, GroupMember, GroupState};
 use group::{Delivery, DeliveryOutcome};
+pub use groups::{GroupMap, GroupMut};
 
 // Group-count and group-size caps: `pg_kafka.max_consumer_groups` / `pg_kafka.group_max_size`
 // (crate::kafka::limits), applied through `GroupCoordinator::set_limits`; the memory budget
@@ -186,7 +188,7 @@ enum JoinDisposition {
 /// Uses RwLock for thread-safe access (readers can proceed in parallel, writers get exclusive access).
 pub struct GroupCoordinator {
     /// Consumer groups by group_id
-    pub groups: Arc<RwLock<HashMap<String, ConsumerGroup>>>,
+    pub groups: Arc<RwLock<GroupMap>>,
 
     /// Responders of held JoinGroups, by (group_id, member_id). An entry exists
     /// exactly while that member's `awaiting_join` is true. Always locked after
@@ -213,7 +215,7 @@ impl GroupCoordinator {
     /// Create a new group coordinator
     pub fn new() -> Self {
         Self {
-            groups: Arc::new(RwLock::new(HashMap::new())),
+            groups: Arc::new(RwLock::new(GroupMap::default())),
             pending_joins: Mutex::new(HashMap::new()),
             pending_syncs: Mutex::new(HashMap::new()),
             max_groups: AtomicUsize::new(
@@ -233,11 +235,9 @@ impl GroupCoordinator {
     }
 
     /// What all groups hold in coordinator memory, as counted against
-    /// `pg_kafka.max_group_memory` (0 if the lock is poisoned).
+    /// `pg_kafka.max_group_memory` (0 if the lock is poisoned). O(1).
     pub fn held_bytes(&self) -> usize {
-        self.groups
-            .read()
-            .map_or(0, |groups| total_held_bytes(&groups))
+        self.groups.read().map_or(0, |groups| groups.total_held())
     }
 
     /// Set the group-count and group-size caps (the JoinGroup handler applies the current
@@ -341,11 +341,10 @@ impl GroupCoordinator {
 
     fn remember_refusal(&self, group_id: &str, generation_id: i32, why: AssignmentRefusal) {
         if let Ok(mut groups) = self.groups.write() {
-            if let Some(group) = groups
-                .get_mut(group_id)
-                .filter(|g| g.generation_id == generation_id)
-            {
-                group.refused_assignment = Some((generation_id, why));
+            if let Some(mut group) = groups.get_mut(group_id) {
+                if group.generation_id == generation_id {
+                    group.refused_assignment = Some((generation_id, why));
+                }
             }
         }
     }
@@ -357,8 +356,7 @@ impl GroupCoordinator {
     /// Empty group can be forgotten) or `pg_kafka.max_group_memory` was raised, the leader's
     /// retry computes them again, instead of failing until the rebalance timeout evicts it.
     ///
-    /// Cost: O(1), plus for a refusal by the memory budget O(groups) to sum what the other
-    /// groups hold, as the leader's SyncGroup does anyway ([`Self::sync_group`]).
+    /// Cost: O(1) (what the other groups hold is a running total, [`GroupMap`]).
     pub fn assignment_refused(
         &self,
         group_id: &str,
@@ -456,21 +454,31 @@ impl GroupCoordinator {
 
     /// The JoinGroup state transition, under the groups write lock. Answers for held
     /// JoinGroups (this one's included) are appended to `out`.
+    ///
+    /// Cost: independent of the other groups. Only the named group's empty-group TTL and
+    /// rebalance timeout run here; the ~1 s sweep
+    /// ([`Self::check_and_remove_timed_out_members`]) runs every group's, so a stuck group
+    /// another JoinGroup would have evicted is evicted at most about a second later, and until
+    /// then counts as in use for `pg_kafka.max_consumer_groups` and the memory budget (a join
+    /// refused for that gets the retriable COORDINATOR_NOT_AVAILABLE). The admission checks
+    /// read running totals ([`GroupMap`]); room is made by forgetting Empty groups oldest
+    /// first, O(log groups) each.
     fn join_locked(
-        groups: &mut HashMap<String, ConsumerGroup>,
+        groups: &mut GroupMap,
         params: &JoinGroupParams,
         limits: JoinLimits,
         out: &mut Vec<Delivery>,
     ) -> Result<JoinDisposition> {
-        // Clean up stale empty groups (TTL-based)
-        groups.retain(|_, g| !g.is_expired_empty());
-
-        // Run the rebalance timeouts (also run by the periodic sweep).
-        for group in groups.values_mut() {
-            expire_and_recount(group, out);
-        }
-
         let group_id = params.group_id.clone();
+        if groups
+            .get(group_id.as_str())
+            .is_some_and(ConsumerGroup::is_expired_empty)
+        {
+            groups.remove(&group_id);
+        }
+        if let Some(mut group) = groups.get_mut(&group_id) {
+            expire_and_recount(&mut group, out);
+        }
 
         // As in Kafka: a JoinGroup presenting a member id is a rejoin. If the group or the
         // member is unknown (evicted, or lost in a worker restart) it gets UNKNOWN_MEMBER_ID and
@@ -478,14 +486,14 @@ impl GroupCoordinator {
         // group is created for it.
         if let Some(id) = params.member_id.as_deref() {
             if !groups
-                .get(&group_id)
+                .get(group_id.as_str())
                 .is_some_and(|g| g.members.contains_key(id))
             {
                 return Err(KafkaError::unknown_member(&group_id, id));
             }
         }
 
-        match groups.get(&group_id) {
+        match groups.get(group_id.as_str()) {
             Some(group) => Self::admit_member(group, params, limits.group_size)?,
             None => Self::admit_new_group(groups, params, limits.groups)?,
         }
@@ -497,9 +505,7 @@ impl GroupCoordinator {
         // Checked before the group is created, so a refused join leaves no group behind.
         Self::admit_memory(groups, params, &member_id, limits.memory)?;
 
-        let group = groups
-            .entry(group_id.clone())
-            .or_insert_with(|| ConsumerGroup::new(group_id.clone()));
+        let mut group = groups.get_or_create(&group_id);
         let unchanged = known_id
             .as_ref()
             .and_then(|id| group.members.get(id))
@@ -511,7 +517,7 @@ impl GroupCoordinator {
             member_id,
             group.state
         );
-        let disposition = Self::apply_join(group, member_id, params, unchanged, out);
+        let disposition = Self::apply_join(&mut group, member_id, params, unchanged, out);
         group.recount();
         Ok(disposition)
     }
@@ -530,27 +536,28 @@ impl GroupCoordinator {
     /// out (GROUP_MAX_SIZE_REACHED would be fatal to the Java consumer, and names the
     /// group's size, which is not what is exhausted).
     fn admit_memory(
-        groups: &mut HashMap<String, ConsumerGroup>,
+        groups: &mut GroupMap,
         params: &JoinGroupParams,
         member_id: &str,
         max_memory: usize,
     ) -> Result<()> {
-        let (before, assignment, group_after) = if let Some(group) = groups.get(&params.group_id) {
-            let member = group.members.get(member_id);
-            let (group_now, group_after, completes) = group.join_held_bytes(member_id, params);
-            (
-                member.map_or(0, GroupMember::held_bytes) + group_now,
-                // A join that completes the phase drops the member's assignment too.
-                member
-                    .and_then(|m| m.assignment.as_deref())
-                    .filter(|_| !completes),
-                group_after,
-            )
-        } else {
-            let group = ConsumerGroup::new(params.group_id.clone());
-            let (_, group_after, _) = group.join_held_bytes(member_id, params);
-            (0, None, group.held_bytes() + group_after)
-        };
+        let (before, assignment, group_after) =
+            if let Some(group) = groups.get(params.group_id.as_str()) {
+                let member = group.members.get(member_id);
+                let (group_now, group_after, completes) = group.join_held_bytes(member_id, params);
+                (
+                    member.map_or(0, GroupMember::held_bytes) + group_now,
+                    // A join that completes the phase drops the member's assignment too.
+                    member
+                        .and_then(|m| m.assignment.as_deref())
+                        .filter(|_| !completes),
+                    group_after,
+                )
+            } else {
+                let group = ConsumerGroup::new(params.group_id.clone());
+                let (_, group_after, _) = group.join_held_bytes(member_id, params);
+                (0, None, group.held_bytes() + group_after)
+            };
         let after = group::member_held_bytes(member_id, params, assignment) + group_after;
         if after <= before {
             return Ok(());
@@ -558,7 +565,7 @@ impl GroupCoordinator {
         if make_room(groups, &params.group_id, after - before, max_memory) {
             return Ok(());
         }
-        let held = total_held_bytes(groups);
+        let held = groups.total_held();
         crate::pg_warning!(
             "JoinGroup for group '{}' refused: its member state ({} bytes) does not fit the {} bytes groups hold of pg_kafka.max_group_memory ({} bytes)",
             params.group_id,
@@ -578,8 +585,9 @@ impl GroupCoordinator {
     /// so they remain visible as Empty groups) until the count is below the cap; when the
     /// non-Empty groups alone reach the cap, nothing is forgotten and the join gets the
     /// retriable COORDINATOR_NOT_AVAILABLE.
+    /// Cost: O(1) to count the groups in use, plus O(log groups) per Empty group forgotten.
     fn admit_new_group(
-        groups: &mut HashMap<String, ConsumerGroup>,
+        groups: &mut GroupMap,
         params: &JoinGroupParams,
         max_groups: usize,
     ) -> Result<()> {
@@ -589,19 +597,13 @@ impl GroupCoordinator {
         }
         // Forgetting Empty groups only helps if it can get below the cap; when the groups
         // in use alone fill it, the join is refused and the Empty groups stay.
-        let in_use = groups
-            .values()
-            .filter(|g| g.state != GroupState::Empty)
-            .count();
+        let in_use = groups.non_empty_count();
         // A reload can lower the cap below the number of groups in memory, so as many
         // Empty groups are forgotten as it takes.
         while in_use < max_groups && groups.len() >= max_groups {
-            let victim = groups
-                .values()
-                .filter(|g| g.state == GroupState::Empty)
-                .min_by_key(|g| g.last_activity)
-                .map(|g| g.group_id.clone());
-            let Some(victim) = victim else { break };
+            let Some(victim) = groups.empty_by_age().next().cloned() else {
+                break;
+            };
             groups.remove(&victim);
         }
         if groups.len() < max_groups {
@@ -796,8 +798,11 @@ impl GroupCoordinator {
 
     /// The SyncGroup state transition, under the groups write lock. `Ok(None)` means
     /// the member's SyncGroup is parked (its `awaiting_sync` is now set).
+    ///
+    /// Cost: independent of the other groups (what they hold is a running total), plus
+    /// O(log groups) per Empty group forgotten to make room for a leader's assignments.
     fn sync_locked(
-        groups: &mut HashMap<String, ConsumerGroup>,
+        groups: &mut GroupMap,
         request: SyncRequest<'_>,
         max_memory: usize,
         out: &mut Vec<Delivery>,
@@ -812,7 +817,7 @@ impl GroupCoordinator {
         // The member and its generation are checked before anything else: a SyncGroup
         // answered UNKNOWN_MEMBER_ID or ILLEGAL_GENERATION changes nothing, not even the
         // Empty groups the memory budget would forget for its assignments.
-        let group = current_member_group(groups, group_id, member_id, generation_id)?;
+        let group = current_member(groups, group_id, member_id, generation_id)?;
         // What every other group holds, for the memory budget of a leader's assignments
         // (only a leader's SyncGroup in the sync phase stores any).
         let stores_assignments = group.state == GroupState::CompletingRebalance
@@ -820,25 +825,22 @@ impl GroupCoordinator {
         // Room for the assignments is made first (forgetting least recently active Empty
         // groups), so the check below sees what is left.
         if stores_assignments {
-            let growth = groups.get(group_id).map_or(0, |g| {
-                g.held_bytes_after_sync(&assignments)
-                    .saturating_sub(g.held_bytes)
-            });
+            let growth = group
+                .held_bytes_after_sync(&assignments)
+                .saturating_sub(group.held_bytes);
             if growth > 0 {
                 make_room(groups, group_id, growth, max_memory);
             }
         }
         let held_elsewhere = if stores_assignments {
             groups
-                .iter()
-                .filter(|(id, _)| id.as_str() != group_id)
-                .map(|(_, g)| g.held_bytes)
-                .sum::<usize>()
+                .total_held()
+                .saturating_sub(groups.get(group_id).map_or(0, |g| g.held_bytes))
         } else {
             0
         };
         // Still there: make_room keeps the group it makes room for.
-        let group = current_member_group(groups, group_id, member_id, generation_id)?;
+        let mut group = current_member_group(groups, group_id, member_id, generation_id)?;
         let is_leader = group.leader.as_deref() == Some(member_id);
         if matches!(
             group.state,
@@ -1059,7 +1061,7 @@ impl GroupCoordinator {
             KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
         })?;
 
-        let group = current_member_group(&mut groups, group_id, member_id, generation_id)?;
+        let mut group = current_member_group(&mut groups, group_id, member_id, generation_id)?;
         let Some(member) = group.members.get_mut(member_id) else {
             return Err(KafkaError::unknown_member(group_id, member_id));
         };
@@ -1112,9 +1114,9 @@ impl GroupCoordinator {
                 KafkaError::Internal(format!("Failed to acquire groups write lock: {e}"))
             })?;
             let member_ids = member_ids.into_iter();
-            match groups.get_mut(group_id) {
+            let codes = match groups.get_mut(group_id) {
                 None => member_ids.map(|_| ERROR_UNKNOWN_MEMBER_ID).collect(),
-                Some(group) => {
+                Some(mut group) => {
                     let codes: Vec<i16> = member_ids
                         .map(|member_id| {
                             if group.take_member(member_id, &mut deliveries) {
@@ -1138,7 +1140,8 @@ impl GroupCoordinator {
                     }
                     codes
                 }
-            }
+            };
+            codes
         };
         self.deliver(deliveries);
         Ok(codes)
@@ -1155,6 +1158,10 @@ impl GroupCoordinator {
     /// requests arrive, so a held JoinGroup is always answered within about a second
     /// of its phase completing or timing out.
     ///
+    /// Cost per run: O(groups) to visit them (an Empty group is skipped at once), plus
+    /// O(members) of each group that is not Empty, plus O(log groups) per expired Empty group
+    /// forgotten. It is the only step that walks every group.
+    ///
     /// # Returns
     /// List of (group_id, member_id) pairs that were removed
     pub fn check_and_remove_timed_out_members(&self) -> Vec<(String, String)> {
@@ -1167,16 +1174,16 @@ impl GroupCoordinator {
                 return removed;
             };
 
-            for (group_id, group) in groups.iter_mut() {
+            groups.for_each_mut(|group_id, group| {
                 if group.state == GroupState::Empty {
-                    continue;
+                    return;
                 }
 
                 for member_id in expire_and_recount(group, &mut deliveries) {
-                    removed.push((group_id.clone(), member_id));
+                    removed.push((group_id.to_string(), member_id));
                 }
                 if group.state == GroupState::Empty {
-                    continue;
+                    return;
                 }
 
                 let mut timed_out: Vec<String> = group
@@ -1187,7 +1194,7 @@ impl GroupCoordinator {
                     .collect();
                 timed_out.sort();
                 if timed_out.is_empty() {
-                    continue;
+                    return;
                 }
 
                 for member_id in &timed_out {
@@ -1197,17 +1204,17 @@ impl GroupCoordinator {
                         group_id
                     );
                     group.remove_member(member_id, &mut deliveries);
-                    removed.push((group_id.clone(), member_id.clone()));
+                    removed.push((group_id.to_string(), member_id.clone()));
                 }
                 group.on_members_removed(&mut deliveries);
                 group.recount();
-            }
+            });
 
-            // Reclaim expired empty groups here (every sweep), not just on the next
-            // join_group's pass, so an idle Empty group does not outlive EMPTY_GROUP_TTL_SECS.
+            // Reclaim expired empty groups here (every sweep; a JoinGroup reclaims only the
+            // group it names), so an idle Empty group does not outlive EMPTY_GROUP_TTL_SECS.
             // Forgetting one earlier is safe too (make_room and pg_kafka.max_consumer_groups do,
             // at any age): see remove_member for why a recreated group needs no old generation.
-            groups.retain(|_, g| !g.is_expired_empty());
+            groups.remove_expired_empty();
         }
 
         self.deliver(deliveries);
@@ -1577,18 +1584,13 @@ pub enum AssignmentRefusal {
 }
 
 /// What the groups other than `group_id` would hold once `make_room` forgot every Empty
-/// one it may: the room a SyncGroup of `group_id` finds for its assignments. O(groups).
-fn held_elsewhere_after_room(groups: &HashMap<String, ConsumerGroup>, group_id: &str) -> usize {
-    groups
-        .values()
-        .filter(|g| g.group_id != group_id && g.state != GroupState::Empty)
-        .map(|g| g.held_bytes)
-        .sum()
-}
-
-/// What all groups hold in coordinator memory, as last counted.
-fn total_held_bytes(groups: &HashMap<String, ConsumerGroup>) -> usize {
-    groups.values().map(|g| g.held_bytes).sum()
+/// one it may: the room a SyncGroup of `group_id` finds for its assignments. O(1).
+fn held_elsewhere_after_room(groups: &GroupMap, group_id: &str) -> usize {
+    let own = groups
+        .get(group_id)
+        .filter(|g| g.state != GroupState::Empty)
+        .map_or(0, |g| g.held_bytes);
+    groups.non_empty_held().saturating_sub(own)
 }
 
 /// Make `extra` more bytes fit `max_memory` by forgetting the least recently active Empty
@@ -1597,41 +1599,32 @@ fn total_held_bytes(groups: &HashMap<String, ConsumerGroup>) -> usize {
 /// Empty group), and without this the Empty groups a JoinGroup and LeaveGroup leave behind
 /// would keep their bytes for `EMPTY_GROUP_TTL_SECS`. Nothing is forgotten when forgetting
 /// every Empty group would still not make room. Returns whether `extra` fits.
-fn make_room(
-    groups: &mut HashMap<String, ConsumerGroup>,
-    keep: &str,
-    extra: usize,
-    max_memory: usize,
-) -> bool {
-    let mut held = total_held_bytes(groups);
+///
+/// Cost: O(1) to decide (running totals), plus O(log groups) per group forgotten (the Empty
+/// groups are kept ordered by last activity, [`GroupMap`]); no group id is copied.
+fn make_room(groups: &mut GroupMap, keep: &str, extra: usize, max_memory: usize) -> bool {
+    let mut held = groups.total_held();
     if held.saturating_add(extra) <= max_memory {
         return true;
     }
-    let forgettable = |g: &&ConsumerGroup| g.state == GroupState::Empty && g.group_id != keep;
-    // Whether forgetting helps is decided before anything is collected: a refusal costs no
-    // copy of the (up to 32 KB) group ids.
-    let reclaimable: usize = groups
-        .values()
-        .filter(forgettable)
-        .map(|g| g.held_bytes)
-        .sum();
+    let kept_empty = groups
+        .get(keep)
+        .filter(|g| g.state == GroupState::Empty)
+        .map_or(0, |g| g.held_bytes);
+    let reclaimable = groups.empty_held().saturating_sub(kept_empty);
     if held.saturating_sub(reclaimable).saturating_add(extra) > max_memory {
         return false;
     }
-    let mut candidates: Vec<(Instant, &str, usize)> = groups
-        .values()
-        .filter(forgettable)
-        .map(|g| (g.last_activity, g.group_id.as_str(), g.held_bytes))
-        .collect();
-    candidates.sort_unstable();
-    // Only the ids of the groups actually forgotten are copied.
     let mut victims = Vec::new();
-    for (_, group_id, bytes) in candidates {
+    for key in groups.empty_by_age() {
         if held.saturating_add(extra) <= max_memory {
             break;
         }
-        victims.push(group_id.to_string());
-        held = held.saturating_sub(bytes);
+        if &**key == keep {
+            continue;
+        }
+        held = held.saturating_sub(groups.get(key).map_or(0, |g| g.held_bytes));
+        victims.push(Arc::clone(key));
     }
     for group_id in victims {
         groups.remove(&group_id);
@@ -1655,13 +1648,26 @@ fn expire_and_recount(group: &mut ConsumerGroup, out: &mut Vec<Delivery>) -> Vec
 /// or an unknown member gets UNKNOWN_MEMBER_ID, which makes the client rejoin as a new
 /// member; then a generation other than the current one gets ILLEGAL_GENERATION.
 fn current_member_group<'a>(
-    groups: &'a mut HashMap<String, ConsumerGroup>,
+    groups: &'a mut GroupMap,
     group_id: &str,
     member_id: &str,
     generation_id: i32,
-) -> Result<&'a mut ConsumerGroup> {
-    let group = groups
+) -> Result<GroupMut<'a>> {
+    current_member(groups, group_id, member_id, generation_id)?;
+    groups
         .get_mut(group_id)
+        .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))
+}
+
+/// [`current_member_group`], read-only.
+fn current_member<'a>(
+    groups: &'a GroupMap,
+    group_id: &str,
+    member_id: &str,
+    generation_id: i32,
+) -> Result<&'a ConsumerGroup> {
+    let group = groups
+        .get(group_id)
         .ok_or_else(|| KafkaError::unknown_member(group_id, member_id))?;
     if !group.members.contains_key(member_id) {
         return Err(KafkaError::unknown_member(group_id, member_id));
