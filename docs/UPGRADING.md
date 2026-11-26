@@ -91,6 +91,31 @@ the Kafka port open, answers every request with the retriable `KAFKA_STORAGE_ERR
 and resumes (partition maintenance, shadow configuration, role) as soon as `CREATE
 EXTENSION pg_kafka` has run, without a restart.
 
+## A 0.1.0 schema made by an earlier build of 0.1.0
+
+0.1.0 has not been released; its schema changed while it was developed, and `ALTER
+EXTENSION pg_kafka UPDATE` changes nothing between two builds of the same version. Two
+changes matter for a database whose 0.1.0 schema an earlier build created:
+
+- `GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker`: the
+  retention sweep locks the rows it deletes from the DEFAULT leaf with `FOR UPDATE SKIP
+  LOCKED`, which needs UPDATE. Without it the worker finds `pgkafka_worker` lacking a
+  privilege and keeps the bootstrap superuser, with the WARNING `pg_kafka.run_as_role
+  'pgkafka_worker' lacks kafka.messages_default:UPDATE; the worker keeps the bootstrap superuser`. Run the GRANT (as the extension
+  owner) and restart the worker (`pg_terminate_backend()` on `pg_kafka_listener`): it then
+  switches to the role.
+- `kafka.lock_message_tables(regclass)`, which locks only `kafka.messages`, the leaf a
+  drop removes and the DEFAULT leaf: an earlier schema has `kafka.lock_message_tables()`,
+  which locks every leaf, so a vacuum of any leaf makes leaf creation and drops time out
+  (retried, but the DEFAULT leaf collects rows meanwhile). Re-create the extension, or
+  run the definitions of `kafka.lock_message_tables`, `kafka.create_message_partition` and
+  `kafka.drop_message_partition` (and their REVOKE) from `sql/bootstrap.sql` as the
+  extension owner.
+
+Re-creating the extension (`DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka`,
+which deletes its data) applies every such change at once. A 0.0.0 schema upgraded with
+this build's `ALTER EXTENSION pg_kafka UPDATE` has both.
+
 ## 0.0.0 -> 0.1.0
 
 `sql/pg_kafka--0.0.0--0.1.0.sql`:
