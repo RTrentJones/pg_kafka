@@ -116,6 +116,18 @@ pub struct TransactionalProducer {
 /// counts per group, which an entry of a held group never undercuts.
 pub const LISTED_GROUP_OVERHEAD: usize = 8;
 
+/// The groups known by their offsets that a ListGroups may list
+/// ([`OffsetStore::list_offset_groups`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OffsetGroupPage {
+    /// The first ids in byte order, as long as the running total of their lengths plus
+    /// [`LISTED_GROUP_OVERHEAD`] each, before each id, stays within the budget (so the first
+    /// one past the budget is among them).
+    pub ids: Vec<String>,
+    /// Whether a group with offsets follows the last of `ids`: the read stopped at the budget.
+    pub more: bool,
+}
+
 /// One topic's committed offsets of a group, as [`OffsetStore::fetch_all_offsets`] reads
 /// them: the topic's name and its `(partition, offset)` pairs, an offset left out as `None`.
 pub type GroupTopicOffsets = (String, Vec<(i32, Option<CommittedOffset>)>);
@@ -614,13 +626,14 @@ pub trait OffsetStore {
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
     /// The ids of the groups that have at least one committed offset or pending
-    /// transactional offset, sorted, as long as the running total of their lengths plus
-    /// [`LISTED_GROUP_OVERHEAD`] each stays within `max_bytes`, and the first id past that
-    /// (so the caller sees the list goes on): what ListGroups may list (see
-    /// `handlers::coordinator::list_groups`). The other ids past it are not read. These groups exist for DescribeGroups / ListGroups / DeleteGroups even
-    /// when the in-memory coordinator does not know them (e.g. after a worker restart, or a
-    /// group only a TxnOffsetCommit named), as Kafka reports them as Empty groups.
-    fn list_offset_groups(&self, max_bytes: usize) -> Result<Vec<String>>;
+    /// transactional offset, in byte order, as long as the running total of their lengths
+    /// plus [`LISTED_GROUP_OVERHEAD`] each stays within `max_bytes` before the id (so the
+    /// first id past the budget is included), and whether more follow: what ListGroups may
+    /// list (see `handlers::coordinator::list_groups`). The ids past the page are not read.
+    /// These groups exist for DescribeGroups / ListGroups / DeleteGroups even when the
+    /// in-memory coordinator does not know them (e.g. after a worker restart, or a group only
+    /// a TxnOffsetCommit named), as Kafka reports them as Empty groups.
+    fn list_offset_groups(&self, max_bytes: usize) -> Result<OffsetGroupPage>;
 
     /// Which of `group_ids` have at least one committed offset or pending transactional
     /// offset, in one statement.

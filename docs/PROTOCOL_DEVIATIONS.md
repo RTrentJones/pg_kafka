@@ -460,12 +460,14 @@ algorithm; see "Server-side sticky assignment" below)
 - **Deviation:** a ListGroups response is bounded by `pg_kafka.fetch_max_bytes` (Kafka builds
   the whole list). Group ids are client strings of up to 32 KB, and the groups known only by
   their offsets are bounded only by the database, so 300 groups of 30 KB ids made a 9 MB
-  response and a few hundred thousand of them gigabytes. The groups are listed in the order of
-  their ids, the first always, while their entries fit; the rest are left out and the server
-  logs a WARNING. ListGroups has no per-group error code, and a top-level error makes the Java
+  response and a few hundred thousand of them gigabytes. The groups are listed in the byte
+  order of their ids, the first always, while their entries fit; the rest are left out and the
+  server logs a WARNING. The list is always the first groups, in that order, of those the state
+  filter selects. ListGroups has no per-group error code, and a top-level error makes the Java
   admin client drop the whole list (librdkafka keeps the groups next to the error), so the
   shortened list is answered NONE. Use the v4 state filter or DescribeGroups of the groups
-  wanted to see the others. With a state filter the list may stop a little short of the bound.
+  wanted to see the others. With a state filter the list may stop short of the bound (groups
+  known by their offsets that the coordinator holds in a filtered-out state count toward it).
 - ✅ LeaveGroup v3+ answers every entry of `members` in order, as Kafka 3.7 does: NONE for a
   member removed, UNKNOWN_MEMBER_ID for one the group does not have, a repeat of an entry
   already removed included. **Deviation:** the group reacts once to all the members a request

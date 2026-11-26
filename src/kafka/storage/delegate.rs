@@ -389,7 +389,7 @@ macro_rules! delegate_offset_store {
         fn list_offset_groups(
             &self,
             max_bytes: usize,
-        ) -> $crate::kafka::error::Result<Vec<String>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::OffsetGroupPage> {
             $via::list_offset_groups(max_bytes)
         }
         fn groups_with_offsets(
@@ -450,7 +450,7 @@ macro_rules! delegate_offset_store {
         fn list_offset_groups(
             &self,
             max_bytes: usize,
-        ) -> $crate::kafka::error::Result<Vec<String>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::OffsetGroupPage> {
             $via::list_offset_groups(&self.$field, max_bytes)
         }
         fn groups_with_offsets(

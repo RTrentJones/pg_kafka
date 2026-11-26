@@ -11,6 +11,7 @@ mod coordinator_state;
 mod describe_size;
 mod group_cap;
 mod lifecycle;
+mod list_order;
 mod list_size;
 mod member_memory;
 mod protocol_rules;
@@ -47,6 +48,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         member_memory::test_member_state_beyond_the_memory_budget_is_refused: sequential, // changes a GUC
         describe_size::test_describe_groups_of_a_repeated_group_is_bounded: sequential, // changes a GUC
         list_size::test_list_groups_is_bounded_by_fetch_max_bytes: sequential, // changes a GUC
+        list_order::test_list_groups_reads_only_the_listed_groups: sequential, // ends the worker to flush its statistics
+        list_order::test_list_groups_is_a_byte_order_prefix: sequential, // changes a GUC
+        list_order::test_list_groups_state_filter_lists_a_prefix: sequential, // changes a GUC
         member_memory::test_empty_groups_do_not_exhaust_the_memory_budget: sequential, // changes a GUC
         member_memory::test_a_rejoin_is_priced_with_the_protocol_it_selects: sequential, // changes a GUC
         sync_liveness::test_member_that_never_syncs_is_removed: sequential, // Has sleep delays

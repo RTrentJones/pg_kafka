@@ -666,9 +666,13 @@ CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
--- Committed offsets per consumer group, topic and partition.
+-- Committed offsets per consumer group, topic and partition. group_id sorts by its bytes
+-- (COLLATE "C"), whatever the database's collation: ListGroups walks the distinct ids of the
+-- primary key in that order up to its response bound and lists them, with the groups the
+-- coordinator holds, in byte order; under a linguistic collation the index could not serve
+-- that walk, and an ORDER BY in the database's order cut a different set of groups.
 CREATE TABLE kafka.consumer_offsets (
-    group_id TEXT NOT NULL,
+    group_id TEXT COLLATE "C" NOT NULL,
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
     committed_offset BIGINT NOT NULL,
@@ -893,7 +897,7 @@ WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
 -- These offsets are moved to consumer_offsets on commit, deleted on abort
 CREATE TABLE kafka.txn_pending_offsets (
     transactional_id TEXT NOT NULL REFERENCES kafka.transactions(transactional_id) ON DELETE CASCADE,
-    group_id TEXT NOT NULL,
+    group_id TEXT COLLATE "C" NOT NULL,  -- byte order, as in kafka.consumer_offsets
     topic_id INT NOT NULL REFERENCES kafka.topics(id) ON DELETE CASCADE,
     partition_id INT NOT NULL,
     pending_offset BIGINT NOT NULL,
