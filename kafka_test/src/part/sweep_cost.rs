@@ -353,21 +353,22 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
         .map(|i| -i)
         .collect();
     larger.extend_from_slice(&topic_ids);
-    // A one-hour leaf in 2001 (no other test's leaves use that year), a row per topic.
+    // A one-hour leaf in 1987 (no other test's leaves or rows use that year), a row per
+    // topic.
     let hour: i32 = db
         .query_one("SELECT (random() * 8000)::int", &[])
         .await?
         .get(0);
     db.execute(
         "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
-         FROM (SELECT timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
+         FROM (SELECT timestamptz '1987-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
         &[&hour],
     )
     .await?;
     let leaf: String = db
         .query_one(
             "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
-             WHERE lower_bound = timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
+             WHERE lower_bound = timestamptz '1987-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
             &[&hour],
         )
         .await?
@@ -375,7 +376,7 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
     db.execute(
         "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
          SELECT t, 0, 0, 'v'::bytea,
-                timestamptz '2001-01-01 00:00+00' + $2::int * INTERVAL '1 hour'
+                timestamptz '1987-01-01 00:00+00' + $2::int * INTERVAL '1 hour'
          FROM unnest($1::int[]) AS t",
         &[&topic_ids, &hour],
     )
@@ -409,7 +410,7 @@ pub async fn test_sweep_drop_recheck_is_linear_in_the_leaf_topics() -> TestResul
             "an eightfold expired set made the drop {ratio:.2}x as long (limit \
              {MAX_DROP_RATIO}x): the re-check is not linear"
         );
-        // Now for good: the leaf goes, so no empty 2001 leaf is left behind.
+        // Now for good: the leaf goes, so no empty 1987 leaf is left behind.
         let dropped: bool = db
             .query_one(
                 "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",

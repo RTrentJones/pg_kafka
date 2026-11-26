@@ -700,7 +700,34 @@ async fn probe_of_many_topics() -> SendResult<()> {
         .await
         .map_err(boxed)?;
     let prefix = unique("probe-cost");
-    let forever = create_topic(&db, &format!("{prefix}-forever"), -1).await?;
+    let mut leaf = None;
+    let outcome = probe_of_many_topics_run(&db, &prefix, &mut leaf).await;
+    // On every path: the 100,000 topics (and their rows, by cascade) and the leaf.
+    let cleanup = drop_probe_fixture(&db, &prefix, leaf.as_deref()).await;
+    db.execute("SELECT pg_advisory_unlock($1)", &[&MAINTENANCE_LOCK_KEY])
+        .await
+        .map_err(boxed)?;
+    let (took, expired) = outcome?;
+    cleanup?;
+    if took > PROBE_PASS_LIMIT || expired < 1 {
+        return Err(format!(
+            "a pass whose probe found {PROBED_TOPICS} trims took {took:?} (limit \
+             {PROBE_PASS_LIMIT:?}) and expired {expired} of their rows"
+        )
+        .into());
+    }
+    println!("✅ the pass stayed within its budget");
+    Ok(())
+}
+
+/// The fixture and the sweep of [`probe_of_many_topics`]; `leaf` is set as soon as the
+/// leaf exists. Returns the sweep's time and how many of the topics' rows it expired.
+async fn probe_of_many_topics_run(
+    db: &Client,
+    prefix: &str,
+    leaf: &mut Option<String>,
+) -> SendResult<(Duration, i64)> {
+    let forever = create_topic(db, &format!("{prefix}-forever"), -1).await?;
     let mut topics: Vec<i32> = db
         .query(
             "INSERT INTO kafka.topics (name, partitions, retention_ms)
@@ -727,7 +754,7 @@ async fn probe_of_many_topics() -> SendResult<()> {
     )
     .await
     .map_err(boxed)?;
-    let leaf: String = db
+    let name: String = db
         .query_one(
             "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
              WHERE lower_bound = timestamptz '1995-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
@@ -736,6 +763,7 @@ async fn probe_of_many_topics() -> SendResult<()> {
         .await
         .map_err(boxed)?
         .get(0);
+    *leaf = Some(name.clone());
     topics.push(forever);
     db.execute(
         "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
@@ -746,44 +774,49 @@ async fn probe_of_many_topics() -> SendResult<()> {
     )
     .await
     .map_err(boxed)?;
-    println!("Step 0: {leaf} holds {PROBED_TOPICS} expired topics and an infinite one");
+    println!("Step 0: {name} holds {PROBED_TOPICS} expired topics and an infinite one");
 
     let started = Instant::now();
-    let result = db
-        .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+    db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
         .await
-        .map_err(boxed);
+        .map_err(boxed)?;
     let took = started.elapsed();
     let expired: i64 = db
         .query_one(
-            &format!("SELECT {PROBED_TOPICS} - count(*) FROM {leaf} WHERE topic_id <> $1"),
+            &format!("SELECT {PROBED_TOPICS} - count(*) FROM {name} WHERE topic_id <> $1"),
             &[&forever],
         )
         .await
         .map_err(boxed)?
         .get(0);
     println!("Step 1: the sweep took {took:?} and expired {expired} of the topics' rows");
-    db.query(
-        "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
-        &[&leaf, &topics],
-    )
-    .await
-    .map_err(boxed)?;
+    Ok((took, expired))
+}
+
+/// Drop what [`probe_of_many_topics_run`] created, however far it got: the leaf (when
+/// it exists) and every topic named after `prefix`.
+async fn drop_probe_fixture(db: &Client, prefix: &str, leaf: Option<&str>) -> SendResult<()> {
+    let topics: Vec<i32> = db
+        .query(
+            "SELECT id FROM kafka.topics WHERE starts_with(name, $1 || '-')",
+            &[&prefix],
+        )
+        .await
+        .map_err(boxed)?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    if let Some(leaf) = leaf {
+        db.query(
+            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, $2::int[])",
+            &[&leaf, &topics],
+        )
+        .await
+        .map_err(boxed)?;
+    }
     db.execute("DELETE FROM kafka.topics WHERE id = ANY($1)", &[&topics])
         .await
         .map_err(boxed)?;
-    db.execute("SELECT pg_advisory_unlock($1)", &[&MAINTENANCE_LOCK_KEY])
-        .await
-        .map_err(boxed)?;
-    result?;
-    if took > PROBE_PASS_LIMIT || expired < 1 {
-        return Err(format!(
-            "a pass whose probe found {PROBED_TOPICS} trims took {took:?} (limit \
-             {PROBE_PASS_LIMIT:?}) and expired {expired} of their rows"
-        )
-        .into());
-    }
-    println!("✅ the pass stayed within its budget");
     Ok(())
 }
 

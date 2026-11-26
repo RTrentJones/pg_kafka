@@ -121,24 +121,31 @@ async fn release(sweeper: &Client) -> SendResult<()> {
 }
 
 /// The stale-producer prune picks its candidates from the statement's snapshot, and
-/// a DELETE that waited for a row re-checks only its own WHERE on the committed
-/// version: a producer idle past the 7-day window that InitProducerId (or a KIP-360
-/// epoch bump) revived while the prune waited for it was deleted after the revival
-/// committed, with its sequences, and the client held an id and epoch the broker no
-/// longer knew.
+/// its row lock (`FOR UPDATE SKIP LOCKED`) re-checks only the lock query's own WHERE on
+/// the newest version of a row committed since: a producer idle past the 7-day window
+/// that InitProducerId (or a KIP-360 epoch bump) revived and committed after the
+/// statement's snapshot (its sequence rows too, which the snapshot still sees idle) was
+/// deleted, with its sequences, unless that WHERE repeats the idle window, and the
+/// client held an id and epoch the broker no longer knew.
 ///
-/// Asserts: a producer idle for 20 years with a sequence row, revived (epoch bump,
-/// last_active_at = NOW(), sequences reset, as `bump_producer_epoch` and
-/// `reset_producer_sequences` do) by a transaction held open while an on-demand sweep
-/// runs (the prune skips the row it holds, or, waiting for it, re-checks the committed
-/// version), keeps its row at the new epoch and its sequence row.
-pub async fn test_sweep_prune_keeps_a_producer_revived_during_its_wait() -> TestResult {
+/// Asserts: a producer idle for 20 years with a sequence row; a writer revives it
+/// (epoch bump, last_active_at = NOW(), sequences reset, as `bump_producer_epoch` and
+/// `reset_producer_sequences` do) and holds its transaction open; an on-demand sweep
+/// runs with the prune paused after its snapshot
+/// (`pg_kafka.test_producer_prune_pause_ms`), and the writer commits during the pause,
+/// before the prune locks; the producer keeps its row at the new epoch and its
+/// sequence row.
+pub async fn test_sweep_prune_keeps_a_producer_revived_after_its_snapshot() -> TestResult {
     into_test_result(revived_producer().await)
 }
 
 async fn revived_producer() -> SendResult<()> {
-    println!("=== Test: the producer prune keeps a producer revived while it waits ===\n");
+    println!("=== Test: the producer prune keeps a producer revived after its snapshot ===\n");
     let sweeper = sweeper_session().await?;
+    sweeper
+        .batch_execute("SET pg_kafka.test_producer_prune_pause_ms = 1500")
+        .await
+        .map_err(boxed)?;
     let topic = create_topic(&sweeper, &unique("prune-race"), -1).await?;
     // An explicit negative id, never issued by the sequence.
     let producer_id: i64 = sweeper
@@ -179,11 +186,15 @@ async fn revived_producer() -> SendResult<()> {
             .map_err(boxed)?;
         println!("Step 2: a writer revives it (epoch 4) and holds its transaction open");
 
-        let (pruned, waited) =
+        let (pruned, paused) =
             sweep_against_writer(&sweeper, &observer, &writer, "stale_producers").await?;
         println!(
-            "Step 3: the sweep pruned {pruned} producer(s); it waited for the writer: {waited}"
+            "Step 3: the writer committed during the prune's pause: {paused}; the sweep \
+             pruned {pruned} producer(s)"
         );
+        if !paused {
+            return Err("the writer never saw the prune's pause".into());
+        }
         let epoch: Option<i16> = sweeper
             .query_opt(
                 "SELECT epoch FROM kafka.producer_ids WHERE producer_id = $1",
@@ -203,7 +214,7 @@ async fn revived_producer() -> SendResult<()> {
         println!("Step 4: producer epoch {epoch:?}, {sequences} sequence row(s)");
         if epoch != Some(4) || sequences != 1 {
             return Err(format!(
-                "the prune deleted a producer revived during its wait \
+                "the prune deleted a producer revived after its snapshot \
                  (epoch {epoch:?}, sequence rows {sequences})"
             )
             .into());
@@ -227,6 +238,10 @@ async fn revived_producer() -> SendResult<()> {
         .map_err(boxed)?;
     sweeper
         .execute("DELETE FROM kafka.topics WHERE id = $1", &[&topic])
+        .await
+        .map_err(boxed)?;
+    sweeper
+        .batch_execute("RESET pg_kafka.test_producer_prune_pause_ms")
         .await
         .map_err(boxed)?;
     release(&sweeper).await?;
@@ -535,11 +550,6 @@ async fn prune_during_produce() -> SendResult<()> {
     println!("Step 1: producer {pid} at sequence 0 on topic A, idle for 20 years; topic B new");
     let result: SendResult<()> = async {
         let worker = listener(&observer).await?;
-        let sweeper_pid: i32 = sweeper
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .map_err(boxed)?
-            .get(0);
         blocker
             .execute("SELECT pg_advisory_lock($1, 0)", &[&held_topic])
             .await
@@ -583,43 +593,28 @@ async fn prune_during_produce() -> SendResult<()> {
                 "Step 3: the Produce waits for topic B ({written} locked sequence row(s) of \
                  topic A)"
             );
-            let sweep = async {
-                Ok::<i64, Box<dyn std::error::Error + Send + Sync>>(
-                    sweeper
-                        .query_one(
-                            "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
-                             WHERE category = 'stale_producers'",
-                            &[],
-                        )
-                        .await
-                        .map_err(boxed)?
-                        .get(0),
+            // The sweep runs while the Produce is held (it skips the rows the Produce
+            // holds); B's append lock is released as soon as it returns, well within the
+            // worker's lock_timeout (5 s).
+            let pruned = sweeper
+                .query_one(
+                    "SELECT deleted FROM pg_kafka_run_retention_sweep(0, 60)
+                     WHERE category = 'stale_producers'",
+                    &[],
                 )
-            };
-            let release = async {
-                // The worker's lock waits end after worker_lock_timeout_ms (5 s).
-                let waited = wait_until_waiting(
-                    &observer,
-                    sweeper_pid,
-                    "transactionid",
-                    Duration::from_secs(3),
-                )
-                .await?;
-                blocker
-                    .execute("SELECT pg_advisory_unlock($1, 0)", &[&held_topic])
-                    .await
-                    .map_err(boxed)?;
-                Ok::<bool, Box<dyn std::error::Error + Send + Sync>>(waited)
-            };
-            let (pruned, waited) = tokio::join!(sweep, release);
-            Ok::<(i64, bool), Box<dyn std::error::Error + Send + Sync>>((pruned?, waited?))
+                .await
+                .map_err(boxed);
+            blocker
+                .execute("SELECT pg_advisory_unlock($1, 0)", &[&held_topic])
+                .await
+                .map_err(boxed)?;
+            Ok::<i64, Box<dyn std::error::Error + Send + Sync>>(pruned?.get(0))
         };
         let (produced, control) = tokio::join!(produce, control);
-        let (pruned, waited) = control?;
+        let pruned = control?;
         let produced = produced?;
         println!(
-            "Step 4: the sweep pruned {pruned} producer(s) (it waited for the Produce: \
-             {waited}); the Produce answered {produced:?}"
+            "Step 4: the sweep pruned {pruned} producer(s); the Produce answered {produced:?}"
         );
         let acked = |topic: &str| {
             produced

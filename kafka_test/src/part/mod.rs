@@ -50,7 +50,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         sweep_datestyle::test_sweep_bounds_survive_the_session_datestyle: sequential,
         sweep_isolation::test_sweep_keeps_rows_committed_during_a_repeatable_read_drop: sequential,
         sweep_isolation::test_worker_sweep_drops_under_a_repeatable_read_default: sequential,
-        sweep_races::test_sweep_prune_keeps_a_producer_revived_during_its_wait: sequential,
+        sweep_races::test_sweep_prune_keeps_a_producer_revived_after_its_snapshot: sequential,
         sweep_races::test_sweep_log_start_never_passes_a_concurrent_produce: sequential,
         sweep_races::test_sweep_prune_keeps_a_producer_whose_produce_is_open: sequential,
         sweep_races::test_sweep_prune_then_produce_keeps_producer_state: sequential,

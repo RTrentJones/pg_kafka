@@ -1547,18 +1547,31 @@ fn terminal_transactions_batch(client: &mut SpiClient<'_>) -> Result<u64> {
 ///
 /// Cost: one tuple lock per producer it deletes, no more than the deletes themselves
 /// (at most [`RETENTION_DELETE_BATCH`] a statement); kept candidates are not locked.
-fn producer_prune_sql(with_cursor: bool) -> String {
+///
+/// `test_pause_ms` > 0 (`pg_kafka.test_producer_prune_pause_ms`, tests only) adds a
+/// one-time sleep to the candidates, between the statement's snapshot and the victims'
+/// locks.
+fn producer_prune_sql(with_cursor: bool, test_pause_ms: i32) -> String {
     let after = if with_cursor {
         "AND (p.last_active_at, p.producer_id)
              > (TIMESTAMP 'epoch' + $3::bigint * INTERVAL '1 microsecond', $4::bigint)"
     } else {
         ""
     };
+    let pause = if test_pause_ms > 0 {
+        format!(
+            "AND EXISTS (SELECT 1 FROM pg_sleep({}))",
+            f64::from(test_pause_ms) / 1000.0
+        )
+    } else {
+        String::new()
+    };
     format!(
         "WITH candidates AS (
              SELECT p.producer_id, p.last_active_at FROM kafka.producer_ids p
              WHERE p.last_active_at < NOW() - ($1 || ' seconds')::interval
                {after}
+               {pause}
              ORDER BY p.last_active_at, p.producer_id
              LIMIT $2
          ),
@@ -1572,7 +1585,9 @@ fn producer_prune_sql(with_cursor: bool) -> String {
                -- Repeated from candidates: the lock re-checks this condition on the
                -- newest version of a row updated since the statement's snapshot, so
                -- an InitProducerId or epoch bump that revived an idle producer and
-               -- committed meanwhile keeps it.
+               -- committed meanwhile keeps it. It is the only re-check: the DELETE
+               -- below takes exactly the rows locked here, which nothing changes
+               -- before it.
                AND p.last_active_at < NOW() - ($1 || ' seconds')::interval
                AND NOT EXISTS (
                    SELECT 1 FROM kafka.transactions t
@@ -1591,7 +1606,6 @@ fn producer_prune_sql(with_cursor: bool) -> String {
          doomed AS (
              DELETE FROM kafka.producer_ids p
              WHERE p.producer_id = ANY (ARRAY(SELECT v.producer_id FROM victims v))
-               AND p.last_active_at < NOW() - ($1 || ' seconds')::interval
              RETURNING p.producer_id
          ),
          seqs AS (
@@ -1632,14 +1646,15 @@ fn stale_producers_batch(
     cursor: Option<(i64, i64)>,
 ) -> Result<(u64, Option<(i64, i64)>)> {
     let window = whole_seconds(PRODUCER_ID_RETENTION);
+    let pause_ms = crate::config::TEST_PRODUCER_PRUNE_PAUSE_MS.get();
     let table = match cursor {
         None => client.update(
-            &producer_prune_sql(false),
+            &producer_prune_sql(false, pause_ms),
             None,
             &[window.into(), RETENTION_DELETE_BATCH.into()],
         )?,
         Some((at_us, producer_id)) => client.update(
-            &producer_prune_sql(true),
+            &producer_prune_sql(true, pause_ms),
             None,
             &[
                 window.into(),
@@ -1782,7 +1797,11 @@ mod tests {
     #[test]
     fn producer_prune_locks_without_waiting_and_rechecks_the_idle_window() {
         for with_cursor in [false, true] {
-            let sql = producer_prune_sql(with_cursor);
+            let sql = producer_prune_sql(with_cursor, 0);
+            assert!(
+                !sql.contains("pg_sleep"),
+                "the production statement never sleeps"
+            );
             let victims = sql
                 .split("victims AS (")
                 .nth(1)
@@ -1805,6 +1824,18 @@ mod tests {
                 "the DELETE must take only locked rows: {delete}"
             );
         }
+    }
+
+    /// The test pause sits in the candidates, before the victims take their locks.
+    #[test]
+    fn producer_prune_test_pause_precedes_the_locks() {
+        let sql = producer_prune_sql(false, 1500);
+        let pause = sql.find("pg_sleep(1.5)");
+        let victims = sql.find("victims AS (");
+        assert!(
+            matches!((pause, victims), (Some(p), Some(v)) if p < v),
+            "{sql}"
+        );
     }
 
     #[test]
