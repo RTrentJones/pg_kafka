@@ -176,6 +176,16 @@ fn fetch_mock(partition_count: i32, hwm: i64, log_start: i64) -> MockKafkaStore 
 }
 
 fn fetch_one(mock: &MockKafkaStore, partition_index: i32, fetch_offset: i64) -> (i16, i64) {
+    let p = fetch_entry(mock, partition_index, fetch_offset);
+    (p.error_code, p.high_watermark)
+}
+
+/// The response entry of one partition fetched from `fetch_offset`.
+fn fetch_entry(
+    mock: &MockKafkaStore,
+    partition_index: i32,
+    fetch_offset: i64,
+) -> kafka_protocol::messages::fetch_response::PartitionData {
     let env = TestEnv::new();
     let ctx = env.ctx(mock);
     let response = fetch::handle_fetch(
@@ -191,8 +201,7 @@ fn fetch_one(mock: &MockKafkaStore, partition_index: i32, fetch_offset: i64) -> 
         crate::kafka::storage::IsolationLevel::ReadUncommitted,
     )
     .unwrap();
-    let p = &response.responses[0].partitions[0];
-    (p.error_code, p.high_watermark)
+    response.responses[0].partitions[0].clone()
 }
 
 /// Bug 6: fetching a partition that does not exist reports UNKNOWN_TOPIC_OR_PARTITION.
@@ -208,10 +217,60 @@ fn fetch_unknown_partition_is_an_error() {
 #[test]
 fn fetch_offset_out_of_range_is_an_error() {
     let mock = fetch_mock(1, 10, 3);
-    assert_eq!(fetch_one(&mock, 0, 1000), (ERROR_OFFSET_OUT_OF_RANGE, 10));
-    assert_eq!(fetch_one(&mock, 0, 2), (ERROR_OFFSET_OUT_OF_RANGE, 10));
+    assert_eq!(fetch_one(&mock, 0, 1000), (ERROR_OFFSET_OUT_OF_RANGE, -1));
+    assert_eq!(fetch_one(&mock, 0, 2), (ERROR_OFFSET_OUT_OF_RANGE, -1));
     assert_eq!(fetch_one(&mock, 0, 10).0, ERROR_NONE);
     assert_eq!(fetch_one(&mock, 0, 3).0, ERROR_NONE);
+}
+
+/// An OFFSET_OUT_OF_RANGE entry is Kafka 3.7's (offsets -1, null aborted transactions,
+/// empty records) and its records field encodes as length 0, never the null (-1) that
+/// makes librdkafka drop the whole response, at every Fetch version served.
+#[test]
+fn fetch_offset_out_of_range_entry_has_empty_records_at_every_version() {
+    use crate::kafka::api::ApiSchema;
+    use bytes::Buf;
+    use kafka_protocol::protocol::{Decodable, Encodable};
+
+    let mock = fetch_mock(1, 10, 3);
+    for fetch_offset in [1000, 2] {
+        let p = fetch_entry(&mock, 0, fetch_offset);
+        assert_eq!(p.error_code, ERROR_OFFSET_OUT_OF_RANGE);
+        assert_eq!(
+            p.records.as_deref(),
+            Some(&[][..]),
+            "empty, non-null records"
+        );
+        assert_eq!(
+            (p.high_watermark, p.last_stable_offset, p.log_start_offset),
+            (-1, -1, -1)
+        );
+        assert_eq!(p.aborted_transactions, None);
+        assert_eq!(p.preferred_read_replica.0, -1);
+
+        let api =
+            crate::kafka::api::FetchApi::MIN_VERSION..=crate::kafka::api::FetchApi::MAX_VERSION;
+        for version in api {
+            let mut response = kafka_protocol::messages::FetchResponse::default();
+            let mut topic =
+                kafka_protocol::messages::fetch_response::FetchableTopicResponse::default();
+            topic.partitions = vec![p.clone()];
+            response.responses = vec![topic];
+            let mut buf = bytes::BytesMut::new();
+            response.encode(&mut buf, version).unwrap();
+            // The records length is the entry's last field: the frame's last 4 bytes.
+            let mut tail = &buf[buf.len() - 4..];
+            assert_eq!(tail.get_i32(), 0, "records length at Fetch v{version}");
+            let decoded =
+                kafka_protocol::messages::FetchResponse::decode(&mut buf.freeze(), version)
+                    .unwrap();
+            assert_eq!(
+                decoded.responses[0].partitions[0].records.as_deref(),
+                Some(&[][..]),
+                "v{version}"
+            );
+        }
+    }
 }
 
 /// The fetch lower bound is the durable log start, not the first surviving row:

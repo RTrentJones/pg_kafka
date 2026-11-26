@@ -130,7 +130,8 @@ pub async fn test_retention_sweep_catches_up_on_backlog() -> TestResult {
 /// (`PostgresStore::get_partition_bounds`). The bounds must match the single-value
 /// queries they replaced: high watermark from the offset counter, last stable offset
 /// at the first pending transactional row (read_committed only), log start offset
-/// from the durable truncation point, and OFFSET_OUT_OF_RANGE below it.
+/// from the durable truncation point, and OFFSET_OUT_OF_RANGE (with Kafka's bound-less
+/// entry) below it.
 pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
     println!("=== Test: Fetch Bounds From A Single Statement ===\n");
 
@@ -204,7 +205,12 @@ pub async fn test_fetch_bounds_from_single_statement() -> TestResult {
     let response = roundtrip(&mut stream, 5, 9103, &fetch_request(&topic.name, 0, 1, 0)).await?;
     let p = &response.responses[0].partitions[0];
     assert_eq!(p.error_code, 1, "expected OFFSET_OUT_OF_RANGE (1)");
-    assert_eq!(p.log_start_offset, 2);
+    // Kafka 3.7's OFFSET_OUT_OF_RANGE entry carries no bounds, and empty (non-null) records.
+    assert_eq!(
+        (p.high_watermark, p.last_stable_offset, p.log_start_offset),
+        (-1, -1, -1)
+    );
+    assert_eq!(p.records.as_ref().map(bytes::Bytes::len), Some(0));
 
     ctx.db()
         .execute(
