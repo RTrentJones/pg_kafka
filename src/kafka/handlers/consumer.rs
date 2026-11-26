@@ -187,10 +187,11 @@ fn commit_partition_offset(
     ) {
         Ok(()) => ERROR_NONE,
         Err(e) => {
+            // One line per failed partition, so it names the partition and not the group:
+            // a group id is up to 32 KB, and a request may name 100,000 partitions.
             if e.is_server_error() {
                 crate::pg_warning!(
-                    "Failed to commit offset for group='{}', topic_id={}, partition={}: {}",
-                    group_id,
+                    "Failed to commit an offset for topic_id={}, partition={}: {}",
                     topic_id,
                     partition_id,
                     e
@@ -449,6 +450,57 @@ mod tests {
         // topics = None selects the fetch-all path.
         let resp = handle_offset_fetch(&ctx, "g", None, false).unwrap();
         assert_ne!(resp.error_code, ERROR_NONE);
+    }
+
+    /// A storage failure on every partition of an OffsetCommit logs a line per partition
+    /// that does not copy the group id: 1,000 partitions of a 30 KB group allocate a few
+    /// hundred bytes each, where each line used to format the whole id (30 MB here).
+    #[test]
+    fn test_offset_commit_failures_do_not_log_the_group_id_per_partition() {
+        use crate::kafka::messages::{OffsetCommitPartitionData, OffsetCommitTopicData};
+        use crate::kafka::storage::TopicMetadata;
+        let mut store = MockKafkaStore::new();
+        store.expect_get_topic_metadata().returning(|_| {
+            Ok(vec![TopicMetadata {
+                name: "t".to_string(),
+                id: 1,
+                partition_count: 1_000,
+            }])
+        });
+        store
+            .expect_commit_offset()
+            .returning(|_, _, _, _, _| Err(KafkaError::database("connection lost")));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&store);
+        let group = "g".repeat(30 * 1024);
+        let topics = vec![OffsetCommitTopicData {
+            name: "t".to_string(),
+            partitions: (0..1_000)
+                .map(|partition_index| OffsetCommitPartitionData {
+                    partition_index,
+                    committed_offset: 1,
+                    metadata: None,
+                })
+                .collect(),
+        }];
+        let (resp, allocated) = crate::testing::heap_allocated(|| {
+            handle_offset_commit(&ctx, &group, -1, "", topics).unwrap()
+        });
+        assert_eq!(resp.topics[0].partitions.len(), 1_000);
+        // The mock formats its arguments on every call (its message for a call no
+        // expectation matches): measured alone and not counted.
+        let ((), mock) = crate::testing::heap_allocated(|| {
+            for partition in 0..1_000 {
+                let _ = crate::kafka::storage::OffsetStore::commit_offset(
+                    &store, &group, 1, partition, 1, None,
+                );
+            }
+        });
+        let handler = allocated.saturating_sub(mock);
+        assert!(
+            handler < 1_000 * 1024,
+            "1,000 failed partitions allocated {handler} bytes besides the mock's {mock}"
+        );
     }
 
     /// Kafka answers UNKNOWN_TOPIC_OR_PARTITION for a commit to a partition the topic
