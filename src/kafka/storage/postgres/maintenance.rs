@@ -355,11 +355,18 @@ impl PostgresStore {
             let mut orphaned = BatchStep::new(Batch::OrphanedShadowRows);
 
             let mut pass = SweepPass::new(client, pass_start, &mut found);
-            // Phase 1 order: the probes (reads only) and the drops first, as a drop runs
-            // only before the pass holds a row ([`DropStep`]); terminal transactions
-            // before the producer prune (their foreign key on producer_ids keeps those
-            // producers); the orphaned outbox rows last (after the log start this pass's
-            // deletes and drops moved).
+            // The probes (reads only) and the drops first, on their own, as a drop runs
+            // only while the pass holds no row ([`DropStep`]): the drops the probes find
+            // are done in this pass, before any row delete. Interleaved with the other
+            // steps, a probe after the first one ran once a delete held rows, and its
+            // drops waited for the next pass, which an on-demand pass in a fresh
+            // session never has (what it found dies with the session). Bounded like any
+            // pass: at most 64 probes and 64 drops, within the budget plus one turn each.
+            retention::run_pass(&mut [&mut probes, &mut drops], &mut pass, pass_budget())?;
+            // Then every step, in this phase 1 order: terminal transactions before the
+            // producer prune (their foreign key on producer_ids keeps those producers);
+            // the orphaned outbox rows last (after the log start this pass's deletes and
+            // drops moved).
             retention::run_pass(
                 &mut [
                     &mut probes,
@@ -1173,8 +1180,11 @@ fn delete_batch(
 /// ([`SweepPass::holds_rows`]): a transaction that holds ROW EXCLUSIVE on kafka.messages
 /// and waits for a row the pass deleted would otherwise close a cycle with it. The drops
 /// therefore come first in a pass; once a turn has deleted a row, the rest wait for the
-/// next pass. After the first drop the pass holds kafka.messages itself, so later drops
-/// of the pass do not wait for other sessions' locks on it. The log start of the dropped
+/// next pass ([`PostgresStore::run_retention_sweep`] runs the probes and the drops in a
+/// pass of their own before the other steps, so the drops the probes find come before
+/// any row delete). After the first drop the pass holds kafka.messages itself, so later
+/// drops of the pass do not wait for other sessions' locks on it; once a session waits
+/// for it, the pass ends ([`SweepPass::after_turn`]). The log start of the dropped
 /// leaf's partitions moves in the drop's own subtransaction
 /// ([`SweepPass::remove_and_advance`]): if a counter stays held, the drop is rolled back
 /// and the pass ends.

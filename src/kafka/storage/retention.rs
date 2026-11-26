@@ -18,10 +18,18 @@
 //! 2. then, while the pass is within its budget and some step has work, the step with
 //!    work that has spent the least time this pass takes the next turn.
 //!
-//! A turn that finds a row another transaction keeps (an offset counter it cannot skip)
-//! ends the pass in either phase ([`PassClock::ended`]); the guarantees below hold for
-//! the passes no other transaction cuts short this way, and a cut pass leaves every
-//! step's items and cursor where they were, so it only delays them by one pass.
+//! A turn that finds a row another transaction keeps (an offset counter it cannot skip),
+//! or after which another session waits for a lock the pass holds, ends the pass in
+//! either phase ([`PassClock::ended`], [`PassClock::after_turn`]); the guarantees below
+//! hold for the passes no other transaction cuts short this way, and a cut pass leaves
+//! every step's items and cursor where they were, so it only delays them by one pass.
+//!
+//! `PostgresStore::run_retention_sweep` runs two such passes back to back in one
+//! transaction, on one budget clock: first the contents probes and the leaf drops alone
+//! (a drop runs only while the pass holds no row, so the drops the probes find must come
+//! before any row delete, or a pass whose found work dies with it, an on-demand pass in
+//! a fresh session, never does them), then every step. Each is scheduled as below, so
+//! a sweep costs at most the budget plus one turn per step plus one probe and one drop.
 //!
 //! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
 //! through a [`Lap`]: the items in key order, starting after the key of the last item

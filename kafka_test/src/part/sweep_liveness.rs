@@ -329,3 +329,70 @@ async fn ddl_beside_vacuum() -> SendResult<()> {
     Ok(())
 }
 
+/// An on-demand pass runs in a session of its own, usually a fresh one, so nothing
+/// it found survives it. A drop runs only while the pass holds no row, and the probes
+/// after the pass's first one ran once the row deletes had started: the drops those
+/// probes found were gated and forgotten with the session, so calls from fresh
+/// sessions dropped only the leaf the first probe found.
+///
+/// Asserts: with an older leaf to trim (an expired topic beside an infinite-retention
+/// one) and a newer, wholly expired leaf, one `pg_kafka_run_retention_sweep()` call from
+/// a fresh session trims the first and drops the second.
+pub async fn test_fresh_session_sweep_drops_what_its_probes_find() -> TestResult {
+    into_test_result(fresh_session_drops().await)
+}
+
+async fn fresh_session_drops() -> SendResult<()> {
+    println!("=== Test: a fresh-session sweep drops the leaves its probes find ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '60s'")
+        .await
+        .map_err(boxed)?;
+    let expired = create_topic(&db, &unique("fresh-expired"), 1000).await?;
+    let forever = create_topic(&db, &unique("fresh-forever"), -1).await?;
+    let hour = random_hour(&db).await?;
+    let trimmed = hour_leaf(&db, hour).await?;
+    let droppable = hour_leaf(&db, hour + 1).await?;
+    let outcome = async {
+        fill_leaf(&db, expired, hour, 0, 5).await?;
+        fill_leaf(&db, forever, hour, 0, 1).await?;
+        fill_leaf(&db, expired, hour + 1, 5, 5).await?;
+        println!("Step 1: {trimmed} to trim, {droppable} to drop");
+        let fresh = session().await?;
+        let rows = fresh
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        println!(
+            "Step 2: one call from a fresh session: {} expired row(s), {} leaf(s) dropped",
+            category(&rows, "expired_messages"),
+            category(&rows, "dropped_partitions")
+        );
+        let left: i64 = db
+            .query_one(
+                "SELECT count(*) FROM kafka.messages WHERE topic_id = $1",
+                &[&expired],
+            )
+            .await
+            .map_err(boxed)?
+            .get(0);
+        if leaf_exists(&db, &droppable).await? {
+            return Err(format!(
+                "a fresh-session pass did not drop {droppable}, which its probes found"
+            )
+            .into());
+        }
+        if left != 0 {
+            return Err(format!("{left} expired rows left in {trimmed}").into());
+        }
+        SendResult::Ok(())
+    }
+    .await;
+    force_drop(&db, &trimmed).await?;
+    force_drop(&db, &droppable).await?;
+    delete_topics(&db, &[expired, forever]).await?;
+    outcome?;
+    println!("✅ the pass dropped the leaf its own probe found");
+    Ok(())
+}
+
