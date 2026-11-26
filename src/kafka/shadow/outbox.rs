@@ -168,32 +168,143 @@ pub struct AcksApplied {
     pub held: Vec<RowKey>,
 }
 
-/// The ack statements' rows: the acks' keys (`$1`-`$3`), each locked unless another
-/// transaction holds it (`lk`, one primary-key probe per ack), and the acks of pending
-/// rows it could not lock (`held`). An ack statement never waits for a row: the tick
-/// waiting for one stopped the DB thread, and a held row failed the whole batch of acks,
-/// every topic's. Ends with the `held` CTE's closing parenthesis; the statement goes on
-/// with its own CTEs over `lk`.
-macro_rules! ack_rows {
-    ($columns:literal) => {
-        concat!(
-            "WITH a AS (SELECT * FROM unnest(", $columns, ")), \
-             lk AS MATERIALIZED ( \
-                 SELECT k.* FROM a CROSS JOIN LATERAL ( \
-                     SELECT a.*, st.ctid AS row_ctid FROM kafka.shadow_tracking st \
-                     WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o \
-                       AND st.external_offset IS NULL \
-                     FOR UPDATE OF st SKIP LOCKED) k \
-             ), \
-             held AS ( \
-                 SELECT a.t, a.p, a.o FROM a \
-                 WHERE EXISTS (SELECT 1 FROM kafka.shadow_tracking st \
-                               WHERE st.topic_id = a.t AND st.partition_id = a.p \
-                                 AND st.local_offset = a.o AND st.external_offset IS NULL) \
-                   AND (a.t, a.p, a.o) NOT IN (SELECT lk.t, lk.p, lk.o FROM lk) \
-             )"
-        )
-    };
+/// Lock the outbox rows of a batch of acks (`$1`-`$3`, their keys) and report what it
+/// found: the ctids and keys of the pending rows it locked (one primary-key probe per
+/// ack), and the keys of the pending rows another transaction holds (`held_*`: a
+/// primary-key probe for each ack it did not lock, usually none). It never waits for a
+/// row (`SKIP LOCKED`): the tick waiting for one stopped the DB thread, and a held row
+/// failed the whole batch of acks, every topic's. The probes are LATERAL subqueries
+/// (cut at one row for `held`), not joins or `EXISTS` the planner could turn into a
+/// scan of the outbox, and they name the full primary key and nothing else: with
+/// `external_offset IS NULL` in their WHERE the planner took the partial pending index
+/// (`topic_id, partition_id, dead, local_offset`), whose key cannot be matched without
+/// `dead`, so every probe walked its partition's whole backlog (8 192 acks behind a
+/// 250 000-row partition: 30 s, the DB thread stopped meanwhile). A row found delivered
+/// is locked but left alone; the `pending` test runs outside the materialized `probed`,
+/// where the planner cannot push it back into the probe. The rows are then changed by
+/// ctid in a statement of their own ([`ack_update_by_tid`]).
+const LOCK_ACK_ROWS_SQL: &str = "
+    WITH a AS (SELECT * FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(t, p, o)),
+    probed AS MATERIALIZED (
+        SELECT k.* FROM a CROSS JOIN LATERAL (
+            SELECT st.topic_id AS t, st.partition_id AS p, st.local_offset AS o,
+                   st.ctid AS row_ctid, st.external_offset IS NULL AS pending
+            FROM kafka.shadow_tracking st
+            WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o
+            FOR UPDATE OF st SKIP LOCKED) k
+    ),
+    lk AS (SELECT t, p, o, row_ctid FROM probed WHERE pending),
+    held AS (
+        SELECT u.t, u.p, u.o
+        FROM (SELECT * FROM a
+              WHERE (a.t, a.p, a.o) NOT IN (SELECT lk.t, lk.p, lk.o FROM lk)) u
+        CROSS JOIN LATERAL (
+            SELECT st.external_offset IS NULL AS pending FROM kafka.shadow_tracking st
+            WHERE st.topic_id = u.t AND st.partition_id = u.p AND st.local_offset = u.o
+            LIMIT 1) r
+        WHERE r.pending
+    )
+    SELECT ARRAY(SELECT lk.row_ctid::text FROM lk) AS locked_ctid,
+           ARRAY(SELECT lk.t FROM lk) AS locked_t,
+           ARRAY(SELECT lk.p FROM lk) AS locked_p,
+           ARRAY(SELECT lk.o FROM lk) AS locked_o,
+           ARRAY(SELECT t FROM held) AS held_t,
+           ARRAY(SELECT p FROM held) AS held_p,
+           ARRAY(SELECT o FROM held) AS held_o";
+
+/// The planner settings under which an ack update by ctid can only read the outbox by
+/// TID (every other scan disabled, TID scans enabled whatever the session says), set
+/// transaction-locally; returns the five settings as they were (`saved`), in the order
+/// [`RESTORE_ACK_SCAN_SETTINGS_SQL`] puts them back. With the rows named by ctid a TID
+/// scan reads exactly them; otherwise the planner, from statistics that lag a large
+/// enqueue, chose a hash join over a scan of every outbox row (16 s per ack batch
+/// behind a few hundred thousand rows, the DB thread stopped meanwhile). Nested loops are
+/// off too: the update joins the TID scan with the acks' values by ctid, and from an
+/// estimate of one pending row the planner rescanned the values for every row it
+/// updated (8 192 x 8 192 comparisons, 9 s per ack batch); a hash or merge join on the
+/// ctid is linear (n log n). Only the
+/// UPDATE of the outbox runs under them: a statement that fires a foreign-key check (the
+/// `kafka.shadow_metrics` upsert checks `kafka.topics`) would plan that check under them,
+/// and Postgres keeps such a plan for the session, so it would scan `kafka.topics` on
+/// every later check.
+const ACK_SCAN_SETTINGS_SQL: &str = "
+    SELECT ARRAY[o.tid, o.seq, o.bitmap, o.idx, o.ios, o.nl] AS saved,
+           set_config('enable_tidscan', 'on', true),
+           set_config('enable_seqscan', 'off', true),
+           set_config('enable_bitmapscan', 'off', true),
+           set_config('enable_indexscan', 'off', true),
+           set_config('enable_indexonlyscan', 'off', true),
+           set_config('enable_nestloop', 'off', true)
+    FROM (SELECT current_setting('enable_tidscan') AS tid,
+                 current_setting('enable_seqscan') AS seq,
+                 current_setting('enable_bitmapscan') AS bitmap,
+                 current_setting('enable_indexscan') AS idx,
+                 current_setting('enable_indexonlyscan') AS ios,
+                 current_setting('enable_nestloop') AS nl
+          OFFSET 0) o";
+
+/// Put back what [`ACK_SCAN_SETTINGS_SQL`] read (`$1`, in its order).
+const RESTORE_ACK_SCAN_SETTINGS_SQL: &str = "
+    SELECT set_config('enable_tidscan', $1[1], true),
+           set_config('enable_seqscan', $1[2], true),
+           set_config('enable_bitmapscan', $1[3], true),
+           set_config('enable_indexscan', $1[4], true),
+           set_config('enable_indexonlyscan', $1[5], true),
+           set_config('enable_nestloop', $1[6], true)";
+
+/// The rows [`LOCK_ACK_ROWS_SQL`] locked (ctid as text, key) and the keys it found held.
+struct LockedAckRows {
+    locked: Vec<(String, RowKey)>,
+    held: Vec<RowKey>,
+}
+
+/// Run [`LOCK_ACK_ROWS_SQL`] for `keys`.
+fn lock_ack_rows(client: &mut pgrx::spi::SpiClient<'_>, keys: KeyColumns) -> Result<LockedAckRows> {
+    let table = client.update(
+        LOCK_ACK_ROWS_SQL,
+        Some(1),
+        &[
+            keys.topic_ids.into(),
+            keys.partition_ids.into(),
+            keys.local_offsets.into(),
+        ],
+    )?;
+    let row = table.first();
+    let ctids: Vec<Option<String>> = row.get_by_name("locked_ctid")?.unwrap_or_default();
+    let keys = key_columns(&row, "locked")?;
+    Ok(LockedAckRows {
+        locked: ctids
+            .into_iter()
+            .zip(keys)
+            .filter_map(|(c, k)| c.map(|c| (c, k)))
+            .collect(),
+        held: key_columns(&row, "held")?,
+    })
+}
+
+/// Run `update` (an ack statement whose rows are named by ctid) under
+/// [`ACK_SCAN_SETTINGS_SQL`], restored afterwards.
+fn ack_update_by_tid<T>(
+    client: &mut pgrx::spi::SpiClient<'_>,
+    update: impl FnOnce(&mut pgrx::spi::SpiClient<'_>) -> Result<T>,
+) -> Result<T> {
+    let saved: Vec<Option<String>> = client
+        .update(ACK_SCAN_SETTINGS_SQL, Some(1), &[])?
+        .first()
+        .get_by_name("saved")?
+        .unwrap_or_default();
+    let out = update(client)?;
+    client.update(RESTORE_ACK_SCAN_SETTINGS_SQL, None, &[saved.into()])?;
+    Ok(out)
+}
+
+/// For each locked row (in order), the payload of the first ack of its key.
+fn payloads_of<'a, P>(locked: &[(String, RowKey)], acks: &'a [(RowKey, P)]) -> Vec<&'a P> {
+    let by_key: HashMap<RowKey, &P> = acks.iter().rev().map(|(k, p)| (*k, p)).collect();
+    locked
+        .iter()
+        .filter_map(|(_, k)| by_key.get(k).copied())
+        .collect()
 }
 
 /// Every database/GUC access shadow mode makes.
@@ -1026,56 +1137,57 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(AcksApplied::default());
         }
-        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
-        let external_offsets: Vec<i64> = rows.iter().map(|&(_, x)| x).collect();
-        // The metric is bumped in the SAME statement that flips the rows,
-        // guarded by `external_offset IS NULL`, so a duplicate ack updates
-        // nothing and counts nothing: exactly once per row. One statement for
-        // the whole batch of acks.
+        // The update is guarded by `external_offset IS NULL`, so a duplicate ack updates
+        // nothing and counts nothing: the metric counts exactly the rows it returns.
         Spi::connect_mut(|client| {
-            let table = client.update(
-                concat!(
-                    ack_rows!("$1::int4[], $2::int4[], $3::int8[], $4::int8[]) AS a(t, p, o, x"),
-                    ", \
-                 done AS ( \
-                     UPDATE kafka.shadow_tracking st \
-                     SET external_offset = lk.x, forwarded_at = NOW(), error_message = NULL, \
+            let locked = lock_ack_rows(client, rows.iter().map(|(k, _)| k).collect())?;
+            if locked.locked.is_empty() {
+                return Ok(AcksApplied {
+                    transitioned: 0,
+                    held: locked.held,
+                });
+            }
+            let ctids: Vec<&str> = locked.locked.iter().map(|(c, _)| c.as_str()).collect();
+            let external: Vec<i64> = payloads_of(&locked.locked, rows)
+                .into_iter()
+                .copied()
+                .collect();
+            let done = ack_update_by_tid(client, |client| {
+                returned_keys(client.update(
+                    "UPDATE kafka.shadow_tracking st \
+                     SET external_offset = u.x, forwarded_at = NOW(), error_message = NULL, \
                          attempt_open = false \
-                     FROM lk \
-                     WHERE st.ctid = lk.row_ctid \
-                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
+                     FROM unnest($1::text[]::tid[], $2::int8[]) AS u(c, x) \
+                     WHERE st.ctid = ANY ($1::text[]::tid[]) AND st.ctid = u.c \
                        AND st.external_offset IS NULL \
-                     RETURNING st.topic_id, st.partition_id, st.local_offset \
-                 ), \
-                 bumped AS ( \
-                     INSERT INTO kafka.shadow_metrics \
+                     RETURNING st.topic_id, st.partition_id, st.local_offset",
+                    None,
+                    &[ctids.into(), external.into()],
+                )?)
+            })?;
+            if metrics && !done.is_empty() {
+                let keys: KeyColumns = done.iter().collect();
+                client.update(
+                    "INSERT INTO kafka.shadow_metrics \
                          (topic_id, partition_id, messages_forwarded, last_forwarded_offset, last_forwarded_at) \
-                     SELECT topic_id, partition_id, COUNT(*), MAX(local_offset), NOW() FROM done \
-                     WHERE $5 \
-                     GROUP BY topic_id, partition_id \
+                     SELECT t, p, COUNT(*), MAX(o), NOW() \
+                     FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS d(t, p, o) \
+                     GROUP BY t, p \
                      ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
                         messages_forwarded = kafka.shadow_metrics.messages_forwarded + EXCLUDED.messages_forwarded, \
                         last_forwarded_offset = GREATEST(kafka.shadow_metrics.last_forwarded_offset, EXCLUDED.last_forwarded_offset), \
-                        last_forwarded_at = NOW() \
-                 ) \
-                 SELECT (SELECT COUNT(*) FROM done)::int8 AS n, \
-                        ARRAY(SELECT t FROM held) AS held_t, ARRAY(SELECT p FROM held) AS held_p, \
-                        ARRAY(SELECT o FROM held) AS held_o"
-                ),
-                Some(1),
-                &[
-                    keys.topic_ids.into(),
-                    keys.partition_ids.into(),
-                    keys.local_offsets.into(),
-                    external_offsets.into(),
-                    metrics.into(),
-                ],
-            )?;
-            let row = table.first();
+                        last_forwarded_at = NOW()",
+                    None,
+                    &[
+                        keys.topic_ids.into(),
+                        keys.partition_ids.into(),
+                        keys.local_offsets.into(),
+                    ],
+                )?;
+            }
             Ok(AcksApplied {
-                transitioned: usize::try_from(row.get_by_name::<i64, _>("n")?.unwrap_or(0))
-                    .unwrap_or(0),
-                held: held_keys(&row)?,
+                transitioned: done.len(),
+                held: locked.held,
             })
         })
     }
@@ -1090,66 +1202,62 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(FailedApplied::default());
         }
-        let keys: KeyColumns = rows.iter().map(|(k, _)| k).collect();
-        let errors: Vec<&str> = rows.iter().map(|(_, e)| e.as_str()).collect();
         Spi::connect_mut(|client| {
-            let table = client.update(
-                concat!(
-                    ack_rows!("$1::int4[], $2::int4[], $3::int8[], $4::text[]) AS a(t, p, o, e"),
-                    ", \
-                 failed AS ( \
-                     UPDATE kafka.shadow_tracking st \
-                     SET retry_count = st.retry_count + 1, error_message = lk.e, \
+            let locked = lock_ack_rows(client, rows.iter().map(|(k, _)| k).collect())?;
+            let mut out = FailedApplied {
+                held: locked.held,
+                ..FailedApplied::default()
+            };
+            if locked.locked.is_empty() {
+                return Ok(out);
+            }
+            let ctids: Vec<&str> = locked.locked.iter().map(|(c, _)| c.as_str()).collect();
+            let errors: Vec<&str> = payloads_of(&locked.locked, rows)
+                .into_iter()
+                .map(String::as_str)
+                .collect();
+            let mut failed_keys = Vec::new();
+            ack_update_by_tid(client, |client| {
+                let table = client.update(
+                    "UPDATE kafka.shadow_tracking st \
+                     SET retry_count = st.retry_count + 1, error_message = u.e, \
                          forwarded_at = NOW(), attempt_open = false, \
-                         dead = st.retry_count + 1 >= $6 \
-                     FROM lk \
-                     WHERE st.ctid = lk.row_ctid \
-                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
+                         dead = st.retry_count + 1 >= $3 \
+                     FROM unnest($1::text[]::tid[], $2::text[]) AS u(c, e) \
+                     WHERE st.ctid = ANY ($1::text[]::tid[]) AND st.ctid = u.c \
                        AND st.external_offset IS NULL \
                      RETURNING st.topic_id, st.partition_id, st.local_offset, st.retry_count, \
-                               st.error_message \
-                 ), \
-                 bumped AS ( \
-                     INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
-                     SELECT topic_id, partition_id, COUNT(*) FROM failed \
-                     WHERE $5 \
-                     GROUP BY topic_id, partition_id \
+                               st.error_message",
+                    None,
+                    &[ctids.into(), errors.into(), max_retries.into()],
+                )?;
+                for row in table {
+                    let key = RowKey::new(
+                        row.get_by_name("topic_id")?.unwrap_or(0),
+                        row.get_by_name("partition_id")?.unwrap_or(0),
+                        row.get_by_name("local_offset")?.unwrap_or(0),
+                    );
+                    failed_keys.push(key);
+                    let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
+                    if i64::from(retry_count) >= max_retries {
+                        out.dead_lettered
+                            .push((key, row.get_by_name("error_message")?.unwrap_or_default()));
+                    }
+                }
+                Ok(())
+            })?;
+            out.transitioned = failed_keys.len();
+            if metrics && !failed_keys.is_empty() {
+                let keys: KeyColumns = failed_keys.iter().collect();
+                client.update(
+                    "INSERT INTO kafka.shadow_metrics (topic_id, partition_id, messages_failed) \
+                     SELECT t, p, COUNT(*) FROM unnest($1::int4[], $2::int4[]) AS d(t, p) \
+                     GROUP BY t, p \
                      ON CONFLICT (topic_id, partition_id) DO UPDATE SET \
-                        messages_failed = kafka.shadow_metrics.messages_failed + EXCLUDED.messages_failed \
-                 ) \
-                 SELECT f.topic_id, f.partition_id, f.local_offset, f.retry_count, f.error_message, \
-                        false AS is_held \
-                 FROM failed f \
-                 UNION ALL \
-                 SELECT h.t, h.p, h.o, NULL, NULL, true FROM held h"
-                ),
-                None,
-                &[
-                    keys.topic_ids.into(),
-                    keys.partition_ids.into(),
-                    keys.local_offsets.into(),
-                    errors.into(),
-                    metrics.into(),
-                    max_retries.into(),
-                ],
-            )?;
-            let mut out = FailedApplied::default();
-            for row in table {
-                let key = RowKey::new(
-                    row.get_by_name("topic_id")?.unwrap_or(0),
-                    row.get_by_name("partition_id")?.unwrap_or(0),
-                    row.get_by_name("local_offset")?.unwrap_or(0),
-                );
-                if row.get_by_name::<bool, _>("is_held")?.unwrap_or(false) {
-                    out.held.push(key);
-                    continue;
-                }
-                out.transitioned += 1;
-                let retry_count: i32 = row.get_by_name("retry_count")?.unwrap_or(0);
-                if i64::from(retry_count) >= max_retries {
-                    out.dead_lettered
-                        .push((key, row.get_by_name("error_message")?.unwrap_or_default()));
-                }
+                        messages_failed = kafka.shadow_metrics.messages_failed + EXCLUDED.messages_failed",
+                    None,
+                    &[keys.topic_ids.into(), keys.partition_ids.into()],
+                )?;
             }
             Ok(out)
         })
@@ -1160,36 +1268,32 @@ impl ShadowDb for SpiShadowDb {
         if rows.is_empty() {
             return Ok(AcksApplied::default());
         }
-        let keys: KeyColumns = rows.iter().collect();
         Spi::connect_mut(|client| {
-            let table = client.update(
-                concat!(
-                    ack_rows!("$1::int4[], $2::int4[], $3::int8[]) AS a(t, p, o"),
-                    ", \
-                 closed AS ( \
-                     UPDATE kafka.shadow_tracking st SET attempt_open = false \
-                     FROM lk \
-                     WHERE st.ctid = lk.row_ctid \
-                       AND st.topic_id = lk.t AND st.partition_id = lk.p AND st.local_offset = lk.o \
-                       AND st.external_offset IS NULL \
-                     RETURNING 1 \
-                 ) \
-                 SELECT (SELECT COUNT(*) FROM closed)::int8 AS n, \
-                        ARRAY(SELECT t FROM held) AS held_t, ARRAY(SELECT p FROM held) AS held_p, \
-                        ARRAY(SELECT o FROM held) AS held_o"
-                ),
-                Some(1),
-                &[
-                    keys.topic_ids.into(),
-                    keys.partition_ids.into(),
-                    keys.local_offsets.into(),
-                ],
-            )?;
-            let row = table.first();
+            let locked = lock_ack_rows(client, rows.iter().collect())?;
+            if locked.locked.is_empty() {
+                return Ok(AcksApplied {
+                    transitioned: 0,
+                    held: locked.held,
+                });
+            }
+            let ctids: Vec<&str> = locked.locked.iter().map(|(c, _)| c.as_str()).collect();
+            let n = ack_update_by_tid(client, |client| {
+                let table = client.update(
+                    "WITH closed AS ( \
+                         UPDATE kafka.shadow_tracking st SET attempt_open = false \
+                         WHERE st.ctid = ANY ($1::text[]::tid[]) \
+                           AND st.external_offset IS NULL \
+                         RETURNING 1 \
+                     ) \
+                     SELECT COUNT(*)::int8 AS n FROM closed",
+                    Some(1),
+                    &[ctids.into()],
+                )?;
+                Ok(table.first().get_by_name::<i64, _>("n")?.unwrap_or(0))
+            })?;
             Ok(AcksApplied {
-                transitioned: usize::try_from(row.get_by_name::<i64, _>("n")?.unwrap_or(0))
-                    .unwrap_or(0),
-                held: held_keys(&row)?,
+                transitioned: usize::try_from(n).unwrap_or(0),
+                held: locked.held,
             })
         })
     }
@@ -1236,11 +1340,24 @@ impl ShadowDb for SpiShadowDb {
     }
 }
 
-/// The `held_t`, `held_p`, `held_o` columns of an ack statement's result row.
-fn held_keys(row: &pgrx::spi::SpiTupleTable<'_>) -> Result<Vec<RowKey>> {
-    let t: Vec<Option<i32>> = row.get_by_name("held_t")?.unwrap_or_default();
-    let p: Vec<Option<i32>> = row.get_by_name("held_p")?.unwrap_or_default();
-    let o: Vec<Option<i64>> = row.get_by_name("held_o")?.unwrap_or_default();
+/// The `(topic_id, partition_id, local_offset)` of every row a statement returned.
+fn returned_keys(table: pgrx::spi::SpiTupleTable<'_>) -> Result<Vec<RowKey>> {
+    let mut keys = Vec::with_capacity(table.len());
+    for row in table {
+        keys.push(RowKey::new(
+            row.get_by_name("topic_id")?.unwrap_or(0),
+            row.get_by_name("partition_id")?.unwrap_or(0),
+            row.get_by_name("local_offset")?.unwrap_or(0),
+        ));
+    }
+    Ok(keys)
+}
+
+/// The `<prefix>_t`, `<prefix>_p`, `<prefix>_o` key columns of a result row.
+fn key_columns(row: &pgrx::spi::SpiTupleTable<'_>, prefix: &str) -> Result<Vec<RowKey>> {
+    let t: Vec<Option<i32>> = row.get_by_name(format!("{prefix}_t"))?.unwrap_or_default();
+    let p: Vec<Option<i32>> = row.get_by_name(format!("{prefix}_p"))?.unwrap_or_default();
+    let o: Vec<Option<i64>> = row.get_by_name(format!("{prefix}_o"))?.unwrap_or_default();
     Ok(t.into_iter()
         .zip(p)
         .zip(o)
