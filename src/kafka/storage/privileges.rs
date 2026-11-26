@@ -528,7 +528,7 @@ mod tests {
             "kafka.ensure_message_partitions(int, int)",
             "kafka.drop_message_partition(regclass, int[])",
             "kafka.try_maintenance_lock()",
-            "kafka.lock_message_tables()",
+            "kafka.lock_message_tables(regclass)",
         ] {
             assert!(
                 bootstrap.contains(&format!("revoke execute on function {f} from public;")),

@@ -240,14 +240,15 @@ impl PostgresStore {
     /// EXCLUSIVE too, waits for those rows or for the lock: a deadlock. `lock` says
     /// whether to queue for the lock or, if another session holds it, skip the pass
     /// (`Ok(None)`). A drop's ACCESS EXCLUSIVE lock on kafka.messages is held until the
-    /// pass commits, at most the rest of the pass.
+    /// pass commits: once a session waits for it (or for any lock the pass holds), the
+    /// pass ends after the turn in progress ([`SweepPass::after_turn`]).
     ///
     /// Lock waits: the pass is one transaction, which holds every row it deleted or
     /// locked until it commits, and `pg_kafka_run_retention_sweep()` runs it in a session
     /// of its own beside the worker, whose group commit holds the rows of every request
     /// of a batch until one commit (and beside the shadow forwarder's acks, operators'
-    /// SQL). So once a pass holds a row, none of its statements waits in the lock manager
-    /// for a row another transaction holds: waiting for one while holding a row the other
+    /// SQL). So once a pass holds a row, none of its statements waits for a row lock
+    /// another transaction holds: waiting for one while holding a row the other
     /// transaction then writes (a Produce that upserts a counter the pass needs and then
     /// refreshes a producer the pass pruned; an ack batch that updates an outbox row the
     /// reaper waits for and then one it deleted) closed a cycle, and the deadlock detector
@@ -258,10 +259,19 @@ impl PostgresStore {
     /// locks, runs only while the pass holds no row ([`DropStep`]). A turn that finds a
     /// counter still held, or a session waiting for this transaction, rolls back its own
     /// statements and ends the pass ([`PassClock::ended`]), whose commit then frees the
-    /// rows that session waits for; what it left goes to the next pass. A worker
-    /// statement can still wait for a row the pass holds, until the pass commits (at
-    /// most the budget plus one turn per step, and the poll of one counter), as for any
-    /// transaction; it can no longer be the end of a cycle through the pass.
+    /// rows that session waits for; what it left goes to the next pass. A session that
+    /// starts waiting for a lock of the pass (a row it deleted or locked, kafka.messages
+    /// after a drop) ends the pass the same way, after the turn in progress
+    /// ([`SweepPass::after_turn`]): a worker statement waits for the pass at most one
+    /// turn (one bounded statement, or one drop) plus the poll of one counter, not the
+    /// rest of the budget, and it can no longer be the end of a cycle through the pass.
+    /// Relation locks are taken as by any statement: a delete's ROW EXCLUSIVE on
+    /// kafka.messages and its leaf can queue behind a session that waits for a stronger
+    /// lock on them (DDL such as ALTER TABLE, or LOCK TABLE), until that session's
+    /// lock_timeout or the holder it waits for ends. With a worker batch also waiting for
+    /// a row of the pass, that DDL closes a three-way cycle (pass, DDL, batch), which
+    /// deadlock detection breaks by failing one of them: run such DDL as the ADR-001
+    /// section "Your own DDL on kafka.messages" says, with a lock_timeout.
     pub fn run_retention_sweep(
         &self,
         message_retention_hours: i32,
@@ -345,11 +355,18 @@ impl PostgresStore {
             let mut orphaned = BatchStep::new(Batch::OrphanedShadowRows);
 
             let mut pass = SweepPass::new(client, pass_start, &mut found);
-            // Phase 1 order: the probes (reads only) and the drops first, as a drop runs
-            // only before the pass holds a row ([`DropStep`]); terminal transactions
-            // before the producer prune (their foreign key on producer_ids keeps those
-            // producers); the orphaned outbox rows last (after the log start this pass's
-            // deletes and drops moved).
+            // The probes (reads only) and the drops first, on their own, as a drop runs
+            // only while the pass holds no row ([`DropStep`]): the drops the probes find
+            // are done in this pass, before any row delete. Interleaved with the other
+            // steps, a probe after the first one ran once a delete held rows, and its
+            // drops waited for the next pass, which an on-demand pass in a fresh
+            // session never has (what it found dies with the session). Bounded like any
+            // pass: at most 64 probes and 64 drops, within the budget plus one turn each.
+            retention::run_pass(&mut [&mut probes, &mut drops], &mut pass, pass_budget())?;
+            // Then every step, in this phase 1 order: terminal transactions before the
+            // producer prune (their foreign key on producer_ids keeps those producers);
+            // the orphaned outbox rows last (after the log start this pass's deletes and
+            // drops moved).
             retention::run_pass(
                 &mut [
                     &mut probes,
@@ -645,6 +662,10 @@ struct SweepPass<'p, 'conn> {
     log_start_moved: bool,
     /// A turn gave up on a row another transaction holds: the pass ends.
     contended: bool,
+    /// The pass dropped a leaf: it holds ACCESS EXCLUSIVE on kafka.messages.
+    dropped: bool,
+    /// A session waits for a lock the pass holds: the pass ends.
+    waited_for: bool,
     stats: RetentionSweepStats,
 }
 
@@ -663,6 +684,8 @@ impl<'p, 'conn> SweepPass<'p, 'conn> {
             holds_rows: false,
             log_start_moved: false,
             contended: false,
+            dropped: false,
+            waited_for: false,
             stats: RetentionSweepStats::default(),
         }
     }
@@ -702,8 +725,47 @@ impl PassClock for SweepPass<'_, '_> {
     }
 
     fn ended(&self) -> bool {
-        self.contended
+        self.contended || self.waited_for
     }
+
+    /// End the pass once another session waits for a lock it holds: the rows it
+    /// deleted or locked, or kafka.messages after a drop (every write and read through
+    /// the parent, the worker's Produce and Fetch among them, then waits until this
+    /// transaction ends). The pass commits at once instead of running the rest of its
+    /// budget while they wait; what it left goes to the next pass. Checked only once
+    /// the pass holds something (a pass that has deleted nothing and dropped nothing
+    /// holds no lock a client statement needs). Cost: one read of pg_locks per turn
+    /// ([`session_waits_for_pass`]), against a turn of one bounded statement.
+    fn after_turn(&mut self) {
+        if self.waited_for || !(self.holds_rows || self.dropped) {
+            return;
+        }
+        // A failed check ends the pass too: committing early is always safe.
+        self.waited_for = session_waits_for_pass(self.client).unwrap_or(true);
+    }
+}
+
+/// Whether another session waits for a lock this transaction holds, other than the
+/// partition-maintenance lock ([`MAINTENANCE_LOCK_KEY`]): a sweep or a maintenance pass
+/// queued for that one waits for the whole pass by design, and ending the pass for it
+/// would only hand the work to it. One read of pg_locks, and `pg_blocking_pids` for each
+/// waiting session only.
+fn session_waits_for_pass(client: &SpiClient<'_>) -> Result<bool> {
+    Ok(client
+        .select(
+            "SELECT EXISTS (
+                 SELECT 1 FROM (SELECT DISTINCT l.pid FROM pg_locks l
+                                WHERE NOT l.granted AND l.pid IS NOT NULL
+                                  AND l.pid <> pg_backend_pid()
+                                  AND NOT (l.locktype = 'advisory' AND l.objsubid = 1
+                                           AND ((l.classid::int8 << 32) | l.objid::int8) = $1)) w
+                 WHERE pg_backend_pid() = ANY (pg_blocking_pids(w.pid))) AS waits",
+            Some(1),
+            &[MAINTENANCE_LOCK_KEY.into()],
+        )?
+        .first()
+        .get_by_name::<bool, _>("waits")?
+        .unwrap_or(false))
 }
 
 /// Run `f` in an internal subtransaction (the sequence PL/pgSQL's exception blocks
@@ -1024,8 +1086,17 @@ enum DeleteTarget<'a> {
 /// The batch skips the rows another transaction holds (a DeleteRecords or an EndTxn of
 /// the worker's open batch, a session's own DML): it never waits for them (see "Lock
 /// waits" on [`PostgresStore::run_retention_sweep`]). A skipped row stays, so the log
-/// start stops at it, and a later batch or pass takes it. The lock costs one tuple lock
-/// per row the batch deletes and no read beyond the ones the delete makes.
+/// start stops at it, and a later batch or pass takes it.
+///
+/// Two statements: the first finds and locks the batch's rows (`FOR UPDATE SKIP
+/// LOCKED`, through the indexes the predicate names) and returns their ctids; the
+/// second deletes exactly those, by TID ([`TID_DELETE_SETTINGS_SQL`]). In one statement
+/// (`ctid = ANY (ARRAY(subquery))`) the planner did not know the array and was free to
+/// read the leaf another way and test every row against it: under stale statistics it
+/// chose a BRIN bitmap scan of the whole leaf (47 s for one batch on a 990 000-row
+/// leaf). Cost: the first statement's index reads, then one heap fetch per row deleted;
+/// the ctids travel as one text array of at most [`RETENTION_DELETE_BATCH`] entries
+/// (about 15 bytes each).
 fn delete_batch(
     client: &mut SpiClient<'_>,
     filter: BatchFilter,
@@ -1034,58 +1105,90 @@ fn delete_batch(
 ) -> Result<u64> {
     let predicate = filter.predicate();
     let (topic_id, age_ms) = filter.args();
-    let table = match target {
+    let leaf = match target {
+        DeleteTarget::Leaf(leaf) => Some(leaf),
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => None,
+    };
+    let lower = leaf.flatten().and_then(|l| l.lower);
+    let upper = leaf.flatten().and_then(|l| l.upper);
+    let oid = leaf.flatten().map_or(0, |l| i64::from(l.partition.oid));
+    let (lock_sql, delete_sql) = match target {
         DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
             let table = if matches!(target, DeleteTarget::Unpartitioned) {
                 "kafka.messages"
             } else {
                 "kafka.messages_default"
             };
-            client.update(
-                &format!(
-                    "DELETE FROM {table}
-                     WHERE ctid IN (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3
-                                    FOR UPDATE OF m SKIP LOCKED)
+            (
+                format!(
+                    "SELECT COALESCE(array_agg(s.ctid::text), '{{}}') AS ctids
+                     FROM (SELECT m.ctid FROM {table} m WHERE {predicate} LIMIT $3
+                           FOR UPDATE OF m SKIP LOCKED) s"
+                ),
+                format!(
+                    "DELETE FROM {table} WHERE ctid = ANY ($1::text[]::tid[])
                      RETURNING topic_id, partition_id, partition_offset"
                 ),
-                None,
-                &[
-                    topic_id.into(),
-                    age_ms.into(),
-                    RETENTION_DELETE_BATCH.into(),
-                ],
-            )?
+            )
         }
-        DeleteTarget::Leaf(leaf) => {
-            let lower = leaf.and_then(|l| l.lower);
-            let upper = leaf.and_then(|l| l.upper);
-            let oid = leaf.map_or(0, |l| i64::from(l.partition.oid));
-            client.update(
-                &format!(
-                    "DELETE FROM kafka.messages
-                     WHERE created_at >= COALESCE($4::timestamptz, '-infinity')
-                       AND created_at < COALESCE($5::timestamptz, 'infinity')
-                       AND tableoid = $6::bigint::oid
-                       AND ctid = ANY (ARRAY(
-                           SELECT m.ctid FROM kafka.messages m
-                           WHERE m.created_at >= COALESCE($4::timestamptz, '-infinity')
-                             AND m.created_at < COALESCE($5::timestamptz, 'infinity')
-                             AND m.tableoid = $6::bigint::oid
-                             AND {predicate}
-                           LIMIT $3
-                           FOR UPDATE OF m SKIP LOCKED))
-                     RETURNING topic_id, partition_id, partition_offset"
-                ),
-                None,
-                &[
-                    topic_id.into(),
-                    age_ms.into(),
-                    RETENTION_DELETE_BATCH.into(),
-                    lower.into(),
-                    upper.into(),
-                    oid.into(),
-                ],
-            )?
+        DeleteTarget::Leaf(_) => (
+            format!(
+                "SELECT COALESCE(array_agg(s.ctid::text), '{{}}') AS ctids
+                 FROM (SELECT m.ctid FROM kafka.messages m
+                       WHERE m.created_at >= COALESCE($4::timestamptz, '-infinity')
+                         AND m.created_at < COALESCE($5::timestamptz, 'infinity')
+                         AND m.tableoid = $6::bigint::oid
+                         AND {predicate}
+                       LIMIT $3
+                       FOR UPDATE OF m SKIP LOCKED) s"
+            ),
+            "DELETE FROM kafka.messages
+             WHERE created_at >= COALESCE($2::timestamptz, '-infinity')
+               AND created_at < COALESCE($3::timestamptz, 'infinity')
+               AND tableoid = $4::bigint::oid
+               AND ctid = ANY ($1::text[]::tid[])
+             RETURNING topic_id, partition_id, partition_offset"
+                .to_string(),
+        ),
+    };
+    let lock_args: Vec<pgrx::datum::DatumWithOid> = match target {
+        DeleteTarget::Leaf(_) => vec![
+            topic_id.into(),
+            age_ms.into(),
+            RETENTION_DELETE_BATCH.into(),
+            lower.into(),
+            upper.into(),
+            oid.into(),
+        ],
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
+            vec![
+                topic_id.into(),
+                age_ms.into(),
+                RETENTION_DELETE_BATCH.into(),
+            ]
+        }
+    };
+    let ctids: Vec<Option<String>> = client
+        .update(&lock_sql, Some(1), &lock_args)?
+        .first()
+        .get_by_name("ctids")?
+        .unwrap_or_default();
+    if ctids.is_empty() {
+        return Ok(0);
+    }
+    let saved: Vec<Option<String>> = client
+        .update(TID_DELETE_SETTINGS_SQL, Some(1), &[])?
+        .first()
+        .get_by_name("saved")?
+        .unwrap_or_default();
+    let table = match target {
+        DeleteTarget::Leaf(_) => client.update(
+            &delete_sql,
+            None,
+            &[ctids.into(), lower.into(), upper.into(), oid.into()],
+        )?,
+        DeleteTarget::Unpartitioned | DeleteTarget::DefaultLeaf => {
+            client.update(&delete_sql, None, &[ctids.into()])?
         }
     };
     let mut deleted = 0u64;
@@ -1099,8 +1202,37 @@ fn delete_batch(
             affected.removed(topic_id, partition_id, offset.saturating_add(1));
         }
     }
+    client.update(RESTORE_TID_DELETE_SETTINGS_SQL, None, &[saved.into()])?;
     Ok(deleted)
 }
+
+/// The planner settings under which [`delete_batch`]'s delete can only be a TID scan
+/// (every other scan disabled, TID scans enabled whatever the session says), set
+/// transaction-locally; returns the five settings as they were (`saved`), in the order
+/// [`RESTORE_TID_DELETE_SETTINGS_SQL`] puts them back. The delete names the rows by
+/// ctid, so a TID scan reads exactly them; the settings make that the plan whatever
+/// the statistics say about the leaf.
+const TID_DELETE_SETTINGS_SQL: &str = "
+    SELECT ARRAY[o.tid, o.seq, o.bitmap, o.idx, o.ios] AS saved,
+           set_config('enable_tidscan', 'on', true),
+           set_config('enable_seqscan', 'off', true),
+           set_config('enable_bitmapscan', 'off', true),
+           set_config('enable_indexscan', 'off', true),
+           set_config('enable_indexonlyscan', 'off', true)
+    FROM (SELECT current_setting('enable_tidscan') AS tid,
+                 current_setting('enable_seqscan') AS seq,
+                 current_setting('enable_bitmapscan') AS bitmap,
+                 current_setting('enable_indexscan') AS idx,
+                 current_setting('enable_indexonlyscan') AS ios
+          OFFSET 0) o";
+
+/// Put back what [`TID_DELETE_SETTINGS_SQL`] read (`$1`, in its order).
+const RESTORE_TID_DELETE_SETTINGS_SQL: &str = "
+    SELECT set_config('enable_tidscan', $1[1], true),
+           set_config('enable_seqscan', $1[2], true),
+           set_config('enable_bitmapscan', $1[3], true),
+           set_config('enable_indexscan', $1[4], true),
+           set_config('enable_indexonlyscan', $1[5], true)";
 
 /// Drop the found leaves (each re-checked under its lock by
 /// `kafka.drop_message_partition`), one a turn, at most
@@ -1118,8 +1250,11 @@ fn delete_batch(
 /// ([`SweepPass::holds_rows`]): a transaction that holds ROW EXCLUSIVE on kafka.messages
 /// and waits for a row the pass deleted would otherwise close a cycle with it. The drops
 /// therefore come first in a pass; once a turn has deleted a row, the rest wait for the
-/// next pass. After the first drop the pass holds kafka.messages itself, so later drops
-/// of the pass do not wait for other sessions' locks on it. The log start of the dropped
+/// next pass ([`PostgresStore::run_retention_sweep`] runs the probes and the drops in a
+/// pass of their own before the other steps, so the drops the probes find come before
+/// any row delete). After the first drop the pass holds kafka.messages itself, so later
+/// drops of the pass do not wait for other sessions' locks on it; once a session waits
+/// for it, the pass ends ([`SweepPass::after_turn`]). The log start of the dropped
 /// leaf's partitions moves in the drop's own subtransaction
 /// ([`SweepPass::remove_and_advance`]): if a counter stays held, the drop is rolled back
 /// and the pass ends.
@@ -1174,6 +1309,7 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
         };
         if dropped {
             ctx.stats.dropped_partitions += 1;
+            ctx.dropped = true;
         }
         if lock_timed_out {
             self.lap.served(false);
@@ -1188,10 +1324,35 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
 }
 
 /// How long [`advance_log_start`] polls for a counter row another transaction holds
-/// before it gives up and the pass ends. A worker batch holds one for its group commit
-/// (tens of milliseconds); the poll outlasts that, but not a session that holds the row
-/// on purpose.
+/// before it gives up and the pass ends, or the session's `lock_timeout` when that is
+/// lower ([`held_counter_poll`]). A worker batch holds one for its group commit (tens of
+/// milliseconds); the poll outlasts that, but not a session that holds the row on
+/// purpose.
 const HELD_COUNTER_POLL: Duration = Duration::from_secs(1);
+
+/// [`HELD_COUNTER_POLL`], or the session's `lock_timeout` when that is set and lower.
+/// The worker's own pass runs with a short one: no worker request runs during it (one
+/// DB thread), so a counter it finds held is held by another session (an operator's
+/// transaction), and every client waits while the pass polls.
+fn held_counter_poll(client: &SpiClient<'_>) -> Result<Duration> {
+    let ms: i64 = client
+        .select(
+            "SELECT COALESCE((EXTRACT(EPOCH FROM
+                        NULLIF(current_setting('lock_timeout'), '0')::interval) * 1000)::int8,
+                    0) AS ms",
+            Some(1),
+            &[],
+        )?
+        .first()
+        .get_by_name("ms")?
+        .unwrap_or(0);
+    Ok(u64::try_from(ms)
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map_or(HELD_COUNTER_POLL, |ms| {
+            HELD_COUNTER_POLL.min(Duration::from_millis(ms))
+        }))
+}
 
 /// The pause between two attempts of the poll, in seconds (`pg_sleep`).
 const HELD_COUNTER_RETRY_PAUSE_S: f64 = 0.02;
@@ -1222,7 +1383,7 @@ const HELD_COUNTER_RETRY_PAUSE_S: f64 = 0.02;
 /// The locks never wait in the lock manager (see "Lock waits" on
 /// [`PostgresStore::run_retention_sweep`]): the free counters are locked `SKIP LOCKED`
 /// in one statement; each held one is polled with `FOR UPDATE NOWAIT`, one attempt every
-/// [`HELD_COUNTER_RETRY_PAUSE_S`] for at most [`HELD_COUNTER_POLL`], each attempt after
+/// [`HELD_COUNTER_RETRY_PAUSE_S`] for at most [`held_counter_poll`], each attempt after
 /// checking that no session waits for this transaction ([`someone_waits_for_us`]): a
 /// session that does may hold the counter until it gets a row of ours, so the poll stops
 /// and the pass commits. A partition without a counter row gets one from the upsert;
@@ -1259,7 +1420,13 @@ fn advance_log_start(client: &mut SpiClient<'_>, affected: AffectedPartitions) -
         None,
         &[topic_ids.clone().into(), partition_ids.clone().into()],
     )?)?;
-    let deadline = Instant::now() + HELD_COUNTER_POLL;
+    let held = present.difference(&free).count() > 0;
+    let poll = if held || present.len() != topic_ids.len() {
+        held_counter_poll(client)?
+    } else {
+        HELD_COUNTER_POLL
+    };
+    let deadline = Instant::now() + poll;
     for &(topic_id, partition_id) in present.difference(&free) {
         let locked = poll_without_waiting(client, deadline, |client| {
             client.update(

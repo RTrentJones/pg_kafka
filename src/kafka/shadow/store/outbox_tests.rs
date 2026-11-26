@@ -1208,14 +1208,115 @@ fn metrics_disabled_still_finalizes_rows() {
 fn outbox_failures_back_off_and_log_sparsely() {
     let h = async_harness(16);
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
-    assert!(h.store.note_outbox_tick(false), "first failure is logged");
+    assert!(
+        h.store.note_outbox_tick(TickOutcome::Failed),
+        "first failure is logged"
+    );
     assert!(!h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL), "paused");
-    assert!(h.store.note_outbox_tick(false), "2nd");
-    assert!(!h.store.note_outbox_tick(false), "3rd is not logged");
-    assert!(h.store.note_outbox_tick(false), "4th");
+    assert!(h.store.note_outbox_tick(TickOutcome::Failed), "2nd");
+    assert!(
+        !h.store.note_outbox_tick(TickOutcome::Failed),
+        "3rd is not logged"
+    );
+    assert!(h.store.note_outbox_tick(TickOutcome::Failed), "4th");
     // Success resets.
-    assert!(!h.store.note_outbox_tick(true));
+    assert!(!h.store.note_outbox_tick(TickOutcome::Ok));
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+/// A tick that ran out of a lock wait (another session holds a lock it needs) pauses
+/// one poll interval however often it happens in a row: an exponential backoff kept
+/// forwarding stopped up to 30 s after the holder was gone.
+#[test]
+fn lock_timeouts_do_not_grow_the_backoff() {
+    let h = async_harness(16);
+    for n in 1..=12u32 {
+        let logged = h.store.note_outbox_tick(TickOutcome::LockTimedOut);
+        assert_eq!(
+            logged,
+            n.is_power_of_two(),
+            "lock timeout {n} logged sparsely"
+        );
+        let until = lock(&h.store.outbox_failures)
+            .paused_until
+            .expect("a lock timeout pauses the tick");
+        assert!(
+            until <= Instant::now() + OUTBOX_POLL_INTERVAL,
+            "lock timeout {n} paused the tick past one poll interval"
+        );
+    }
+    assert_eq!(lock(&h.store.outbox_failures).consecutive, 0);
+    // Real failures still back off exponentially, lock timeouts beside them or not.
+    for _ in 0..4 {
+        h.store.note_outbox_tick(TickOutcome::Failed);
+    }
+    let until = lock(&h.store.outbox_failures).paused_until.unwrap();
+    assert!(until > Instant::now() + OUTBOX_POLL_INTERVAL * 7);
+    assert!(!h.store.note_outbox_tick(TickOutcome::Ok));
+    assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+/// Rows another transaction holds (an open replay) stop only their own partition, at
+/// the first held row, so its records still go out in order; the other partitions are
+/// claimed as usual. An ack of a held row is not applied: it stays queued with its row
+/// in flight (so the row is not claimed again) until a tick after the holder is gone.
+#[test]
+fn held_rows_stop_only_their_partition_and_their_acks_wait() {
+    let h = async_harness(64);
+    let a: Vec<RowKey> = (0..4).map(|o| RowKey::new(T, 0, o)).collect();
+    let b: Vec<RowKey> = (0..3).map(|o| RowKey::new(T, 1, o)).collect();
+    seed_rows(&h.store, &a);
+    seed_rows(&h.store, &b);
+    h.store.db().state().held.insert(RowKey::new(T, 0, 2));
+
+    h.store.poll_and_forward_outbox().unwrap();
+    let sent = sent_records(&h);
+    let by_partition = |p: i32| -> Vec<i64> {
+        sent.iter()
+            .filter(|r| r.row.partition_id == p)
+            .map(|r| r.row.local_offset)
+            .collect()
+    };
+    assert_eq!(
+        by_partition(0),
+        vec![0, 1],
+        "partition 0 cut at its held row 2"
+    );
+    assert_eq!(
+        by_partition(1),
+        vec![0, 1, 2],
+        "partition 1 claimed in full"
+    );
+
+    // Row 1 of partition 0 becomes held after its claim: its ack waits.
+    h.store.db().state().held.insert(RowKey::new(T, 0, 1));
+    h.acks.send(ok_ack(RowKey::new(T, 0, 0), 100)).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 0, 1), 101)).unwrap();
+    h.acks.send(err_ack(RowKey::new(T, 1, 0))).unwrap();
+    h.store.db().state().held.insert(RowKey::new(T, 1, 0));
+    h.acks.send(skipped_ack(RowKey::new(T, 1, 1))).unwrap();
+    h.store.db().state().held.insert(RowKey::new(T, 1, 1));
+    assert_eq!(drain(&h), 1, "only the free row's ack is applied");
+    let row = |p: i32, o: i64| h.store.db().row(RowKey::new(T, p, o)).unwrap();
+    assert_eq!(row(0, 0).external_offset, Some(100));
+    assert_eq!(row(0, 1).external_offset, None);
+    assert_eq!(row(1, 0).retry_count, 0);
+    assert!(row(1, 1).attempt_open, "the not-attempted ack waits too");
+    // The held rows are still in flight: nothing is claimed twice.
+    h.store.db().state().held.clear();
+    h.store.poll_and_forward_outbox().unwrap();
+    let again = offsets(&sent_records(&h));
+    assert_eq!(
+        again,
+        vec![2, 3],
+        "only the rows the hold stopped are claimed now"
+    );
+
+    // The holder is gone: the next tick applies the kept acks.
+    assert_eq!(drain(&h), 3);
+    assert_eq!(row(0, 1).external_offset, Some(101));
+    assert_eq!(row(1, 0).retry_count, 1);
+    assert!(!row(1, 1).attempt_open);
 }
 
 fn sync_harness() -> Harness {

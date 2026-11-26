@@ -10,6 +10,7 @@
 //! the frozen 0.0.0 install script (`sql/upgrade-test/pg_kafka--0.0.0.sql`) into the
 //! server's extension directory, exactly as `scripts/check-upgrade.sh` does.
 
+mod background_waits;
 mod debug_log;
 mod lifecycle;
 mod same_version;
@@ -208,6 +209,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         same_version::test_same_version_schema_warning_names_recreation: sequential,
         lifecycle::test_extension_ddl_loop_under_load: sequential,
         debug_log::test_pg_debug_logs_when_debug1_is_logged: sequential, // changes log_min_messages
+        background_waits::test_metrics_flush_skips_held_rows: sequential,
+        background_waits::test_worker_maintenance_waits_briefly_behind_a_reader: sequential,
     ]
 }
 

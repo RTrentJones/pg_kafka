@@ -291,12 +291,16 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   drop the leaf's `topic_id` foreign key, `kafka.topics` (`SHARE ROW EXCLUSIVE`). A worker
   transaction locks these two tables in either order (a group-commit batch can fetch from
   one topic and then auto-create another, whose produce upserts `kafka.topics`), so no fixed
-  order avoids a cycle with it. `kafka.lock_message_tables()` takes both (topics, then
-  messages) in attempts of at most 50 ms each, well below `deadlock_timeout`, in a
-  subtransaction whose failure releases both, and retries with a random pause until the
+  order avoids a cycle with it. `kafka.lock_message_tables(leaf)` takes them (topics, then
+  `ONLY kafka.messages`, then the leaf a drop removes and `kafka.messages_default`, whose
+  partition constraint both DDLs change) in attempts of at most 50 ms each, well below
+  `deadlock_timeout`, in a subtransaction whose failure releases them all, and retries with a random pause until the
   caller's `lock_timeout` (2 s in the partition functions) has passed. A worker transaction
   therefore waits at most one attempt, and one that holds a lock the DDL needs simply makes
-  it retry.
+  it retry. No other leaf is locked: a `LOCK TABLE` without `ONLY` locks every leaf, and a
+  `SHARE UPDATE EXCLUSIVE` holder on any of them (autovacuum, `VACUUM`, `ANALYZE`) made every
+  creation and drop time out while it ran. A vacuum of the leaf being dropped or of the
+  DEFAULT leaf still makes that DDL wait (and time out after its 2 s, retried next pass).
 * **Every lock wait in maintenance is bounded and handled.** A session that ran maintenance
   and stayed open makes the next pass skip with a WARNING instead of stalling it (and, for
   the worker, the whole broker). `drop_message_partition` takes its table locks inside a
@@ -331,7 +335,7 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   them (it inserts its records, then advances the counter, and commits), and only then
   reads the oldest surviving offset with a new snapshot, so the log start never passes a
   record the sweep did not delete (`kafka_test/src/part/sweep_races.rs`).
-* **A manual sweep never waits in the lock manager once it holds a row.** The pass is one
+* **A manual sweep never waits for a row lock once it holds a row.** The pass is one
   transaction and holds every row it deleted or locked until it commits, while the worker's
   group commit holds the rows of every request of a batch until one commit and the shadow
   forwarder's acks update outbox rows in arrival order. A sweep statement that waited for
@@ -349,10 +353,20 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   counter stays held, or a session waits for the sweep (it may hold the counter until it
   gets a row the sweep holds), the turn's delete is rolled back with it and the pass ends,
   so its commit frees what that session waits for. Drops queue for their table locks
-  (above), so a pass drops leaves only before it holds any row: the drops come first in a
-  pass, and once a turn has deleted a row the remaining ones wait for the next pass. A
-  worker statement can still wait for a row the sweep holds until the sweep commits, as
-  for any transaction, but never as the closing edge of a cycle.
+  (above), so a pass drops leaves only before it holds any row: the contents probes and the
+  drops run first, in a pass of their own (so the drops the probes find are done in the
+  same call, which matters for an on-demand call from a fresh session: what a pass found
+  dies with its session), and once a turn has deleted a row the remaining drops wait for
+  the next pass. After every turn that left the pass holding rows or a dropped leaf's
+  ACCESS EXCLUSIVE lock on `kafka.messages`, the pass checks `pg_locks` and ends (commits)
+  as soon as another session waits for one of its locks (other than the maintenance lock):
+  a worker statement waits for the sweep at most one turn (one bounded statement or one
+  drop) plus one counter poll, not the rest of the pass budget, and never as the closing
+  edge of a cycle. Relation locks are taken as by any statement: a turn's ROW EXCLUSIVE on
+  `kafka.messages` can queue behind DDL waiting for a stronger lock on it, and with a
+  worker batch also waiting for a row of the pass that is a three-way cycle, which the
+  deadlock detector breaks by failing one of them (run your own DDL as below, with a
+  `lock_timeout`).
 * **Maintenance locks the parent before any leaf.** Every worker statement on
   `kafka.messages` locks the parent first and then its leaves in bound order, and
   `ensure_message_partitions` takes `ACCESS SHARE` on `kafka.messages` before it reads
@@ -373,8 +387,11 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
 
 The worker runs as `pgkafka_worker`, which has no DDL rights. All partition DDL runs inside
 SECURITY DEFINER functions owned by the extension owner, each with `SET search_path = pg_catalog,
-pg_temp`, schema-qualified names and `lock_timeout = 2s` around the DDL (a lock that cannot be had
-in time is a WARNING and a retry next pass, never a stalled worker). EXECUTE is revoked from PUBLIC
+pg_temp`, schema-qualified names and lock waits of at most 2 s around the DDL, or the caller's
+`lock_timeout` when that is lower (the worker runs its own maintenance and sweep with 200 ms: the
+single DB thread answers every client, and an operator's open transaction or a vacuum is all it
+would wait for). A lock that cannot be had in time is a WARNING and a retry next pass, never a
+stalled worker. EXECUTE is revoked from PUBLIC
 and granted to `pgkafka_worker` only for `ensure_message_partitions`, `message_partition_contents`
 and `drop_message_partition`; `create_message_partition` and the lock helpers
 `try_maintenance_lock` and `lock_message_tables` are internal. Each function refuses any

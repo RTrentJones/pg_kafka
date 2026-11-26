@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 use super::batch::notify_transaction_ended;
 use super::network::Inbox;
 use super::txn::{
-    log_txn_error, run_maintenance_task, run_request_in_subtransaction, worker_transaction,
-    TaskNames, TxnError,
+    log_txn_error, run_in_subtransaction, run_maintenance_task, run_request_in_subtransaction,
+    worker_transaction, TaskNames, TxnError,
 };
 use crate::kafka::metrics::MetricsFlusher;
+use crate::kafka::shadow::store::TickOutcome;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::storage::postgres::ABORTED_MESSAGE_GRACE;
 use crate::kafka::storage::retention::MaintenanceLockWait;
@@ -71,6 +72,21 @@ impl Periodic {
     }
 }
 
+/// The `lock_timeout` of the worker's partition maintenance and retention sweep.
+///
+/// Lock waits: both run on the DB thread, so no worker request runs meanwhile and
+/// whatever they wait for is held by another session: the maintenance lock (an
+/// on-demand sweep or maintenance call, for as long as its caller's transaction stays
+/// open), a lock on kafka.messages or a leaf (an operator's open transaction that read
+/// kafka.messages, a long query, autovacuum on the leaf being dropped or on the DEFAULT
+/// leaf), an offset counter row (an operator's UPDATE). The partition functions wait
+/// up to 2 s for each of them by default, the counter poll 1 s, and every client waited
+/// with them; with this `lock_timeout` the functions and the poll wait at most this long
+/// (both take the caller's lock_timeout when it is lower), give up (a WARNING; the leaf
+/// is made or dropped by a later pass, and leaves are made two widths ahead), and the
+/// sweep's other statements fail its subtransaction instead of waiting 5 s.
+const MAINTENANCE_LOCK_TIMEOUT_MS: i32 = 200;
+
 /// ADR-001: one time-partition maintenance pass (`PostgresStore::ensure_time_partitions`):
 /// leaves for now and the next widths, and rows caught by kafka.messages_default moved
 /// into their leaf.
@@ -82,6 +98,7 @@ pub(super) fn run_partition_maintenance() {
         panic: "Partition maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(MAINTENANCE_LOCK_TIMEOUT_MS, "Partition maintenance");
         let store = PostgresStore::new();
         match store.ensure_time_partitions(crate::config::MESSAGE_PARTITION_MINUTES.get()) {
             Ok(created) if created > 0 => {
@@ -105,14 +122,26 @@ pub(super) fn load_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     }
 }
 
+/// The `lock_timeout` of the shadow part of a configuration reload.
+const SHADOW_RELOAD_LOCK_TIMEOUT_MS: i32 = 100;
+
 /// The shadow part of a configuration reload: the per-topic configuration, the
 /// primary/standby status, and the metrics flush.
+///
+/// Lock waits: the reload reads kafka.shadow_config and kafka.topics, every
+/// `pg_kafka.config_reload_interval_ms`, so it waits only for a session holding or
+/// queued for ACCESS EXCLUSIVE on them (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK TABLE,
+/// for as long as that session's transaction lasts). It runs with a transaction-local
+/// `lock_timeout` of [`SHADOW_RELOAD_LOCK_TIMEOUT_MS`] instead of waiting the worker's
+/// 5 s: such a lock rolls this reload back (a WARNING; the cache keeps the previous
+/// configuration) and the next one retries.
 pub(super) fn reload_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     let names = TaskNames {
         task: "Shadow config reload",
         panic: "Shadow config-reload/metrics maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(SHADOW_RELOAD_LOCK_TIMEOUT_MS, "Shadow config reload");
         match shadow_store.load_topic_config_from_db() {
             Ok(count) => pg_log!("Reloaded {count} shadow topic configurations"),
             Err(e) => pg_warning!("Failed to reload shadow config: {e:?}"),
@@ -140,59 +169,76 @@ const OUTBOX_TICK_LOCK_TIMEOUT_MS: i32 = 50;
 /// Lock waits: the tick's statements update outbox rows, which other sessions hold
 /// across statements: `kafka.replay_shadow_messages` holds every row it re-queues until
 /// its caller commits (seconds, or as long as an operator keeps the transaction open),
-/// and an on-demand retention sweep holds the rows it reaped until its pass commits. A
-/// tick waiting for one stopped every client of the DB thread for up to
-/// `pg_kafka.worker_lock_timeout_ms`, at every tick while the holder lasted, and its
-/// ack batch (rows held) followed by the claim (waiting) could close a cycle with a
-/// replay locking the same rows in another order. So the tick runs with a
+/// and an on-demand retention sweep holds the rows it reaped until its pass commits. The
+/// claim, the ack statements and the dead-flag sync never wait for such a row: they lock
+/// theirs `FOR UPDATE SKIP LOCKED`, the claim cuts each partition at its first held row
+/// (so a held row stops only its own partition, in order) and a skipped ack stays queued
+/// for a later tick (see `SpiShadowDb` in `shadow/outbox.rs`). What can still wait (a
+/// relation lock held by DDL, a `kafka.shadow_metrics` row an operator holds) runs with a
 /// transaction-local `lock_timeout` of [`OUTBOX_TICK_LOCK_TIMEOUT_MS`] (or the worker's,
 /// if lower): a wait that runs out fails the ack subtransaction or the poll like any
-/// ERROR, the tick backs off (`note_outbox_tick`), and the next one retries. A failed
-/// ack application keeps its acks (they stay in `unapplied_acks` until a tick that
-/// applied them commits) and their rows in flight, so nothing is lost or sent twice. A
-/// cycle cannot outlast the timeout: the tick's wait ends within it, long before the
-/// other session's deadlock check (deadlock_timeout, 1 s by default) for a wait it began
-/// after the tick took its rows.
+/// ERROR, and the next tick comes after the usual interval
+/// ([`TickOutcome::LockTimedOut`]: no exponential backoff, which kept forwarding stopped
+/// up to 30 s after the holder was gone). A failed ack application keeps its acks (they
+/// stay in `unapplied_acks` until a tick that applied them commits) and their rows in
+/// flight, so nothing is lost or sent twice. A cycle cannot outlast the timeout: the
+/// tick's wait ends within it, long before the other session's deadlock check
+/// (deadlock_timeout, 1 s by default) for a wait it began after the tick took its rows.
 pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
     let outcome = worker_transaction(|| {
-        bound_tick_lock_waits();
+        bound_lock_waits(OUTBOX_TICK_LOCK_TIMEOUT_MS, "Shadow outbox");
         // The acks are applied first (marking delivered rows done so the poll does not
         // re-dispatch them), in a subtransaction of their own, so a Postgres ERROR in
         // the poll does not roll their application back with it.
         let mut applied = 0;
         let mut failure: Option<String> = None;
-        if let Err(panic_msg) = run_request_in_subtransaction(|| {
+        let mut lock_timeouts_only = true;
+        if let Err(panic) = run_in_subtransaction(|| {
             applied = shadow_store.drain_forward_acks();
         }) {
-            failure = Some(format!("ack application failed, rolled back: {panic_msg}"));
+            lock_timeouts_only &= panic.lock_timeout;
+            failure = Some(format!(
+                "ack application failed, rolled back: {}",
+                panic.message
+            ));
         }
         let mut poll_error: Option<String> = None;
-        let result = run_request_in_subtransaction(|| {
-            match shadow_store.poll_and_forward_outbox() {
-                Ok(dispatched) => {
-                    if applied > 0 || dispatched > 0 {
-                        tracing::debug!(
-                            "Shadow outbox: {applied} ack(s) applied, {dispatched} row(s) dispatched"
-                        );
-                    }
+        let result = run_in_subtransaction(|| match shadow_store.poll_and_forward_outbox() {
+            Ok(dispatched) => {
+                if applied > 0 || dispatched > 0 {
+                    tracing::debug!(
+                        "Shadow outbox: {applied} ack(s) applied, {dispatched} row(s) dispatched"
+                    );
                 }
-                Err(e) => poll_error = Some(format!("poll failed: {e:?}")),
+            }
+            Err(e) => {
+                lock_timeouts_only = false;
+                poll_error = Some(format!("poll failed: {e:?}"));
             }
         });
-        if let Err(panic_msg) = result {
-            poll_error = Some(format!("poll failed, rolled back: {panic_msg}"));
+        if let Err(panic) = result {
+            lock_timeouts_only &= panic.lock_timeout;
+            poll_error = Some(format!("poll failed, rolled back: {}", panic.message));
         }
         if poll_error.is_some() {
             shadow_store.discard_staged_poll();
         }
         match failure.or(poll_error) {
+            Some(msg) if lock_timeouts_only => {
+                if shadow_store.note_outbox_tick(TickOutcome::LockTimedOut) {
+                    pg_warning!(
+                        "Shadow outbox {msg} (another session holds a lock the tick needs; \
+                         retrying every tick)"
+                    );
+                }
+            }
             Some(msg) => {
-                if shadow_store.note_outbox_tick(false) {
+                if shadow_store.note_outbox_tick(TickOutcome::Failed) {
                     pg_warning!("Shadow outbox {msg} (worker survived; backing off)");
                 }
             }
             None => {
-                shadow_store.note_outbox_tick(true);
+                shadow_store.note_outbox_tick(TickOutcome::Ok);
             }
         }
     });
@@ -204,23 +250,25 @@ pub(super) fn tick_shadow_outbox(shadow_store: &ShadowStore<PostgresStore>) {
     }
 }
 
-/// Set this transaction's `lock_timeout` to [`OUTBOX_TICK_LOCK_TIMEOUT_MS`], or to
+/// Set this transaction's `lock_timeout` to `bound_ms`, or to
 /// `pg_kafka.worker_lock_timeout_ms` when that is lower (0 there means no timeout).
-fn bound_tick_lock_waits() {
-    let ms = tick_lock_timeout_ms(crate::config::WORKER_LOCK_TIMEOUT_MS.get());
+/// `task` names the caller in the WARNING if it cannot be set.
+fn bound_lock_waits(bound_ms: i32, task: &str) {
+    let ms = bounded_lock_timeout_ms(crate::config::WORKER_LOCK_TIMEOUT_MS.get(), bound_ms);
     if let Err(e) = Spi::run(&format!(
         "SELECT set_config('lock_timeout', '{ms}ms', true)"
     )) {
-        pg_warning!("Shadow outbox: could not bound the tick's lock waits: {e}");
+        pg_warning!("{task}: could not bound its lock waits: {e}");
     }
 }
 
-/// The tick's lock_timeout for a worker lock_timeout of `worker_ms` (0: none).
-fn tick_lock_timeout_ms(worker_ms: i32) -> i32 {
+/// The lock_timeout of a background task bounded by `bound_ms`, for a worker
+/// lock_timeout of `worker_ms` (0: none).
+fn bounded_lock_timeout_ms(worker_ms: i32, bound_ms: i32) -> i32 {
     if worker_ms > 0 {
-        worker_ms.min(OUTBOX_TICK_LOCK_TIMEOUT_MS)
+        worker_ms.min(bound_ms)
     } else {
-        OUTBOX_TICK_LOCK_TIMEOUT_MS
+        bound_ms
     }
 }
 
@@ -231,11 +279,23 @@ pub(super) fn check_member_timeouts(coordinator: &GroupCoordinator) {
     }
 }
 
+/// The `lock_timeout` of a transaction-timeout check.
+const TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS: i32 = 100;
+
 /// Abort transactions that outlived their timeout. An abort ends transactions, so
 /// parked read_committed fetches are woken now (their LSO moved) rather than on the
 /// long-poll safety net. The shadow store keeps nothing for an open transaction (a
 /// commit enqueues its records into the outbox from kafka.messages), so an abort
 /// leaves it nothing to undo.
+///
+/// Lock waits: the abort updates the transaction's pending rows of kafka.messages, its
+/// producer and transaction rows and deletes its pending offsets; no worker request
+/// runs meanwhile (one DB thread), so only another session can hold them: an operator's
+/// open transaction, or an on-demand retention sweep (which never holds a pending
+/// message row, and holds producer or transaction rows only of producers idle for a
+/// week). The check runs with a transaction-local `lock_timeout` of
+/// [`TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS`], not the worker's 5 s: a wait that runs out
+/// rolls the whole check back (WARNING), and the next check, 10 s later, retries.
 pub(super) fn check_transaction_timeouts(
     shadow_store: &ShadowStore<PostgresStore>,
     notify_tx: &Sender<InternalNotification>,
@@ -246,6 +306,10 @@ pub(super) fn check_transaction_timeouts(
     };
     let mut aborted_any = false;
     let ran = run_maintenance_task(names, || {
+        bound_lock_waits(
+            TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
+            "Transaction-timeout check",
+        );
         match shadow_store.abort_timed_out_transactions(DEFAULT_TRANSACTION_TIMEOUT) {
             Ok(aborted) => {
                 aborted_any = !aborted.is_empty();
@@ -277,6 +341,7 @@ pub(super) fn run_retention_sweep() {
         panic: "Retention-sweep maintenance",
     };
     run_maintenance_task(names, || {
+        bound_lock_waits(MAINTENANCE_LOCK_TIMEOUT_MS, "Retention sweep");
         let store = PostgresStore::new();
         match store.run_retention_sweep(
             crate::config::MESSAGE_RETENTION_HOURS.get(),
@@ -306,14 +371,27 @@ pub(super) fn run_retention_sweep() {
     });
 }
 
+/// The `lock_timeout` of a broker-metrics flush.
+const METRICS_FLUSH_LOCK_TIMEOUT_MS: i32 = 10;
+
 /// Publish the broker request metrics to kafka.broker_api_stats / kafka.broker_gauges:
 /// at most once per second and only when they changed (one upsert statement, no SQL at
 /// all otherwise).
+///
+/// Lock waits: another session can hold those rows (an operator's `SELECT ... FOR
+/// UPDATE` or UPDATE in an open transaction) or the tables (VACUUM FULL, ALTER,
+/// TRUNCATE, or DDL queued behind a reader), for as long as it likes. The flush waited
+/// `pg_kafka.worker_lock_timeout_ms` for them once per interval, and every client of
+/// the DB thread with it. So it runs with a transaction-local `lock_timeout` of
+/// [`METRICS_FLUSH_LOCK_TIMEOUT_MS`]: a wait that runs out skips this interval's
+/// write, and the counters (cumulative, kept in memory) go out with the next flush
+/// that gets its locks ([`MetricsFlusher::finish`] keeps the published baseline).
 pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) {
     let Some(batch) = flusher.poll(inbox.requests.len(), inbox.liveness.len()) else {
         return;
     };
     let written = worker_transaction(|| {
+        bound_lock_waits(METRICS_FLUSH_LOCK_TIMEOUT_MS, "Broker metrics flush");
         let mut written = Ok(());
         let guard = run_request_in_subtransaction(|| {
             written = crate::kafka::metrics::write_batch(&batch);
@@ -333,13 +411,25 @@ pub(super) fn flush_broker_metrics(flusher: &mut MetricsFlusher, inbox: &Inbox) 
 
 #[cfg(test)]
 mod tests {
-    use super::{tick_lock_timeout_ms, OUTBOX_TICK_LOCK_TIMEOUT_MS};
+    use super::{
+        bounded_lock_timeout_ms, MAINTENANCE_LOCK_TIMEOUT_MS, METRICS_FLUSH_LOCK_TIMEOUT_MS,
+        OUTBOX_TICK_LOCK_TIMEOUT_MS, SHADOW_RELOAD_LOCK_TIMEOUT_MS,
+        TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
+    };
 
     #[test]
-    fn tick_lock_timeout_is_the_lower_bound_and_never_unbounded() {
-        assert_eq!(tick_lock_timeout_ms(5000), OUTBOX_TICK_LOCK_TIMEOUT_MS);
-        assert_eq!(tick_lock_timeout_ms(0), OUTBOX_TICK_LOCK_TIMEOUT_MS);
-        assert_eq!(tick_lock_timeout_ms(-1), OUTBOX_TICK_LOCK_TIMEOUT_MS);
-        assert_eq!(tick_lock_timeout_ms(10), 10);
+    fn background_lock_timeouts_are_the_lower_bound_and_never_unbounded() {
+        for bound in [
+            OUTBOX_TICK_LOCK_TIMEOUT_MS,
+            METRICS_FLUSH_LOCK_TIMEOUT_MS,
+            TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
+            MAINTENANCE_LOCK_TIMEOUT_MS,
+            SHADOW_RELOAD_LOCK_TIMEOUT_MS,
+        ] {
+            assert_eq!(bounded_lock_timeout_ms(5000, bound), bound);
+            assert_eq!(bounded_lock_timeout_ms(0, bound), bound);
+            assert_eq!(bounded_lock_timeout_ms(-1, bound), bound);
+            assert_eq!(bounded_lock_timeout_ms(1, bound), 1);
+        }
     }
 }

@@ -339,6 +339,24 @@ where
     R: Into<RequestOutcome>,
     F: FnOnce() -> R,
 {
+    run_in_subtransaction(f).map_err(|panic| panic.message)
+}
+
+/// A panic [`run_in_subtransaction`] caught and rolled back.
+#[derive(Debug)]
+pub(super) struct SubtransactionPanic {
+    pub(super) message: String,
+    /// It was a lock-not-available ERROR (a `lock_timeout` ran out, a NOWAIT lock).
+    pub(super) lock_timeout: bool,
+}
+
+/// [`run_request_in_subtransaction`], also telling whether a caught panic was a lock
+/// timeout.
+pub(super) fn run_in_subtransaction<R, F>(f: F) -> Result<RequestOutcome, SubtransactionPanic>
+where
+    R: Into<RequestOutcome>,
+    F: FnOnce() -> R,
+{
     // SAFETY: called inside a transaction on the main thread; this is the sequence
     // PL/pgSQL's exception blocks use, and every path restores the memory context and
     // resource owner saved here.
@@ -359,9 +377,13 @@ where
             }
             Err(payload) => {
                 let message = panic_payload_message(payload.as_ref());
+                let lock_timeout = is_lock_timeout(payload.as_ref());
                 pg_sys::FlushErrorState();
                 pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                Err(message)
+                Err(SubtransactionPanic {
+                    message,
+                    lock_timeout,
+                })
             }
         };
         pg_sys::MemoryContextSwitchTo(old_context);

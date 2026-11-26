@@ -77,6 +77,9 @@ pub struct State {
     /// The cap of every claim that ran the full dead-flag sync, in order. (The fake
     /// does not model the `dead` column: its claim filters on `retry_count`.)
     pub dead_flag_syncs: Vec<i64>,
+    /// Outbox rows another transaction holds (`kafka.replay_shadow_messages` open):
+    /// the claim and the acks skip them, as `FOR UPDATE SKIP LOCKED` does.
+    pub held: std::collections::HashSet<RowKey>,
     /// What `current_transaction_id` returns.
     pub current_xid: u32,
     /// Xids `transaction_committed` reports as committed.
@@ -357,10 +360,33 @@ impl ShadowDb for InMemoryShadowDb {
         let mut out = ClaimedRows::default();
         if claim.sync_dead_flags {
             s.dead_flag_syncs.push(claim.max_retries);
-            out.dead_flags_synced = true;
+            // A sync that skipped a held pending row is not done (the fake does not
+            // model `dead`, so any held pending row counts).
+            out.dead_flags_synced = !s.held.iter().any(|k| {
+                s.tracking
+                    .get(k)
+                    .is_some_and(|r| r.external_offset.is_none())
+            });
         }
         let candidates = s.claim_candidates(claim, now);
         let (due, share) = due_rows(&candidates, claim.batch_limit);
+        // Each partition is cut at its first held due row.
+        let mut first_held: HashMap<(i32, i32), i64> = HashMap::new();
+        for &(key, _) in &due {
+            if s.held.contains(&key) {
+                first_held
+                    .entry(key.partition())
+                    .or_insert(key.local_offset);
+            }
+        }
+        let due: Vec<(RowKey, bool)> = due
+            .into_iter()
+            .filter(|(key, _)| {
+                first_held
+                    .get(&key.partition())
+                    .is_none_or(|&h| key.local_offset < h)
+            })
+            .collect();
         for (key, restart) in due {
             s.open_attempt(key, now);
             // The JOIN with kafka.topics drops a row whose topic is gone.
@@ -372,7 +398,7 @@ impl ShadowDb for InMemoryShadowDb {
         Ok(out)
     }
 
-    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<usize> {
+    fn apply_delivered(&self, rows: &[(RowKey, i64)], metrics: bool) -> Result<AcksApplied> {
         let mut s = self.state();
         if s.fail_apply_delivered {
             return Err(KafkaError::Internal("apply_delivered failed".to_string()));
@@ -383,11 +409,17 @@ impl ShadowDb for InMemoryShadowDb {
         }
         let now = s.now_ms;
         let mut n = 0;
+        let mut held = Vec::new();
         for &(key, external_offset) in rows {
+            let is_held = s.held.contains(&key);
             let Some(row) = s.tracking.get_mut(&key) else {
                 continue;
             };
             if row.external_offset.is_some() {
+                continue;
+            }
+            if is_held {
+                held.push(key);
                 continue;
             }
             row.external_offset = Some(external_offset);
@@ -405,7 +437,10 @@ impl ShadowDb for InMemoryShadowDb {
                 );
             }
         }
-        Ok(n)
+        Ok(AcksApplied {
+            transitioned: n,
+            held,
+        })
     }
 
     fn apply_failed(
@@ -418,10 +453,15 @@ impl ShadowDb for InMemoryShadowDb {
         let now = s.now_ms;
         let mut out = FailedApplied::default();
         for (key, error) in rows {
+            let is_held = s.held.contains(key);
             let Some(row) = s.tracking.get_mut(key) else {
                 continue;
             };
             if row.external_offset.is_some() {
+                continue;
+            }
+            if is_held {
+                out.held.push(*key);
                 continue;
             }
             row.retry_count += 1;
@@ -442,16 +482,23 @@ impl ShadowDb for InMemoryShadowDb {
         Ok(out)
     }
 
-    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<()> {
+    fn apply_not_attempted(&self, rows: &[RowKey]) -> Result<AcksApplied> {
         let mut s = self.state();
+        let mut out = AcksApplied::default();
         for key in rows {
+            let is_held = s.held.contains(key);
             if let Some(row) = s.tracking.get_mut(key) {
                 if row.external_offset.is_none() {
-                    row.attempt_open = false;
+                    if is_held {
+                        out.held.push(*key);
+                    } else {
+                        row.attempt_open = false;
+                        out.transitioned += 1;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     fn load_topic_configs(&self) -> Option<Vec<TopicShadowConfig>> {
