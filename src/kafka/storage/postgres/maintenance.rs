@@ -359,30 +359,33 @@ impl PostgresStore {
             let mut orphaned = BatchStep::new(Batch::OrphanedShadowRows);
 
             let mut pass = SweepPass::new(client, pass_start, &mut found);
-            // Phase 1 order: the probes (reads only) first; terminal transactions before
-            // the producer prune (their foreign key on producer_ids keeps those
-            // producers); the orphaned outbox rows after the row deletes whose log starts
-            // they read; the drops last. A drop takes ACCESS EXCLUSIVE on kafka.messages
-            // until the pass commits, and the pass ends once a session has waited
-            // [`WAITER_GRACE`] for it ([`SweepPass::after_turn`]): under steady traffic
-            // that is soon after the first drop, so every other step takes its phase 1
-            // turn before it. A drop also runs after the pass holds rows, then gated on
-            // no session waiting for it and with one short lock attempt ([`DropStep`]),
-            // so the drops this pass's probes find are done in this pass (an on-demand
-            // pass in a fresh session has no later pass that remembers them).
-            retention::run_pass(
+            // The probes (reads only) lead (phase 0, their share of the budget), so the
+            // drops they find are known before any step holds a row. Phase 1 order: the
+            // drops first, while the pass holds no row: a pass that holds one (an offset
+            // counter of a partition it trimmed, which a Produce then waits for while it
+            // holds ROW EXCLUSIVE on kafka.messages) can take no drop's lock until it
+            // commits, and an on-demand pass in a fresh session has no later pass that
+            // remembers what its probes found. After the first drop the pass holds
+            // kafka.messages, so no worker statement waits for its rows and later drops
+            // keep their gate open ([`DropStep`]); the pass ends once a session has
+            // waited [`WAITER_GRACE`] for it ([`SweepPass::after_turn`]). Then terminal
+            // transactions before the producer prune (their foreign key on producer_ids
+            // keeps those producers); the orphaned outbox rows after the row deletes
+            // whose log starts they read.
+            retention::run_pass_led(
                 &mut [
                     &mut probes,
+                    &mut drops,
                     &mut aborted,
                     &mut expiry,
                     &mut terminal,
                     &mut producers,
                     &mut delivered,
                     &mut orphaned,
-                    &mut drops,
                 ],
                 &mut pass,
                 pass_budget(),
+                1,
             )?;
             Ok(Some(pass.stats))
         })

@@ -630,6 +630,126 @@ async fn second_drop_behind_leaf_holder() -> SendResult<()> {
     Ok(())
 }
 
+/// A pass that has trimmed a partition holds its offset counter until it commits, and a
+/// Produce to that partition waits for it while holding ROW EXCLUSIVE on kafka.messages:
+/// no drop can take its lock then. The drops came after the row deletes, and a drop of a
+/// pass that holds rows is refused while a session waits for one of them, so an on-demand
+/// pass in a fresh session under steady Produce traffic to a partition it trimmed dropped
+/// nothing its probes found, and the session took what they found with it.
+///
+/// Asserts: with an older leaf to trim (a topic with a 1 s window beside an
+/// infinite-retention one) and a newer leaf of only that topic, and a producer writing to
+/// the topic all along (its records expire too, row by row), one
+/// `pg_kafka_run_retention_sweep()` call from a fresh session drops the newer leaf, and
+/// calls from fresh sessions trim the older one.
+pub async fn test_fresh_session_sweep_drops_beside_produce_to_a_trimmed_partition() -> TestResult {
+    into_test_result(drops_beside_produce().await)
+}
+
+async fn drops_beside_produce() -> SendResult<()> {
+    use rdkafka::producer::FutureRecord;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    println!("=== Test: a fresh-session sweep drops beside Produce to a trimmed partition ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '60s'")
+        .await
+        .map_err(boxed)?;
+    drain_droppable_leaves(&db).await?;
+    let topic = unique("produce-trim");
+    let short = create_topic(&db, &topic, 1000).await?;
+    let forever = create_topic(&db, &unique("produce-trim-forever"), -1).await?;
+    let hour = random_hour(&db).await?;
+    let trimmed = hour_leaf(&db, hour).await?;
+    let droppable = hour_leaf(&db, hour + 1).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let produced = Arc::new(AtomicU64::new(0));
+    let producer = crate::worker::quick_producer("20000")?;
+    let traffic = {
+        let (stop, produced, topic) = (stop.clone(), produced.clone(), topic.clone());
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                producer
+                    .send(
+                        FutureRecord::<(), _>::to(&topic).payload("p").partition(0),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .map_err(|(e, _)| boxed(e))?;
+                produced.fetch_add(1, Ordering::Relaxed);
+            }
+            SendResult::Ok(())
+        })
+    };
+    let outcome = async {
+        fill_leaf(&db, short, hour, 0, 5).await?;
+        fill_leaf(&db, forever, hour, 0, 1).await?;
+        fill_leaf(&db, short, hour + 1, 5, 5).await?;
+        // The producer's records are older than the 1 s window when the sweep runs.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let before = produced.load(Ordering::Relaxed);
+        if before == 0 || traffic.is_finished() {
+            return Err("the producer did not produce".into());
+        }
+        println!("Step 1: {trimmed} to trim, {droppable} to drop; {before} records produced");
+
+        let fresh = session().await?;
+        let rows = fresh
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        let during = produced.load(Ordering::Relaxed) - before;
+        println!(
+            "Step 2: one call from a fresh session: {} expired row(s), {} leaf(s) dropped; \
+             {during} records produced meanwhile",
+            category(&rows, "expired_messages"),
+            category(&rows, "dropped_partitions")
+        );
+        if leaf_exists(&db, &droppable).await? {
+            return Err(format!(
+                "a fresh-session pass under Produce traffic to a trimmed partition did not \
+                 drop {droppable}, which its probes found"
+            )
+            .into());
+        }
+        let mut left: i64 = -1;
+        for _ in 0..10 {
+            let fresh = session().await?;
+            fresh
+                .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            left = db
+                .query_one(
+                    "SELECT count(*) FROM kafka.messages
+                     WHERE topic_id = $1 AND created_at < timestamptz '2002-01-01 00:00+00'",
+                    &[&short],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            if left == 0 {
+                break;
+            }
+        }
+        if left != 0 {
+            return Err(format!("{left} expired rows left in {trimmed}").into());
+        }
+        println!("Step 3: calls from fresh sessions trimmed {trimmed}");
+        SendResult::Ok(())
+    }
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let traffic = traffic.await.map_err(boxed)?;
+    force_drop(&db, &trimmed).await?;
+    force_drop(&db, &droppable).await?;
+    delete_topics(&db, &[short, forever]).await?;
+    outcome?;
+    traffic?;
+    println!("✅ the pass dropped the leaf beside a Produce waiting for its trimmed partition");
+    Ok(())
+}
+
 /// Rows the plan test keeps in the leaf beside the expired ones.
 const KEPT_ROWS: i64 = 100_000;
 /// Expired rows the plan test deletes from the leaf.
