@@ -16,7 +16,7 @@ use crate::kafka::{
     BrokerMetadata, GroupCoordinator, InternalNotification, KafkaRequest, KafkaResponse,
     KafkaStore, PostgresStore,
 };
-use crate::pg_warning;
+use crate::{pg_log, pg_warning};
 
 /// Most requests one top-level transaction carries (group commit).
 ///
@@ -484,7 +484,7 @@ fn log_batch_timing(batch_size: usize, total: Duration, handler_time: Duration) 
     let overhead_pct = (tx_overhead.as_micros() * 100)
         .checked_div(total.as_micros())
         .unwrap_or(0);
-    log!(
+    pg_log!(
         "TIMING: batch={} total={}us handler={}us tx_overhead={}us ({}%)",
         batch_size,
         total.as_micros(),

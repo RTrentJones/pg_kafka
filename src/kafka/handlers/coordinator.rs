@@ -566,8 +566,9 @@ pub fn handle_sync_group<F>(
 type MemberAssignmentBytes = (String, Vec<u8>);
 
 /// The assignments the server computes for `group_id` with the group's assignor over the
-/// topics its members subscribe to: `None` when there is nothing to assign (no member
-/// subscribes to a topic, or no subscribed topic exists); a `PolicyViolation` when the
+/// topics its members subscribe to: `None` when there is nothing to assign (the group's
+/// assignor is not one the server implements, no member subscribes to a topic, or no
+/// subscribed topic exists); a `PolicyViolation` when the
 /// computation would exceed [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`]; any other `Err`
 /// when it failed (the topics could not be read, the assignments not encoded), which the
 /// caller answers as retriable.
@@ -576,6 +577,15 @@ fn server_side_assignments(
     group_id: &str,
 ) -> Result<Option<Vec<MemberAssignmentBytes>>> {
     let coordinator = ctx.coordinator;
+    // An assignor the server does not implement: the leader's empty assignments are stored as
+    // sent (Kafka 3.7 computes nothing), and nothing is read.
+    if !coordinator.assigns_server_side(group_id) {
+        crate::pg_debug!(
+            "SyncGroup: group {} uses an assignor the server does not implement; storing the leader's empty assignments",
+            crate::kafka::coordinator::shown(group_id)
+        );
+        return Ok(None);
+    }
     let topics = coordinator.get_subscribed_topics(group_id)?;
     if topics.is_empty() {
         return Ok(None);
@@ -966,10 +976,16 @@ pub fn handle_list_groups(
 /// the coordinator holds as well, also those in a state the filter removes, so with a filter
 /// the list may stop short of `max_bytes`; it is then reported as cut all the same.
 ///
-/// Cost, for `h` held groups and `o` offset-only groups read: the store reads O(o) index
-/// entries, at most about `max_bytes / LISTED_GROUP_OVERHEAD` groups; time O(h + (h + o)
-/// log(h + o)) to filter and sort references to them; memory O(h + o) references, the ids
-/// read (at most about `max_bytes`) and a response of at most about `max_bytes`.
+/// Cost, for `o` offset-only groups read and `w` held groups walked: the store reads O(o)
+/// index entries, at most about `max_bytes / LISTED_GROUP_OVERHEAD` groups; the held groups
+/// are walked in id order from the coordinator's index ([`GroupMap::in_id_order`]) and merged
+/// with the offset ids, stopping at the cut, so time is O(o + w) plus the bytes of the ids
+/// compared and copied into the response; memory O(o) references, the ids read and a response
+/// of at most about `max_bytes`. Without a filter `w` is at most the listed groups plus one;
+/// with a filter it also counts the held groups the filter skips before the cut (Kafka walks
+/// every group).
+///
+/// [`GroupMap::in_id_order`]: crate::kafka::coordinator::GroupMap::in_id_order
 ///
 /// [`OffsetStore::list_offset_groups`]: crate::kafka::storage::OffsetStore::list_offset_groups
 pub fn list_groups(
@@ -1028,30 +1044,53 @@ fn list_groups_cut(
         .then(|| offset_groups.ids.last().map(String::as_bytes))
         .flatten();
     let within = |group_id: &str| horizon.is_none_or(|last| group_id.as_bytes() <= last);
-    let mut listed: Vec<(&str, &str, &'static str)> = coordinator_groups
-        .iter()
-        .filter(|(group_id, group)| wanted(group.state.as_str()) && within(group_id))
-        .map(|(group_id, group)| {
-            (
-                &**group_id,
-                group.protocol_type.as_deref().unwrap_or("consumer"),
-                group.state.as_str(),
-            )
-        })
-        .collect();
-    listed.extend(
-        offset_groups
-            .ids
-            .iter()
-            .filter(|group_id| !coordinator_groups.contains_key(group_id.as_str()))
-            .map(|group_id| (group_id.as_str(), "consumer", "Empty")),
-    );
-    // Byte order (`str`'s), the order the store reads the offset groups in.
-    listed.sort_unstable();
+
+    // Two id-ordered streams merged, walked only until the list is cut: the held groups (the
+    // coordinator's id index) and the offset-only ids (the store reads them in id order; a
+    // test double may not, so they are sorted if need be, at most about `max_bytes` of them).
+    // A held group shadows its offset id.
+    let mut offset_ids: Vec<&str> = offset_groups.ids.iter().map(String::as_str).collect();
+    if !offset_ids.is_sorted() {
+        offset_ids.sort_unstable();
+    }
+    offset_ids.dedup();
+    let mut held = coordinator_groups.in_id_order().peekable();
+    let mut offsets = offset_ids.into_iter().peekable();
+    let mut next_entry = || -> Option<(&str, Option<&ConsumerGroup>)> {
+        let take_held = match (held.peek(), offsets.peek()) {
+            (None, None) => return None,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some((h, _)), Some(o)) => h.as_bytes() <= o.as_bytes(),
+        };
+        if take_held {
+            let (id, group) = held.next()?;
+            crate::kafka::coordinator::count_work(1);
+            if offsets.peek() == Some(&&**id) {
+                offsets.next();
+            }
+            Some((&**id, Some(group)))
+        } else {
+            offsets.next().map(|id| (id, None))
+        }
+    };
 
     let mut listed_bytes = 0_usize;
     let mut cut = offset_groups.more;
-    for (group_id, protocol_type, state) in listed {
+    while let Some((group_id, group)) = next_entry() {
+        if !within(group_id) {
+            break;
+        }
+        let (protocol_type, state) = match group {
+            Some(g) => (
+                g.protocol_type.as_deref().unwrap_or("consumer"),
+                g.state.as_str(),
+            ),
+            None => ("consumer", "Empty"),
+        };
+        if !wanted(state) {
+            continue;
+        }
         let bytes = listed_group_bytes(group_id, protocol_type, state);
         if listed_bytes > 0 && listed_bytes.saturating_add(bytes) > max_bytes {
             cut = true;
@@ -1640,6 +1679,32 @@ mod tests {
         let again = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
         assert_eq!(again.error_code, ERROR_NONE);
         assert_eq!(again.assignment, synced.assignment);
+    }
+
+    /// A leader whose group selected an assignor the server does not implement, and that sends
+    /// empty assignments, gets NONE and an empty assignment, and the group becomes Stable: Kafka
+    /// 3.7 computes nothing server-side and stores what the leader sent. Answering the retriable
+    /// COORDINATOR_NOT_AVAILABLE instead made the leader rejoin and retry forever, each retry
+    /// logging the whole protocol name (up to 1 MiB). Nothing is read for it.
+    #[test]
+    fn test_sync_group_with_an_unknown_assignor_stores_the_empty_assignments() {
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(0);
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let name = format!("custom-{}", "x".repeat(100_000));
+        let join = take(&f.join_protocol("g", "", 30_000, &name, metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let empty = vec![SyncGroupAssignment {
+            member_id: member.clone(),
+            assignment: vec![],
+        }];
+        let synced = take_sync(&f.sync("g", &member, join.generation_id, empty)).unwrap();
+        assert_eq!(synced.error_code, ERROR_NONE);
+        assert!(synced.assignment.is_empty());
+        let group = f.coordinator.get_group_state("g").unwrap();
+        assert_eq!(group.state, crate::kafka::coordinator::GroupState::Stable);
     }
 
     /// A Postgres ERROR while the leader's SyncGroup reads its subscribed topics (a lock
@@ -2336,6 +2401,32 @@ mod tests {
         assert_eq!(every.groups.len(), 5);
         assert_eq!(every.groups[4].group_id.as_str(), empty);
         assert!(!cut);
+    }
+
+    /// ListGroups walks the held groups in id order only up to where the list is cut: 20 000
+    /// held groups, a bound that lists a few dozen of them, and the work is about what is listed
+    /// (it sorted every held group per request: 128 ms at a million groups, pipelined).
+    #[test]
+    fn test_list_groups_walks_held_groups_only_to_the_cut() {
+        let f = Fixture::new();
+        f.coordinator.add_empty_groups("held-", 20_000);
+        let max_bytes = 1_000;
+        for filter in [Vec::new(), vec!["Empty".to_string()]] {
+            crate::kafka::coordinator::take_work();
+            let (listed, cut) = list_groups_cut(&f.ctx(), &filter, max_bytes).unwrap();
+            let walked = crate::kafka::coordinator::take_work();
+            assert!(cut, "the list is cut");
+            let ids: Vec<&str> = listed.groups.iter().map(|g| g.group_id.as_str()).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(ids, sorted, "listed in byte order");
+            assert_eq!(ids[0], "held-0", "the first id in byte order");
+            assert!(
+                walked <= listed.groups.len() + 1,
+                "walked {walked} held groups to list {}",
+                listed.groups.len()
+            );
+        }
     }
 
     /// ListGroups is bounded by `max_bytes` whatever the group ids weigh: 40 held groups and

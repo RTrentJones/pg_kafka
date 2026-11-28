@@ -105,12 +105,24 @@ pub struct GroupMember {
 const ALLOCATION_OVERHEAD: usize = 48;
 
 /// What one protocol list holds in coordinator memory: each name and metadata, plus a
-/// fixed cost per allocation.
+/// fixed cost per allocation, and each name once more for the copy the group's
+/// supported-protocol counts may hold of it (`ConsumerGroup::supported_protocols`; a name is
+/// copied there only by the first member to list it, so this is an upper bound).
 pub(super) fn protocols_held_bytes(protocols: &[(String, Vec<u8>)]) -> usize {
     protocols
         .iter()
-        .map(|(name, metadata)| name.len() + metadata.len() + 2 * ALLOCATION_OVERHEAD)
+        .map(|(name, metadata)| 2 * name.len() + metadata.len() + 3 * ALLOCATION_OVERHEAD)
         .sum()
+}
+
+/// The distinct names of a protocol list, in its order (a client may repeat a name). O(p x
+/// len) time, O(p) memory.
+fn distinct_names(protocols: &[(String, Vec<u8>)]) -> impl Iterator<Item = &str> {
+    let mut seen = std::collections::HashSet::with_capacity(protocols.len());
+    protocols.iter().filter_map(move |(name, _)| {
+        super::count_work(name.len());
+        seen.insert(name.as_str()).then_some(name.as_str())
+    })
 }
 
 /// What a member with these fields holds in coordinator memory (counted against
@@ -282,6 +294,13 @@ pub struct ConsumerGroup {
     /// `GroupCoordinator::refuse_assignment`).
     pub(super) refused_assignment: Option<(i32, super::AssignmentRefusal)>,
 
+    /// How many members list each protocol name (Kafka's `supportedProtocols`), a member counted
+    /// once per distinct name: kept by [`Self::upsert_member`] and [`Self::take_member`], the
+    /// only changes to the member set, so a JoinGroup's protocol check and a completion's
+    /// vote look names up instead of scanning every member's list. Its copies of the names are
+    /// counted in each member's held bytes ([`protocols_held_bytes`]).
+    supported_protocols: HashMap<String, usize>,
+
     /// What the group held in coordinator memory when last counted ([`Self::recount`]): the
     /// coordinator recounts a group after every operation that changes it, and bounds the
     /// sum over all groups by `pg_kafka.max_group_memory`.
@@ -304,6 +323,7 @@ impl ConsumerGroup {
             sync_started_at: None,
             protocol_type: None,
             refused_assignment: None,
+            supported_protocols: HashMap::new(),
             held_bytes: 0,
         }
         .recounted()
@@ -445,6 +465,43 @@ impl ConsumerGroup {
         after
     }
 
+    /// Count a member's protocol names in [`Self::supported_protocols`]. O(p x len).
+    fn count_protocols(&mut self, protocols: &[(String, Vec<u8>)]) {
+        for name in distinct_names(protocols) {
+            if let Some(count) = self.supported_protocols.get_mut(name) {
+                *count += 1;
+            } else {
+                self.supported_protocols.insert(name.to_string(), 1);
+            }
+        }
+    }
+
+    /// Take a departing (or rejoining) member's names out of [`Self::supported_protocols`].
+    /// O(p x len).
+    fn uncount_protocols(&mut self, protocols: &[(String, Vec<u8>)]) {
+        for name in distinct_names(protocols) {
+            if let Some(count) = self.supported_protocols.get_mut(name) {
+                *count -= 1;
+                if *count == 0 {
+                    self.supported_protocols.remove(name);
+                }
+            }
+        }
+    }
+
+    /// The supported-protocol counts recomputed from the members, for tests that check the
+    /// running ones.
+    #[cfg(test)]
+    pub(super) fn supported_protocols_exact(&self) -> bool {
+        let mut counted: HashMap<String, usize> = HashMap::new();
+        for m in self.members.values() {
+            for name in distinct_names(&m.protocols) {
+                *counted.entry(name.to_string()).or_default() += 1;
+            }
+        }
+        counted == self.supported_protocols
+    }
+
     /// Kafka's `supportsProtocols` rule for a JoinGroup: joining an Empty group
     /// needs a non-empty protocol type and at least one protocol; joining a group with members
     /// needs the group's protocol type and at least one protocol every *other* member supports
@@ -463,18 +520,20 @@ impl ConsumerGroup {
         if !self.members.is_empty() && self.protocol_type.as_deref() != Some(protocol_type) {
             return false;
         }
-        let others: Vec<&GroupMember> = self
-            .members
-            .values()
-            .filter(|m| Some(m.member_id.as_str()) != member_id)
-            .collect();
-        if others.is_empty() {
+        // Kafka's rule over the supported-protocol counts, less the rejoining member's own
+        // (old) list. O((p_joiner + p_old) x name length).
+        let own: std::collections::HashSet<&str> = member_id
+            .and_then(|id| self.members.get(id))
+            .map_or_else(Default::default, |m| distinct_names(&m.protocols).collect());
+        let others = self.members.len()
+            - usize::from(member_id.is_some_and(|id| self.members.contains_key(id)));
+        if others == 0 {
             return true;
         }
         protocols.iter().any(|(name, _)| {
-            others
-                .iter()
-                .all(|m| m.protocols.iter().any(|(n, _)| n == name))
+            super::count_work(name.len());
+            let listing = self.supported_protocols.get(name).copied().unwrap_or(0);
+            listing - usize::from(own.contains(name.as_str())) == others
         })
     }
 
@@ -482,7 +541,12 @@ impl ConsumerGroup {
     /// assignment and its `awaiting_join` flag; the first member of a leaderless group
     /// becomes the leader.
     pub(super) fn upsert_member(&mut self, member_id: &str, params: &JoinGroupParams) {
-        let existing = self.members.get(member_id);
+        let existing = self.members.remove(member_id);
+        if let Some(old) = &existing {
+            self.uncount_protocols(&old.protocols);
+        }
+        self.count_protocols(&params.protocols);
+        let existing = existing.as_ref();
         let assignment = existing.and_then(|m| m.assignment.clone());
         let awaiting_join = existing.is_some_and(|m| m.awaiting_join);
         let awaiting_sync = existing.is_some_and(|m| m.awaiting_sync);
@@ -665,34 +729,38 @@ impl ConsumerGroup {
             .as_ref()
             .and_then(|l| self.members.get(l))
             .or_else(|| self.members.values().next())?;
-        let candidates: Vec<&String> = leader
-            .protocols
-            .iter()
-            .map(|(name, _)| name)
-            .filter(|name| {
-                self.members
-                    .values()
-                    .all(|m| m.protocols.iter().any(|(n, _)| n == *name))
-            })
-            .collect();
+        // The leader's names every member lists: a lookup each in the counts.
+        let everyone = self.members.len();
+        let mut candidates: Vec<&str> = Vec::new();
+        for name in distinct_names(&leader.protocols) {
+            if self.supported_protocols.get(name) == Some(&everyone) {
+                candidates.push(name);
+            }
+        }
         if candidates.is_empty() {
             return leader.protocols.first().map(|(name, _)| name.clone());
         }
-        let mut votes: HashMap<&String, usize> = HashMap::new();
+        // Each member's vote: the first of its names that is a candidate. One pass over every
+        // member's list, as Kafka's `vote`.
+        let mut votes: HashMap<&str, usize> = candidates.iter().map(|&name| (name, 0)).collect();
         for m in self.members.values() {
-            if let Some((name, _)) = m.protocols.iter().find(|(n, _)| candidates.contains(&n)) {
-                *votes.entry(name).or_default() += 1;
+            let vote = m.protocols.iter().find_map(|(name, _)| {
+                super::count_work(name.len());
+                votes.contains_key(name.as_str()).then_some(name.as_str())
+            });
+            if let Some(count) = vote.and_then(|name| votes.get_mut(name)) {
+                *count += 1;
             }
         }
         // Highest vote count; among equals, the earliest in the leader's preference.
-        let mut best: Option<(&String, usize)> = None;
-        for name in &candidates {
+        let mut best: Option<(&str, usize)> = None;
+        for name in candidates {
             let v = votes.get(name).copied().unwrap_or(0);
             if best.is_none_or(|(_, bv)| v > bv) {
                 best = Some((name, v));
             }
         }
-        best.map(|(name, _)| name.clone())
+        best.map(|(name, _)| name.to_string())
     }
 
     /// Remove a member from the group. A member whose JoinGroup is held gets
@@ -714,6 +782,7 @@ impl ConsumerGroup {
         let Some(removed) = self.members.remove(member_id) else {
             return false;
         };
+        self.uncount_protocols(&removed.protocols);
         // Clean up previous assignments for this member (memory leak fix)
         self.previous_assignments.remove(member_id);
 

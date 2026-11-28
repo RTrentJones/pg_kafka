@@ -2378,7 +2378,8 @@ impl Rng {
     }
 }
 
-/// The running totals and Empty-group index agree with a recount from every group.
+/// The running totals, the Empty-group index, the id index and every group's supported-protocol
+/// counts agree with a recount from every group.
 fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
     let groups = c.groups.read().unwrap();
     let (running, running_empty) = groups.running();
@@ -2388,6 +2389,13 @@ fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
         running_empty, counted_empty,
         "Empty index after step {step} (op {op})"
     );
+    assert!(groups.ids_exact(), "id index after step {step} (op {op})");
+    for (id, group) in groups.iter() {
+        assert!(
+            group.supported_protocols_exact(),
+            "supported-protocol counts of {id} after step {step} (op {op})"
+        );
+    }
 }
 
 #[test]
@@ -2519,4 +2527,107 @@ fn test_logged_ids_are_bounded() {
         "{logged}"
     );
     assert!(logged.ends_with("(201 bytes)"));
+}
+
+/// `len`-byte protocol names that differ only in their last bytes, so every comparison reads
+/// them whole.
+fn long_names(indexes: impl Iterator<Item = usize>, len: usize) -> Vec<(String, Vec<u8>)> {
+    indexes
+        .map(|i| (format!("{}{i:04}", "a".repeat(len - 4)), Vec::new()))
+        .collect()
+}
+
+#[test]
+fn test_protocol_checks_cost_what_the_joiner_sends() {
+    // The review's shape: members listing many long names (each member lacks a different
+    // one, and lists the rest in reverse), and a joiner whose every name is lacked by some
+    // member. Matching each joiner name against every member's list cost O(p_joiner x sum p x
+    // len) per JoinGroup (100-270 ms per 1 MiB JoinGroup), also for a refused one, and the same
+    // again when a join phase completed.
+    let (members, p, len) = (40, 16, 1_000);
+    let mut g = ConsumerGroup::new("g".to_string());
+    for k in 0..members {
+        let mut m = params("g", None, &[]);
+        m.protocols = long_names((0..p).rev().filter(|i| *i != k % p), len);
+        g.upsert_member(&format!("m{k:03}"), &m);
+    }
+    let joiner = long_names(0..p, len);
+    take_work();
+    assert!(!g.supports_protocols(None, "consumer", &joiner));
+    let refused = take_work();
+    // A known member's rejoin with its own list: its old list is looked at once.
+    assert!(!g.supports_protocols(Some("m000"), "consumer", &joiner));
+    let rejoined = take_work();
+    let joiner_bytes = p * len;
+    println!("refused join: {refused} units, rejoin: {rejoined} units");
+    assert!(
+        refused <= 2 * joiner_bytes,
+        "{refused} units for a {joiner_bytes}-byte joiner"
+    );
+    assert!(
+        rejoined <= 4 * joiner_bytes,
+        "{rejoined} units for a rejoin"
+    );
+
+    // Completion: every member supports the names but the last of each; the vote reads each
+    // member's list once.
+    let mut g = ConsumerGroup::new("g".to_string());
+    for k in 0..members {
+        let mut m = params("g", None, &[]);
+        m.protocols = long_names((0..p).rev(), len);
+        g.upsert_member(&format!("m{k:03}"), &m);
+    }
+    take_work();
+    let chosen = g.select_group_protocol();
+    let selected = take_work();
+    assert_eq!(
+        chosen,
+        Some(long_names(std::iter::once(p - 1), len)[0].0.clone())
+    );
+    let group_bytes = members * p * len;
+    println!("completion: {selected} units for {group_bytes} bytes of names");
+    assert!(
+        selected <= 3 * group_bytes,
+        "{selected} units at completion"
+    );
+}
+
+#[test]
+fn test_remove_group_looks_only_at_its_own_pending_answers() {
+    // The review's shape: DeleteGroups of many Empty groups while other groups hold many
+    // JoinGroups. Each removal scanned every held JoinGroup and parked SyncGroup (23 s for 50 000
+    // deletes beside 32 000 held), although an Empty group holds none.
+    let c = GroupCoordinator::new();
+    c.set_limits(10_000, 5_000);
+    let first = joined(&join(&c, "busy", None)).member_id;
+    let held: Vec<Slot> = (0..2_000).map(|_| join(&c, "busy", None)).collect();
+    assert!(held.iter().all(is_pending));
+    assert_eq!(c.pending_join_count(), 2_000);
+    c.add_empty_groups("empty-", 500);
+    take_work();
+    for i in 0..500 {
+        c.remove_group(&format!("empty-{i}"));
+    }
+    let work = take_work();
+    assert!(
+        work <= 500,
+        "{work} pending answers looked at for 500 Empty groups"
+    );
+    assert_eq!(
+        c.pending_join_count(),
+        2_000,
+        "the other group's answers are kept"
+    );
+
+    // A group removed with held answers (a non-empty group) still answers them.
+    let mut leaver = c.get_group_state("busy").unwrap().members.into_keys();
+    assert!(leaver.any(|m| m != first));
+    c.remove_group("busy");
+    assert_eq!(c.pending_join_count(), 0);
+    for slot in &held {
+        assert_eq!(
+            join_error_code(slot),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+    }
 }

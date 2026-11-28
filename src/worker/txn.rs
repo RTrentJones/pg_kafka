@@ -52,12 +52,21 @@ pub(super) fn schema_found_again() {
 
 /// Why a worker transaction did not run or commit.
 #[derive(Debug)]
-pub(super) enum TxnError {
+pub(crate) enum TxnError {
     /// The extension is gone (DROP EXTENSION); nothing ran.
     SchemaGone,
     /// A Postgres ERROR outside any request's subtransaction: taking the schema locks
     /// (lock_timeout), or the COMMIT itself. The transaction was rolled back.
     Failed { message: String, lock_timeout: bool },
+}
+
+impl std::fmt::Display for TxnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxnError::SchemaGone => f.write_str("the pg_kafka extension does not exist"),
+            TxnError::Failed { message, .. } => f.write_str(message),
+        }
+    }
 }
 
 impl TxnError {
@@ -186,9 +195,50 @@ fn is_lock_timeout(payload: &(dyn Any + Send)) -> bool {
     }
 }
 
+/// Discard a query cancel (`pg_cancel_backend()` on the worker) that is still pending when the
+/// worker starts a transaction.
+///
+/// The worker keeps Postgres's SIGINT handler (StatementCancelHandler): a cancel interrupts
+/// the statement or lock wait it arrives in, at its next CHECK_FOR_INTERRUPTS, inside the
+/// error boundary of [`guarded_transaction`] (that request or task fails and rolls back; the
+/// worker carries on). A cancel that arrives between transactions, or while a log message held
+/// interrupts ([`crate::pg_log!`]) after the transaction's last check, has no statement to
+/// cancel: like an idle backend's (ProcessInterrupts ignores a cancel while it reads a
+/// command), it is dropped here instead of failing whatever runs next. O(1).
+pub(crate) fn discard_idle_cancel() {
+    // SAFETY: a volatile store to this backend's flag, on its main thread; the signal
+    // handler only ever sets it.
+    unsafe { (&raw mut pg_sys::QueryCancelPending).write_volatile(0) };
+}
+
+/// Run `f` in a transaction of its own inside an error boundary: a Postgres ERROR in it (or
+/// in the commit), a cancel included, rolls it back and is returned as `Err(Failed)` instead
+/// of unwinding to the worker's entry point, which would exit the worker. A pending cancel
+/// from before the transaction is dropped first ([`discard_idle_cancel`]). Every transaction
+/// of the DB thread goes through here, most of them through [`worker_transaction`].
+///
+/// While it runs, SIGTERM interrupts the backend (see [`begin_db_work`]).
+pub(crate) fn guarded_transaction<R>(f: impl FnOnce() -> R) -> Result<R, TxnError> {
+    discard_idle_cancel();
+    begin_db_work();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        BackgroundWorker::transaction(AssertUnwindSafe(f))
+    }));
+    end_db_work();
+    result.map_err(|payload| {
+        let message = panic_payload_message(payload.as_ref());
+        let lock_timeout = is_lock_timeout(payload.as_ref());
+        recover_from_transaction_error();
+        TxnError::Failed {
+            message,
+            lock_timeout,
+        }
+    })
+}
+
 /// Run `f` in one worker transaction: start it, take the schema locks
-/// ([`lock_schema`]), run `f`, commit. Every database transaction of the main loop goes
-/// through here.
+/// ([`lock_schema`]), run `f`, commit. Every database transaction of the main loop that
+/// reads or writes the kafka schema goes through here.
 ///
 /// * `Err(SchemaGone)`: the extension does not exist; `f` did not run, and the main
 ///   loop is told to wait for the schema again.
@@ -196,29 +246,13 @@ fn is_lock_timeout(payload: &(dyn Any + Send)) -> bool {
 ///   is rolled back and the worker carries on, so the caller can still answer the
 ///   requests it took.
 ///
-/// While it runs, SIGTERM interrupts the backend (see [`begin_db_work`]).
+/// The transaction is a [`guarded_transaction`].
 pub(super) fn worker_transaction<R>(f: impl FnOnce() -> R) -> Result<R, TxnError> {
-    begin_db_work();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        BackgroundWorker::transaction(AssertUnwindSafe(|| lock_schema().then(f)))
-    }));
-    end_db_work();
-    match result {
-        Ok(Some(value)) => Ok(value),
-        Ok(None) => {
-            SCHEMA_LOST.store(true, Ordering::SeqCst);
-            Err(TxnError::SchemaGone)
-        }
-        Err(payload) => {
-            let message = panic_payload_message(payload.as_ref());
-            let lock_timeout = is_lock_timeout(payload.as_ref());
-            recover_from_transaction_error();
-            Err(TxnError::Failed {
-                message,
-                lock_timeout,
-            })
-        }
-    }
+    let Some(value) = guarded_transaction(|| lock_schema().then(f))? else {
+        SCHEMA_LOST.store(true, Ordering::SeqCst);
+        return Err(TxnError::SchemaGone);
+    };
+    Ok(value)
 }
 
 /// Log a worker transaction that did not run (`what` names the task). A missing

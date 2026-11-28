@@ -518,7 +518,7 @@ pub fn init() {
         GucContext::Sighup,
         GucFlags::default(),
     );
-    pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
+    crate::pg_log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 
 /// The value of a string GUC, `None` when unset.

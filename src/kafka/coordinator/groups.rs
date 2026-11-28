@@ -78,17 +78,21 @@ fn account(
     }
 }
 
-/// The coordinator's groups by id, with the running [`Totals`] and the Empty groups ordered by
-/// last activity. Reads go through `Deref` to the map; every change goes through
-/// [`Self::get_mut`] (or the other methods here), which keeps the totals exact.
+/// The coordinator's groups by id, with the running [`Totals`], the Empty groups ordered by
+/// last activity and every group id in byte order. Reads go through `Deref` to the map; every
+/// change goes through [`Self::get_mut`] (or the other methods here), which keeps the totals
+/// and both indexes exact.
 ///
-/// Memory: one `Arc` and an `Instant` per Empty group in the index (bounded by
-/// `pg_kafka.max_consumer_groups`), no copy of any id.
+/// Memory: one `Arc` and an `Instant` per Empty group in the activity index, and one `Arc` per
+/// group in the id index (both bounded by `pg_kafka.max_consumer_groups`), no copy of any id.
 #[derive(Debug, Default)]
 pub struct GroupMap {
     map: HashMap<Arc<str>, ConsumerGroup>,
     totals: Totals,
     empty: EmptyIndex,
+    /// Every group id in byte order (`str`'s `Ord`), for ListGroups. A group's id never
+    /// changes, so only [`Self::insert`] and [`Self::remove`] touch it.
+    ids: BTreeSet<Arc<str>>,
 }
 
 /// A group borrowed for a change: on drop, the totals move by what the change did. O(log
@@ -172,12 +176,14 @@ impl GroupMap {
             None,
             Some(Snapshot::of(&group)),
         );
+        self.ids.insert(Arc::clone(&key));
         self.map.insert(key, group);
     }
 
     /// Remove the group `group_id`.
     pub fn remove(&mut self, group_id: &str) -> Option<ConsumerGroup> {
         let (key, group) = self.map.remove_entry(group_id)?;
+        self.ids.remove(&key);
         account(
             &mut self.totals,
             &mut self.empty,
@@ -226,6 +232,15 @@ impl GroupMap {
         self.empty.iter().map(|(_, key)| key)
     }
 
+    /// Every group with its id, in byte order of the ids. O(1) to start, then O(1) amortized
+    /// per group walked plus its hash lookup: a caller that stops early pays only for what it
+    /// walked.
+    pub fn in_id_order(&self) -> impl Iterator<Item = (&Arc<str>, &ConsumerGroup)> + '_ {
+        self.ids
+            .iter()
+            .filter_map(|key| self.map.get(&**key).map(|group| (key, group)))
+    }
+
     /// What all groups hold.
     pub(super) fn total_held(&self) -> usize {
         self.totals.held
@@ -244,6 +259,12 @@ impl GroupMap {
     /// How many groups are not Empty.
     pub(super) fn non_empty_count(&self) -> usize {
         self.totals.non_empty
+    }
+
+    /// Whether the id index holds exactly the map's ids, for tests.
+    #[cfg(test)]
+    pub(super) fn ids_exact(&self) -> bool {
+        self.ids.len() == self.map.len() && self.ids.iter().all(|k| self.map.contains_key(k))
     }
 
     /// The totals and Empty index recomputed from every group, for tests that check the

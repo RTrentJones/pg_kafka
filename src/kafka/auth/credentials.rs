@@ -139,7 +139,7 @@ fn fake_params(mechanism: ScramMechanism) -> FakeCredentialParams {
         }
     }
     let params = read_fake_params(mechanism).unwrap_or_else(|e| {
-        pgrx::debug1!(
+        crate::pg_debug!(
             "pg_kafka: fake SASL credential parameters unavailable: {}",
             e
         );

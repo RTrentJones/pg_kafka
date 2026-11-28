@@ -489,6 +489,10 @@ algorithm; see "Server-side sticky assignment" below)
   Kafka 3.7 (`resetAndPropagateAssignmentError`) answers every parked member with the error and
   starts a new join phase, so every member rejoins and the generation moves; here the leader's
   retry completes the same generation without a rebalance.
+- ✅ A leader that sends empty assignments for a group whose selected protocol is not one of
+  the server's assignors (range, roundrobin, sticky, cooperative-sticky) has them stored as
+  sent and gets NONE, as Kafka 3.7 stores whatever the leader sends: every member gets an
+  empty assignment and the group is Stable. Nothing is read for it.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 
@@ -556,7 +560,8 @@ algorithm; see "Server-side sticky assignment" below)
   `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST; and
   `pg_kafka.max_group_memory` (default 128MB) bounds the member state of all groups together
   (member ids, protocols and their metadata, assignments and the copies kept for the sticky
-  assignor; a group's copies of its leader's id and of its protocol name count as the longest
+  assignor; each protocol name counts twice, for the copy the group's per-name member counts
+  may keep, as Kafka's `supportedProtocols`; a group's copies of its leader's id and of its protocol name count as the longest
   id and protocol name of its members, since a leave can make any of them the leader or
   complete a join phase with any of their protocols, and nothing is refused then). Kafka has no such bound (its heap is the limit), but without it the caps above
   still allowed about 1e14 bytes, held up to the 30-minute session timeout by members that

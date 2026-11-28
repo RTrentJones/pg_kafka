@@ -1238,6 +1238,17 @@ impl GroupCoordinator {
             .and_then(|groups| groups.get(group_id).map(|g| g.members.is_empty()))
     }
 
+    /// Hold `count` Empty groups named `{prefix}{i}`, for tests that need many groups without
+    /// a JoinGroup each.
+    #[cfg(test)]
+    pub fn add_empty_groups(&self, prefix: &str, count: usize) {
+        let mut groups = self.groups.write().unwrap();
+        for i in 0..count {
+            let id = format!("{prefix}{i}");
+            groups.insert(id.clone(), ConsumerGroup::new(id));
+        }
+    }
+
     /// A snapshot of a group's state, for tests: it copies the whole group.
     #[cfg(test)]
     pub fn get_group_state(&self, group_id: &str) -> Option<ConsumerGroup> {
@@ -1245,6 +1256,18 @@ impl GroupCoordinator {
             .read()
             .ok()
             .and_then(|groups| groups.get(group_id).cloned())
+    }
+
+    /// Whether the server can compute assignments for `group_id`'s selected protocol (or
+    /// "range" if none is selected): one of its assignors ([`server_assignor_known`]). A leader
+    /// of a group with another assignor that sends empty assignments has them stored as sent,
+    /// as Kafka 3.7 stores what the leader sends. O(1) plus the name's length.
+    pub fn assigns_server_side(&self, group_id: &str) -> bool {
+        self.groups.read().is_ok_and(|groups| {
+            groups.get(group_id).is_some_and(|g| {
+                server_assignor_known(g.protocol_name.as_deref().unwrap_or("range"))
+            })
+        })
     }
 
     /// Compute partition assignments for all members in a group
@@ -1308,7 +1331,7 @@ impl GroupCoordinator {
         pg_log!(
             "Computed assignments for group {} using strategy {}: {} members",
             shown(group_id),
-            strategy_name,
+            shown(strategy_name),
             encoded.len()
         );
 
@@ -1371,34 +1394,43 @@ impl GroupCoordinator {
     ///
     /// This is used by DeleteGroups to remove empty groups.
     /// Should only be called after confirming the group has no active members; any
-    /// JoinGroup still held for the group is answered UNKNOWN_MEMBER_ID.
+    /// JoinGroup still held for the group (or SyncGroup parked) is answered UNKNOWN_MEMBER_ID.
+    ///
+    /// The held answers are found from the removed group's own members (an entry of
+    /// `pending_joins` / `pending_syncs` exists exactly while its member's `awaiting_join` /
+    /// `awaiting_sync` is set): O(members of the group) lookups, none for an Empty group,
+    /// whatever the other groups hold.
     pub fn remove_group(&self, group_id: &str) {
         let mut orphaned_joins: Vec<(String, JoinResponder)> = Vec::new();
         let mut orphaned_syncs: Vec<(String, SyncResponder)> = Vec::new();
         if let Ok(mut groups) = self.groups.write() {
-            groups.remove(group_id);
+            let Some(group) = groups.remove(group_id) else {
+                return;
+            };
             pg_log!("Removed group '{}' from coordinator", shown(group_id));
-            let mut pending = self.lock_pending();
-            let keys: Vec<(String, String)> = pending
-                .keys()
-                .filter(|(g, _)| g == group_id)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(r) = pending.remove(&key) {
-                    orphaned_joins.push((key.1, r));
+            let waiting = || {
+                group
+                    .members
+                    .values()
+                    .filter(|m| m.awaiting_join || m.awaiting_sync)
+            };
+            if waiting().next().is_some() {
+                let mut joins = self.lock_pending();
+                for m in waiting().filter(|m| m.awaiting_join) {
+                    count_work(1);
+                    let key = (group_id.to_string(), m.member_id.clone());
+                    if let Some(r) = joins.remove(&key) {
+                        orphaned_joins.push((key.1, r));
+                    }
                 }
-            }
-            drop(pending);
-            let mut pending = self.lock_pending_syncs();
-            let keys: Vec<(String, String)> = pending
-                .keys()
-                .filter(|(g, _)| g == group_id)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(r) = pending.remove(&key) {
-                    orphaned_syncs.push((key.1, r));
+                drop(joins);
+                let mut syncs = self.lock_pending_syncs();
+                for m in waiting().filter(|m| m.awaiting_sync) {
+                    count_work(1);
+                    let key = (group_id.to_string(), m.member_id.clone());
+                    if let Some(r) = syncs.remove(&key) {
+                        orphaned_syncs.push((key.1, r));
+                    }
                 }
             }
         }
@@ -1516,6 +1548,14 @@ fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {
     Ok(())
 }
 
+/// Whether [`run_assignor`] has an assignor for `strategy_name`. O(name length); a name too
+/// long to be one of the assignors is not lowercased.
+fn server_assignor_known(strategy_name: &str) -> bool {
+    const LONGEST_NAME: usize = "cooperative-sticky".len();
+    strategy_name.contains("sticky")
+        || (strategy_name.len() <= LONGEST_NAME * 4 && create_strategy(strategy_name).is_some())
+}
+
 /// Run the assignor `strategy_name` over `input` for `group_id`. The sticky assignor starts
 /// from `previous`, the group's previous assignments, and is refused with POLICY_VIOLATION
 /// once it has spent `sticky_steps` steps: how long its balancing runs depends on how the
@@ -1545,8 +1585,12 @@ fn run_assignor(
                 }
             });
     }
+    // The caller asks `assigns_server_side` first, so this is not reached for an unknown name.
     let strategy = create_strategy(strategy_name).ok_or_else(|| {
-        KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
+        KafkaError::Internal(format!(
+            "Unknown assignment strategy: {}",
+            shown(strategy_name)
+        ))
     })?;
     Ok(strategy.assign(input))
 }
@@ -1680,6 +1724,29 @@ fn current_member<'a>(
         ));
     }
     Ok(group)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Work units [`count_work`] recorded on this thread, for the cost tests.
+    static WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record `units` of work (groups walked, pending answers looked at, protocol-name bytes
+/// compared or hashed) for the cost tests, which bound it by what a request names; nothing
+/// outside unit tests.
+#[inline]
+pub(crate) fn count_work(units: usize) {
+    #[cfg(test)]
+    WORK.with(|w| w.set(w.get().saturating_add(units)));
+    #[cfg(not(test))]
+    let _ = units;
+}
+
+/// The work [`count_work`] recorded on this thread since the last call, for the cost tests.
+#[cfg(test)]
+pub(crate) fn take_work() -> usize {
+    WORK.with(|w| w.replace(0))
 }
 
 /// The most bytes of a client string (a group or member id) a log line carries.

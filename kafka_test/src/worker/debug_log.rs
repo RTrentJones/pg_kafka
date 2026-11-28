@@ -31,6 +31,41 @@ async fn heartbeat(group: &str) -> SendResult<()> {
     Ok(())
 }
 
+/// Resets `log_min_messages` when dropped, unless [`Self::reset`] already did: a failed
+/// assertion while DEBUG1 is logged must not leave every later test logging at DEBUG1. Drop
+/// cannot await, so it resets from a thread with a runtime of its own.
+struct LogLevelReset {
+    armed: bool,
+}
+
+impl LogLevelReset {
+    async fn reset(mut self, db: &tokio_postgres::Client) -> SendResult<()> {
+        self.armed = false;
+        set_guc(db, "log_min_messages", None).await.map(|_| ())
+    }
+}
+
+impl Drop for LogLevelReset {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let reset = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(boxed)?;
+            runtime.block_on(async {
+                let db = session().await?;
+                set_guc(&db, "log_min_messages", None).await.map(|_| ())
+            })
+        });
+        if !matches!(reset.join(), Ok(Ok(()))) {
+            eprintln!("could not reset log_min_messages; run ALTER SYSTEM RESET log_min_messages");
+        }
+    }
+}
+
 /// Wait until the log since `from` contains `needle`, for up to `within`.
 async fn logged(log: &ServerLog, from: u64, needle: &str, within: Duration) -> bool {
     let deadline = Instant::now() + within;
@@ -56,6 +91,7 @@ async fn debug_lines() -> SendResult<()> {
     let quiet = unique("debug-off");
     println!("Step 1: log_min_messages = debug1, a Heartbeat for {loud}...");
     let from = log.end();
+    let guard = LogLevelReset { armed: true };
     set_guc(&db, "log_min_messages", Some("debug1")).await?;
     let sent = heartbeat(&loud).await;
     let found = logged(
@@ -65,7 +101,7 @@ async fn debug_lines() -> SendResult<()> {
         Duration::from_secs(5),
     )
     .await;
-    set_guc(&db, "log_min_messages", None).await?;
+    guard.reset(&db).await?;
     sent?;
     assert!(found, "the handler's pg_debug! line is in the server log");
 
