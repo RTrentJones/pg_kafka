@@ -1,3 +1,17 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-print-in-tests = true
+# Every log line goes through crate::pg_log! / pg_warning! / pg_debug!, which hold interrupts
+# around the ereport: pgrx's macros call errfinish without an error boundary, and its
+# CHECK_FOR_INTERRUPTS would raise a pending cancel as an ERROR that longjmps past Rust frames.
+disallowed-macros = [
+    { path = "pgrx_pg_sys::log", reason = "use crate::pg_log!, which holds interrupts" },
+    { path = "pgrx_pg_sys::warning", reason = "use crate::pg_warning!, which holds interrupts" },
+    { path = "pgrx_pg_sys::notice", reason = "use crate::pg_log!, which holds interrupts" },
+    { path = "pgrx_pg_sys::info", reason = "use crate::pg_log!, which holds interrupts" },
+    { path = "pgrx_pg_sys::debug1", reason = "use crate::pg_debug!, which holds interrupts" },
+    { path = "pgrx_pg_sys::debug2", reason = "use crate::pg_debug!, which holds interrupts" },
+    { path = "pgrx_pg_sys::debug3", reason = "use crate::pg_debug!, which holds interrupts" },
+    { path = "pgrx_pg_sys::debug4", reason = "use crate::pg_debug!, which holds interrupts" },
+    { path = "pgrx_pg_sys::debug5", reason = "use crate::pg_debug!, which holds interrupts" },
+]

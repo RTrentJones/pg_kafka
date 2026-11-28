@@ -75,7 +75,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // SPI needs the database where CREATE EXTENSION was run.
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
     if !wait_for_schema(&config.database) {
-        log!("Shutdown signal received while waiting for schema");
+        pg_log!("Shutdown signal received while waiting for schema");
         exit_for_restart();
     }
     // Drop from the bootstrap superuser to pg_kafka.run_as_role.
@@ -96,7 +96,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         run_partition_maintenance();
     }
 
-    log!(
+    pg_log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
         config.host,
@@ -157,7 +157,7 @@ fn new_shadow_store(config: &Config) -> ShadowStore<PostgresStore> {
     let shadow_store = ShadowStore::new(PostgresStore::new());
     shadow_store.set_license_key(&config.shadow_license_key);
     if config.shadow_mode_enabled {
-        log!(
+        pg_log!(
             "Shadow mode enabled, configured to forward to: {}",
             config.shadow_bootstrap_servers
         );
@@ -253,7 +253,7 @@ impl MainLoop<'_> {
     /// from starting.
     fn exit_if_stopping(&self) {
         if sigterm_received() {
-            log!("pg_kafka background worker shutting down");
+            pg_log!("pg_kafka background worker shutting down");
             shutdown_and_exit(
                 &self.network.shutdown_tx,
                 &self.network.handle,

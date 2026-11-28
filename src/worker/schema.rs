@@ -2,18 +2,19 @@
 //! re-deciding the worker's role when it changes, and detecting a schema older than the
 //! library (not served until `ALTER EXTENSION pg_kafka UPDATE`).
 
-use pgrx::bgworkers::BackgroundWorker;
 use pgrx::prelude::*;
-use pgrx::{spi, Spi};
+use pgrx::Spi;
 use std::time::{Duration, Instant};
 
 use super::batch::reject_request;
 use super::lifecycle::{postmaster_alive, sigterm_received};
 use super::network::Inbox;
-use super::txn::{schema_found_again, schema_lost, worker_transaction};
+use super::txn::{
+    discard_idle_cancel, guarded_transaction, schema_found_again, schema_lost, worker_transaction,
+};
 use super::RECV_TIMEOUT;
 use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
-use crate::pg_warning;
+use crate::{pg_log, pg_warning};
 
 /// How often the schema waits re-check for the kafka schema.
 const SCHEMA_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -158,7 +159,7 @@ pub(super) fn refresh_schema_state(state: &mut SchemaState) -> bool {
     }
     if now.is_current() {
         if !state.version.is_empty() {
-            log!(
+            pg_log!(
                 "pg_kafka schema is now version {}: serving Kafka clients",
                 now.version
             );
@@ -200,10 +201,18 @@ fn unserved_schema_warning(state: &SchemaState, library: &str) -> String {
 }
 
 /// Go back to the bootstrap superuser (`SET ROLE NONE`), in a transaction of its own.
-fn reset_worker_role() -> Result<(), spi::Error> {
-    BackgroundWorker::transaction(|| {
-        Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")
-    })
+fn reset_worker_role() -> Result<(), String> {
+    match guarded_transaction(|| Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// [`verify_schema`] in a transaction of its own; a Postgres ERROR in it (a cancel) counts as
+/// a failed check.
+fn verify_schema_now(database: &str) -> Result<(), String> {
+    guarded_transaction(|| verify_schema(database)).unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Re-decide the worker's role after the schema changed under it (DROP + CREATE
@@ -268,10 +277,10 @@ pub(super) fn wait_for_schema(database: &str) -> bool {
     let mut last_logged: Option<Duration> = None;
     loop {
         // SPI calls require a transaction context
-        match BackgroundWorker::transaction(|| verify_schema(database)) {
+        match verify_schema_now(database) {
             Ok(()) => {
                 if last_logged.is_some() {
-                    log!(
+                    pg_log!(
                         "pg_kafka schema found after waiting {} ms",
                         waited.as_millis()
                     );
@@ -280,21 +289,55 @@ pub(super) fn wait_for_schema(database: &str) -> bool {
             }
             Err(e) => {
                 if schema_wait_should_log(waited, last_logged) {
-                    log!(
+                    pg_log!(
                         "Waiting for pg_kafka schema (run 'CREATE EXTENSION pg_kafka' in database '{database}'): {e}"
                     );
                     last_logged = Some(waited);
                 }
             }
         }
-        // wait_latch returns false once SIGTERM has been received (it consumes the
-        // flag) or the postmaster has died. Our own SIGTERM handler replaces pgrx's
-        // flag, so check ours too.
-        if !BackgroundWorker::wait_latch(Some(SCHEMA_CHECK_INTERVAL)) || sigterm_received() {
+        if !wait_on_latch(SCHEMA_CHECK_INTERVAL) {
             return false;
         }
         waited = waited.saturating_add(SCHEMA_CHECK_INTERVAL);
     }
+}
+
+/// Sleep on the process latch for up to `timeout` (SIGTERM and SIGHUP set it). Returns false
+/// once SIGTERM has been received or the postmaster has died.
+///
+/// pgrx's `BackgroundWorker::wait_latch` runs CHECK_FOR_INTERRUPTS after the wait, outside any
+/// error boundary: a cancel (`pg_cancel_backend()`) arriving during the wait would raise its
+/// ERROR there and exit the worker. Here the wait has no statement to cancel, so a cancel is
+/// dropped ([`discard_idle_cancel`]); other interrupts are served at the next transaction's
+/// checks. O(1).
+fn wait_on_latch(timeout: Duration) -> bool {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "the WL_* flags are small bit constants"
+    )]
+    let events = (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32;
+    let timeout_ms =
+        std::ffi::c_long::try_from(timeout.as_millis()).unwrap_or(std::ffi::c_long::MAX);
+    // SAFETY: on the main thread, with MyLatch set (signal handlers are attached before the
+    // worker waits); WaitLatch and ResetLatch raise no error for these arguments.
+    let rc = unsafe {
+        let rc = pg_sys::WaitLatch(
+            pg_sys::MyLatch,
+            events,
+            timeout_ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+        rc
+    };
+    discard_idle_cancel();
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "WL_POSTMASTER_DEATH is a small bit constant"
+    )]
+    let postmaster_died = rc & pg_sys::WL_POSTMASTER_DEATH as i32 != 0;
+    !postmaster_died && !sigterm_received()
 }
 
 /// Keep the listener up while the worker cannot serve: answer every request with a
@@ -336,7 +379,7 @@ fn refuse_requests_until(inbox: &Inbox, refusal: &str, mut ready: impl FnMut() -
 /// the schema exists again. Returns true once it exists, false on SIGTERM or
 /// postmaster death (the caller's loop handles those).
 pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bool {
-    log!(
+    pg_log!(
         "pg_kafka extension is gone from database '{database}' (DROP EXTENSION?); answering requests \
          with KAFKA_STORAGE_ERROR until CREATE EXTENSION pg_kafka"
     );
@@ -346,11 +389,11 @@ pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bo
     let _ = reset_worker_role();
     let started = Instant::now();
     refuse_requests_until(inbox, "pg_kafka schema is missing", || {
-        if BackgroundWorker::transaction(|| verify_schema(database)).is_err() {
+        if verify_schema_now(database).is_err() {
             return false;
         }
         schema_found_again();
-        log!(
+        pg_log!(
             "pg_kafka schema found again after {} ms; resuming",
             started.elapsed().as_millis()
         );

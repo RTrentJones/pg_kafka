@@ -1,18 +1,20 @@
 //! The worker's startup switch to its least-privilege role.
 
 use crate::kafka::storage::privileges::{self, RoleDecision};
-use pgrx::bgworkers::BackgroundWorker;
+use crate::worker::txn::guarded_transaction;
+use crate::{pg_log, pg_warning};
 use pgrx::prelude::*;
 use pgrx::spi::SpiError;
 
 /// Whether `role` exists, and the privileges (`object:PRIVILEGE`) it lacks.
-fn probe_role(role: &str) -> Result<(bool, Vec<String>), SpiError> {
+fn probe_role(role: &str) -> Result<(bool, Vec<String>), String> {
     let checks = privileges::required_worker_privileges();
     let kinds: Vec<&str> = checks.iter().map(|c| c.kind.as_str()).collect();
     let objects: Vec<&str> = checks.iter().map(|c| c.object).collect();
     let privs: Vec<&str> = checks.iter().map(|c| c.privilege).collect();
-    BackgroundWorker::transaction(move || {
-        Spi::connect(move |client| {
+    // A Postgres ERROR in it (a cancel) is a failed check, not a worker exit.
+    let probed = guarded_transaction(move || {
+        Spi::connect(move |client| -> Result<(bool, Vec<String>), SpiError> {
             let exists: bool = client
                 .select(
                     "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1) AS e",
@@ -53,7 +55,11 @@ fn probe_role(role: &str) -> Result<(bool, Vec<String>), SpiError> {
             }
             Ok((true, missing))
         })
-    })
+    });
+    match probed {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// 0.1.0 least privilege: switch the background worker from the bootstrap superuser
@@ -69,14 +75,16 @@ fn probe_role(role: &str) -> Result<(bool, Vec<String>), SpiError> {
 /// partially upgraded install keeps working instead of failing requests at runtime.
 pub fn apply_worker_role() {
     let Some(role) = privileges::configured_run_as_role() else {
-        log!("pg_kafka: pg_kafka.run_as_role is empty; the worker keeps the bootstrap superuser");
+        pg_log!(
+            "pg_kafka: pg_kafka.run_as_role is empty; the worker keeps the bootstrap superuser"
+        );
         return;
     };
 
     let decision = match probe_role(&role) {
         Ok((exists, missing)) => privileges::decide_role_switch(Some(role), exists, missing),
         Err(e) => {
-            warning!(
+            pg_warning!(
                 "pg_kafka: could not check pg_kafka.run_as_role '{role}' ({e}); the worker keeps the bootstrap superuser"
             );
             return;
@@ -85,25 +93,24 @@ pub fn apply_worker_role() {
 
     match decision {
         RoleDecision::Switch(role) => {
-            let switched: Result<(), spi::Error> =
-                BackgroundWorker::transaction(|| {
-                    Spi::run_with_args(
-                        "SELECT pg_catalog.set_config('role', $1, false)",
-                        &[role.as_str().into()],
-                    )
-                });
-            match switched {
-                Ok(()) => log!("pg_kafka: background worker now runs as role '{role}'"),
-                Err(e) => warning!(
+            let switched = guarded_transaction(|| {
+                Spi::run_with_args(
+                    "SELECT pg_catalog.set_config('role', $1, false)",
+                    &[role.as_str().into()],
+                )
+            });
+            match switched.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+                Ok(()) => pg_log!("pg_kafka: background worker now runs as role '{role}'"),
+                Err(e) => pg_warning!(
                     "pg_kafka: could not switch to role '{role}' ({e}); the worker keeps the bootstrap superuser"
                 ),
             }
         }
-        RoleDecision::MissingRole(role) => warning!(
+        RoleDecision::MissingRole(role) => pg_warning!(
             "pg_kafka: pg_kafka.run_as_role '{role}' does not exist (run ALTER EXTENSION pg_kafka UPDATE, \
              or set pg_kafka.run_as_role = '' to silence this); the worker keeps the bootstrap superuser"
         ),
-        RoleDecision::MissingPrivileges(role, missing) => warning!(
+        RoleDecision::MissingPrivileges(role, missing) => pg_warning!(
             "pg_kafka: pg_kafka.run_as_role '{role}' lacks {}; the worker keeps the bootstrap superuser",
             missing.join(", ")
         ),

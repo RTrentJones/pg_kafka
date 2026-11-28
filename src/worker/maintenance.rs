@@ -113,7 +113,7 @@ pub(super) fn run_partition_maintenance() {
 /// (Re)load the per-topic shadow configuration into the ShadowStore cache.
 pub(super) fn load_shadow_config(shadow_store: &ShadowStore<PostgresStore>) {
     let outcome = worker_transaction(|| match shadow_store.load_topic_config_from_db() {
-        Ok(count) if count > 0 => log!("Loaded {count} shadow topic configurations"),
+        Ok(count) if count > 0 => pg_log!("Loaded {count} shadow topic configurations"),
         Ok(_) => {}
         Err(e) => pg_warning!("Failed to load shadow config: {e:?}"),
     });
