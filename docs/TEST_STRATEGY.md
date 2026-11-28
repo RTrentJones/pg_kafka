@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->985<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
-| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest wire-format invariants and boundary tests |
-| E2E Tests | <!--gen:tests-e2e-->408<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1403<!--/gen-->** | |
+| Unit Tests | <!--gen:tests-unit-->1181<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest round-trips of the kafka-protocol crate's header and field encodings that pg_kafka relies on (no pg_kafka code) |
+| E2E Tests | <!--gen:tests-e2e-->517<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1708<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -27,7 +27,7 @@ cargo test --features pg14 --test property_tests -- --list | grep -c ': test$'  
 cd kafka_test && cargo run --release -- --list                                 # E2E per category
 ```
 
-`kafka_test`'s own runner unit tests (`cargo test --bin kafka_test` in `kafka_test/`)
+`kafka_test`'s own runner unit tests (`cargo test --lib --bin kafka_test` in `kafka_test/`)
 are not counted above.
 
 ---
@@ -40,7 +40,7 @@ module):
 | Module | Focus |
 |--------|-------|
 | Shadow Mode (`kafka/shadow/`) | External forwarding, SASL/SSL settings, licensing, routing, outbox, config |
-| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests.rs`) |
+| Handler Logic (`kafka/handlers/`) | Every API handler, mostly with MockKafkaStore (`handlers/tests/`) |
 | Protocol (`kafka/protocol/`) | Decoding, encoding, RecordBatch framing, proptest fuzz harnesses |
 | Assignment (`kafka/assignment/`) | Range, RoundRobin, Sticky algorithms, subscription/assignment codecs |
 | Storage Layer (`kafka/storage/`) | Store role traits, types, mock verification, retention and partition-drop planning, privileges |
@@ -66,29 +66,29 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 <!--gen:tests-e2e-categories-->
 | Category | Tests |
 |----------|-------|
-| `admin` | 21 |
+| `admin` | 25 |
 | `producer` | 8 |
-| `consumer` | 5 |
-| `offset_management` | 13 |
-| `consumer_group` | 18 |
+| `consumer` | 7 |
+| `offset_management` | 19 |
+| `consumer_group` | 35 |
 | `partition` | 9 |
-| `error_paths` | 70 |
+| `error_paths` | 74 |
 | `edge_cases` | 13 |
-| `concurrent` | 15 |
+| `concurrent` | 16 |
 | `negative` | 5 |
 | `performance` | 7 |
-| `long_poll` | 11 |
+| `long_poll` | 15 |
 | `compression` | 10 |
-| `idempotent` | 16 |
-| `transaction` | 35 |
-| `shadow` | 53 |
+| `idempotent` | 17 |
+| `transaction` | 45 |
+| `shadow` | 60 |
 | `metadata` | 5 |
-| `protocol` | 5 |
-| `part` | 14 |
+| `protocol` | 6 |
+| `part` | 45 |
 | `auth` | 16 |
-| `network` | 53 |
-| `worker` | 6 |
-| **Total** | **408** |
+| `network` | 68 |
+| `worker` | 12 |
+| **Total** | **517** |
 <!--/gen-->
 
 ### Running E2E Tests
@@ -207,14 +207,15 @@ pg_kafka uses `PGC_POSTMASTER` GUC variables that must be defined before Postgre
 |-----|--------------|
 | `Lint & Format` | `cargo fmt --check` and clippy `-D warnings` on both crates (pg14), the QA-1 policy check (`.github/scripts/check-coverage-policy.sh`) |
 | `Test Suite` | unit tests under `cargo llvm-cov` (pg14, uploaded to Codecov; includes the API-docs drift test), property tests |
-| `Build kafka_test` | the E2E runner, once, shared with the `e2e` legs as an artifact |
+| `Build kafka_test` | the E2E runner, once (`cargo build --release --locked` in `kafka_test/`), shared with the `e2e` legs as an artifact; the runner's own unit tests (`cargo test --release --locked --lib --bin kafka_test`; those that need a database are `#[ignore]`d) |
 | `E2E pg14` … `E2E pg18` | per major: clippy, unit and property tests, `cargo pgrx install` into that PostgreSQL, `scripts/ci-pg.sh start`, the functional E2E suite (`--exclude performance --exclude shadow`, 25 min step timeout), `scripts/check-upgrade.sh`, the generated GUC reference check; pg14 also the test-count check and the `shadow` and `performance` categories |
 | `Interop` | `interop/run-java-checks.sh` and `interop/diff/run.py` on PG18 against Kafka 3.7 (see above) |
 | `Security Audit`, `Verify Lockfile`, `SPI change needs E2E test` | `cargo audit` + `cargo deny`; `--locked` checks; the QA-1 guard (pull requests) |
 
-The functional suite took 4.5 minutes (223 tests, including the auth category's listener
-restarts) on PG18 in a 4-core sandbox; the step timeout leaves about a 5x margin and the job
-timeout (90 min) covers a cold build.
+The functional suite (every category but performance and shadow, including the auth, network
+and worker categories' listener restarts; 365 tests at the time) took 9.6 minutes on PG16 in a 4-core sandbox shared with two other builds; the 25-minute
+step timeout leaves about a 2.5x margin over that loaded run, and the job timeout (100 min)
+covers a cold build, the suite and, on pg14, the shadow and performance categories.
 
 ---
 
@@ -224,8 +225,8 @@ timeout (90 min) covers a cold build.
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Project Coverage | 80%+ | Testable code only |
-| Patch Coverage | 90%+ | New/modified code must be well-tested |
+| Project Coverage | 80% (gate 78%) | Testable code only; `codecov.yml` threshold 2% |
+| Patch Coverage | 90% (gate 85%) | New/modified code; threshold 5% |
 | Handler Tests | 95%+ | Aspirational; not enforced by `codecov.yml` |
 
 ### Generating Coverage Reports
@@ -249,8 +250,8 @@ cargo llvm-cov --lib --features pg14 --fail-under-lines 80
 
 Coverage is enforced in CI via **Codecov's commit status checks** (configured in `codecov.yml`): the
 `test` job uploads `lcov.info` (produced by `cargo llvm-cov --lib`), and Codecov computes the two statuses
-that gate the PR — `codecov/project` (target 80%, threshold 2%) and `codecov/patch` (target 90% on
-changed lines, threshold 5%). The
+that gate the PR — `codecov/project` (target 80%, threshold 2%: passes at 78% and above) and
+`codecov/patch` (target 90% on changed lines, threshold 5%: passes at 85% and above). The
 workflow itself does **not** run a local `--fail-under-lines` gate; the Codecov statuses are the
 enforcement.
 
@@ -276,5 +277,5 @@ See `docs/PGRX_TESTING_GUIDE.md` for the full testing strategy.
 ---
 
 **Test Count:** see [Test Summary](#test-summary)
-**Coverage Target:** 80%+ (testable code)
+**Coverage Target:** 80% of testable code (gated at 78%)
 **All Tests Passing:** ✅

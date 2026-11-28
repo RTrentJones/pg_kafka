@@ -17,6 +17,14 @@ use tokio::net::TcpStream;
 /// for up to `pg_kafka.worker_lock_timeout_ms` (5 s by default) per request batch.
 const SCHEMA_LOCK_KEY: i64 = 8_099_547_369_649_367_906;
 
+/// The broker's pre-auth deadline (`PRE_AUTH_TIMEOUT` in `src/kafka/listener/connection.rs`):
+/// a connection not authenticated this long after accept is closed.
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How soon after connecting a connection whose lookup is unanswered must be closed: the
+/// pre-auth deadline plus the test host's scheduling.
+const CLOSED_WITHIN: Duration = Duration::from_secs(PRE_AUTH_TIMEOUT.as_secs() + 2);
+
 /// With the DB thread stalled in a lock wait, a pre-auth ApiVersions on the SASL listener
 /// is still answered at once, while one on the PLAINTEXT listener (served by the DB
 /// thread) waits.
@@ -90,6 +98,12 @@ fn plain_authenticate() -> SaslAuthenticateRequest {
 /// credentials. The connection is closed without a SaslAuthenticate response, which
 /// every client retries, not answered SASL_AUTHENTICATION_FAILED, which the Java client
 /// treats as fatal. Once the DB thread serves again the same login succeeds.
+///
+/// The lookup fails after one lock wait when the DB thread takes it first, but it can be
+/// queued behind other work the stalled DB thread is doing (another client's request, a
+/// metrics flush or other maintenance, each waiting out its own lock timeout); then the
+/// pre-auth deadline, [`PRE_AUTH_TIMEOUT`] from accept, closes the connection. Either way
+/// it closes unanswered by then.
 pub async fn test_auth_unanswered_lookup_closes_without_failing_authentication() -> TestResult {
     println!("=== Test: an unanswered credential lookup closes, it does not fail auth ===\n");
     auth_env().await?;
@@ -98,13 +112,13 @@ pub async fn test_auth_unanswered_lookup_closes_without_failing_authentication()
     db.execute("SELECT pg_advisory_lock($1)", &[&SCHEMA_LOCK_KEY])
         .await?;
     let outcome = async {
+        let started = Instant::now();
         let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;
         let hs = roundtrip(&mut s, 1, 1, &plain_handshake()).await?;
         assert_eq!(hs.error_code, 0, "the handshake needs no lookup");
         send(&mut s, 2, 2, &plain_authenticate()).await?;
-        let started = Instant::now();
-        let answer = tokio::time::timeout(
-            Duration::from_secs(9),
+        let answer = tokio::time::timeout_at(
+            (started + CLOSED_WITHIN).into(),
             recv::<SaslAuthenticateRequest>(&mut s, 2, 2),
         )
         .await;
@@ -120,19 +134,22 @@ pub async fn test_auth_unanswered_lookup_closes_without_failing_authentication()
     match answer {
         Err(_) => {
             return Err(format!(
-                "SaslAuthenticate neither answered nor closed within 9 s ({elapsed:?})"
+                "SaslAuthenticate neither answered nor closed within {CLOSED_WITHIN:?} of \
+                 connecting ({elapsed:?})"
             )
             .into())
         }
         Ok(Ok(response)) => {
             return Err(format!(
-                "the unanswered lookup was answered with error {} after {elapsed:?}; \
+                "the unanswered lookup was answered with error {} {elapsed:?} after connecting; \
                  expected the connection to close without an answer",
                 response.error_code
             )
             .into())
         }
-        Ok(Err(e)) => println!("Step 1: closed without an answer after {elapsed:?} ({e})"),
+        Ok(Err(e)) => {
+            println!("Step 1: closed without an answer {elapsed:?} after connecting ({e})");
+        }
     }
 
     let mut s = TcpStream::connect(("127.0.0.1", SASL_PLAINTEXT_PORT)).await?;

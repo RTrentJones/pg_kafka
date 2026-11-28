@@ -17,6 +17,13 @@
 //!    - Partitions that no longer exist
 //! 3. Collect orphaned partitions (from departed members or removed assignments)
 //! 4. Distribute orphaned partitions to members with fewest assignments
+//! 5. Move partitions from members at least two heavier than the lightest subscriber of
+//!    their topic to that subscriber
+//!
+//! This is not the general assign algorithm of Kafka's StickyAssignor (which places the
+//! partitions with the fewest possible consumers first), so for the same input the two can
+//! choose different, equally balanced assignments (docs/PROTOCOL_DEVIATIONS.md). Every step
+//! is counted against a budget ([`StickyStrategy::assign_within`]).
 //!
 //! # Example
 //!
@@ -31,8 +38,9 @@
 //! - **Pros**: Minimizes rebalance overhead, reduces consumer disruption
 //! - **Cons**: More complex, requires tracking previous state
 
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
 use super::{AssignmentInput, AssignmentOutput, AssignmentStrategy};
 use crate::kafka::assignment::MemberAssignment;
@@ -63,16 +71,20 @@ impl StickyStrategy {
 
     /// Keep each remaining member's previous partitions that still exist, that it still
     /// subscribes to and that no other member kept first; returns the kept partitions.
-    fn keep_previous_assignments(
+    ///
+    /// Cost: a binary search of each previous member's id among the members (about
+    /// `log m` id comparisons), a map lookup of each previous topic name, and one set
+    /// insertion per previous partition; the member is then its index, so no id is hashed
+    /// or compared per topic or partition.
+    fn keep_previous_assignments<'a>(
         &self,
-        input: &AssignmentInput,
-        all_partitions: &HashSet<(String, i32)>,
-        result: &mut AssignmentOutput,
-    ) -> HashSet<(String, i32)> {
+        input: &'a AssignmentInput,
+        result: &mut [MemberAssignment],
+    ) -> HashSet<(&'a str, i32)> {
         let mut assigned = HashSet::new();
         for (member_id, prev_assignment) in &self.previous_assignments {
             // Departed members keep nothing.
-            let Some(subscription) = input.subscriptions.get(member_id) else {
+            let Some(member) = input.member_index(member_id) else {
                 continue;
             };
             for (topic, prev_partitions) in &prev_assignment.topic_partitions {
@@ -80,32 +92,101 @@ impl StickyStrategy {
                 // topic is looked up once, and only a topic that exists is keyed per
                 // partition, so a long name over many partitions is not copied or hashed
                 // per partition.
-                let Some(topic) = input
-                    .topic_partitions
-                    .get_key_value(topic)
-                    .map(|(name, _)| name)
-                else {
+                let Some((topic, &count)) = input.topic_partitions.get_key_value(topic) else {
                     continue;
                 };
-                if !subscription.topics.contains(topic) {
+                if !input.is_subscribed(member, topic) {
                     continue;
                 }
                 for &partition in prev_partitions {
-                    let key = (topic.clone(), partition);
-                    if all_partitions.contains(&key) && !assigned.contains(&key) {
-                        result
-                            .get_mut(member_id)
-                            .expect("every member is initialised in `result` before this step")
+                    if (0..count).contains(&partition)
+                        && assigned.insert((topic.as_str(), partition))
+                    {
+                        let partitions = result[member]
                             .topic_partitions
                             .entry(topic.clone())
-                            .or_default()
-                            .push(partition);
-                        assigned.insert(key);
+                            .or_default();
+                        partitions.push(partition);
                     }
                 }
             }
         }
         assigned
+    }
+}
+
+impl StickyStrategy {
+    /// Compute the assignment in at most `budget` steps, or return [`StepBudgetExceeded`]
+    /// once they are spent.
+    ///
+    /// The assignment runs on the single DB thread, where a slow one stalls every other
+    /// request. Its size is bounded before it starts (`limits::MAX_ASSIGNMENT_WORK`), but how
+    /// much work the balancing takes also depends on the shape of the input (how the members'
+    /// subscriptions overlap and how far the previous assignment is from balanced), so every
+    /// step of distributing and balancing is counted here: one step is about one ordered-set
+    /// or map operation (a move counts [`MOVE_STEPS`]), or [`ARRAY_STEPS`] array accesses or
+    /// ordered entries looked at in order.
+    pub fn assign_within(
+        &self,
+        input: &AssignmentInput,
+        budget: usize,
+    ) -> Result<AssignmentOutput, StepBudgetExceeded> {
+        let mut steps = Steps::new(budget);
+        // Every member's assignment, by member index.
+        let mut result = input.empty_assignments();
+
+        // Calculate total partitions for balancing
+        let total_partitions: usize = input
+            .topic_partitions
+            .values()
+            .map(|&count| usize::try_from(count).unwrap_or(0))
+            .sum();
+
+        let num_members = input.member_count();
+
+        // If no members or partitions, return empty
+        if num_members == 0 || total_partitions == 0 {
+            return Ok(input.output(result));
+        }
+
+        // Step 1: Preserve valid assignments from previous state
+        let assigned = self.keep_previous_assignments(input, &mut result);
+
+        // Step 2: Collect orphaned partitions (not yet assigned), by topic name and then
+        // partition for a deterministic assignment order
+        let mut topics: Vec<(&String, i32)> = input
+            .topic_partitions
+            .iter()
+            .map(|(topic, &count)| (topic, count))
+            .collect();
+        topics.sort_unstable();
+        let orphaned: Vec<(&String, Vec<i32>)> = topics
+            .into_iter()
+            .map(|(topic, count)| {
+                let partitions = (0..count)
+                    .filter(|&partition| !assigned.contains(&(topic.as_str(), partition)))
+                    .collect();
+                (topic, partitions)
+            })
+            .collect();
+
+        // Step 3: Distribute orphaned partitions to members
+        let mut members = Members::new(input, &result);
+        distribute_orphans(&mut members, orphaned, &mut result, &mut steps)?;
+
+        // Step 4: Balance: move partitions from overloaded members to underloaded ones. Sticky
+        // preservation (Step 1) can leave a member holding far more partitions than a peer
+        // (e.g. when a new member joins an assignment one member already fully owns).
+        balance_assignments(&mut members, &mut result, &mut steps)?;
+
+        // Sort partition lists for consistent output
+        for assignment in &mut result {
+            for partitions in assignment.topic_partitions.values_mut() {
+                partitions.sort_unstable();
+            }
+        }
+
+        Ok(input.output(result))
     }
 }
 
@@ -118,62 +199,52 @@ impl AssignmentStrategy for StickyStrategy {
         "sticky"
     }
 
+    /// The assignment without a step budget; the coordinator runs
+    /// [`StickyStrategy::assign_within`] instead.
     fn assign(&self, input: &AssignmentInput) -> AssignmentOutput {
-        let mut result: AssignmentOutput = HashMap::new();
-
-        // Initialize empty assignments for all current members
-        for member_id in input.subscriptions.keys() {
-            result.insert(member_id.clone(), MemberAssignment::new());
+        match self.assign_within(input, usize::MAX) {
+            Ok(result) => result,
+            Err(exceeded) => unreachable!("an assignment spent {} steps", exceeded.budget),
         }
+    }
+}
 
-        // Calculate total partitions for balancing
-        let total_partitions: usize = input
-            .topic_partitions
-            .values()
-            .map(|&count| usize::try_from(count).unwrap_or(0))
-            .sum();
+/// A sticky assignment spent its step budget before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepBudgetExceeded {
+    /// The budget that was spent.
+    pub budget: usize,
+}
 
-        let num_members = input.subscriptions.len();
+/// The steps one move takes: about as many ordered-set and map operations update the two
+/// members' assignments and loads.
+const MOVE_STEPS: usize = 16;
 
-        // If no members or partitions, return empty
-        if num_members == 0 || total_partitions == 0 {
-            return result;
+/// The steps left of an assignment's budget.
+struct Steps {
+    left: usize,
+    budget: usize,
+}
+
+impl Steps {
+    fn new(budget: usize) -> Self {
+        Self {
+            left: budget,
+            budget,
         }
+    }
 
-        // Collect all available (topic, partition) pairs
-        let mut all_partitions: HashSet<(String, i32)> = HashSet::new();
-        for (topic, count) in &input.topic_partitions {
-            for partition in 0..*count {
-                all_partitions.insert((topic.clone(), partition));
+    /// Spend `n` steps, or fail once the budget is spent.
+    fn spend(&mut self, n: usize) -> Result<(), StepBudgetExceeded> {
+        match self.left.checked_sub(n) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
             }
+            None => Err(StepBudgetExceeded {
+                budget: self.budget,
+            }),
         }
-
-        // Step 1: Preserve valid assignments from previous state
-        let assigned = self.keep_previous_assignments(input, &all_partitions, &mut result);
-
-        // Step 2: Collect orphaned partitions (not yet assigned), sorted for a deterministic
-        // assignment order
-        let mut orphaned: Vec<(String, i32)> =
-            all_partitions.difference(&assigned).cloned().collect();
-        orphaned.sort();
-
-        // Step 3: Distribute orphaned partitions to members
-        let mut members = Members::new(input, &result);
-        distribute_orphans(&mut members, orphaned, &mut result);
-
-        // Step 4: Balance: move partitions from overloaded members to underloaded ones. Sticky
-        // preservation (Step 1) can leave a member holding far more partitions than a peer
-        // (e.g. when a new member joins an assignment one member already fully owns).
-        balance_assignments(&mut members, &mut result);
-
-        // Sort partition lists for consistent output
-        for assignment in result.values_mut() {
-            for partitions in assignment.topic_partitions.values_mut() {
-                partitions.sort_unstable();
-            }
-        }
-
-        result
     }
 }
 
@@ -181,44 +252,49 @@ impl AssignmentStrategy for StickyStrategy {
 /// topics), with each member's partition count.
 ///
 /// The lightest subscriber of a topic is the lightest of the lightest members of the classes
-/// subscribed to it, so a load change updates one ordered set instead of one per subscribed
-/// topic: with wide subscriptions (hundreds of topics per member) that is the difference
-/// between microseconds and seconds per rebalance, and the rebalance runs on the single DB
-/// thread, where a slow assignment stalls every other request. Topics subscribed to by the
-/// same classes form a topic group, which shares its lightest subscriber.
+/// subscribed to it, so a load change updates one ordered set (and the order of the classes'
+/// lightest members) instead of one per subscribed topic: with wide subscriptions (hundreds of
+/// topics per member) that is the difference between microseconds and seconds per rebalance,
+/// and the rebalance runs on the single DB thread, where a slow assignment stalls every other
+/// request. Topics subscribed to by the same classes form a topic group, which shares its
+/// lightest subscriber.
+///
+/// A member is its index in the input ([`AssignmentInput::member_id`]), so index order is
+/// id order and ties broken by index are broken by member id, without comparing ids.
 struct Members<'a> {
-    /// Member ids in ascending order. A member is its index here, so index order is id
-    /// order and ties broken by index are broken by member id.
-    ids: Vec<&'a str>,
     /// Partitions held, per member.
     loads: Vec<usize>,
     /// Subscription class, per member.
     class_of: Vec<usize>,
     /// Per class, its members by (load, index): the first is the class's lightest member.
     classes: Vec<BTreeSet<(usize, usize)>>,
+    /// Every class's lightest member, as (load, index, class): the first entry whose class
+    /// subscribes to a topic is that topic's lightest subscriber.
+    firsts: BTreeSet<(usize, usize, usize)>,
     /// The topic group of every subscribed topic.
     topic_group: HashMap<&'a str, usize>,
-    /// Per topic group, the classes subscribed to its topics.
+    /// Per topic group, the classes subscribed to its topics, in ascending order.
     group_classes: Vec<Vec<usize>>,
 }
 
 impl<'a> Members<'a> {
-    fn new(input: &'a AssignmentInput, result: &AssignmentOutput) -> Self {
-        let mut ids: Vec<&str> = input.subscriptions.keys().map(String::as_str).collect();
-        ids.sort_unstable();
+    /// Cost: hashing each member's topic list once (about its subscription's bytes), plus
+    /// one ordered-set insertion per member.
+    fn new(input: &'a AssignmentInput, result: &[MemberAssignment]) -> Self {
+        let count = input.member_count();
         let mut class_index: HashMap<Vec<&str>, usize> = HashMap::new();
         let mut topic_classes: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut classes = Vec::new();
-        let mut class_of = Vec::with_capacity(ids.len());
-        let mut loads = Vec::with_capacity(ids.len());
-        for (index, id) in ids.iter().enumerate() {
-            let mut topics: Vec<&str> = input.subscriptions[*id]
+        let mut class_of = Vec::with_capacity(count);
+        let mut loads = Vec::with_capacity(count);
+        for (index, assignment) in result.iter().enumerate() {
+            // Sorted and without repeats (`AssignmentInput::new`).
+            let topics: Vec<&str> = input
+                .subscription(index)
                 .topics
                 .iter()
                 .map(String::as_str)
                 .collect();
-            topics.sort_unstable();
-            topics.dedup();
             let class = match class_index.entry(topics) {
                 Entry::Occupied(entry) => *entry.get(),
                 Entry::Vacant(entry) => {
@@ -230,11 +306,19 @@ impl<'a> Members<'a> {
                     *entry.insert(class)
                 }
             };
-            let load = result[*id].partition_count();
+            let load = assignment.partition_count();
             classes[class].insert((load, index));
             class_of.push(class);
             loads.push(load);
         }
+        let firsts = classes
+            .iter()
+            .enumerate()
+            .filter_map(|(class, members)| {
+                let &(load, member) = members.first()?;
+                Some((load, member, class))
+            })
+            .collect();
 
         let mut group_index: HashMap<Vec<usize>, usize> = HashMap::new();
         let mut group_classes = Vec::new();
@@ -249,70 +333,274 @@ impl<'a> Members<'a> {
             })
             .collect();
         Members {
-            ids,
             loads,
             class_of,
             classes,
+            firsts,
             topic_group,
             group_classes,
         }
     }
 
-    /// The subscriber of the topics of `group` with the fewest partitions, ties broken by
-    /// member id, as (load, member).
-    fn lightest(&self, group: usize) -> Option<(usize, usize)> {
-        self.group_classes[group]
-            .iter()
-            .filter_map(|&class| self.classes[class].first().copied())
-            .min()
-    }
-
     fn set_load(&mut self, member: usize, load: usize) {
-        let class = &mut self.classes[self.class_of[member]];
+        let class_id = self.class_of[member];
+        let class = &mut self.classes[class_id];
+        let before = class.first().copied();
         class.remove(&(self.loads[member], member));
         class.insert((load, member));
         self.loads[member] = load;
+        let after = class.first().copied();
+        if before != after {
+            if let Some((load, member)) = before {
+                self.firsts.remove(&(load, member, class_id));
+            }
+            if let Some((load, member)) = after {
+                self.firsts.insert((load, member, class_id));
+            }
+        }
     }
 }
 
 /// Give each orphaned partition (in order) to the subscribed member with the fewest
 /// partitions, ties broken by member id; a partition no member subscribes to stays
 /// unassigned.
+///
+/// The lightest members of the classes subscribed to a topic are put in a heap once per
+/// topic: while its partitions are given out only the receiver's class changes, so a
+/// partition costs a heap operation instead of a look at every subscribed class, and the
+/// whole distribution about the subscription entries plus the partitions.
 fn distribute_orphans(
     members: &mut Members<'_>,
-    orphaned: Vec<(String, i32)>,
-    result: &mut AssignmentOutput,
-) {
-    for (topic, partition) in orphaned {
-        let Some((load, member)) = members
-            .topic_group
-            .get(topic.as_str())
-            .and_then(|&group| members.lightest(group))
-        else {
+    orphaned: Vec<(&String, Vec<i32>)>,
+    result: &mut [MemberAssignment],
+    steps: &mut Steps,
+) -> Result<(), StepBudgetExceeded> {
+    for (topic, partitions) in orphaned {
+        steps.spend(1)?;
+        if partitions.is_empty() {
+            continue;
+        }
+        let Some(&group) = members.topic_group.get(topic.as_str()) else {
             continue;
         };
-        result
-            .get_mut(members.ids[member])
-            .expect("`members` holds only members of `result`")
-            .topic_partitions
-            .entry(topic)
-            .or_default()
-            .push(partition);
-        members.set_load(member, load + 1);
+        let classes = &members.group_classes[group];
+        steps.spend(classes.len())?;
+        let mut lightest: BinaryHeap<Reverse<(usize, usize, usize)>> = classes
+            .iter()
+            .filter_map(|&class| {
+                let &(load, member) = members.classes[class].first()?;
+                Some(Reverse((load, member, class)))
+            })
+            .collect();
+        for partition in partitions {
+            steps.spend(1)?;
+            let Some(Reverse((load, member, class))) = lightest.pop() else {
+                break;
+            };
+            result[member]
+                .topic_partitions
+                .entry(topic.clone())
+                .or_default()
+                .push(partition);
+            members.set_load(member, load + 1);
+            if let Some(&(load, member)) = members.classes[class].first() {
+                lightest.push(Reverse((load, member, class)));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Per member, the subscribed topics it holds partitions of, by (topic group, topic): the
 /// first entry of a group is the member's alphabetically first topic of that group.
-type Held<'a> = Vec<BTreeSet<(usize, &'a str)>>;
+type Held<'a> = BTreeSet<(usize, &'a str)>;
+
+/// What a member's held topics share with each class: how many of its held topic groups
+/// each class subscribes to, and, for the classes it has looked up a topic for, those groups
+/// by (the member's first held topic of the group, group). The first entry of a class is the
+/// alphabetically first topic the member holds and the class subscribes to.
+///
+/// The counts are an array per member, so building them costs about an increment per
+/// (held group, subscribed class) pair; the ordered topics are built for a class only once
+/// the member gives to it.
+struct Shares<'a> {
+    groups: Vec<u32>,
+    topics: HashMap<usize, BTreeSet<(&'a str, usize)>>,
+}
+
+/// Array increments, or ordered-set entries looked at in order, that count as one step:
+/// each costs about an eighth of an ordered-set insertion or removal.
+const ARRAY_STEPS: usize = 8;
+
+impl<'a> Shares<'a> {
+    /// The shares of a member holding `held`.
+    fn build(
+        members: &Members<'a>,
+        held: &Held<'a>,
+        steps: &mut Steps,
+    ) -> Result<Self, StepBudgetExceeded> {
+        let class_count = members.classes.len();
+        steps.spend(class_count.div_ceil(ARRAY_STEPS) + 1)?;
+        let mut groups = vec![0_u32; class_count];
+        for (group, _) in group_firsts(held) {
+            let classes = &members.group_classes[group];
+            steps.spend(classes.len().div_ceil(ARRAY_STEPS) + 1)?;
+            for &class in classes {
+                groups[class] += 1;
+            }
+        }
+        Ok(Shares {
+            groups,
+            topics: HashMap::new(),
+        })
+    }
+
+    /// Whether `class` subscribes to a topic group the member holds.
+    fn shares(&self, class: usize) -> bool {
+        self.groups[class] > 0
+    }
+
+    /// The member's alphabetically first held topic that `class` subscribes to, with its
+    /// group.
+    fn first_topic(
+        &mut self,
+        members: &Members<'a>,
+        held: &Held<'a>,
+        class: usize,
+        steps: &mut Steps,
+    ) -> Result<Option<(&'a str, usize)>, StepBudgetExceeded> {
+        if let Entry::Vacant(entry) = self.topics.entry(class) {
+            let mut topics = BTreeSet::new();
+            for (group, topic) in group_firsts(held) {
+                steps.spend(1)?;
+                if members.group_classes[group].binary_search(&class).is_ok() {
+                    topics.insert((topic, group));
+                }
+            }
+            entry.insert(topics);
+        }
+        Ok(self.topics.get(&class).and_then(|t| t.first().copied()))
+    }
+
+    /// Record that the member's first held topic of `group` changed from `before` to
+    /// `after` (`None`: it holds none of the group).
+    fn change(
+        &mut self,
+        members: &Members<'a>,
+        group: usize,
+        (before, after): (Option<&'a str>, Option<&'a str>),
+        steps: &mut Steps,
+    ) -> Result<(), StepBudgetExceeded> {
+        let classes = &members.group_classes[group];
+        if before.is_none() || after.is_none() {
+            steps.spend(classes.len().div_ceil(ARRAY_STEPS))?;
+            for &class in classes {
+                if before.is_none() {
+                    self.groups[class] += 1;
+                } else {
+                    self.groups[class] -= 1;
+                }
+            }
+        }
+        let update = |topics: &mut BTreeSet<(&'a str, usize)>| {
+            if let Some(before) = before {
+                topics.remove(&(before, group));
+            }
+            if let Some(after) = after {
+                topics.insert((after, group));
+            }
+        };
+        if self.topics.len() < classes.len() {
+            steps.spend(self.topics.len())?;
+            for (class, topics) in &mut self.topics {
+                if classes.binary_search(class).is_ok() {
+                    update(topics);
+                }
+            }
+        } else {
+            steps.spend(classes.len())?;
+            for class in classes {
+                if let Some(topics) = self.topics.get_mut(class) {
+                    update(topics);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The first held topic of each topic group in `held`, with its group.
-fn group_firsts<'s, 'a>(
-    held: &'s BTreeSet<(usize, &'a str)>,
-) -> impl Iterator<Item = (usize, &'a str)> + 's {
+fn group_firsts<'s, 'a>(held: &'s Held<'a>) -> impl Iterator<Item = (usize, &'a str)> + 's {
     std::iter::successors(held.first().copied(), |&(group, _)| {
         held.range((group + 1, "")..).next().copied()
     })
+}
+
+/// The first topic of `group` in `held`.
+fn first_of_group<'a>(held: &Held<'a>, group: usize) -> Option<&'a str> {
+    held.range((group, "")..)
+        .next()
+        .filter(|&&(g, _)| g == group)
+        .map(|&(_, topic)| topic)
+}
+
+/// Add (`add`) or remove `topic` of `group` in a member's `held` topics, and update its
+/// `shares` (when they were built) if the member's first topic of the group changes.
+fn change_held<'a>(
+    members: &Members<'a>,
+    held: &mut Held<'a>,
+    shares: Option<&mut Shares<'a>>,
+    (group, topic): (usize, &'a str),
+    add: bool,
+    steps: &mut Steps,
+) -> Result<(), StepBudgetExceeded> {
+    steps.spend(1)?;
+    let before = first_of_group(held, group);
+    let changed = if add {
+        held.insert((group, topic))
+    } else {
+        held.remove(&(group, topic))
+    };
+    let Some(shares) = shares.filter(|_| changed) else {
+        return Ok(());
+    };
+    let after = first_of_group(held, group);
+    if before == after {
+        return Ok(());
+    }
+    shares.change(members, group, (before, after), steps)
+}
+
+/// The lightest member subscribed to a topic in `shares` (the shares of a donor holding
+/// `held`, `from_load` partitions), with the donor's alphabetically first topic it subscribes
+/// to and that topic's group, if that member holds at least two partitions fewer than the
+/// donor.
+fn receiver<'a>(
+    members: &Members<'a>,
+    held: &Held<'a>,
+    shares: &mut Shares<'a>,
+    from_load: usize,
+    steps: &mut Steps,
+) -> Result<Option<(usize, &'a str, usize)>, StepBudgetExceeded> {
+    let mut found = None;
+    for (scanned, &(load, member, class)) in members.firsts.iter().enumerate() {
+        if scanned % ARRAY_STEPS == 0 {
+            steps.spend(1)?;
+        }
+        if load + 1 >= from_load {
+            break;
+        }
+        if shares.shares(class) {
+            found = Some((member, class));
+            break;
+        }
+    }
+    let Some((member, class)) = found else {
+        return Ok(None);
+    };
+    Ok(shares
+        .first_topic(members, held, class, steps)?
+        .map(|(topic, group)| (member, topic, group)))
 }
 
 /// Move partitions from overloaded members to subscribed, less-loaded members until no
@@ -324,92 +612,88 @@ fn group_firsts<'s, 'a>(
 /// partition is moved at most once per unit of imbalance and the members keep the rest of
 /// their previous partitions.
 ///
+/// A donor's receiver is found from its shares (which classes subscribe to the topics it
+/// holds) and the classes' lightest members in load order, so finding one costs the lighter
+/// classes skipped, not the donor's topic groups times their classes; the shares change only
+/// when a member's first held topic of a group does. A move then costs a few ordered-set
+/// operations plus at most a look at each class, so with few distinct subscriptions the
+/// balancing is about linear in the moves; with many, the step budget bounds it.
+///
 /// A member that cannot give is set aside until it can again, so the search for a donor does
-/// not rescan every heavy member on every move. Only two things can let it give: a member
-/// subscribed to one of the topics it holds gets lighter (the donor of a later move, the only
-/// member whose load drops), or it receives a partition itself. A receiver getting heavier
-/// never opens a move.
-fn balance_assignments(members: &mut Members<'_>, result: &mut AssignmentOutput) {
-    let count = members.ids.len();
-    let mut held: Held<'_> = members
-        .ids
-        .iter()
-        .map(|id| {
-            result[*id]
-                .topic_partitions
+/// not rescan every heavy member on every move. Only two things can let it give: it receives
+/// or gives a partition itself, or the lightest member of a class sharing its topics gets
+/// lighter, to at least two below it. Loads only drop for a donor, so after each move only
+/// the members set aside at least two above the donor's new load are looked at, and only if
+/// the donor is now its class's lightest member. A receiver getting heavier never opens a
+/// move.
+fn balance_assignments(
+    members: &mut Members<'_>,
+    result: &mut [MemberAssignment],
+    steps: &mut Steps,
+) -> Result<(), StepBudgetExceeded> {
+    let count = members.loads.len();
+    let mut held: Vec<Held<'_>> = Vec::with_capacity(count);
+    for assignment in result.iter() {
+        let topics = &assignment.topic_partitions;
+        steps.spend(topics.len() + 1)?;
+        held.push(
+            topics
                 .iter()
                 .filter(|(_, parts)| !parts.is_empty())
                 .filter_map(|(topic, _)| {
                     let (&topic, &group) = members.topic_group.get_key_value(topic.as_str())?;
                     Some((group, topic))
                 })
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
+    // Built when a member is first tried as a donor.
+    let mut shares: Vec<Option<Shares<'_>>> = (0..count).map(|_| None).collect();
     let mut by_load: BTreeSet<(usize, usize)> = members.loads.iter().copied().zip(0..).collect();
     // The members that are not set aside, by (load, member); donors are tried from the
     // heaviest down.
     let mut candidates = by_load.clone();
-    // Per member set aside, the stamp it was set aside with; per class, the members set
-    // aside that a lighter member of the class may let give, with their stamps (an entry
-    // whose stamp is no longer the member's is stale).
-    let mut set_aside: Vec<Option<u64>> = vec![None; count];
-    let mut waiting: Vec<Vec<(usize, u64)>> = vec![Vec::new(); members.classes.len()];
-    let mut class_marked: Vec<u64> = vec![0; members.classes.len()];
-    let mut stamp = 0_u64;
+    // The members set aside, by (load, member).
+    let mut set_aside: BTreeSet<(usize, usize)> = BTreeSet::new();
 
     while let Some(&(min_load, _)) = by_load.first() {
         let mut cannot_give = Vec::new();
         let mut chosen = None;
         for &(from_load, from) in candidates.iter().rev() {
+            steps.spend(1)?;
             // The lightest possible receiver is at least the overall minimum, so no donor
             // this light (or lighter) can give.
             if from_load < min_load + 2 {
                 break;
             }
-            let best = group_firsts(&held[from])
-                .filter_map(|(group, topic)| {
-                    let (to_load, to) = members.lightest(group)?;
-                    Some((to_load, to, topic, group))
-                })
-                .min();
-            match best {
-                Some((to_load, to, topic, group)) if to_load + 1 < from_load => {
+            if shares[from].is_none() {
+                shares[from] = Some(Shares::build(members, &held[from], steps)?);
+            }
+            let Some(donor_shares) = &mut shares[from] else {
+                continue;
+            };
+            match receiver(members, &held[from], donor_shares, from_load, steps)? {
+                Some((to, topic, group)) => {
                     chosen = Some((from, to, topic, group));
                     break;
                 }
-                _ => cannot_give.push(from),
+                None => cannot_give.push(from),
             }
         }
 
+        steps.spend(cannot_give.len())?;
         for member in cannot_give {
-            stamp += 1;
-            set_aside[member] = Some(stamp);
-            candidates.remove(&(members.loads[member], member));
-            for (group, _) in group_firsts(&held[member]) {
-                for &class in &members.group_classes[group] {
-                    if class_marked[class] == stamp {
-                        continue;
-                    }
-                    class_marked[class] = stamp;
-                    let list = &mut waiting[class];
-                    list.push((member, stamp));
-                    // Each member has at most one live entry per class, so dropping the
-                    // stale ones keeps a list within twice the member count.
-                    if list.len() > 2 * count {
-                        list.retain(|&(m, at)| set_aside[m] == Some(at));
-                    }
-                }
-            }
+            let entry = (members.loads[member], member);
+            candidates.remove(&entry);
+            set_aside.insert(entry);
         }
 
         let Some((from, to, topic, group)) = chosen else {
             break;
         };
 
-        let donor = result
-            .get_mut(members.ids[from])
-            .expect("`from` is a member of `result`")
+        steps.spend(MOVE_STEPS)?;
+        let donor = result[from]
             .topic_partitions
             .get_mut(topic)
             .expect("the donor topic was chosen for holding a partition");
@@ -417,34 +701,65 @@ fn balance_assignments(members: &mut Members<'_>, result: &mut AssignmentOutput)
             .pop()
             .expect("the donor topic was chosen for holding a partition");
         if donor.is_empty() {
-            held[from].remove(&(group, topic));
+            change_held(
+                members,
+                &mut held[from],
+                shares[from].as_mut(),
+                (group, topic),
+                false,
+                steps,
+            )?;
         }
-        result
-            .get_mut(members.ids[to])
-            .expect("`to` is a member of `result`")
+        result[to]
             .topic_partitions
             .entry(topic.to_string())
             .or_default()
             .push(partition);
-        held[to].insert((group, topic));
+        change_held(
+            members,
+            &mut held[to],
+            shares[to].as_mut(),
+            (group, topic),
+            true,
+            steps,
+        )?;
 
         let (from_load, to_load) = (members.loads[from], members.loads[to]);
+        let class = members.class_of[from];
+        let lightest_before = members.classes[class].first().map(|&(load, _)| load);
         for (member, load) in [(from, from_load - 1), (to, to_load + 1)] {
             let old = (members.loads[member], member);
             by_load.remove(&old);
             by_load.insert((load, member));
+            set_aside.remove(&old);
             candidates.remove(&old);
             candidates.insert((load, member));
-            set_aside[member] = None;
             members.set_load(member, load);
         }
-        for (member, at) in std::mem::take(&mut waiting[members.class_of[from]]) {
-            if set_aside[member] == Some(at) {
-                set_aside[member] = None;
-                candidates.insert((members.loads[member], member));
+        // Only the donor got lighter: a member set aside may give again if the lightest
+        // member of the donor's class got lighter, below it by two, and it holds a topic
+        // that class subscribes to.
+        let lightest = from_load - 1;
+        if lightest_before.is_some_and(|before| lightest < before) {
+            let mut woken = Vec::new();
+            for (scanned, &(load, member)) in set_aside.range((lightest + 2, 0)..).enumerate() {
+                if scanned % ARRAY_STEPS == 0 {
+                    steps.spend(1)?;
+                }
+                if shares[member]
+                    .as_ref()
+                    .is_some_and(|shares| shares.shares(class))
+                {
+                    woken.push((load, member));
+                }
+            }
+            for entry in woken {
+                set_aside.remove(&entry);
+                candidates.insert(entry);
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -815,24 +1130,43 @@ mod tests {
 
     /// A previous assignment is the leader's SyncGroup, whatever names it carries: a name
     /// that is no topic, subscribed to and over many partitions, costs nothing per
-    /// partition. Each partition copied and hashed the name, so four times the name took
-    /// four times as long.
+    /// partition. Each partition copied and hashed the name, so a 32 KB name over 100 000
+    /// partitions took some 100 000 name-sized copies and hashes more than a 1-byte name.
+    /// Both assignments also keep 100 000 partitions of a real topic, the same work for
+    /// either name; the inputs are built outside the measured runs, which time only the
+    /// assignment.
     #[test]
     fn test_previous_partitions_of_a_long_name_cost_nothing_per_partition() {
-        let growth = crate::testing::flat_growth(8 * 1024, |len| {
+        const PARTITIONS: i32 = 100_000;
+        let cost = |len: usize| {
             let name = "n".repeat(len);
-            let mut previous = HashMap::new();
-            previous.insert(
+            let previous: HashMap<String, MemberAssignment> = HashMap::from([(
                 "m".to_string(),
-                make_assignment(vec![(name.as_str(), (0..100_000).collect())]),
+                make_assignment(vec![
+                    (name.as_str(), (0..PARTITIONS).collect()),
+                    ("t", (0..PARTITIONS).collect()),
+                ]),
+            )]);
+            let input = make_input(
+                vec![("m", vec![name.as_str(), "t"])],
+                vec![("t", PARTITIONS)],
             );
-            let input = make_input(vec![("m", vec![name.as_str(), "t"])], vec![("t", 1)]);
-            let result = StickyStrategy::with_previous(previous).assign(&input);
-            assert_eq!(result["m"].partitions("t"), vec![0]);
-        });
+            // The least CPU time of three runs (noise only ever adds to it).
+            (0..3)
+                .map(|_| {
+                    let strategy = StickyStrategy::with_previous(previous.clone());
+                    let (result, spent) = crate::testing::cpu_time(|| strategy.assign(&input));
+                    assert_eq!(result["m"].partition_count(), 100_000);
+                    spent
+                })
+                .min()
+                .unwrap()
+        };
+        let short = cost(1);
+        let long = cost(32 * 1024);
         assert!(
-            growth < 2.0,
-            "4x the name length took {growth:.1}x the time"
+            long < short * 3,
+            "a 32 KB name took {long:?}, a 1-byte name {short:?}"
         );
     }
 
@@ -877,11 +1211,7 @@ mod tests {
             previous: &super::StickyStrategy,
             input: &AssignmentInput,
         ) -> AssignmentOutput {
-            let mut result: AssignmentOutput = input
-                .subscriptions
-                .keys()
-                .map(|id| (id.clone(), super::MemberAssignment::new()))
-                .collect();
+            let mut kept = input.empty_assignments();
             let mut all_partitions = std::collections::HashSet::new();
             for (topic, count) in &input.topic_partitions {
                 for partition in 0..*count {
@@ -889,11 +1219,14 @@ mod tests {
                 }
             }
             if all_partitions.is_empty() {
-                return result;
+                return input.output(kept);
             }
-            let assigned = previous.keep_previous_assignments(input, &all_partitions, &mut result);
-            let mut orphaned: Vec<(String, i32)> =
-                all_partitions.difference(&assigned).cloned().collect();
+            let assigned = previous.keep_previous_assignments(input, &mut kept);
+            let mut result = input.output(kept);
+            let mut orphaned: Vec<(String, i32)> = all_partitions
+                .into_iter()
+                .filter(|(topic, partition)| !assigned.contains(&(topic.as_str(), *partition)))
+                .collect();
             orphaned.sort();
             distribute_orphans(input, orphaned, &mut result);
             balance_assignments(&mut result, input);
@@ -922,12 +1255,12 @@ mod tests {
 
         fn topic_queues(input: &AssignmentInput, loads: &Loads) -> TopicQueues {
             let mut queues = TopicQueues::new();
-            for (member_id, subscription) in &input.subscriptions {
+            for (member_id, subscription) in input.subscriptions() {
                 for topic in &subscription.topics {
                     queues
                         .entry(topic.clone())
                         .or_default()
-                        .insert((loads[member_id], member_id.clone()));
+                        .insert((loads[member_id], member_id.to_string()));
                 }
             }
             queues
@@ -941,7 +1274,8 @@ mod tests {
             old: usize,
             new: usize,
         ) {
-            for topic in &input.subscriptions[member_id].topics {
+            let member = input.member_index(member_id).expect("a member");
+            for topic in &input.subscription(member).topics {
                 if let Some(queue) = queues.get_mut(topic) {
                     queue.remove(&(old, member_id.to_string()));
                     queue.insert((new, member_id.to_string()));
@@ -1192,7 +1526,7 @@ mod tests {
         for (member, assignment) in result {
             for (topic, parts) in &assignment.topic_partitions {
                 assert!(
-                    input.subscriptions[member].topics.contains(topic),
+                    input.is_subscribed(input.member_index(member).expect("a member"), topic),
                     "{member} holds unsubscribed {topic}"
                 );
                 for &p in parts {
@@ -1343,24 +1677,167 @@ mod tests {
         }
         let input = input_of(&all, &topics);
         let result = timed(&input, &StickyStrategy::with_previous(previous));
-        // No partition sits on a member two heavier than the lightest subscriber of its topic.
-        for (member, assignment) in &result {
+        assert_balanced(&input, &result);
+    }
+
+    /// Assert no partition sits on a member two heavier than the lightest subscriber of its
+    /// topic.
+    fn assert_balanced(input: &AssignmentInput, result: &AssignmentOutput) {
+        let loads: HashMap<&str, usize> = result
+            .iter()
+            .map(|(m, a)| (m.as_str(), a.partition_count()))
+            .collect();
+        for (member, assignment) in result {
             for (topic, parts) in &assignment.topic_partitions {
                 if parts.is_empty() {
                     continue;
                 }
-                let lightest = result
+                let lightest = input
+                    .members_for_topic(topic)
                     .iter()
-                    .filter(|(m, _)| input.subscriptions[*m].topics.contains(topic))
-                    .map(|(_, a)| a.partition_count())
+                    .map(|&m| loads[input.member_id(m)])
                     .min()
                     .unwrap_or(0);
                 assert!(
-                    assignment.partition_count() <= lightest + 1,
+                    loads[member.as_str()] <= lightest + 1,
                     "{member} holds {topic} at {} over a subscriber at {lightest}",
-                    assignment.partition_count()
+                    loads[member.as_str()]
                 );
             }
+        }
+    }
+
+    /// Topics t00000.. of `parts` partitions each, all owned by member 0 before; member 0
+    /// subscribes to every topic and member i (for i in 1..topics) to the topics from t{i}
+    /// on. Every topic is then a topic group of its own, subscribed to by a different number
+    /// of classes, and the donor of every move holds all of them. With `shuffled`, member ids
+    /// do not follow the subscriptions (as with the random ids clients get), which changes
+    /// the assignor's tie-breaks and the members it finds lighter.
+    fn nested_over_one_owner(
+        topics: usize,
+        parts: i32,
+        shuffled: bool,
+    ) -> (StickyStrategy, AssignmentInput) {
+        let names = topic_names("t", topics);
+        // 389 is a prime above every count used, so i * 389 mod topics is a permutation.
+        let id = |i: usize| {
+            if shuffled {
+                format!("m{:05}", (i + 1) * 389 % topics)
+            } else {
+                format!("m{i:05}")
+            }
+        };
+        let all: Vec<(String, Vec<String>)> =
+            (0..topics).map(|i| (id(i), names[i..].to_vec())).collect();
+        let mut owned = MemberAssignment::new();
+        for topic in &names {
+            owned
+                .topic_partitions
+                .insert(topic.clone(), (0..parts).collect());
+        }
+        let input = input_of(
+            &all,
+            &names.iter().map(|t| (t.clone(), parts)).collect::<Vec<_>>(),
+        );
+        (
+            StickyStrategy::with_previous(HashMap::from([(id(0), owned)])),
+            input,
+        )
+    }
+
+    #[test]
+    fn test_nested_subscriptions_over_one_owner_are_fast() {
+        // Finding a receiver must not cost the donor's topic groups times the classes of
+        // each: here that is about 125,000 per move.
+        for shuffled in [false, true] {
+            let (strategy, input) = nested_over_one_owner(500, 4, shuffled);
+            let result = timed(&input, &strategy);
+            assert_balanced(&input, &result);
+            if !shuffled {
+                // Every member ends with 4 partitions.
+                assert!(result.values().all(|a| a.partition_count() == 4));
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_subscriptions_without_previous_are_fast() {
+        let (_, input) = nested_over_one_owner(700, 8, false);
+        let result = timed(&input, &StickyStrategy::new());
+        assert_balanced(&input, &result);
+        assert!(result.values().all(|a| a.partition_count() == 8));
+    }
+
+    #[test]
+    fn test_matches_reference_assignor_on_nested_subscriptions() {
+        for (topics, parts) in [(30, 3), (17, 1), (40, 7)] {
+            for shuffled in [false, true] {
+                let (strategy, input) = nested_over_one_owner(topics, parts, shuffled);
+                assert_eq!(
+                    strategy.assign(&input),
+                    reference::assign(&strategy, &input)
+                );
+                let fresh = StickyStrategy::new();
+                assert_eq!(fresh.assign(&input), reference::assign(&fresh, &input));
+            }
+        }
+    }
+
+    #[test]
+    fn test_assignment_over_its_step_budget_is_refused() {
+        let (strategy, input) = nested_over_one_owner(60, 3, true);
+        let unbounded = strategy.assign(&input);
+        // The smallest budget the assignment fits in.
+        let (mut lo, mut hi) = (0, 1 << 30);
+        while lo + 1 < hi {
+            let mid = usize::midpoint(lo, hi);
+            if strategy.assign_within(&input, mid).is_ok() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        assert_eq!(strategy.assign_within(&input, hi), Ok(unbounded));
+        assert_eq!(
+            strategy.assign_within(&input, hi - 1),
+            Err(StepBudgetExceeded { budget: hi - 1 })
+        );
+        // The steps grow with the work: 60 topics of 3 partitions, about 180 moves and
+        // 1,800 subscription entries.
+        assert!(hi > 180 * MOVE_STEPS, "{hi} steps");
+        assert!(hi < 20_000, "{hi} steps");
+    }
+
+    #[test]
+    fn test_largest_nested_shape_fits_the_step_budget() {
+        // 999 members (just under the default group_max_size) over 999 topics: of 64
+        // partitions (about 630,000 entries and 64,000 moves), and of 8 with shuffled ids.
+        for (parts, shuffled) in [(64, false), (8, true)] {
+            let (strategy, input) = nested_over_one_owner(999, parts, shuffled);
+            let result = strategy
+                .assign_within(&input, crate::kafka::limits::MAX_ASSIGNMENT_STEPS / 2)
+                .expect("within half the budget");
+            assert_balanced(&input, &result);
+        }
+    }
+
+    #[test]
+    fn test_nested_prefix_shape_against_the_step_budget() {
+        // 999 members over 999 topics, member i subscribed to the first i + 1 (ids in
+        // subscription order), from a fresh group: 10 partitions per topic fit, 12 are
+        // refused (as limits::MAX_ASSIGNMENT_STEPS documents).
+        let names = topic_names("t", 999);
+        let all: Vec<(String, Vec<String>)> = (0..999)
+            .map(|i| (format!("m{i:05}"), names[..=i].to_vec()))
+            .collect();
+        for (parts, fits) in [(10, true), (12, false)] {
+            let input = input_of(
+                &all,
+                &names.iter().map(|t| (t.clone(), parts)).collect::<Vec<_>>(),
+            );
+            let result = StickyStrategy::new()
+                .assign_within(&input, crate::kafka::limits::MAX_ASSIGNMENT_STEPS);
+            assert_eq!(result.is_ok(), fits, "{parts} partitions per topic");
         }
     }
 }

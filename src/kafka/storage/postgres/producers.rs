@@ -4,6 +4,7 @@
 //! The sequence rules themselves are the pure [`validate_sequence`]; this module reads
 //! the state it needs and persists what it decides.
 
+use super::maintenance::PRODUCER_ID_RETENTION;
 use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, INT8OID};
 use crate::kafka::constants::ERROR_INVALID_PRODUCER_EPOCH;
 use crate::kafka::error::{KafkaError, Result};
@@ -14,6 +15,7 @@ use crate::kafka::storage::{
 };
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
+use std::time::Duration;
 
 /// INVALID_PRODUCER_EPOCH: what Kafka 3.7 answers a Produce with a stale epoch, for
 /// idempotent and transactional producers alike.
@@ -170,12 +172,6 @@ fn forget_producer_sequences(
     Ok(())
 }
 
-/// An advisory-lock key for one producer on one partition: serializes the sequence
-/// check of concurrent batches against out-of-band writers.
-fn sequence_lock_key(producer_id: i64, topic_id: i32, partition_id: i32) -> i64 {
-    producer_id ^ (i64::from(topic_id) << 20) ^ (i64::from(partition_id) << 40)
-}
-
 /// Advance a partition's last sequence (upsert into `kafka.producer_sequences`).
 fn upsert_last_sequence(
     client: &mut SpiClient<'_>,
@@ -222,12 +218,59 @@ struct PartitionSequenceState {
     cached: Vec<CachedBatch>,
 }
 
-/// Read a producer's [`ProducerState`]; None when the broker holds none.
-fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<Option<ProducerState>> {
+/// How far a producer's `last_active_at` may fall behind its appends: half the
+/// expiration window. See [`read_producer_state`].
+const PRODUCER_ACTIVITY_REFRESH: Duration =
+    Duration::from_secs(PRODUCER_ID_RETENTION.as_secs() / 2);
+
+/// Read a producer's [`ProducerState`] for a batch it appends; None when the broker
+/// holds none.
+///
+/// A producer whose `last_active_at` is more than [`PRODUCER_ACTIVITY_REFRESH`] old has
+/// it set to now, through an UPDATE whose RETURNING row is the state (the newest
+/// committed version, after any wait for the row). The sweep's producer prune
+/// (`maintenance::producer_prune_sql`) takes only producers idle past twice that, and an
+/// on-demand prune runs beside the worker: it re-checks `last_active_at` on the row it
+/// locks, but reads the sequence rows a Produce writes from its own snapshot. So a
+/// producer the prune can take is always one whose Produce writes its producer row
+/// first: a prune that reaches the row while that Produce is open skips it (`FOR UPDATE
+/// SKIP LOCKED`, never a wait) and keeps the producer; a Produce that reaches it after
+/// an uncommitted prune deleted it waits for the prune, finds no row (None), and the
+/// batch starts the producer afresh ([`adopt_unknown_producer`]), so what it acks is
+/// recorded under a producer row. That wait cannot close a lock cycle: the sweep never
+/// waits for a row lock once it holds a row (`run_retention_sweep`, "Lock
+/// waits"), so the counter or rows of this batch's earlier requests are never what the
+/// sweep is waiting for.
+///
+/// Cost: one primary-key read per batch, plus one UPDATE of the row (and its
+/// idx_producer_ids_last_active entry) at most once per producer per
+/// [`PRODUCER_ACTIVITY_REFRESH`] of appends.
+fn read_producer_state(
+    client: &mut SpiClient<'_>,
+    producer_id: i64,
+) -> Result<Option<ProducerState>> {
     let table = client.select(
-        "SELECT epoch, transactional_id IS NOT NULL AS transactional
+        "SELECT epoch, transactional_id IS NOT NULL AS transactional,
+                last_active_at < NOW() - ($2 || ' seconds')::interval AS stale
          FROM kafka.producer_ids
          WHERE producer_id = $1",
+        Some(1),
+        &[producer_id.into(), refresh_seconds().into()],
+    )?;
+    if table.is_empty() {
+        return Ok(None);
+    }
+    let row = table.first();
+    if !row.get_by_name::<bool, _>("stale")?.unwrap_or(false) {
+        return Ok(Some(ProducerState {
+            epoch: row.get_by_name("epoch")?.unwrap_or(0),
+            transactional: row.get_by_name("transactional")?.unwrap_or(false),
+        }));
+    }
+    let table = client.update(
+        "UPDATE kafka.producer_ids SET last_active_at = NOW()
+         WHERE producer_id = $1
+         RETURNING epoch, transactional_id IS NOT NULL AS transactional",
         Some(1),
         &[producer_id.into()],
     )?;
@@ -239,6 +282,11 @@ fn read_producer_state(client: &SpiClient<'_>, producer_id: i64) -> Result<Optio
         epoch: row.get_by_name("epoch")?.unwrap_or(0),
         transactional: row.get_by_name("transactional")?.unwrap_or(false),
     }))
+}
+
+/// [`PRODUCER_ACTIVITY_REFRESH`] in whole seconds, for SQL interval arithmetic.
+fn refresh_seconds() -> i64 {
+    i64::try_from(PRODUCER_ACTIVITY_REFRESH.as_secs()).unwrap_or(i64::MAX)
 }
 
 /// Record a producer the broker holds no state for at the id and epoch its batch
@@ -409,11 +457,8 @@ impl PostgresStore {
                 ));
             }
 
-            client.select(
-                "SELECT pg_advisory_xact_lock($1)",
-                None,
-                &[sequence_lock_key(producer_id, topic_id, partition_id).into()],
-            )?;
+            // No lock: producer state is read and written only by the worker's single
+            // DB thread, so nothing else can change it between this read and the write.
             let partition = read_partition_sequence_state(client, &batch)?;
 
             // RV-8: nothing is advanced here; record_producer_batch persists the batch

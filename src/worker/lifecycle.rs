@@ -4,6 +4,7 @@
 //! Every exit uses status 1 so the postmaster restarts the worker after
 //! [`WORKER_RESTART_INTERVAL`]; see [`exit_for_restart`].
 
+use crate::{pg_log, pg_warning};
 use pgrx::prelude::*;
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,11 +197,11 @@ pub(super) fn shutdown_and_exit(
     let join_start = Instant::now();
     loop {
         if network_handle.is_finished() {
-            log!("pg_kafka network thread shut down cleanly");
+            pg_log!("pg_kafka network thread shut down cleanly");
             break;
         }
         if join_start.elapsed() > timeout {
-            pgrx::warning!("pg_kafka network thread shutdown timed out");
+            pg_warning!("pg_kafka network thread shutdown timed out");
             break;
         }
         std::thread::sleep(NETWORK_EXIT_POLL);
@@ -217,7 +218,7 @@ pub(super) fn exit_after_postmaster_death(
     shutdown_tx: &Sender<()>,
     network_handle: &JoinHandle<()>,
 ) -> ! {
-    log!("pg_kafka background worker exiting: the postmaster died");
+    pg_log!("pg_kafka background worker exiting: the postmaster died");
     let _ = shutdown_tx.send(());
     let start = Instant::now();
     while !network_handle.is_finished() && start.elapsed() < POSTMASTER_DEATH_NETWORK_WAIT {

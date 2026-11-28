@@ -10,7 +10,7 @@ This document lists intentional deviations from the official Kafka protocol spec
 |----------|--------|
 | **Producer APIs** | ✅ Full support (idempotent + transactional) |
 | **Consumer APIs** | ✅ Full support (with automatic rebalancing) |
-| **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies) |
+| **Coordinator APIs** | ✅ Full support (Range, RoundRobin, Sticky strategies; server-side Sticky is not Kafka's StickyAssignor algorithm, see §5) |
 | **Admin APIs** | ✅ Supported (CreateTopics, DeleteTopics, CreatePartitions, DeleteGroups; see §13) |
 | **Config & Log APIs** | ✅ Minimal support (DescribeConfigs, IncrementalAlterConfigs for `retention.ms` only, DeleteRecords) |
 | **Transaction APIs** | ✅ Full support (EOS with read-committed isolation) |
@@ -62,7 +62,9 @@ This document lists intentional deviations from the official Kafka protocol spec
 **Implementation:**
 - ✅ **Inbound (Producer → Server)**: pg_kafka reads the RecordBatch v2 itself, with Kafka 3.7's
   record grammar (varints of at most 5 bytes, the timestamp delta a varlong of at most 10)
-- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC
+- ✅ **Outbound (Server → Consumer)**: Configurable via `pg_kafka.compression_type` GUC (the
+  last batch of a partition's Fetch records is sent uncompressed when only that fits the
+  Fetch's byte limits, §7)
 - ✅ **Supported codecs**: none, gzip, snappy, lz4, zstd
 
 **Configuration:**
@@ -97,8 +99,9 @@ pg_kafka.compression_type = 'gzip'
   and so does any request that finds the 512 MiB of decoded records waiting for the database
   full, until room comes free. The wait is at most half the request's `timeout_ms` and at most
   10 s (Java and librdkafka send their `request.timeout.ms`, 30 s by default, so the answer
-  reaches them first); past it the request is answered REQUEST_TIMED_OUT (7) on every
-  partition and nothing is written. Clients retry it (an idempotent producer keeps its order;
+  reaches them first), counted from when the request's frame was read, whatever it waited for
+  before its records (room for the rest of the decoded request, below); past it the request is
+  answered REQUEST_TIMED_OUT (7) on every partition and nothing is written. Clients retry it (an idempotent producer keeps its order;
   a non-idempotent one with several requests in flight may reorder, as on any retriable
   error). Kafka has no such limit on decoding: when its request queue is full
   (`queued.max.requests`, 500) or it lacks memory for requests (`queued.max.request.bytes`,
@@ -162,8 +165,10 @@ pg_kafka.compression_type = 'gzip'
   - Data after the batch too short to hold another batch is ignored, as Kafka trims it.
   - As in Kafka, a negative key, value or header value length is null (a null header
     value is stored empty) and duplicate header keys are stored, in order (see §7 for
-    what a fetch returns). A header key that is not UTF-8 is accepted and stored with
-    replacement characters, what a Java client reads it as; Kafka stores its bytes.
+    what a fetch returns). A UTF-8 header key is stored as sent, U+0000 included (and shadow
+    mode forwards it so). A header
+    key that is not UTF-8 is accepted and stored with replacement characters, what a Java
+    client reads it as; Kafka stores its bytes.
 
   As in Kafka 3.7, each partition is answered on its own: a partition whose data fails a
   check gets that code and nothing of it is written, while the request's other partitions
@@ -214,7 +219,8 @@ pg_kafka.compression_type = 'gzip'
   answers it, and the request's other partitions are written (with acks=0 the refusal
   closes the connection); no producer state is taken from it, so the producer's next
   batch there is checked against its earlier batches only
-- ✅ PostgreSQL advisory locks for sequence serialization
+- ✅ Sequence checks are serialized by the worker's single database thread (every batch of
+  every producer is checked and recorded there, one at a time), not by a lock
 - ✅ A producer the broker holds no state for (a producer id with no `kafka.producer_ids`
   row: removed by the retention sweep after 7 idle days, lost with DROP EXTENSION, or never
   issued here) is accepted as Kafka 3.7 accepts it (KIP-360): its batch is written at
@@ -231,6 +237,13 @@ pg_kafka.compression_type = 'gzip'
   older than the producer's current one is INVALID_PRODUCER_EPOCH on every partition.
   Kafka compares the epoch with the producer's state on the batch's partition only and
   accepts an older epoch on a partition where the producer has no state.
+- **Deviation:** a producer id that a transactional id owns takes no epoch it presents
+  itself: any batch of it, transactional or not, at an epoch other than its current one is
+  INVALID_PRODUCER_EPOCH, a higher epoch too (its epoch moves only with InitProducerId).
+  Kafka 3.7 (`ProducerAppendInfo.checkProducerEpoch`) refuses only a lower epoch, and
+  accepts a non-transactional batch at a higher one as the producer's new epoch. The one
+  exception is a partition its open transaction has written to, where a higher epoch is
+  answered as Kafka answers it (§4).
 - Produce responses report `log_append_time_ms = -1` (topics use CreateTime)
 
 **Client Impact:**
@@ -265,8 +278,10 @@ pg_kafka.compression_type = 'gzip'
   refuses the other producer's batch there on its own, 49, where Kafka answers 3); and a non-transactional batch of a producer whose open transaction has written
   to the partition is INVALID_TXN_STATE (48), with or without a transactional id in the
   request, after the epoch and sequence checks (one at a bumped epoch must start at
-  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch; a
-  partition the transaction only added takes it, committed). **Deviation:** transactional batches of one producer id at two
+  sequence 0, OUT_OF_ORDER_SEQUENCE_NUMBER otherwise, and moves no stored epoch). On a
+  partition the transaction only added, a non-transactional batch at the current epoch is
+  written, committed; one at a bumped epoch is INVALID_PRODUCER_EPOCH (§3: a producer id
+  that a transactional id owns takes no epoch it presents; Kafka 3.7 writes it). **Deviation:** transactional batches of one producer id at two
   epochs are checked per epoch (the current epoch's written, the other refused); Kafka
   verifies all of them with the epoch of whichever partition its request map yields first,
   so it refuses or accepts them all. AddPartitionsToTxn,
@@ -290,15 +305,28 @@ pg_kafka.compression_type = 'gzip'
   fenced (PRODUCER_FENCED, INVALID_PRODUCER_EPOCH before v4) and changes nothing. A presented id without an epoch, or the
   reverse, is INVALID_REQUEST (42). An InitProducerId presenting none (-1/-1) fences
   the previous producer, after which its retry is fenced too. An idempotent producer
-  always gets a new producer id. **Deviation:** a retry of a re-init that moved the
+  always gets a new producer id. While the transactional id has a transaction Ongoing, an
+  InitProducerId that would bump it (the current epoch presented, the epoch before the last
+  bump, or none) aborts that transaction under the next epoch and is answered
+  CONCURRENT_TRANSACTIONS (51), as in Kafka 3.7; the client retries, and a retry presenting
+  the same epoch is then fenced while one presenting none gets the epoch after the fenced one.
+  (The Java client and librdkafka end a transaction with EndTxn before they bump its epoch,
+  and retry CONCURRENT_TRANSACTIONS.) **Deviation:** a retry of a re-init that moved the
   producer to a new id (epoch 32767 exhausted) is PRODUCER_FENCED; Kafka also
-  remembers the previous producer id.
+  remembers the previous producer id. **Deviation:** an InitProducerId presenting the
+  current producer id with any other epoch (older than the one before the last bump, or
+  newer than the current one) while a transaction is Ongoing is PRODUCER_FENCED and leaves
+  that transaction open; Kafka 3.7 checks only the producer id there and aborts the
+  owner's transaction (CONCURRENT_TRANSACTIONS) on behalf of such a zombie.
 - ✅ The transaction timeout (`transaction.timeout.ms`) runs from the start of each
   transaction, as Kafka's does; the timeout sweep aborts an expired one and fences its
   producer with the next epoch (a new producer id when the epoch is exhausted)
 - ✅ AddOffsetsToTxn includes consumer offsets in transaction: it registers the group in
   the open transaction (`kafka.txn_groups`, cleared with `kafka.txn_partitions`)
-- ✅ EndTxn commits or aborts atomically
+- ✅ EndTxn commits or aborts atomically. EndTxn of a transaction that added nothing since
+  InitProducerId (Empty) is INVALID_TXN_STATE (48), commit or abort, as in Kafka 3.7 (the Java
+  client and librdkafka send no EndTxn for such a transaction); a retried EndTxn whose
+  transaction already ended the way it asks is NONE
 - ✅ TxnOffsetCommit commits offsets within transaction context; for a group the
   transaction did not add with AddOffsetsToTxn it is INVALID_TXN_STATE (48) on every
   partition and version and stores nothing, as in Kafka 3.7. **Deviation:** Kafka verifies
@@ -335,7 +363,9 @@ pg_kafka.compression_type = 'gzip'
 
 **Status:** Full support with automatic partition assignment and rebalancing
 **Kafka Behavior:** Automatic partition assignment with rebalancing
-**pg_kafka Behavior:** Same, with Range, RoundRobin, and Sticky strategies
+**pg_kafka Behavior:** Same, with Range, RoundRobin, and Sticky strategies (the server-side
+Sticky assignor balances and keeps previous assignments but is not Kafka's StickyAssignor
+algorithm; see "Server-side sticky assignment" below)
 
 **What Works:**
 - ✅ FindCoordinator API
@@ -368,10 +398,103 @@ pg_kafka.compression_type = 'gzip'
   and answered with its assignment (empty if the leader left it out) when the
   leader's SyncGroup arrives; the generation does not move. A held SyncGroup is
   answered REBALANCE_IN_PROGRESS if a new rebalance starts first (a member joins or
-  leaves, or the leader misses the rebalance timeout and the sweep evicts it), and
+  leaves, or the sweep evicts the members that did not sync, below), and
   UNKNOWN_MEMBER_ID if the member itself is removed. Like a waiting joiner, a member
   whose SyncGroup is held is exempt from its session timeout. Server-side
-  assignment (a leader sending empty assignments) is computed only for the leader.
+  assignment (a leader sending empty assignments) is computed only for the SyncGroup the
+  coordinator takes assignments from: the leader's, at the current generation, while the
+  group is in its sync phase (a stale generation or a Stable group's SyncGroup ignores its
+  assignments, so nothing is computed for it). A member's repeated subscriptions count once.
+  An assignment over 2,000,000 entries (subscribed topics per member, repeats included, the
+  topic entries of the sticky assignor's previous assignments, also those naming no existing
+  topic or listing no partitions, the partitions they list, and the partitions of the
+  subscribed topics) is refused with POLICY_VIOLATION (44) before it is computed, and the
+  group stays in its sync phase (the rebalance timeout evicts the leader), since it would
+  hold the DB thread that serves every client. Of a previous assignment only the entries for
+  existing topics with partitions are kept in memory. The assignors work on member indexes,
+  so a member id (up to 32 KB of client id) costs its length only when the ids are sorted and
+  copied into the result, once per assignment, never per subscribed topic, partition or
+  move. Range and RoundRobin take about one step per entry. Sticky distributes in about the
+  entries plus the partitions and moves a partition for balance in a few ordered-set
+  operations plus at most a look at each distinct subscription, so a rebalance of members
+  sharing a few subscriptions also takes about as many steps as entries. How much balancing
+  an input needs depends on how the subscriptions overlap and how far the previous
+  assignment is from balanced, so every step is counted, and a sticky assignment that would
+  take more than 10,000,000 steps (about a second at most) is refused the same way. Measured
+  with 999 members over 999 topics: member i subscribed to the topics from the i-th on,
+  rebalancing from one owner of everything, fits up to about 430 partitions per topic
+  (beyond the default `pg_kafka.max_total_partitions`; 5,419,770 steps at 200), with
+  ordered or random member ids; member i subscribed to the first i + 1 topics fits up to 10
+  to 24 partitions per topic, depending on the member ids and the previous assignment
+  (up to 11 from a fresh group with member ids in subscription order, refused at 12). The
+  leader's retries of a refused assignment in the same generation are answered
+  POLICY_VIOLATION without computing it again; the refusal holds until the generation moves
+  (a member joins, leaves or is evicted, or the leader rejoins, as a client does when its
+  subscribed topics change), not when partitions are added within the generation. Kafka
+  assigns on the client and has no such limits.
+- ⚠️ **Deviation: server-side sticky assignment.** When the group's protocol is "sticky" and
+  the leader sends empty assignments, the server's Sticky assignor keeps each remaining
+  member's previous partitions that it still subscribes to, gives the other partitions (by
+  topic name, then partition) to the lightest subscriber, and then moves partitions until no
+  partition sits on a member two partitions heavier than the lightest subscriber of its
+  topic. It is not the general assign algorithm of Kafka 3.7's StickyAssignor, which places
+  the partitions with the fewest possible consumers first and balances by a different
+  search, so the two can choose differently: for a fresh group over topics a (3 partitions),
+  b (3) and c (2) with m1 subscribed to {a}, m2 to {a, b} and m3 to {a, b, c}, Kafka gives
+  m1 [a0, a1, a2], m2 [b0, b1, b2], m3 [c0, c1], and pg_kafka m1 [a0, a2], m2 [a1, b0, b2],
+  m3 [b1, c0, c1]; after a member joins, the two can also move different partitions. It only applies to leaders that send empty assignments: the Java
+  client and librdkafka run their sticky assignors on the client, and the server only
+  passes those assignments on.
+- ✅ As in Kafka 3.0+ (`pendingSyncMembers`, checked against a 3.7 broker): every member of
+  a new generation must send its SyncGroup within the group's rebalance timeout of the
+  join's completion. The sweep removes those that have not, though they heartbeat and
+  whether the group is still CompletingRebalance or already Stable (the leader's SyncGroup
+  came), and the others rebalance (their Heartbeat gets REBALANCE_IN_PROGRESS).
+- ✅ DescribeGroups reports the protocol and each member's metadata and assignment only for a
+  Stable group; in PreparingRebalance and CompletingRebalance the protocol is "" and the
+  members carry neither, as Kafka 3.7's `GroupMetadata.summary` does. **Deviation:** every
+  member's `client_host` is "localhost"; Kafka reports the member's address (for example
+  "/127.0.0.1"). The DB-thread handler is not given the connection's peer address.
+- ✅ ListGroups' `states_filter` (v4) matches state names case-sensitively, as Kafka 3.7
+  does (`kafka-consumer-groups --state` sends the canonical names).
+- **Deviation:** a ListGroups response is bounded by `pg_kafka.fetch_max_bytes` (Kafka builds
+  the whole list). Group ids are client strings of up to 32 KB, and the groups known only by
+  their offsets are bounded only by the database, so 300 groups of 30 KB ids made a 9 MB
+  response and a few hundred thousand of them gigabytes. The groups are listed in the byte
+  order of their ids, the first always, while their entries fit; the rest are left out and the
+  server logs a WARNING. The list is always the first groups, in that order, of those the state
+  filter selects. ListGroups has no per-group error code, and a top-level error makes the Java
+  admin client drop the whole list (librdkafka keeps the groups next to the error), so the
+  shortened list is answered NONE. Use the v4 state filter or DescribeGroups of the groups
+  wanted to see the others. With a state filter the list may stop short of the bound (groups
+  known by their offsets that the coordinator holds in a filtered-out state count toward it).
+- ✅ LeaveGroup v3+ answers every entry of `members` in order, as Kafka 3.7 does: NONE for a
+  member removed, UNKNOWN_MEMBER_ID for one the group does not have, a repeat of an entry
+  already removed included. **Deviation:** the group reacts once to all the members a request
+  removes (a new leader, a rebalance, a join phase completed by the leavers), where Kafka
+  reacts after each entry; a join phase that the first leavers of a request complete is
+  completed once with the members that remain, instead of being completed and restarted by
+  the next entry. The server logs one line per LeaveGroup that removes members, not one per
+  entry.
+- ✅ A leader whose server-side assignment cannot be computed for a transient reason (the
+  subscribed topics could not be read, also when the read ends in a Postgres ERROR such as a
+  lock timeout on `kafka.topics`) gets COORDINATOR_NOT_AVAILABLE (15), retriable, as Kafka 3.7
+  answers a SyncGroup whose assignment it failed to store. Any JoinGroup or SyncGroup the
+  broker fails to answer (its request unwound, or the worker exited while it was held) gets the
+  same code, never UNKNOWN_SERVER_ERROR, which is fatal to the Java consumer. Clients look the
+  coordinator up again and rejoin; a leader that rejoins with unchanged metadata during the
+  sync phase keeps the generation, and its next SyncGroup computes the assignment again.
+  **Deviation:** the group stays in its sync phase and only the leader is answered: the
+  followers' parked SyncGroups keep waiting for the leader's retry (or the rebalance timeout).
+  Kafka 3.7 (`resetAndPropagateAssignmentError`) answers every parked member with the error and
+  starts a new join phase, so every member rejoins and the generation moves; here the leader's
+  retry completes the same generation without a rebalance.
+- ✅ A leader that sends empty assignments for a group whose selected protocol is not one of
+  the server's assignors (range, roundrobin, sticky, cooperative-sticky) has them stored as
+  sent and gets NONE, as Kafka 3.7 stores whatever the leader sends: every member gets an
+  empty assignment and the group is Stable. Nothing is read for it.
+- ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
+  INVALID_REQUEST (42), as Kafka 3.7 does.
 
 **What's Not Implemented:**
 - ❌ Static group membership (KIP-345): `group_instance_id` is not honored
@@ -422,14 +545,43 @@ pg_kafka.compression_type = 'gzip'
   ListGroups and DescribeGroups as Empty groups with protocol type "consumer", so
   `kafka-consumer-groups --list/--describe` shows them with offsets and lag. (Kafka keeps the
   group's actual protocol type; an offsets-only group here is always "consumer", which also
-  covers groups that only ever committed as simple consumers, for which Kafka reports "".)
+  covers groups that only ever committed as simple consumers, for which Kafka reports "".) A
+  group with only a pending transactional offset (a TxnOffsetCommit whose transaction is still
+  open, which in Kafka 3.7 creates the group) is such a group too, for DeleteGroups as well:
+  deleting it, or any group, also drops its pending transactional offsets, so the
+  transaction's commit stores none for it, as in Kafka. (When that transaction aborts, such a
+  group is gone at once; Kafka keeps it Empty until its ~10-minute offsets cleanup.)
 - Resource bounds (deviation: Kafka's `group.max.size` defaults to unlimited and it has no
   group-count cap): `pg_kafka.group_max_size` (default 1000) members per group, beyond which a
   new member gets GROUP_MAX_SIZE_REACHED; `pg_kafka.max_consumer_groups` (default 100000) groups
   in memory, beyond which the least recently active Empty group is forgotten (its offsets stay)
   or, if none is Empty, a JoinGroup for a new group gets COORDINATOR_NOT_AVAILABLE; a member's
   protocol list is limited to 64 protocols and 1 MiB (Kafka bounds it by the 1 MiB
-  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST.
+  `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST; and
+  `pg_kafka.max_group_memory` (default 128MB) bounds the member state of all groups together
+  (member ids, protocols and their metadata, assignments and the copies kept for the sticky
+  assignor; each protocol name counts twice, for the copy the group's per-name member counts
+  may keep, as Kafka's `supportedProtocols`; a group's copies of its leader's id and of its protocol name count as the longest
+  id and protocol name of its members, since a leave can make any of them the leader or
+  complete a join phase with any of their protocols, and nothing is refused then). Kafka has no such bound (its heap is the limit), but without it the caps above
+  still allowed about 1e14 bytes, held up to the 30-minute session timeout by members that
+  never sync; an allocation failure aborts the worker and sends Postgres into crash
+  recovery. A JoinGroup whose member state does not fit, or a leader SyncGroup whose
+  assignments do not, gets COORDINATOR_NOT_AVAILABLE (15), retriable, as for a full
+  `max_consumer_groups`: the memory frees as members leave or time out, and before refusing,
+  the least recently active Empty groups (no members; their committed offsets stay, so they
+  remain listed as Empty groups) are forgotten until the state fits, as at the group-count cap,
+  unless forgetting all of them would not make room. (Kafka removes an Empty group without
+  offsets at its ~10-minute offsets cleanup; an Empty group here otherwise stays in memory for
+  24 hours.) The budget is the broker's, not the group's (GROUP_MAX_SIZE_REACHED names the group's size and is fatal to
+  the Java consumer). A refused JoinGroup creates no group; a refused SyncGroup stores
+  nothing and the group stays in its sync phase. When the server computed the refused
+  assignments (the leader sent empty ones), the refusal is remembered with the bytes the
+  assignments need: the leader's retries get COORDINATOR_NOT_AVAILABLE without the assignment
+  being computed again while it would still not fit, and the first retry after enough memory
+  frees (another group's members leave or time out, `pg_kafka.max_group_memory` is raised)
+  computes it again; one refused for its size holds until the generation moves. A rejoin that
+  holds no more than before is always admitted. `rebalance_timeout_ms` is not bounded, as in Kafka.
 
 **Client Impact:**
 - Full consumer group functionality works with standard Kafka clients
@@ -448,7 +600,37 @@ pg_kafka.compression_type = 'gzip'
   transaction is still open is answered UNSTABLE_OFFSET_COMMIT (88) with offset -1, at
   partition level as Kafka 3.7 does, so a read_committed consumer waits for it
 - ✅ Consumer groups can track progress across restarts
-- ✅ Supports offset metadata field
+- ✅ Supports offset metadata field: metadata longer than 4096 characters (Kafka's default
+  `offset.metadata.max.bytes`, a length in UTF-16 code units) is answered
+  OFFSET_METADATA_TOO_LARGE (12) on its partition by OffsetCommit and TxnOffsetCommit, and
+  the request's other partitions are committed, as in Kafka 3.7. OffsetFetch answers ""
+  for metadata committed as null and for a partition without an offset, as Kafka does
+- ✅ OffsetFetch of a topic that does not exist (never created, or deleted) answers its
+  partitions offset -1 with NONE, as Kafka 3.7 does on every version, like any partition
+  without a committed offset (UNKNOWN_TOPIC_OR_PARTITION there made the Java consumer's
+  poll() throw for a consumer that assign()s such a topic)
+- **Deviation:** the committed leader epoch (OffsetCommit v6+) is not stored, and
+  OffsetFetch v5+ answers `committed_leader_epoch` -1; Kafka echoes the committed one. A
+  client that sees -1 skips its leader-epoch validation of the fetched position (KIP-320),
+  which on a single broker whose leader epoch never changes validates nothing anyway.
+- **Deviation:** an OffsetFetch response's metadata is bounded by `pg_kafka.fetch_max_bytes`
+  (Kafka builds the whole response). Each committed offset may carry up to 12 KB of metadata,
+  so a fetch of every offset of a group of 200,000 partitions could take 2.4 GB. Offsets are
+  answered in order (by topic and partition for a fetch of all offsets, in request order
+  otherwise) while their metadata fits; each later partition with metadata is answered
+  COORDINATOR_NOT_AVAILABLE (15) with offset -1, at partition level, and the first offset is
+  always answered, so any one partition can be read. A partition committed without metadata
+  is always answered. COORDINATOR_NOT_AVAILABLE is what DescribeGroups answers at the same
+  bound. At partition level none of the clients takes it for a partition without an offset
+  and resets its position, but they do not retry it either: the Java consumer's `poll()` (or
+  `committed()`) throws a `KafkaException` ("Unexpected error in fetch offset response for
+  partition ...") for a consumer assigned such a partition, so a group whose committed
+  metadata does not fit cannot be consumed by the Java client until the metadata is
+  committed shorter or `pg_kafka.fetch_max_bytes` is raised; librdkafka reports the
+  partition's error and does not consume it; the Java admin client (`kafka-consumer-groups
+  --describe`) skips the partition with a warning, and `kafka-consumer-groups --reset-offsets`
+  leaves the partitions it was not answered out of the reset without saying so (check the
+  result with `--describe`).
 
 **Difference:**
 - PostgreSQL table instead of Kafka's compacted topic
@@ -465,24 +647,74 @@ pg_kafka.compression_type = 'gzip'
 - ✅ RecordBatch v2 encoding
 - ✅ Record headers returned to consumers
 - ✅ Empty fetch responses (returns empty bytes)
-- ✅ Partition watermarks (high watermark, log start offset)
+- ✅ Partition watermarks (high watermark, log start offset) and the last stable offset (the
+  first offset of an open transaction, else the high watermark), reported for both isolation
+  levels as Kafka does; a read_uncommitted consumer still reads to the high watermark
 - ✅ Byte-budget fetch sizing — small-message fetches fill `max_bytes` via bounded
   iterative queries instead of capping at a fixed row count
 - ✅ Request-level `max_bytes` (KIP-74): partitions are filled in request order until
-  the response budget is spent; the first partition with data always returns at least
-  one message, later partitions return only what still fits (sizes are estimated as
-  key + value + 64 bytes per record, the same accounting `partition_max_bytes` uses)
-- ✅ Long polling (max_wait_ms/min_bytes support). A waiting fetch is re-run only
-  when a Produce to one of its partitions (or, for `read_committed`, any transaction
-  end: EndTxn, an abort by fencing InitProducerId or by the transaction timeout)
-  signals new data, at `max_wait_ms`, or at the slow safety-net interval
-  `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) — idle consumers do not
-  generate repeated fetch work on the DB thread
+  the response budget is spent, each up to its own `partition_max_bytes`; the first
+  partition with data always returns at least one message, later partitions return only
+  what still fits. Both limits count what a record adds to the response: its key, value and
+  header keys and values uncompressed, plus 84 bytes per record and 10 per header for its
+  framing (the most an uncompressed record batch spends on them: a record alone in its batch,
+  as read_committed skipping aborted offsets or alternating producers leave records, carries
+  the whole 61-byte batch header and up to 23 bytes of its own), so the records returned stay
+  within both limits, but for the first one above. With `pg_kafka.compression_type` set, a
+  codec adds framing per batch (some 15 to 20 bytes) and per block of incompressible data
+  that this count does not cover. Each batch is then encoded once and checked at its encoded
+  size: a partition returns every batch that still fits its limit and, of the first batch
+  that does not, the longest prefix of its records that fits by their counted sizes, that
+  prefix compressed if it fits so and uncompressed otherwise (an uncompressed batch always
+  fits by that count, and it is smaller than a compressed one that does not); the records
+  after it are left for the next Fetch. A partition counts the larger of its counted and
+  encoded sizes against `max_bytes`, and the first record of the response is returned
+  whatever its size (alone, when it does not fit). The database reads (and holds) no more than
+  that of a partition, and a later partition whose first record is larger than its limit does
+  not read that record (sizes are stored with each record at Produce, so a fetch reads the key,
+  value and headers only of the records it returns). Kafka counts
+  the bytes of the record batches as stored, compressed when the producer compressed them,
+  so a compressible topic returns fewer records per Fetch than Kafka would, never more
+  than the limits
+- ✅ Broker-side response cap (`pg_kafka.fetch_max_bytes`, default 55 MiB, Kafka's broker
+  `fetch.max.bytes`): a request's `max_bytes` is lowered to it and its `min_bytes` to the
+  result, as Kafka 3.7's `KafkaApis.handleFetchRequest` does, so a `max_bytes` of `i32::MAX`
+  returns at most the cap; each partition reads up to its `partition_max_bytes` within what is
+  left, and the first record of the first partition with data is returned whole even when it
+  is larger (KIP-74; Kafka returns the first record batch). A long poll answers once the bytes
+  available reach `min_bytes`, counted as Kafka 3.7's `DelayedFetch` counts them: per
+  partition, what lies between its fetch offset and its readable end, at most its
+  `partition_max_bytes` (a partition that returned everything up to its readable end counts
+  the bytes it returned; one cut short or not read counts its whole `partition_max_bytes`). `max_wait_ms` is not capped, as in
+  Kafka; a connection waiting on one is closed by the idle timeout once responses behind it
+  wait unread (Network Security Posture)
+- ✅ Long polling (max_wait_ms/min_bytes support), as Kafka's `DelayedFetch`: a waiting
+  fetch is re-checked when a partition it watches changes, and only that partition is
+  re-read: a Produce to it, DeleteRecords of it, DeleteTopics of its topic, or, for
+  `read_committed`, the end of a transaction that added it (EndTxn, an abort by fencing
+  InitProducerId or by the transaction timeout; as Kafka's transaction markers, which
+  complete only the fetches watching the partitions they are written to). An
+  InitProducerId that aborts no open transaction wakes nothing.
+  Once the bytes available reach `min_bytes`, or a re-read partition has an error, the
+  whole fetch is read once more and answered. At `max_wait_ms` it is read once more, or,
+  when nothing was notified since a read of every partition that returned no records and
+  started less than one `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) before, that
+  read is answered. A re-check no notification asks for (the safety-net interval; a
+  retention sweep that removed records; a dropped notification) reads every partition and
+  runs only within an allowance of 256 partitions per interval shared by all long polls.
+  So a change no notification names (an on-demand `pg_kafka_run_retention_sweep()` in
+  another session, DROP EXTENSION) is in a long poll's answer once it is one interval old
+  (Kafka reads again at the deadline, so it answers any change made before it). An idle
+  long poll costs one read of its partitions per request when `max_wait_ms` is shorter
+  than the interval, and otherwise at most two (Kafka's two: on arrival and at expiry)
+  plus the safety-net re-checks the shared allowance grants it. A fetch that names no
+  partition (no topics, or only empty partition lists) has nothing to wait for and is
+  answered at once, as in Kafka 3.7
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)
 - At most 64 long-poll fetches may wait concurrently per connection; a fetch over that cap is answered immediately (possibly empty) instead of waiting for `max_wait_ms`
-- At most 128 requests per connection may be in flight (read but not yet answered on the socket); beyond that the broker stops reading from the connection until responses are consumed (TCP backpressure), much as Kafka mutes a connection while it has an outstanding request
+- At most 128 requests per connection may be in flight (read but not yet answered on the socket); beyond that the broker stops reading from the connection until responses are consumed (TCP backpressure), much as Kafka mutes a connection while it has an outstanding request. Kafka reads a connection's next request only once the previous response is sent, so it holds one response per connection; pg_kafka bounds what the in-flight requests' responses hold together by a per-connection budget of `pg_kafka.fetch_max_bytes`: a Fetch reserves its `max_bytes` before it reads records (a long poll before each attempt), a response counts at its encoded size once it arrives and is given back once written, and while the connection's unwritten responses hold more than the budget it reads no further request. Any other response's size is known only once it arrives, so the reader also stops while 8 requests other than Fetch and Heartbeat wait for their response (Kafka waits for one), and only a Fetch read while the connection holds nothing else and waits for no other response returns a first record larger than its limits (any other Fetch returns at most its `max_bytes` of records, and its first record once it reads alone). The oldest request whose response is not written never waits for room, so a connection holds at most the budget, plus that request's reservation, plus the responses of at most 8 requests other than Fetch, plus one first record larger than its Fetch's limits (and each Fetch response's partition entries, which `max_bytes` does not count, as in Kafka)
 
 **Client Impact:**
 - Works with standard Kafka clients
@@ -501,13 +733,21 @@ the log:
 
 - Records between holes carry their own offsets, so consumers skip holes in the
   middle of a response.
-- When nothing is visible from the fetch offset up to the readable end (the LSO for
-  `read_committed`, the high watermark for `read_uncommitted`), the response holds one
-  **control batch** covering the hole, with a single COMMIT marker at its last offset,
-  like the marker Kafka writes when a transaction ends. Clients skip control records
-  and move their position past it (the Java client to the batch's last offset + 1,
-  librdkafka to the marker's offset + 1), so their position and committed offset reach
-  the end and the lag goes to 0. An open transaction still blocks at the LSO.
+- When a partition returns no record and nothing is visible from the fetch offset up to
+  its first visible record (one that does not fit the response's limits), or up to the
+  readable end without one (the LSO for `read_committed`, the high watermark for
+  `read_uncommitted`), the response holds one **control batch** covering the hole, with a
+  single COMMIT marker at its last offset, like the marker Kafka writes when a transaction
+  ends. Clients skip control records and move their position past it (the Java client to
+  the batch's last offset + 1, librdkafka to the marker's offset + 1), so their position
+  and committed offset reach the end and the lag goes to 0. An open transaction still
+  blocks at the LSO: as in Kafka, a fetch reads nothing past it. The control batch counts
+  against `partition_max_bytes` and `max_bytes` at its encoded size (78 to 82 bytes), as
+  Kafka counts the abort markers it returns: the first partition of a response with data
+  or such a batch returns it whatever its size, a later partition only when it fits what
+  is left of both limits, covering only the first offsets of the hole when that is what
+  fits (a shorter offset delta encodes in fewer bytes). Below 78 bytes nothing fits, and
+  that partition is not read.
 - Fetched records are re-encoded, grouped into one RecordBatch per run of consecutive
   offsets written by the same producer id/epoch. Batches of transactional rows carry their producer
   id/epoch and the transactional flag; other batches `producer_id = -1`. The base
@@ -541,7 +781,14 @@ honored; producer CreateTime timestamps are preserved).
   last offset of that record's batch (KAFKA-16310, fixed in later releases)
 - ✅ Timestamp-based lookup — returns the earliest offset whose record timestamp is ≥ the requested time (record timestamps are persisted)
 - ✅ Timestamp lookups are bounded like Kafka's: a match at or past the high watermark
-  (`read_committed`: the LSO) is offset -1; aborted records are never a match
+  (`read_committed`: the LSO) is offset -1
+- ✅ The leader epoch (v4+) is 0 with every offset found and -1 when none is, as Kafka 3.7
+  answers for a partition whose leader never changed: pg_kafka is one broker that leads every
+  partition in epoch 0 (the record batches it returns carry partition leader epoch 0)
+- ⚠️ **Deviation:** aborted records are never a match of a timestamp or MAX_TIMESTAMP
+  lookup, at either isolation level; the answer is the next record that matches. Kafka 3.7
+  (`FileRecords.searchForTimestamp`, `LogSegment.findOffsetByTimestamp`) searches the batches
+  without a transactional filter, so it can answer an aborted record's offset and timestamp.
 - ✅ A partition the topic does not have is UNKNOWN_TOPIC_OR_PARTITION
 
 ## Metadata API Deviations
@@ -575,6 +822,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 
 **Implementation:**
 - ✅ Topics have 1 to `pg_kafka.max_partitions_per_topic` partitions (default 10000, at most 100000; set via CreateTopics/CreatePartitions or, for auto-created topics, `pg_kafka.default_partitions` capped at the maximum). A larger count is refused with INVALID_PARTITIONS and `kafka.topics` carries a `CHECK (partitions BETWEEN 1 AND 100000)`; a stored count outside that range (only possible by bypassing the constraint) is reported by Metadata as UNKNOWN_SERVER_ERROR for that topic and ignored by the server-side assignors instead of being allocated, so a corrupt count cannot make the worker allocate without bound. Kafka itself has no per-topic cap.
+- ✅ The partitions of all topics together are capped by `pg_kafka.max_total_partitions` (default 200000, at most 10000000). Partitions cost nothing to create here, and every all-topics Metadata request (AdminClient listTopics, `kcat -L`, pattern-subscribed consumers) builds one entry per partition on the worker's DB thread, so without it one CreateTopics of 10,000 topics of 10,000 partitions would make that allocation about 17 GB, abort the worker and send Postgres into crash recovery, again after every restart. CreateTopics (validate_only included, counting the request's earlier topics), CreatePartitions and auto-creation (Metadata, Produce) that would take the total above the cap are refused with POLICY_VIOLATION (44, the code Kafka answers when a broker policy refuses a request) and create nothing; the missing names of one Metadata request are created together or not at all. Topics already above a lowered cap stay. Kafka has no such cap.
 - ✅ Key-based partition routing using murmur2 hash (Kafka-compatible)
 - ✅ Explicit partition assignment in ProduceRequest supported
 - ✅ Metadata reports correct partition count
@@ -582,7 +830,7 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 **Technical Details:**
 - Uses `murmur2` crate with `KAFKA_SEED` for hash compatibility with Kafka
 - When partition_index == -1, server computes: `murmur2(key) % partition_count`
-- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all; clients always pick the partition).
+- Idempotent/transactional producers (`producer_id >= 0`) cannot use partition -1: a batch's sequence numbers are tracked per partition, so splitting it by key would corrupt sequence tracking. Such a batch is rejected with UNKNOWN_TOPIC_OR_PARTITION (real Kafka does not route -1 at all and answers every -1 entry so; clients always pick the partition). So is a plain -1 batch in a topic of the request that also has an idempotent or transactional batch: its records would join that batch's partition and be written under its producer state (sequence-checked as part of it, or pending in its transaction). A routed batch is answered on the partitions it was written to, not on -1.
 
 ### 12. Null Key Partition Routing (Minor Deviation)
 
@@ -607,13 +855,14 @@ As in Kafka 3.7 (checked against a 3.7 broker): a name Kafka does not accept (lo
 
 - **CreateTopics ignores topic configs.** Per-topic `configs` (e.g. `retention.ms`) and manual replica assignments are accepted but not applied. Set `retention.ms` afterwards with IncrementalAlterConfigs.
 - **CreateTopics validation follows Kafka 3.7** (checked against a real 3.7 broker): a name repeated in one request gets a single INVALID_REQUEST "Duplicate topic name." result and is not created; a name that collides with an existing topic once `.` and `_` are treated as equal (`a.b` vs `a_b`) gets INVALID_TOPIC_EXCEPTION "Topic 'a_b' collides with existing topic: a.b"; `replication_factor` must be 1 or -1 (the default): 0 or below -1 gets INVALID_REPLICATION_FACTOR "Replication factor must be larger than 0, or -1 to use the default value.", above 1 gets INVALID_REPLICATION_FACTOR (single broker), and the response reports 1. Remaining differences: two colliding names created in the *same* request are refused here (Kafka 3.7 creates both, checking collisions only against existing topics), and topics auto-created by Metadata/Produce are not collision-checked (that would cost a query per produce).
-- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap).
+- **CreateTopics default partition count.** `num_partitions = -1` ("broker default", what most admin clients send) creates a topic with `pg_kafka.default_partitions` partitions (capped at `pg_kafka.max_partitions_per_topic`), the same default auto-created topics get. Any other value below 1, such as `0`, is rejected with INVALID_PARTITIONS, as is any count above `pg_kafka.max_partitions_per_topic` (CreateTopics and CreatePartitions; Kafka has no such cap). A topic or growth that would take the partitions of all topics above `pg_kafka.max_total_partitions` is refused with POLICY_VIOLATION.
 - **DeleteGroups** deletes an Empty group's committed offsets (also a group known only by its offsets, see §5) and answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets, as Kafka does.
 - **CreatePartitions** does not itself trigger a rebalance; consumers pick up the new partitions on their next metadata refresh.
 - **DescribeConfigs** supports only TOPIC resources and reports only `retention.ms` and `cleanup.policy` (always `delete`; there is no log compaction). BROKER and other resource types return INVALID_REQUEST. Versions v1-v4 only (the kafka-protocol crate does not implement v0).
-- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted.
+- **IncrementalAlterConfigs** accepts only SET/DELETE of `retention.ms` on TOPIC resources. Any other key or operation (APPEND/SUBTRACT) fails the whole resource with INVALID_CONFIG rather than being silently accepted. A resource that names one key twice is INVALID_REQUEST (42) "Error due to duplicate config keys", and then a SET, APPEND or SUBTRACT without a value is INVALID_REQUEST whatever the key; both are checked first, before the resource type and the topic lookup (an unknown topic is then INVALID_REQUEST, not UNKNOWN_TOPIC_OR_PARTITION), and nothing of the resource is applied, as in Kafka 3.7.
+- **DescribeConfigs config types** are Kafka 3.7's: `retention.ms` LONG (5), `cleanup.policy` LIST (7).
 - **AlterConfigs (33)** is not implemented.
-- **Repeated entries follow Kafka 3.7** (checked against a 3.7 broker). OffsetCommit, TxnOffsetCommit, DeleteRecords, OffsetFetch and Fetch act on a partition the request names more than once a single time, with its last entry, and answer it once, under one entry per distinct topic; ListOffsets answers every entry of a repeated partition INVALID_REQUEST; DeleteTopics and CreatePartitions answer a repeated name with one INVALID_REQUEST "Duplicate topic name." entry; IncrementalAlterConfigs answers every entry of a repeated resource INVALID_REQUEST "Each resource must appear at most once."; DeleteGroups deletes and answers a repeated group once; DescribeConfigs and AddPartitionsToTxn answer every entry. Whatever a request repeats, its topics (and, for DescribeGroups/DeleteGroups, its groups' committed offsets) are looked up in one statement, so a small request cannot hold the DB thread, which serves every client, for one round trip per entry. Remaining difference: entries are answered in the order first named; Kafka answers merged entries in no particular order.
+- **Repeated entries follow Kafka 3.7** (checked against a 3.7 broker). OffsetCommit, TxnOffsetCommit, DeleteRecords, OffsetFetch and Fetch act on a partition the request names more than once a single time, with its last entry, and answer it once, under one entry per distinct topic; ListOffsets answers every entry of a repeated partition INVALID_REQUEST; DeleteTopics and CreatePartitions answer a repeated name with one INVALID_REQUEST "Duplicate topic name." entry; IncrementalAlterConfigs answers every entry of a repeated resource INVALID_REQUEST "Each resource must appear at most once."; DeleteGroups deletes and answers a repeated group once; DescribeConfigs, AddPartitionsToTxn and DescribeGroups answer every entry. A DescribeGroups entry carries its group's members' metadata and assignments (up to `pg_kafka.max_group_memory` for one group), so the entries described in full are bounded together by `pg_kafka.fetch_max_bytes`: an entry, a repeat included, whose description would take the response past it is answered COORDINATOR_NOT_AVAILABLE (retriable; a client describes that group again in a smaller request) instead of being described, except the first group described, so any one group can be (Kafka builds the whole response, so a 1.6 kB request repeating a group of 1 MB of member state is answered with 400 MB). Each distinct group is described once and its repeats share that entry's bytes. Whatever a request repeats, its topics (and, for DescribeGroups/DeleteGroups, its groups' committed offsets) are looked up in one statement, so a small request cannot hold the DB thread, which serves every client, for one round trip per entry. Remaining difference: entries are answered in the order first named; Kafka answers merged entries in no particular order.
 
 ## API Version Support
 
@@ -703,14 +952,19 @@ one and on every requested topic/partition/group/resource it echoes:
 | Handler returns `Err`, or panics (a Postgres ERROR) | the error's code / UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 | The batch's commit fails | UNKNOWN_SERVER_ERROR (-1) | every requested entry |
 
+A Fetch below v6 cannot carry KAFKA_STORAGE_ERROR (56): wherever a Fetch response would hold
+it, a v4 or v5 client gets NOT_LEADER_OR_FOLLOWER (6), which it retries after refreshing its
+metadata, as Kafka 3.7's `KafkaApis.handleFetchRequest` down-converts it
+(`ApiSchema::for_version`, applied to every response just before it is encoded).
+
 Remaining deviations: a body that does not decode has no entries to echo, so APIs without
 a top-level error code (Produce, ListOffsets, DescribeGroups, CreateTopics, ...) answer with
 an empty but well-formed response. A version kafka-protocol cannot encode a response in
 (below the advertised minimum, which is the crate's own minimum, or above the crate's
 maximum) closes the connection, as Kafka does for an unsupported version. A frame whose
-header cannot be parsed closes the connection. An API key pg_kafka does not serve gets the
-generic error frame (correlation id, UNSUPPORTED_VERSION, null message), since there is no
-response schema to answer in. An acks=0 Produce never gets a response.
+header cannot be parsed closes the connection, and so does an API key pg_kafka does not
+serve (it is not advertised in ApiVersions), as Kafka 3.7 closes the connection of a request
+for an API that is not enabled. An acks=0 Produce never gets a response.
 
 ### Notable Missing APIs
 
@@ -732,32 +986,53 @@ fire-and-forget with no response frame and no durability claim — see §1.)
 
 ## Shadow Forwarding Delivery Semantics
 
-**Status:** At-least-once on decoupled paths, by design.
+**Status:** At-least-once, in commit order per local partition, by design. Full description:
+[SHADOW_MODE_FLOW_DIAGRAM.md](SHADOW_MODE_FLOW_DIAGRAM.md).
 
-Shadow forwarding to an external Kafka cluster uses a durable outbox
-(`kafka.shadow_tracking`) drained by a poll loop:
+Shadow forwarding to an external Kafka cluster goes through a durable outbox
+(`kafka.shadow_tracking`): a produce writes its records locally and, in the same transaction, one
+pending outbox row per forwarded record. The worker's outbox tick claims due rows after the commit
+and hands them to the forwarder on the network thread, which produces them with an idempotent
+librdkafka producer and answers every record with an ack.
 
-- **Sync mode** (`forward_sync_after_commit`): effectively exactly-once at the
-  external broker in normal operation — after the local commit, and before the
-  produce response is sent, the worker forwards the request's rows and waits
-  (bounded, 5 s) for the external acks. Rows of a request that rolled back are
-  never forwarded, so the external broker never holds a record pg_kafka did
-  not store.
-- **Async / forward-on-commit modes:** **at-least-once**. A row whose forward
-  ack is lost (worker crash between delivery and finalization, dropped ack on
-  a full channel) is re-forwarded after its retry lease expires, so the
-  external topic can receive duplicates in failure windows. This is the
-  standard Kafka mirroring guarantee; consumers of the external topic that
-  need exactly-once semantics must deduplicate (e.g. by key + producer
-  metadata).
-- **In-flight gating:** a row whose forward is merely *slow* (ack pending) is
-  not re-claimed at lease expiry — the DB thread tracks dispatched
-  forwards and the outbox claim skips them until the ack resolves or the
-  entry ages out (`INFLIGHT_EVICT_AFTER`, 150 s, sized above the
-  forwarder's 120 s delivery timeout, which runs from when the forwarder
-  receives the record, time in its backlog included). Duplicates therefore occur only on genuine ack
-  *loss*, not ack *latency*. Local storage and `kafka.shadow_tracking`
-  finalization remain exactly-once in all modes.
+- **One path for sync and async.** `sync_mode` changes only when the client gets its response:
+  a sync-mode response is held (by the forwarder, never by the worker) until its records are
+  delivered or `pg_kafka.shadow_sync_timeout_ms` (default 5 s) passes; on timeout the records stay
+  pending and are forwarded like any other. Both modes write the same outbox rows and are
+  dispatched by the same claim. Nothing is sent before the local commit, so a rolled-back request
+  never leaves a copy on the external broker. Some sync-mode responses are not held (an
+  idempotent producer's retry of an appended batch, records beyond 10 000 sync rows in one
+  group-commit batch, transactional records): see "Sync vs Async Forwarding" there.
+- **At-least-once.** The idempotent producer suppresses duplicates of its own retries within one
+  producer session. A record can land twice when it is re-sent by a new producer (rebuilt after a
+  fatal error, a settings change or the 120 s delivery timeout: the old producer's purged
+  in-flight requests may still have been written), or when its ack is lost (the worker restarted
+  before applying it, or the row's in-flight entry was evicted after 150 s): the claim then takes
+  the row again and counts the lost attempt. Acks are never dropped on the way back (the
+  forwarder keeps those the bounded channel cannot take yet), and a row in flight is not claimed
+  again while the worker tracks it (no lease: a slow ack never causes a re-send). Consumers of the
+  external topic that need exactly-once semantics must deduplicate, for example on an
+  application id.
+- **Order.** The forwarder sends the records of a local partition in local-offset order among
+  those in the outbox, never one ahead of an earlier one's retry. A transaction's records enter
+  the outbox only when it commits, so records of different producers are forwarded in commit
+  order: a later offset written meanwhile by another producer can go out before an open
+  transaction's earlier offsets (a read_committed consumer of the local topic stops at the open
+  transaction and reads them in offset order). The external partition
+  is chosen by key (`murmur2_random`, the Java client's partitioner; random for a null key), so
+  the order the external topic keeps is per external partition: the first copies of the records
+  of one local partition that land in the same external partition (for keyed records, those of
+  one key) are in sending order there (duplicates may follow them). Records with different keys, or null
+  keys, may land in different external partitions with no order between them. A dead-lettered
+  record that is replayed later lands after the records that followed it.
+- **Dead letters.** A row that fails `pg_kafka.shadow_max_retries` delivery attempts stops being
+  forwarded until it is replayed (`kafka.replay_shadow_messages`) or the cap is raised. Only
+  the record a partition waits on is charged an attempt when nothing is sent for reasons outside
+  it (the 120 s delivery timeout, or shadow settings no producer can be built from, such as an
+  unknown `shadow_security_protocol`); the records behind it wait uncounted, so a bad setting
+  dead-letters each partition's records one at a time, not a whole backlog at once.
+- **Local state is exact.** The local write and the outbox row commit together; a delivered row
+  records its external offset once (a duplicate ack matches nothing).
 
 ## Network Security Posture
 
@@ -791,21 +1066,55 @@ reference: [AUTHENTICATION.md](AUTHENTICATION.md).
 - **Network edge limits:** connections are capped per listener
   (`pg_kafka.max_connections`, default 1024; Kafka's cap is broker-wide with per-listener
   overrides) and per IP address across listeners (`pg_kafka.max_connections_per_ip`, default 256,
-  where Kafka's default is unlimited); over a cap the socket is closed at accept. Idle
-  connections close after `pg_kafka.connections_max_idle_ms` (600000, as Kafka), a request frame
-  must arrive within `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its
-  first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
-  incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over 1 MiB
-  (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame would
-  exceed the budget is closed. Responses are not size-capped (they are bounded by the request's
-  `max_bytes`). `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
+  where Kafka's default is unlimited); over a cap the socket is closed at accept. A
+  connection closes after `pg_kafka.connections_max_idle_ms` (600000, as Kafka) without a byte
+  read or written, once nothing it sent is still being answered or responses wait for it to
+  read them: one being written, or answered ones waiting behind an earlier request such as a
+  long poll (a client that stops reading: as Kafka's idle expiry closes a muted connection whose
+  response does not go out). A request still being answered with nothing answered behind it
+  (a long-poll Fetch, a JoinGroup waiting for its group) keeps it open; Kafka's idle expiry
+  closes such a connection too. A request frame must arrive within
+  `pg_kafka.request_read_timeout_ms` (60000; Kafka has no such deadline) of its first byte, and the pre-authentication phase (TLS + SASL) has 10 s from accept. Memory for an
+  incomplete incoming frame is reserved as its bytes arrive, under a 512 MiB budget for frames over
+  1 MiB (Kafka's `queued.max.request.bytes` is unbounded by default); a connection whose frame
+  would exceed the budget is closed. That budget covers only the raw bytes of frames still
+  arriving: what a request decodes to is bounded separately. A frame's size bounds its decoded
+  form poorly (a Metadata v9 topic of an empty name is 2 bytes on the wire and some 90 decoded, a
+  DeleteGroups group name 1 byte and some 60; with their vectors' growth a decode of such entries
+  holds 40 to 100 times its frame), so every request's decode is metered as it allocates: a
+  decode may hold at most 2 MiB on an I/O thread, past which it runs again off the I/O threads
+  (at most two at a time) under the request limit of **64 MiB**; it holds at most about three
+  times its limit at once before it stops. A request that decodes to more than 64 MiB (besides
+  a Produce's records, bounded below) closes the connection without a response, as Kafka closes
+  the connection for a frame over `socket.request.max.bytes` (100 MB): Kafka accepts such a
+  request if its frame is under 100 MB, pg_kafka does not. 64 MiB is what a Metadata request of
+  some 300,000 topic names of 50 bytes decodes to, or a Fetch of some 500,000 partitions, far
+  beyond what clients send. Decoded requests then hold at most 256 MiB together until the
+  DB thread has run them (not until their responses are written: the responses a connection
+  whose client stops reading holds are bounded by its response budget, `pg_kafka.fetch_max_bytes`
+  (§7), until the idle timeout), 32 MiB of it
+  kept for requests of at most 64 KiB (Heartbeats, ApiVersions, commits), so a few large
+  requests cannot lock control traffic out; a decoded request that finds no room is freed and
+  decodes again once there is, waiting up to 10 s (a Produce: half its `timeout_ms`, at most
+  10 s, from when its frame was read; its connection reads nothing meanwhile), after which the
+  connection closes, a Produce's too. A Fetch response holds at most the request's `max_bytes`,
+  lowered to `pg_kafka.fetch_max_bytes`, of record bytes (counted uncompressed, or encoded
+  when `pg_kafka.compression_type` encodes them larger), and its first record
+  whole when that is larger (§7); a large response is written from its own buffer,
+  and a connection's read buffer starts small again after a large frame, so neither keeps the
+  largest frame's memory for the connection's life (Kafka allocates per receive and send).
+  `TCP_NODELAY` is set on every socket. SASL credential lookups are rate limited
   per IP address (10/s, burst 20; Kafka has none). A connection closed for a bad frame, a timeout
   or an acks=0 error first delivers the responses of every request it read before (up to 30 s).
-  Decoded Produce records waiting for the DB thread hold at most 512 MiB together, and decodes
-  of more than 2 MiB run off the I/O threads, at most two at a time; a request that finds no
-  room waits for it, up to 10 s, and is then answered REQUEST_TIMED_OUT (see §2). A request's
-  frame counts against the frame budget while it waits, as an incomplete frame does (one the
-  exhausted budget cannot take is answered REQUEST_TIMED_OUT at once).
+  Decoded Produce records waiting for the DB thread hold at most 512 MiB together (besides the
+  256 MiB of decoded requests), and record decodes of more than 2 MiB run off the I/O threads,
+  at most two at a time; a Produce whose records find no room waits for it, at most half its
+  `timeout_ms` and 10 s from when its frame was read, and is then answered REQUEST_TIMED_OUT
+  (see §2). A request's frame counts against the frame budget while it waits (for a
+  large-decode slot, or for room in either budget), as an incomplete frame does; one the
+  exhausted budget cannot take is refused at once: a Produce waiting for its records' room is
+  answered REQUEST_TIMED_OUT, any other wait (a Produce's included, before its records)
+  closes the connection.
 
 ## Compatibility Testing
 

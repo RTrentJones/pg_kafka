@@ -588,7 +588,7 @@ fn gzip_of_empty_blocks(blocks: usize) -> Vec<u8> {
 }
 
 /// A one-record gzip batch whose section is [`gzip_of_empty_blocks`].
-fn empty_blocks_batch(blocks: usize) -> Bytes {
+pub(super) fn empty_blocks_batch(blocks: usize) -> Bytes {
     batch_with(
         &gzip_of_empty_blocks(blocks),
         1,

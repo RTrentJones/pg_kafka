@@ -140,15 +140,15 @@ fn test_handle_offset_fetch_found() {
     });
 
     mock.expect_fetch_offsets()
-        .withf(|group, partitions| group == "test-group" && partitions == [(1, 0)])
-        .returning(|_, _| {
+        .withf(|group, partitions, _| group == "test-group" && partitions == [(1, 0)])
+        .returning(|_, _, _| {
             Ok(vec![(
                 1,
                 0,
-                CommittedOffset {
+                Some(CommittedOffset {
                     offset: 42,
                     metadata: Some("test-metadata".to_string()),
-                },
+                }),
             )])
         });
 
@@ -181,7 +181,7 @@ fn test_handle_offset_fetch_not_found() {
     });
 
     // No committed offset
-    mock.expect_fetch_offsets().returning(|_, _| Ok(vec![]));
+    mock.expect_fetch_offsets().returning(|_, _, _| Ok(vec![]));
 
     let topics = Some(vec![OffsetFetchTopicData {
         name: "test-topic".to_string(),
@@ -203,23 +203,27 @@ fn test_handle_offset_fetch_not_found() {
 fn test_handle_offset_fetch_all_offsets() {
     let mut mock = MockKafkaStore::new();
 
-    mock.expect_fetch_all_offsets().returning(|_| {
+    mock.expect_fetch_all_offsets().returning(|_, _| {
         Ok(vec![
             (
                 "topic1".to_string(),
-                0,
-                CommittedOffset {
-                    offset: 10,
-                    metadata: None,
-                },
+                vec![(
+                    0,
+                    Some(CommittedOffset {
+                        offset: 10,
+                        metadata: None,
+                    }),
+                )],
             ),
             (
                 "topic2".to_string(),
-                0,
-                CommittedOffset {
-                    offset: 20,
-                    metadata: None,
-                },
+                vec![(
+                    0,
+                    Some(CommittedOffset {
+                        offset: 20,
+                        metadata: None,
+                    }),
+                )],
             ),
         ])
     });

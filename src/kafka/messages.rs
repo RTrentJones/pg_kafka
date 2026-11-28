@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::kafka::api::{Lane, RequestBody, RequestHeader, ResponseBody};
+use crate::kafka::protocol::DecodedCharge;
 
 /// Type alias for TxnOffsetCommit topic data: (topic_name, [(partition, offset, metadata)])
 pub type TxnOffsetCommitTopics = Vec<(String, Vec<(i32, i64, Option<String>)>)>;
@@ -53,6 +54,12 @@ pub struct KafkaRequest {
     pub body: RequestBody,
     /// Where the response goes (the connection's per-request slot).
     pub response_tx: tokio::sync::mpsc::UnboundedSender<KafkaResponse>,
+    /// What the decoded request holds of the decoded-request budget
+    /// (`protocol::DECODED_REQUESTS`), given back when the request is dropped: on the DB
+    /// thread once its handler ran (or in the long-poll task that holds a waiting Fetch), not
+    /// when its response is written, so a client that stops reading its responses holds no
+    /// decoded request memory.
+    pub decode_charge: DecodedCharge,
 }
 
 impl KafkaRequest {
@@ -278,6 +285,16 @@ pub struct SyncGroupAssignment {
     pub assignment: Vec<u8>,
 }
 
+/// The members a LeaveGroup request removes, framed by its version.
+#[derive(Debug, Clone)]
+pub enum LeavingMembers {
+    /// LeaveGroup v0-2: the top-level member id.
+    Single(String),
+    /// LeaveGroup v3+: the `members` array (possibly empty); the top-level member id is
+    /// not part of these versions.
+    Batch(Vec<MemberIdentity>),
+}
+
 /// Member identity for LeaveGroup request (v3+)
 #[derive(Debug, Clone)]
 pub struct MemberIdentity {
@@ -423,6 +440,7 @@ mod tests {
                 group_instance_id: None,
             }),
             response_tx: response_tx.clone(),
+            decode_charge: DecodedCharge::default(),
         };
         lanes.route(&heartbeat).send(heartbeat).unwrap();
         assert!(
@@ -438,6 +456,7 @@ mod tests {
             header: header(crate::kafka::constants::API_KEY_API_VERSIONS, 2),
             body: RequestBody::ApiVersions(crate::kafka::api::ApiVersionsRequestData),
             response_tx,
+            decode_charge: DecodedCharge::default(),
         };
         lanes.route(&api_versions).send(api_versions).unwrap();
         assert!(
@@ -484,10 +503,11 @@ mod tests {
                 refused: Vec::new(),
                 topic_data: vec![],
                 transactional_id: None,
-                decoded: crate::kafka::protocol::DecodedCharge::default(),
+                decoded: DecodedCharge::default(),
                 pending: None,
             }),
             response_tx: orig_tx,
+            decode_charge: DecodedCharge::default(),
         };
 
         let returned = request.swap_response_tx(buf_tx);
@@ -517,6 +537,7 @@ mod tests {
                 header: header(info.key, 1),
                 body: crate::kafka::api::tests::sample_request(info.key),
                 response_tx: orig_tx,
+                decode_charge: DecodedCharge::default(),
             };
             let deferred = request.body.deferred_reply();
             let returned = request.swap_response_tx(buf_tx);
@@ -555,6 +576,7 @@ mod tests {
                 assignments: vec![],
             }),
             response_tx: orig_tx,
+            decode_charge: DecodedCharge::default(),
         };
         let returned = request.swap_response_tx(buf_tx);
         assert!(

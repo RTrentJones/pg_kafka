@@ -46,12 +46,14 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         listener_tests::test_listener_idle_long_poll_does_not_refetch: sequential,
         listener_tests::test_listener_produce_wakes_long_poll_promptly: sequential,
         listener_tests::test_listener_read_committed_long_poll_wakes_on_commit: sequential,
+        listener_tests::test_listener_delete_records_wakes_long_poll: sequential,
+        listener_tests::test_listener_delete_topics_wakes_long_poll: sequential,
         listener_tests::test_listener_pipelined_requests_beyond_in_flight_cap: sequential,
         lifecycle_tests::test_worker_restarts_after_terminate: sequential, // takes the broker down for ~5 s
         lifecycle_tests::test_failed_request_rolls_back_alone,
         lifecycle_tests::test_group_commit_concurrent_acks_visible,
         lifecycle_tests::test_group_commit_pipelined_produces_in_order,
-        metrics_tests::test_metrics_count_produce_and_fetch,
+        metrics_tests::test_metrics_count_produce_and_fetch: sequential,
         metrics_tests::test_consumer_lag_view,
         bug_hunt::test_fetch_into_cleaned_up_aborted_rows_is_in_range,
         bug_hunt::test_fetch_bad_partition_or_offset_returns_error,
@@ -93,5 +95,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_offset_commit_generation_for_offsets_only_group,
         kafka_parity::test_refused_offset_commit_answers_unknown_partitions,
         kafka_parity::test_group_member_checks_match_kafka,
+        kafka_parity::test_negative_partition_max_bytes_is_unknown_server_error,
+        kafka_parity::test_create_topics_success_has_a_null_error_message,
     ]
 }

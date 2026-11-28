@@ -34,8 +34,12 @@ fn test_handle_describe_configs_retention_sources() {
             (2, 1)
         }))
     });
-    mock.expect_get_topic_retention_ms()
-        .returning(|topic_id| Ok(if topic_id == 1 { Some(60_000) } else { None }));
+    mock.expect_get_topics_retention_ms().returning(|ids| {
+        Ok(ids
+            .iter()
+            .map(|&id| (id, if id == 1 { Some(60_000) } else { None }))
+            .collect())
+    });
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -69,7 +73,8 @@ fn test_handle_describe_configs_retention_sources() {
 fn test_handle_describe_configs_key_filter() {
     let mut mock = MockKafkaStore::new();
     expect_topics(&mut mock, |_| Ok(Some((1, 1))));
-    mock.expect_get_topic_retention_ms().returning(|_| Ok(None));
+    mock.expect_get_topics_retention_ms()
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
 
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
@@ -218,12 +223,17 @@ fn test_handle_incremental_alter_configs_rejections() {
             (
                 RESOURCE_TYPE_TOPIC,
                 "v".to_string(),
-                // Valid SET followed by an invalid APPEND: the valid one
+                // Valid SET followed by an unsupported key: the valid one
                 // must NOT be applied (all-or-nothing per resource).
                 vec![
                     ("retention.ms".to_string(), OP_SET, Some("1000".to_string())),
-                    ("retention.ms".to_string(), OP_APPEND, Some("1".to_string())),
+                    ("segment.ms".to_string(), OP_SET, Some("1".to_string())),
                 ],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "w".to_string(),
+                vec![("retention.ms".to_string(), OP_APPEND, Some("1".to_string()))],
             ),
         ],
         false,
@@ -377,13 +387,49 @@ fn test_handle_delete_records_repeated_partition_is_deleted_once() {
 }
 
 /// DescribeConfigs answers every entry of a repeated topic but reads its configs once.
+/// Distinct topics share one retention lookup: a statement per topic held the DB thread for
+/// every topic the request names.
+#[test]
+fn test_handle_describe_configs_of_many_topics_reads_retention_once() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |name| {
+        Ok(name
+            .strip_prefix('t')
+            .and_then(|n| n.parse().ok())
+            .map(|id| (id, 1)))
+    });
+    mock.expect_get_topics_retention_ms()
+        .times(1)
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, Some(i64::from(id)))).collect()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let resources = (0..1000)
+        .map(|i| {
+            (
+                RESOURCE_TYPE_TOPIC,
+                format!("t{i}"),
+                Some(vec!["retention.ms".to_string()]),
+            )
+        })
+        .collect();
+    let response = configs::handle_describe_configs(&ctx, resources, 0).unwrap();
+    assert_eq!(response.results.len(), 1000);
+    for (i, result) in response.results.iter().enumerate() {
+        assert_eq!(result.error_code, ERROR_NONE);
+        assert_eq!(
+            result.configs[0].value.as_deref(),
+            Some(i.to_string().as_str())
+        );
+    }
+}
+
 #[test]
 fn test_handle_describe_configs_repeated_topic_is_read_once() {
     let mut mock = MockKafkaStore::new();
     expect_topics(&mut mock, |_| Ok(Some((1, 1))));
-    mock.expect_get_topic_retention_ms()
+    mock.expect_get_topics_retention_ms()
         .times(1)
-        .returning(|_| Ok(None));
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
     let response = configs::handle_describe_configs(
@@ -394,4 +440,196 @@ fn test_handle_describe_configs_repeated_topic_is_read_once() {
     .unwrap();
     assert_eq!(response.results.len(), 1000);
     assert!(response.results.iter().all(|r| r.error_code == ERROR_NONE));
+}
+
+/// Kafka 3.7 refuses a SET (or APPEND / SUBTRACT) without a value as a malformed request,
+/// INVALID_REQUEST, before it looks at the key; a DELETE needs no value.
+#[test]
+fn test_handle_incremental_alter_configs_null_value_is_invalid_request() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
+    mock.expect_set_topic_retention_ms()
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let resource = |name: &str, configs: Vec<(String, i8, Option<String>)>| {
+        (RESOURCE_TYPE_TOPIC, name.to_string(), configs)
+    };
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            resource("a", vec![("retention.ms".to_string(), OP_SET, None)]),
+            resource("b", vec![("max.message.bytes".to_string(), OP_SET, None)]),
+            resource(
+                "c",
+                vec![
+                    (
+                        "max.message.bytes".to_string(),
+                        OP_SET,
+                        Some("1".to_string()),
+                    ),
+                    ("retention.ms".to_string(), OP_APPEND, None),
+                ],
+            ),
+            resource("d", vec![("retention.ms".to_string(), OP_DELETE, None)]),
+        ],
+        false,
+    )
+    .unwrap();
+    let codes: Vec<i16> = response.responses.iter().map(|r| r.error_code).collect();
+    assert_eq!(
+        codes,
+        [
+            ERROR_INVALID_REQUEST,
+            ERROR_INVALID_REQUEST,
+            ERROR_INVALID_REQUEST,
+            ERROR_NONE
+        ]
+    );
+}
+
+/// Kafka 3.7 (`ConfigAdminManager.preprocess`) refuses a resource that names one config
+/// key twice, INVALID_REQUEST "Error due to duplicate config keys", and applies none of
+/// its alterations (a SET then a DELETE of retention.ms leaves it as it is).
+#[test]
+fn test_handle_incremental_alter_configs_duplicate_keys_are_invalid_request() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((7, 1))));
+    // Only the resource without a repeated key is applied.
+    mock.expect_set_topic_retention_ms()
+        .withf(|_, ms| *ms == Some(5))
+        .times(1)
+        .returning(|_, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let set = |ms: &str| ("retention.ms".to_string(), OP_SET, Some(ms.to_string()));
+    let delete = ("retention.ms".to_string(), OP_DELETE, None);
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            (
+                RESOURCE_TYPE_TOPIC,
+                "a".to_string(),
+                vec![set("1000"), delete.clone()],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "b".to_string(),
+                vec![set("1"), set("2")],
+            ),
+            (RESOURCE_TYPE_TOPIC, "c".to_string(), vec![set("5")]),
+        ],
+        false,
+    )
+    .unwrap();
+    let answers: Vec<(i16, Option<&str>)> = response
+        .responses
+        .iter()
+        .map(|r| (r.error_code, r.error_message.as_deref()))
+        .collect();
+    assert_eq!(
+        answers[..2],
+        [
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+        ]
+    );
+    assert_eq!(answers[2].0, ERROR_NONE);
+}
+
+/// Kafka 3.7 checks repeated keys and missing values before it looks the topic up, so a
+/// malformed resource naming an unknown topic is INVALID_REQUEST, not
+/// UNKNOWN_TOPIC_OR_PARTITION; a well-formed one is UNKNOWN_TOPIC_OR_PARTITION. The null
+/// message names every key without a value.
+#[test]
+fn test_handle_incremental_alter_configs_malformed_before_topic_lookup() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(None));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let set =
+        |name: &str, value: Option<&str>| (name.to_string(), OP_SET, value.map(str::to_string));
+    let response = configs::handle_incremental_alter_configs(
+        &ctx,
+        vec![
+            (
+                RESOURCE_TYPE_TOPIC,
+                "dup".to_string(),
+                vec![
+                    set("retention.ms", Some("1")),
+                    set("retention.ms", Some("2")),
+                ],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "null".to_string(),
+                vec![set("retention.ms", None), set("segment.ms", None)],
+            ),
+            (
+                RESOURCE_TYPE_TOPIC,
+                "plain".to_string(),
+                vec![set("retention.ms", Some("1"))],
+            ),
+        ],
+        false,
+    )
+    .unwrap();
+    let answers: Vec<(i16, Option<&str>)> = response
+        .responses
+        .iter()
+        .map(|r| (r.error_code, r.error_message.as_deref()))
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Error due to duplicate config keys")
+            ),
+            (
+                ERROR_INVALID_REQUEST,
+                Some("Null value not supported for : retention.ms, segment.ms")
+            ),
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                Some("Unknown topic 'plain'")
+            ),
+        ]
+    );
+}
+
+/// cleanup.policy is a LIST config (Kafka 3.7's ConfigType 7), retention.ms a LONG (5).
+#[test]
+fn test_handle_describe_configs_reports_kafka_config_types() {
+    let mut mock = MockKafkaStore::new();
+    expect_topics(&mut mock, |_| Ok(Some((1, 1))));
+    mock.expect_get_topics_retention_ms()
+        .returning(|ids| Ok(ids.iter().map(|&id| (id, None)).collect()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = configs::handle_describe_configs(
+        &ctx,
+        vec![(RESOURCE_TYPE_TOPIC, "t".to_string(), None)],
+        0,
+    )
+    .unwrap();
+    let types: Vec<(String, i8)> = response.results[0]
+        .configs
+        .iter()
+        .map(|c| (c.name.to_string(), c.config_type))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("retention.ms".to_string(), 5),
+            ("cleanup.policy".to_string(), 7)
+        ]
+    );
 }

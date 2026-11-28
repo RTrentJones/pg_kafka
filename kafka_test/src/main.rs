@@ -181,18 +181,24 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// How long a timed-out test's task is waited for after it is aborted: its drop guards (a
+/// `SystemGucGuard` restoring a setting takes half a second or more) run as the task is
+/// dropped, and the next test must not start before they finish.
+const ABORTED_TEST_WAIT: Duration = Duration::from_secs(30);
+
 /// Run one test function in its own task, bounded by `timeout`.
 ///
 /// The test runs in a spawned task so that a failed `assert!` (a panic) is
 /// caught by the task boundary and reported as a FAILED result with its
 /// message, instead of unwinding through the runner and aborting the whole
 /// suite with no summary. On timeout the task is aborted (at its next await
-/// point) and the test is reported FAILED. Returns `(passed, error)`.
+/// point) and awaited, at most [`ABORTED_TEST_WAIT`], so that what its drop
+/// guards put back is back before this returns; the test is reported FAILED.
+/// Returns `(passed, error)`.
 async fn execute_test_fn(test_fn: TestFn, timeout: Duration) -> (bool, Option<String>) {
     // `Box<dyn Error>` is not `Send`, so stringify inside the task.
-    let handle = tokio::spawn(async move { (test_fn)().await.map_err(|e| e.to_string()) });
-    let abort = handle.abort_handle();
-    match tokio::time::timeout(timeout, handle).await {
+    let mut handle = tokio::spawn(async move { (test_fn)().await.map_err(|e| e.to_string()) });
+    match tokio::time::timeout(timeout, &mut handle).await {
         Ok(Ok(Ok(()))) => (true, None),
         Ok(Ok(Err(e))) => (false, Some(e)),
         Ok(Err(join_err)) if join_err.is_panic() => {
@@ -204,11 +210,23 @@ async fn execute_test_fn(test_fn: TestFn, timeout: Duration) -> (bool, Option<St
         }
         Ok(Err(join_err)) => (false, Some(format!("test task failed: {join_err}"))),
         Err(_) => {
-            abort.abort();
-            (
-                false,
-                Some(format!("timed out after {}s", timeout.as_secs_f64())),
-            )
+            handle.abort();
+            let timed_out = format!("timed out after {}s", timeout.as_secs_f64());
+            let error = match tokio::time::timeout(ABORTED_TEST_WAIT, handle).await {
+                Ok(Err(join_err)) if join_err.is_panic() => {
+                    let payload = join_err.into_panic();
+                    format!(
+                        "{timed_out}; panicked while aborted: {}",
+                        panic_message(payload.as_ref())
+                    )
+                }
+                Ok(_) => timed_out,
+                Err(_) => format!(
+                    "{timed_out}; still running {}s after it was aborted",
+                    ABORTED_TEST_WAIT.as_secs()
+                ),
+            };
+            (false, Some(error))
         }
     }
 }
@@ -677,6 +695,45 @@ mod runner_tests {
         .await;
         assert!(!r.passed);
         assert!(start.elapsed() < Duration::from_secs(10));
+        let e = r.error.expect("timeout must produce an error message");
+        assert!(e.starts_with("timed out after"), "{e}");
+    }
+
+    /// Set by [`SlowGuard`]'s drop once it has finished.
+    static GUARD_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// A drop guard that blocks its thread for 500 ms, as a `SystemGucGuard` restoring a
+    /// setting does, then records that it ran.
+    struct SlowGuard;
+
+    impl Drop for SlowGuard {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(500));
+            GUARD_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn hangs_holding_a_guard() -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = SlowGuard;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(())
+    }
+
+    /// A timed-out test's drop guards have run when the runner reports it, so the next
+    /// test starts with what they put back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_tests_guards_run_before_the_next_test() {
+        let r = run_single_test(
+            &def("guarded hang", wrap_test!(hangs_holding_a_guard)),
+            false,
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(!r.passed);
+        assert!(
+            GUARD_DONE.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted test's guard had not finished when the next test could start"
+        );
         let e = r.error.expect("timeout must produce an error message");
         assert!(e.starts_with("timed out after"), "{e}");
     }

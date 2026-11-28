@@ -79,6 +79,9 @@ impl TestContext {
         // Instead, each test sets the GUCs it needs via enable_shadow_mode(),
         // and the per-topic shadow_config table controls forwarding behavior.
         // Tests that don't need shadow mode simply don't insert shadow_config rows.
+        // The shadow category's last test
+        // (`shadow::helpers::test_shadow_teardown_turns_shadow_mode_off`) resets the
+        // GUCs once, after all of them.
 
         let topics = self.topics_created.lock().await;
         let groups = self.groups_created.lock().await;
@@ -181,6 +184,169 @@ impl Drop for TestContext {
     }
 }
 
+/// The error type of [`SystemGucGuard`].
+pub type GucError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A server-wide GUC set with `ALTER SYSTEM` for the duration of a test, then put back
+/// as it was: the earlier `postgresql.auto.conf` entry restored with `ALTER SYSTEM SET`,
+/// or the entry removed with `ALTER SYSTEM RESET` when there was none. `ALTER SYSTEM`
+/// persists across sessions, so a test that skipped this would leave the setting in force
+/// for the rest of the run.
+///
+/// Call [`SystemGucGuard::restore`] on the normal path: it returns an error when the
+/// restore fails or the server does not report the earlier value afterwards. A guard
+/// dropped without it (an early `?` return, a failed `assert!`, the runner aborting the
+/// test at its timeout) restores on a thread of its own with its own runtime and
+/// connection, and the drop waits for it. The runner starts the next test only once the
+/// test's task has ended, an aborted one once its drops ran (it waits up to 30 s for them),
+/// so the setting is back before the next test starts; a failure there panics (the test
+/// fails), or, when the test is already panicking, is printed.
+pub struct SystemGucGuard {
+    name: String,
+    /// The `postgresql.auto.conf` value before the guard (`None`: no entry).
+    previous_entry: Option<String>,
+    /// The value the server reported before the guard, checked after the restore.
+    previous_setting: String,
+    armed: bool,
+}
+
+impl SystemGucGuard {
+    /// `ALTER SYSTEM SET name = value` and reload; `Ok(None)` when the server refuses
+    /// the setting (an unknown GUC, a build without it).
+    pub async fn set(
+        db: &Client,
+        name: &str,
+        value: &str,
+    ) -> Result<Option<SystemGucGuard>, GucError> {
+        let Some(row) = db
+            .query_opt("SELECT setting FROM pg_settings WHERE name = $1", &[&name])
+            .await?
+        else {
+            println!("  (could not set {name}: the server does not know it)");
+            return Ok(None);
+        };
+        let previous_setting: String = row.get(0);
+        let previous_entry: Option<String> = db
+            .query_opt(
+                "SELECT setting FROM pg_file_settings
+                 WHERE name = $1 AND sourcefile LIKE '%postgresql.auto.conf'
+                 ORDER BY seqno DESC LIMIT 1",
+                &[&name],
+            )
+            .await?
+            .map(|r| r.get(0));
+        if let Err(e) = db.batch_execute(&alter_system_set(name, value)).await {
+            println!("  (could not set {name}: {e:?})");
+            return Ok(None);
+        }
+        let guard = SystemGucGuard {
+            name: name.to_string(),
+            previous_entry,
+            previous_setting,
+            armed: true,
+        };
+        db.batch_execute("SELECT pg_reload_conf()").await?;
+        // The worker reloads on SIGHUP at its next loop iteration (<= 100 ms idle).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Ok(Some(guard))
+    }
+
+    /// Put the setting back and check that the server reports the earlier value.
+    pub async fn restore(mut self) -> Result<(), GucError> {
+        self.armed = false;
+        restore_guc(
+            &self.name,
+            self.previous_entry.as_deref(),
+            &self.previous_setting,
+        )
+        .await
+        .map_err(Into::into)
+    }
+}
+
+/// `ALTER SYSTEM SET name = 'value'`.
+fn alter_system_set(name: &str, value: &str) -> String {
+    format!(
+        "ALTER SYSTEM SET {} = '{}'",
+        name,
+        value.replace('\'', "''")
+    )
+}
+
+/// Restore `name` to `previous_entry` (`None`: RESET), reload, and check on a fresh
+/// connection that the server reports `expected`. Each statement on its own: ALTER
+/// SYSTEM cannot run in the implicit transaction of a multi-statement query.
+async fn restore_guc(
+    name: &str,
+    previous_entry: Option<&str>,
+    expected: &str,
+) -> Result<(), String> {
+    let connect = || async {
+        let (client, connection) = tokio_postgres::connect(&get_database_url(), NoTls)
+            .await
+            .map_err(|e| format!("connect: {e:?}"))?;
+        tokio::spawn(connection);
+        Ok::<_, String>(client)
+    };
+    let client = connect().await?;
+    let sql = match previous_entry {
+        Some(value) => alter_system_set(name, value),
+        None => format!("ALTER SYSTEM RESET {name}"),
+    };
+    client
+        .batch_execute(&sql)
+        .await
+        .map_err(|e| format!("{sql}: {e:?}"))?;
+    client
+        .batch_execute("SELECT pg_reload_conf()")
+        .await
+        .map_err(|e| format!("pg_reload_conf(): {e:?}"))?;
+    // The worker reloads on SIGHUP at its next loop iteration (<= 100 ms idle).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // A new session reads the reloaded configuration at its start.
+    let check = connect().await?;
+    let now: String = check
+        .query_one("SELECT setting FROM pg_settings WHERE name = $1", &[&name])
+        .await
+        .map_err(|e| format!("reading {name}: {e:?}"))?
+        .get(0);
+    if now != expected {
+        return Err(format!(
+            "{name} is {now:?} after the restore, expected {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+impl Drop for SystemGucGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        let previous_entry = self.previous_entry.clone();
+        let expected = self.previous_setting.clone();
+        let restore = std::thread::spawn(move || -> Result<(), String> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(restore_guc(&name, previous_entry.as_deref(), &expected))
+        });
+        let outcome = restore
+            .join()
+            .unwrap_or_else(|_| Err("the restore thread panicked".to_string()));
+        if let Err(e) = outcome {
+            let message = format!("could not restore {}: {e}", self.name);
+            if std::thread::panicking() {
+                eprintln!("⚠️  {message}");
+            } else {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
 /// Verify that the pg_kafka server is ready to accept connections (blocks for up to 5 s).
 pub fn verify_server_ready() -> TestResult {
     use rdkafka::config::ClientConfig;
@@ -230,6 +396,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "connects to the test database"]
     async fn test_unique_names_are_unique() {
         let ctx = TestContext::new().await.unwrap();
         let topic1 = ctx.unique_topic("test").await;

@@ -11,6 +11,7 @@ mod basic;
 mod deduplication;
 mod edge_cases;
 mod kafka_model;
+mod lock_keys;
 mod null_records;
 mod unknown_producer;
 
@@ -28,6 +29,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_model::test_idempotent_sequence_wraps_at_i32_max,
         kafka_model::test_idempotent_producer_state_is_per_partition,
         null_records::test_null_records_partition_is_refused,
+        lock_keys::test_producer_id_colliding_with_a_lock_key_is_not_blocked: sequential, // holds the maintenance lock
         unknown_producer::test_unknown_producer_is_accepted_as_new: sequential, // reads the id sequence
         unknown_producer::test_idempotent_producer_survives_pruned_state,
         unknown_producer::test_pruned_producer_resumes_on_every_partition,

@@ -19,15 +19,21 @@ as an upgrade script `sql/pg_kafka--<from>--<to>.sql`; `cargo pgrx install` and
    idempotent Produce reads `kafka.producer_batches`, transactions use
    `kafka.txn_partitions` and `kafka.txn_groups`, SASL logins read `kafka.sasl_credentials` and
    `kafka.sasl_server_secret`, the shadow outbox needs
-   `kafka.shadow_tracking.attempt_open`, maintenance and the metrics flush need the time
-   partitions and `kafka.broker_api_stats` / `kafka.broker_gauges`). At start it checks
+   `kafka.shadow_tracking.attempt_open`, every Produce writes `kafka.messages.record_bytes`,
+   maintenance and the metrics flush need the time partitions and `kafka.broker_api_stats` /
+   `kafka.broker_gauges`). At start it checks
    for each of them and, on an older schema, logs **one** WARNING (`running against an
    older pg_kafka schema (version 0.0.0, library 0.1.0): answering Kafka requests with
    KAFKA_STORAGE_ERROR and running no maintenance until ALTER EXTENSION pg_kafka UPDATE
-   (missing: ...)`). Until step 3, clients see what they see while the extension is
+   (missing: ...)`). A schema at the library's own version that lacks one of them (created
+   by an earlier build of that version) gets a WARNING saying so instead: ALTER EXTENSION
+   UPDATE changes nothing at the same version, so re-create the extension (`DROP EXTENSION
+   pg_kafka CASCADE; CREATE EXTENSION pg_kafka`, which deletes its data) or create the
+   missing objects as `sql/bootstrap.sql` defines them. Until step 3, clients see what they see while the extension is
    dropped: the Kafka port accepts connections and every request the worker serves
    (ApiVersions and Metadata included) is answered with the retriable
-   `KAFKA_STORAGE_ERROR` (56). On a SASL listener the network thread still answers
+   `KAFKA_STORAGE_ERROR` (56; a Fetch below v6 gets `NOT_LEADER_OR_FOLLOWER`, 6, in its place,
+   as from Kafka 3.7). On a SASL listener the network thread still answers
    ApiVersions and SaslHandshake, but the credential lookup of the SaslAuthenticate is
    refused, and the broker then closes the connection without answering it: the
    credentials were not checked, so it is not reported as `SASL_AUTHENTICATION_FAILED`
@@ -67,9 +73,13 @@ the worker's current transaction and the worker's next transactions wait (up to
 `pg_kafka.worker_lock_timeout_ms`, default 5 s, then their requests get a retriable
 error) until the upgrade commits. The script's wait is usually short, a request batch
 (up to 50 ms of handlers plus its commit), but the worker's maintenance runs in
-transactions too and can hold the lock for seconds: a retention sweep spends up to
-1.5 s on row deletes and then up to 2 s waiting for the locks of each leaf it drops,
-and partition maintenance moves rows out of the DEFAULT leaf in one transaction. The
+transactions too and can hold the lock for seconds: a retention sweep starts no
+statement past the first one per step (10,000 rows, one leaf, one probe or one drop) once
+the pass has used its 1.5 s budget, and of its leaf drops, each of which can wait up to 2 s
+for its lock, it stops after the first that times out, so a pass holds the lock for about
+1.5 s plus one statement per step plus one 2 s drop wait at worst (a pass that has deleted
+rows or dropped a leaf ends after its current statement once the script waits for it); partition
+maintenance moves rows out of the DEFAULT leaf in one transaction. The
 upgrade itself holds the lock for as long as it runs (see step 1 of 0.0.0 -> 0.1.0), so
 on a large `kafka.messages` requests fail retriably for most of it.
 
@@ -82,23 +92,92 @@ the Kafka port open, answers every request with the retriable `KAFKA_STORAGE_ERR
 and resumes (partition maintenance, shadow configuration, role) as soon as `CREATE
 EXTENSION pg_kafka` has run, without a restart.
 
+## A 0.1.0 schema made by an earlier build of 0.1.0
+
+0.1.0 has not been released; its schema changed while it was developed, and `ALTER
+EXTENSION pg_kafka UPDATE` changes nothing between two builds of the same version. These
+changes matter for a database whose 0.1.0 schema an earlier build created:
+
+- `GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker`: the
+  retention sweep locks the rows it deletes from the DEFAULT leaf with `FOR UPDATE SKIP
+  LOCKED`, which needs UPDATE. Without it the worker finds `pgkafka_worker` lacking a
+  privilege and keeps the bootstrap superuser, with the WARNING `pg_kafka.run_as_role
+  'pgkafka_worker' lacks kafka.messages_default:UPDATE; the worker keeps the bootstrap superuser`. Run the GRANT (as the extension
+  owner) and restart the worker (`pg_terminate_backend()` on `pg_kafka_listener`): it then
+  switches to the role.
+- `kafka.lock_message_tables(regclass)`, which locks only `kafka.messages`, the leaf a
+  drop removes and the DEFAULT leaf: an earlier schema has `kafka.lock_message_tables()`,
+  which locks every leaf, so a vacuum of any leaf makes leaf creation and drops time out
+  (retried, but the DEFAULT leaf collects rows meanwhile). Re-create the extension, or
+  run the definitions of `kafka.lock_message_tables`, `kafka.create_message_partition` and
+  `kafka.drop_message_partition` (and their REVOKE) from `sql/bootstrap.sql` as the
+  extension owner.
+- `kafka.ensure_message_partitions(int, int)` without a `SET lock_timeout` clause: an
+  earlier schema's definition sets `lock_timeout = '2s'` for its own run, which replaces
+  the 200 ms the worker's partition maintenance sets, so each leaf it creates behind a
+  session holding `kafka.messages` (an open reader, autovacuum on the DEFAULT leaf) can
+  stop the DB thread, and every client, for 2 s instead of 200 ms. Run its definition
+  (and its REVOKE and GRANT) from `sql/bootstrap.sql` as the extension owner, with the
+  other partition functions above.
+- `group_id` of `kafka.consumer_offsets` and `kafka.txn_pending_offsets` in byte order:
+  ListGroups walks the distinct group ids of both tables in byte order (`COLLATE "C"`),
+  which their primary-key indexes serve only when the columns have that collation. In a
+  database whose default collation is not `C`, an earlier schema's columns have the
+  default one, and each step of the walk reads and sorts every offset row instead of one
+  index entry (seconds instead of a millisecond per ListGroups, on the DB thread). Run, as the
+  extension owner:
+
+  ```sql
+  ALTER TABLE kafka.consumer_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+  ALTER TABLE kafka.txn_pending_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+  ```
+
+  Each rewrites its table and indexes under ACCESS EXCLUSIVE (offset commits and fetches
+  wait meanwhile).
+
+Re-creating the extension (`DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka`,
+which deletes its data) applies every such change at once. A 0.0.0 schema upgraded with
+this build's `ALTER EXTENSION pg_kafka UPDATE` has them all.
+
 ## 0.0.0 -> 0.1.0
 
 `sql/pg_kafka--0.0.0--0.1.0.sql`:
 
 - converts `kafka.messages` to a table partitioned by `created_at` (ADR-001): the
   populated 0.0.0 table becomes the leaf `kafka.messages_legacy` covering
-  `[MINVALUE, upgrade time)` without copying rows (it keeps its primary key and unique
+  `[MINVALUE, upgrade time)` (see below for a row dated later) without copying rows (it keeps its primary key and unique
   index as the per-leaf unique indexes and its `global_offset` sequence, now owned by
   the new parent), a DEFAULT leaf `kafka.messages_default` is added, the views
   `kafka.shadow_status` and `kafka.metrics` are recreated on the new parent, and the
   SECURITY DEFINER partition functions are created. The legacy leaf is dropped by the
-  retention sweep once all its rows are expired. This reads the old table three times
-  under ACCESS EXCLUSIVE (bound, attach check, BRIN build);
+  retention sweep once all its rows are expired. Under ACCESS EXCLUSIVE this rewrites
+  the old table once (adding `kafka.messages.record_bytes`, the size of each record a
+  Fetch sums, computed for every row: a full read with each row's headers detoasted, a
+  full write and the rebuild of its three indexes, the two unique ones and the 0.0.0
+  pending-row index, each a full read of the new copy, so it needs free disk for a second
+  copy of the table) and reads it six more times (bound, attach check, BRIN, aborted-row,
+  pending-producer and timestamp index builds): ten full reads in all;
+  A 0.0.0 row whose `created_at` is later than the upgrade time (a clock set ahead, an
+  out-of-band INSERT) extends the legacy leaf to just past that time: partition maintenance
+  creates no leaf for the span before it, so every Produce until then is written to
+  `kafka.messages_legacy`, and that leaf, with everything written to it, is dropped (or a
+  topic's rows in it trimmed) only once its upper bound is past and the topics' windows have
+  run from it; until then only windows shorter than one partition width expire its rows
+  (row by row). Check `SELECT max(created_at) FROM kafka.messages` before the upgrade and
+  correct such rows (on 0.0.0 the table is not partitioned, so an UPDATE of `created_at` is
+  safe there);
 - drops `idx_messages_topic_partition_offset`, which duplicated the `kafka.messages`
   primary key;
 - adds `idx_messages_created_at_brin` (BRIN on `created_at`, `autosummarize = on`) for
   the retention sweep;
+- adds `idx_messages_txn_aborted` (partial, `created_at` of aborted rows) and
+  `idx_shadow_tracking_delivered` (partial, delivered outbox rows), so the retention
+  sweep's aborted-row cleanup and outbox reaping stop reading whole tables;
+- adds `idx_messages_txn_pending_producer` (partial, `producer_id, producer_epoch` of
+  pending rows), so ending a transaction reads only its producer's pending rows;
+- adds `idx_messages_timestamp` (partial, `topic_id, partition_id, timestamp_ms,
+  partition_offset` of non-aborted rows with a timestamp), so ListOffsets by timestamp and
+  MAX_TIMESTAMP stop reading whole partitions;
 - adds `pg_kafka_run_partition_maintenance()`, and revokes EXECUTE on it and on
   `pg_kafka_run_retention_sweep()` from PUBLIC (superusers only, as in a fresh install;
   ADR-001, "Concurrency with the worker and with manual maintenance");
@@ -114,9 +193,27 @@ EXTENSION pg_kafka` has run, without a restart.
   (`kafka.messages.created_at`, `kafka.transactions.started_at`,
   `kafka.shadow_tracking.forwarded_at`) to `TIMESTAMPTZ`, reading the stored values in
   the upgrading session's `TimeZone` (set it to the server's zone if the session's
-  differs). Converting `kafka.messages.created_at` rewrites the table, one more full
-  read and write under the same lock. Layouts older than these are not supported;
-- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present).
+  differs). In a session `TimeZone` of a fixed zero UTC offset (`UTC`, `GMT`,
+  `Etc/UTC`), PostgreSQL changes these types without rewriting the tables (only an index
+  on a converted column is rebuilt: `idx_transactions_timeout` on
+  `kafka.transactions`); in any other zone each conversion rewrites its table, for
+  `kafka.messages.created_at` one more full read and write and three index rebuilds
+  under the same lock. Layouts older than these are not supported;
+- adds `kafka.producer_ids.last_epoch` (the epoch an InitProducerId retry may present);
+- adds indexes on the referencing columns of foreign keys whose parent rows are deleted
+  or updated: `idx_consumer_offsets_topic`, `idx_producer_sequences_topic`,
+  `idx_txn_pending_offsets_topic` and `idx_txn_partitions_topic` (`topic_id`, for the
+  cascade of DeleteTopics) and `idx_transactions_producer` (`kafka.transactions.producer_id`,
+  for the retention sweep's producer prune and the RV-13 producer-id reallocation);
+- adds `idx_producer_ids_last_active` (`last_active_at`, `producer_id`) and
+  `idx_transactions_terminal` (partial, `last_updated_at` of terminal transactions) for
+  the retention sweep's producer and transaction prunes (`last_updated_at` now changes
+  only with a transaction's state: the AddPartitionsToTxn and AddOffsetsToTxn of an
+  Ongoing transaction leave it, so their updates stay HOT);
+- drops `idx_consumer_offsets_group` (its column leads the primary key) and
+  `idx_consumer_offsets_timestamp` (read by no query): an offset commit changes no
+  indexed column any more, so it can be a HOT update instead of writing four index
+  entries.
 
 After the upgrade:
 

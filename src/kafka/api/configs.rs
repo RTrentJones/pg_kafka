@@ -19,6 +19,7 @@ use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader, TopicPa
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::AlterConfigsResources;
+use crate::kafka::notifications::{send_best_effort, InternalNotification};
 
 /// Requested `(resource_type, resource_name)` pairs, the echo of the config APIs.
 pub type ConfigResources = Vec<(i8, String)>;
@@ -116,7 +117,28 @@ impl KafkaApi for DeleteRecordsApi {
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
             handlers::handle_delete_records(&env.ctx, r.topics)
+                .inspect(|response| emit_log_start_notifications(response, env.notify_tx))
         })
+    }
+}
+
+/// Wake the long polls of every partition DeleteRecords moved the log start of: one fetching
+/// from below the new start is answered OFFSET_OUT_OF_RANGE now rather than at its deadline.
+/// One notification per partition answered without error, O(the response).
+fn emit_log_start_notifications(
+    response: &DeleteRecordsResponse,
+    notify_tx: &crossbeam_channel::Sender<InternalNotification>,
+) {
+    for topic in &response.topics {
+        for partition in topic.partitions.iter().filter(|p| p.error_code == 0) {
+            send_best_effort(
+                notify_tx,
+                InternalNotification::LogStartMoved {
+                    topic_name: topic.name.0.to_string(),
+                    partition_id: partition.partition_index,
+                },
+            );
+        }
     }
 }
 
@@ -291,5 +313,39 @@ impl KafkaApi for IncrementalAlterConfigsApi {
         call.run(request, |r, _| {
             handlers::handle_incremental_alter_configs(&env.ctx, r.resources, r.validate_only)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partition(index: i32, error_code: i16) -> DeleteRecordsPartitionResult {
+        let mut partition = DeleteRecordsPartitionResult::default();
+        partition.partition_index = index;
+        partition.error_code = error_code;
+        partition
+    }
+
+    #[test]
+    fn only_partitions_answered_without_error_notify() {
+        let mut topic = DeleteRecordsTopicResult::default();
+        topic.name = TopicName("t".to_string().into());
+        topic.partitions = vec![partition(0, 0), partition(1, 1), partition(2, 0)];
+        let mut response = DeleteRecordsResponse::default();
+        response.topics = vec![topic];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        emit_log_start_notifications(&response, &tx);
+        let moved: Vec<(String, i32)> = rx
+            .try_iter()
+            .map(|n| match n {
+                InternalNotification::LogStartMoved {
+                    topic_name,
+                    partition_id,
+                } => (topic_name, partition_id),
+                other => panic!("unexpected notification {other:?}"),
+            })
+            .collect();
+        assert_eq!(moved, [("t".to_string(), 0), ("t".to_string(), 2)]);
     }
 }

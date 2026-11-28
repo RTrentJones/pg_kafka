@@ -170,7 +170,12 @@ fn age_member(c: &GroupCoordinator, group: &str, member: &str, d: Duration) {
 /// Pretend the group's current rebalance phase started `d` ago.
 fn age_rebalance(c: &GroupCoordinator, group: &str, d: Duration) {
     let mut groups = c.groups.write().unwrap();
-    groups.get_mut(group).unwrap().rebalance_started_at = Some(ago(d));
+    let mut group = groups.get_mut(group).unwrap();
+    group.rebalance_started_at = Some(ago(d));
+    // The sync deadline runs from the same join completion.
+    if group.sync_started_at.is_some() {
+        group.sync_started_at = Some(ago(d));
+    }
 }
 
 /// A single-member group, Stable at generation 1. Returns the member id.
@@ -262,6 +267,7 @@ fn test_invalid_session_timeout_member_is_timed_out() {
         last_heartbeat: Instant::now(),
         awaiting_join: false,
         awaiting_sync: false,
+        pending_sync: false,
         group_instance_id: None,
     };
     assert!(member.is_timed_out());
@@ -287,6 +293,7 @@ fn test_effective_rebalance_timeout_falls_back_to_session_timeout() {
         last_heartbeat: Instant::now(),
         awaiting_join: false,
         awaiting_sync: false,
+        pending_sync: false,
         group_instance_id: None,
     };
     assert_eq!(member.effective_rebalance_timeout_ms(), 45_000);
@@ -1147,7 +1154,7 @@ fn test_sweep_rebalance_timeout_evicts_stragglers_and_completes_join() {
 #[test]
 fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
     // The timeout is the largest rebalance_timeout_ms the members advertise,
-    // not a hardcoded 5 minutes. join_group also runs it (over every group).
+    // not a hardcoded 5 minutes. The sweep runs it; a JoinGroup only for the group it names.
     let c = GroupCoordinator::new();
     let mut p = params("g", None, &[("range", b"sub")]);
     p.rebalance_timeout_ms = 20;
@@ -1158,10 +1165,13 @@ fn test_rebalance_timeout_honors_member_rebalance_timeout_ms() {
     let b = join(&c, "g", None);
     // `b` advertises 60s, so the group's timeout is 60s, not `a`'s 20ms.
     age_rebalance(&c, "g", Duration::from_millis(100));
-    let _ = join(&c, "other", None);
+    c.check_and_remove_timed_out_members();
     assert!(is_pending(&b));
     age_rebalance(&c, "g", Duration::from_secs(61));
-    let _ = join(&c, "other2", None);
+    // Another group's JoinGroup leaves this group's timeout to the sweep.
+    let _ = join(&c, "other", None);
+    assert!(is_pending(&b));
+    c.check_and_remove_timed_out_members();
     let b = joined(&b);
     assert!(b.is_leader());
     assert!(!c.get_group_state("g").unwrap().members.contains_key(&a));
@@ -1191,17 +1201,80 @@ fn test_sweep_rebalance_timeout_with_nobody_rejoined_empties_group() {
 #[test]
 fn test_sweep_sync_phase_timeout_evicts_leader() {
     let c = GroupCoordinator::new();
-    let a = stable_single(&c, "g");
-    let b = join(&c, "g", None);
-    let _ = joined(&join(&c, "g", Some(&a)));
-    let b = joined(&b).member_id;
+    let leader = stable_single(&c, "g");
+    let follower = join(&c, "g", None);
+    let rejoined = joined(&join(&c, "g", Some(&leader)));
+    let follower = joined(&follower).member_id;
     assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+    // The follower synced (parked); the leader never does.
+    let parked = c.sync_park(
+        "g".to_string(),
+        follower.clone(),
+        rejoined.generation_id,
+        vec![],
+    );
     age_rebalance(&c, "g", Duration::from_secs(61));
     let removed = c.check_and_remove_timed_out_members();
-    assert_eq!(removed, vec![("g".to_string(), a)]);
+    assert_eq!(removed, vec![("g".to_string(), leader)]);
     let g = c.get_group_state("g").unwrap();
     assert_eq!(g.state, GroupState::PreparingRebalance);
-    assert_eq!(g.leader.as_deref(), Some(b.as_str()));
+    assert_eq!(g.leader.as_deref(), Some(follower.as_str()));
+    assert_eq!(
+        synced(&parked).unwrap_err().to_kafka_error_code(),
+        crate::kafka::constants::ERROR_REBALANCE_IN_PROGRESS
+    );
+}
+
+#[test]
+fn test_members_that_never_sync_are_evicted_after_the_rebalance_timeout() {
+    // Kafka 3.0+ (pendingSyncMembers / DelayedSync, checked against a 3.7 broker): every
+    // member of a new generation must send its SyncGroup within the rebalance timeout of
+    // the join's completion; one that does not is removed even though it heartbeats, also
+    // after the leader's SyncGroup made the group Stable.
+    let c = GroupCoordinator::new();
+    let (leader, follower, gen) = completing_pair(&c, "g");
+    c.sync_now("g".to_string(), leader.clone(), gen, vec![])
+        .unwrap();
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+    c.heartbeat("g", &follower, gen).unwrap();
+    // Within the timeout nothing happens.
+    assert_eq!(c.check_and_remove_timed_out_members(), []);
+    age_rebalance(&c, "g", Duration::from_secs(61));
+    c.heartbeat("g", &follower, gen).unwrap();
+    assert_eq!(
+        c.check_and_remove_timed_out_members(),
+        vec![("g".to_string(), follower.clone())]
+    );
+    assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
+    assert_eq!(
+        c.heartbeat("g", &follower, gen)
+            .unwrap_err()
+            .to_kafka_error_code(),
+        crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+    );
+    // A generation whose members all synced keeps them however long it lasts.
+    let l = joined(&join(&c, "g", Some(&leader)));
+    c.sync_now("g".to_string(), leader.clone(), l.generation_id, vec![])
+        .unwrap();
+    {
+        let mut groups = c.groups.write().unwrap();
+        let mut g = groups.get_mut("g").unwrap();
+        assert!(g.sync_started_at.is_none());
+        g.rebalance_started_at = Some(ago(Duration::from_secs(600)));
+    }
+    assert_eq!(c.check_and_remove_timed_out_members(), []);
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+}
+
+#[test]
+fn test_no_member_syncing_empties_the_group() {
+    // Nobody syncs: every member of the generation is removed, the leader and the
+    // followers alike (Kafka 3.7), and the group is Empty.
+    let c = GroupCoordinator::new();
+    let (_, _, _) = completing_pair(&c, "g");
+    age_rebalance(&c, "g", Duration::from_secs(61));
+    assert_eq!(c.check_and_remove_timed_out_members().len(), 2);
+    assert_eq!(state(&c, "g"), GroupState::Empty);
 }
 
 #[test]
@@ -1469,13 +1542,130 @@ fn test_remove_group_answers_parked_syncs() {
     assert_eq!(c.pending_sync_count(), 0);
 }
 
+/// Server-side assignments are computed only for the SyncGroup `sync_group` takes
+/// assignments from: the leader's, at the current generation, in the sync phase.
 #[test]
-fn test_is_group_leader() {
+fn test_awaits_leader_sync_only_in_the_sync_phase() {
     let c = GroupCoordinator::new();
-    let (leader, follower, _) = stable_pair(&c, "g");
-    assert!(c.is_group_leader("g", &leader));
-    assert!(!c.is_group_leader("g", &follower));
-    assert!(!c.is_group_leader("nope", &leader));
+    let (leader, follower, gen) = completing_pair(&c, "g");
+    assert!(c.awaits_leader_sync("g", &leader, gen));
+    assert!(
+        !c.awaits_leader_sync("g", &leader, gen - 1),
+        "stale generation"
+    );
+    assert!(
+        !c.awaits_leader_sync("g", &leader, gen + 1),
+        "future generation"
+    );
+    assert!(!c.awaits_leader_sync("g", &follower, gen), "follower");
+    assert!(!c.awaits_leader_sync("nope", &leader, gen), "unknown group");
+    assert!(
+        !c.awaits_leader_sync("g", "stranger", gen),
+        "unknown member"
+    );
+    c.sync_now(
+        "g".to_string(),
+        leader.clone(),
+        gen,
+        vec![(leader.clone(), b"A".to_vec())],
+    )
+    .unwrap();
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+    assert!(!c.awaits_leader_sync("g", &leader, gen), "Stable group");
+    // A rejoin by the leader starts a join phase: still no SyncGroup is awaited.
+    let _ = join(&c, "g", Some(&leader));
+    assert_eq!(state(&c, "g"), GroupState::PreparingRebalance);
+    assert!(!c.awaits_leader_sync("g", &leader, gen));
+}
+
+/// Encoded subscription metadata of `topics`.
+fn subscription(topics: &[&str]) -> Vec<u8> {
+    MemberSubscription::new(topics.iter().map(|t| (*t).to_string()).collect())
+        .encode()
+        .unwrap()
+}
+
+/// A server-side assignment over `limits::MAX_ASSIGNMENT_WORK` entries is refused with
+/// POLICY_VIOLATION before it is computed: subscriptions are counted from the array length
+/// the metadata claims, before parsing, and the partitions to assign before assigning.
+#[test]
+fn test_assignment_over_the_work_limit_is_refused() {
+    let max = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    let policy = crate::kafka::constants::ERROR_POLICY_VIOLATION;
+
+    // Metadata claiming more topics than the limit.
+    let c = GroupCoordinator::new();
+    let mut claimed = vec![0, 0];
+    claimed.extend_from_slice(&i32::try_from(max + 1).unwrap().to_be_bytes());
+    joined(&join_with(&c, &params("g", None, &[("range", &claimed)])));
+    assert_eq!(
+        c.get_subscribed_topics("g")
+            .unwrap_err()
+            .to_kafka_error_code(),
+        policy
+    );
+
+    // A small subscription over more partitions than the limit.
+    let c = GroupCoordinator::new();
+    let names: Vec<String> = (0..=max / 100_000).map(|i| format!("t{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    joined(&join_with(
+        &c,
+        &params("g", None, &[("range", &subscription(&refs))]),
+    ));
+    assert_eq!(c.get_subscribed_topics("g").unwrap().len(), names.len());
+    let partitions: HashMap<String, i32> = names.iter().map(|n| (n.clone(), 100_000)).collect();
+    assert_eq!(
+        c.compute_assignments("g", &partitions)
+            .unwrap_err()
+            .to_kafka_error_code(),
+        policy
+    );
+    // Within the limit it is computed.
+    let partitions: HashMap<String, i32> = names.iter().map(|n| (n.clone(), 10)).collect();
+    assert_eq!(c.compute_assignments("g", &partitions).unwrap().len(), 1);
+}
+
+/// A sticky assignment that spends its step budget is refused with POLICY_VIOLATION;
+/// range and round-robin have no step budget.
+#[test]
+fn test_sticky_assignment_over_its_step_budget_is_refused() {
+    let input = AssignmentInput::new(
+        HashMap::from([
+            (
+                "a".to_string(),
+                MemberSubscription::new(vec!["t".to_string()]),
+            ),
+            (
+                "b".to_string(),
+                MemberSubscription::new(vec!["t".to_string()]),
+            ),
+        ]),
+        HashMap::from([("t".to_string(), 100)]),
+    );
+    let owned = HashMap::from([(
+        "a".to_string(),
+        MemberAssignment::with_partitions(HashMap::from([("t".to_string(), (0..100).collect())])),
+    )]);
+    let refused = run_assignor("g", owned.clone(), &input, "sticky", 100).unwrap_err();
+    assert_eq!(
+        refused.to_kafka_error_code(),
+        crate::kafka::constants::ERROR_POLICY_VIOLATION
+    );
+    let computed = run_assignor(
+        "g",
+        owned,
+        &input,
+        "sticky",
+        crate::kafka::limits::MAX_ASSIGNMENT_STEPS,
+    )
+    .unwrap();
+    assert_eq!(computed["a"].partition_count(), 50);
+    assert_eq!(computed["a"].partitions("t"), (0..50).collect::<Vec<_>>());
+    for strategy in ["range", "roundrobin"] {
+        let computed = run_assignor("g", HashMap::new(), &input, strategy, 0).unwrap();
+        assert_eq!(computed["b"].partition_count(), 50);
+    }
 }
 
 #[test]
@@ -1529,4 +1719,915 @@ fn test_follower_released_by_sync_phase_timeout_is_not_session_expired() {
     let f = joined(&join(&c, "g", Some(&follower)));
     assert!(f.is_leader());
     assert_eq!(f.generation_id, gen + 1);
+}
+
+// ----- memory budget (pg_kafka.max_group_memory) -----
+
+/// What every group holds, counted afresh: the cached counts must always agree with it.
+fn counted_afresh(c: &GroupCoordinator) -> usize {
+    c.groups
+        .read()
+        .unwrap()
+        .values()
+        .map(ConsumerGroup::count_held_bytes)
+        .sum()
+}
+
+fn big_params(group: &str, member: Option<&str>, metadata_bytes: usize) -> JoinGroupParams {
+    let mut p = params(group, member, &[("range", b"")]);
+    p.protocols[0].1 = vec![7; metadata_bytes];
+    p
+}
+
+#[test]
+fn test_held_bytes_follow_every_operation() {
+    let c = GroupCoordinator::new();
+    assert_eq!(c.held_bytes(), 0);
+    let (leader, follower, generation) = stable_pair(&c, "g");
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    let before = c.held_bytes();
+    // A member's metadata is counted while it is stored.
+    let slot = join_with(&c, &big_params("g", Some(&follower), 100_000));
+    assert!(is_pending(&slot));
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(
+        c.held_bytes() >= before + 99_000,
+        "{} {before}",
+        c.held_bytes()
+    );
+    let l = joined(&join(&c, "g", Some(&leader)));
+    assert_eq!(l.generation_id, generation + 1);
+    joined(&slot);
+    // The leader's assignments too (and their copy for the sticky assignor).
+    c.sync_now(
+        "g".to_string(),
+        leader.clone(),
+        l.generation_id,
+        vec![
+            (leader.clone(), vec![1; 50_000]),
+            (follower.clone(), vec![2; 50_000]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() >= before + 290_000);
+    // Released on removal: a leave, a session timeout, the group's deletion.
+    c.leave_group("g", &follower).unwrap();
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() < before + 200_000);
+    age_member(&c, "g", &leader, Duration::from_secs(120));
+    c.check_and_remove_timed_out_members();
+    assert_eq!(state(&c, "g"), GroupState::Empty);
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() < 2_000, "{} bytes", c.held_bytes());
+    c.remove_group("g");
+    assert_eq!(c.held_bytes(), 0);
+}
+
+#[test]
+fn test_join_over_the_memory_budget_is_refused() {
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(1_000_000);
+    let a = joined(&join_with(&c, &big_params("a", None, 400_000)));
+    let b = joined(&join_with(&c, &big_params("b", None, 400_000)));
+    // A third member's metadata does not fit: refused, retriable, and no group is left.
+    let refused = join_with(&c, &big_params("c", None, 400_000));
+    assert_eq!(
+        join_error_code(&refused),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert!(c.get_group_state("c").is_none());
+    // Nor into an existing group.
+    assert_eq!(
+        join_error_code(&join_with(&c, &big_params("a", None, 400_000))),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert_eq!(c.get_group_state("a").unwrap().members.len(), 1);
+    // A small member still fits; a rejoin holding no more than before always does.
+    joined(&join(&c, "small", None));
+    c.set_memory_limit(10_000);
+    let rejoin = join_with(&c, &big_params("a", Some(&a.member_id), 400_000));
+    assert_eq!(joined(&rejoin).generation_id, a.generation_id);
+    // ... but not one that grows.
+    assert_eq!(
+        join_error_code(&join_with(
+            &c,
+            &big_params("a", Some(&a.member_id), 400_001)
+        )),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    // Freed memory is available again.
+    c.set_memory_limit(1_000_000);
+    c.leave_group("b", &b.member_id).unwrap();
+    joined(&join_with(&c, &big_params("c", None, 400_000)));
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() <= 1_000_000);
+}
+
+#[test]
+fn test_sync_over_the_memory_budget_is_refused() {
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(500_000);
+    let a = joined(&join(&c, "g", None));
+    let held = c.held_bytes();
+    // The assignments, and their copy for the sticky assignor, must fit.
+    let refused = c.sync_now(
+        "g".to_string(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![0; 300_000])],
+    );
+    assert_eq!(
+        refused.unwrap_err().to_kafka_error_code(),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+    assert_eq!(c.held_bytes(), held, "nothing stored");
+    c.sync_now(
+        "g".to_string(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![0; 200_000])],
+    )
+    .unwrap();
+    assert_eq!(state(&c, "g"), GroupState::Stable);
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+}
+
+#[test]
+fn test_held_bytes_after_sync_predicts_the_sync() {
+    // The SyncGroup budget check predicts what the group holds after the leader's sync;
+    // it must agree with a recount, whatever the assignments name (repeats, strangers,
+    // members left out) and whatever the previous generation left behind.
+    let c = GroupCoordinator::new();
+    let (leader, follower, _) = stable_pair(&c, "g");
+    let third = join(&c, "g", None);
+    let f = join(&c, "g", Some(&follower));
+    let l = joined(&join(&c, "g", Some(&leader)));
+    joined(&third);
+    joined(&f);
+    let assignments = vec![
+        (leader.clone(), vec![1; 10]),
+        (leader.clone(), vec![1; 1_000]),
+        ("stranger".to_string(), vec![9; 5_000]),
+        (follower.clone(), Vec::new()),
+    ];
+    let predicted = c
+        .get_group_state("g")
+        .unwrap()
+        .held_bytes_after_sync(&assignments);
+    c.sync_now("g".to_string(), leader, l.generation_id, assignments)
+        .unwrap();
+    let group = c.get_group_state("g").unwrap();
+    assert_eq!(group.state, GroupState::Stable);
+    assert_eq!(predicted, group.count_held_bytes());
+    assert_eq!(predicted, group.held_bytes());
+}
+
+#[test]
+fn test_memory_budget_bounds_never_synced_joins() {
+    // The review's reproduction, scaled down: JoinGroups to new groups that never sync,
+    // each with large metadata and the longest session timeout. The coordinator's member
+    // state stays within the budget however many arrive.
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(5_000_000);
+    let mut admitted = 0;
+    for i in 0..30 {
+        let mut p = big_params(&format!("g{i}"), None, 1_000_000);
+        p.session_timeout_ms = MAX_SESSION_TIMEOUT_MS;
+        let slot = join_with(&c, &p);
+        if slot.lock().unwrap().as_ref().is_some_and(Result::is_ok) {
+            admitted += 1;
+        }
+        assert!(c.held_bytes() <= 5_000_000);
+    }
+    assert_eq!(admitted, 4);
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+}
+
+/// Join a new group under a long id and leave it, leaving an Empty group behind.
+fn join_and_leave(c: &GroupCoordinator, group: &str) -> Result<()> {
+    let slot = join_with(c, &params(group, None, &[("range", b"sub")]));
+    let outcome = slot.lock().unwrap().take().expect("join answered at once");
+    let member = outcome?.member_id;
+    c.leave_group(group, &member)
+}
+
+#[test]
+fn test_empty_groups_are_forgotten_when_memory_is_short() {
+    // The review's reproduction, scaled down: each JoinGroup and LeaveGroup under a long
+    // group id leaves an Empty group holding that id. Those groups must not keep their bytes
+    // in the budget: the least recently active are forgotten to make room, as at the group
+    // count cap.
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(300_000);
+    let long = |i: usize| format!("{i}-{}", "x".repeat(30_000));
+    for i in 0..40 {
+        join_and_leave(&c, &long(i))
+            .unwrap_or_else(|e| panic!("group {i}: error {}", e.to_kafka_error_code()));
+        assert!(c.held_bytes() <= 300_000, "{} bytes", c.held_bytes());
+    }
+    // A new group, and a new member of a group in use, still fit.
+    let a = joined(&join(&c, "orders", None));
+    let slot = join_with(&c, &big_params("orders", None, 100_000));
+    assert!(is_pending(&slot), "joins the rebalance");
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    // The least recently active Empty groups went first; the latest is still there.
+    assert!(c.get_group_state(&long(0)).is_none());
+    assert_eq!(
+        c.get_group_state(&long(39)).map(|g| g.state),
+        Some(GroupState::Empty)
+    );
+    // A leader's assignments make room the same way.
+    for i in 40..44 {
+        join_and_leave(&c, &long(i)).unwrap();
+    }
+    let l = joined(&join(&c, "orders", Some(&a.member_id)));
+    let follower = joined(&slot);
+    c.sync_now(
+        "orders".to_string(),
+        l.member_id.clone(),
+        l.generation_id,
+        vec![
+            (l.member_id.clone(), vec![1; 30_000]),
+            (follower.member_id.clone(), vec![2; 30_000]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(state(&c, "orders"), GroupState::Stable);
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(c.held_bytes() <= 300_000, "{} bytes", c.held_bytes());
+}
+
+#[test]
+fn test_empty_groups_stay_when_forgetting_them_would_not_make_room() {
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(1_000_000);
+    joined(&join_with(&c, &big_params("busy", None, 800_000)));
+    join_and_leave(&c, &"e".repeat(30_000)).unwrap();
+    // 800 kB in use plus a 300 kB member cannot fit even without the Empty group.
+    assert_eq!(
+        join_error_code(&join_with(&c, &big_params("new", None, 300_000))),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    assert_eq!(
+        c.get_group_state(&"e".repeat(30_000)).map(|g| g.state),
+        Some(GroupState::Empty)
+    );
+    // The Empty group a JoinGroup targets is not forgotten to make room for it.
+    let target = "t".repeat(30_000);
+    join_and_leave(&c, &target).unwrap();
+    joined(&join_with(&c, &big_params(&target, None, 100_000)));
+    assert!(c.get_group_state(&"e".repeat(30_000)).is_none());
+    assert_eq!(c.get_group_state(&target).map(|g| g.members.len()), Some(1));
+}
+
+#[test]
+fn test_new_group_is_priced_with_what_the_join_stores() {
+    // A group-creating JoinGroup stores the group's own copies of the protocol type, the
+    // leader's id and the protocol name besides the member: the admission must price them.
+    let mut p = params("g", None, &[]);
+    p.protocol_type = "t".repeat(30_000);
+    p.protocols = vec![("p".repeat(30_000), Vec::new())];
+    let unbounded = GroupCoordinator::new();
+    joined(&join_with(&unbounded, &p));
+    let held = unbounded.held_bytes();
+    assert_eq!(held, counted_afresh(&unbounded));
+    let c = GroupCoordinator::new();
+    c.set_memory_limit(held - 1);
+    assert_eq!(
+        join_error_code(&join_with(&c, &p)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE
+    );
+    c.set_memory_limit(held);
+    joined(&join_with(&c, &p));
+    assert_eq!(c.held_bytes(), held);
+}
+
+/// Admission of `p` (run by `setup` first on a fresh coordinator) must price exactly what
+/// the join leaves counted: it is refused one byte short of that and admitted at it.
+fn assert_join_priced_exactly(
+    setup: impl Fn(&GroupCoordinator) -> JoinGroupParams,
+    answered_at_once: bool,
+) {
+    let unbounded = GroupCoordinator::new();
+    let p = setup(&unbounded);
+    let slot = join_with(&unbounded, &p);
+    assert_eq!(!is_pending(&slot), answered_at_once);
+    let held = unbounded.held_bytes();
+    assert_eq!(held, counted_afresh(&unbounded));
+
+    let c = GroupCoordinator::new();
+    let p = setup(&c);
+    c.set_memory_limit(held - 1);
+    assert_eq!(
+        join_error_code(&join_with(&c, &p)),
+        crate::kafka::constants::ERROR_COORDINATOR_NOT_AVAILABLE,
+        "admitted beyond the {held} bytes it leaves counted"
+    );
+    c.set_memory_limit(held);
+    let slot = join_with(&c, &p);
+    assert_eq!(!is_pending(&slot), answered_at_once);
+    if answered_at_once {
+        joined(&slot);
+    }
+    assert_eq!(c.held_bytes(), held);
+}
+
+/// A Stable group of one member: joined, synced, and the rejoin params for its member id
+/// with `protocols`.
+fn lone_stable_member(c: &GroupCoordinator, protocols: &[(&str, &[u8])]) -> JoinGroupParams {
+    let a = joined(&join(c, "g", None));
+    c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![])],
+    )
+    .unwrap();
+    params("g", Some(&a.member_id), protocols)
+}
+
+#[test]
+fn test_a_join_that_completes_at_once_is_priced_with_the_protocol_it_selects() {
+    // A lone Stable member on "range" rejoins with one long protocol: the join phase
+    // completes at once and the group's protocol name becomes the long one. Pricing the
+    // group's current name admitted it 29 000 bytes over the budget.
+    let long = "P".repeat(30_000);
+    assert_join_priced_exactly(|c| lone_stable_member(c, &[(long.as_str(), b"sub")]), true);
+}
+
+#[test]
+fn test_a_new_group_is_priced_with_what_its_count_holds() {
+    // A lone member with a short and a long protocol: the group is priced and counted at the
+    // longest name it could select, so the join is admitted exactly at its count (pricing
+    // the longest but counting the selected short one refused a join that fit).
+    let long = "P".repeat(30_000);
+    assert_join_priced_exactly(
+        |_| params("g", None, &[("a", b"s"), (long.as_str(), b"s")]),
+        true,
+    );
+}
+
+#[test]
+fn test_a_held_join_is_priced_with_the_protocol_a_later_completion_selects() {
+    // Two Stable members on "range"; the follower rejoins with a long protocol it prefers.
+    // The join is held; if the leader then leaves, the phase completes with the follower
+    // alone and its long protocol, with no JoinGroup to refuse: the held join is priced so.
+    let long = "P".repeat(30_000);
+    let two_stable = |c: &GroupCoordinator| {
+        let a = joined(&join(c, "g", None));
+        let sb = join(c, "g", None);
+        let a = joined(&join(c, "g", Some(&a.member_id)));
+        let b = joined(&sb);
+        let assignments = vec![(a.member_id.clone(), vec![]), (b.member_id.clone(), vec![])];
+        c.sync_now(
+            "g".into(),
+            a.member_id.clone(),
+            a.generation_id,
+            assignments,
+        )
+        .unwrap();
+        c.sync_now("g".into(), b.member_id.clone(), b.generation_id, vec![])
+            .unwrap();
+        assert_eq!(state(c, "g"), GroupState::Stable);
+        (a, b)
+    };
+    assert_join_priced_exactly(
+        |c| {
+            let (_, b) = two_stable(c);
+            params(
+                "g",
+                Some(&b.member_id),
+                &[(long.as_str(), b"sub"), ("range", b"sub")],
+            )
+        },
+        false,
+    );
+
+    let c = GroupCoordinator::new();
+    let (a, b) = two_stable(&c);
+    let held_join = join_with(
+        &c,
+        &params(
+            "g",
+            Some(&b.member_id),
+            &[(long.as_str(), b"sub"), ("range", b"sub")],
+        ),
+    );
+    let before = c.held_bytes();
+    c.leave_group("g", &a.member_id).unwrap();
+    assert_eq!(
+        joined(&held_join).protocol_name.as_deref(),
+        Some(long.as_str())
+    );
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(
+        c.held_bytes() < before,
+        "a LeaveGroup grew the count from {before} to {}",
+        c.held_bytes()
+    );
+}
+
+#[test]
+fn test_a_new_leader_is_not_counted_beyond_the_departed_one() {
+    // The leader (short member id) leaves; the follower, whose member id carries a 30 000-byte
+    // client id, becomes the leader and the group copies its id. The count must not grow on
+    // a LeaveGroup ("the memory frees as members leave").
+    let c = GroupCoordinator::new();
+    let a = joined(&join(&c, "g", None));
+    let mut pb = params("g", None, &[("range", b"sub")]);
+    pb.client_id = "c".repeat(30_000);
+    let sb = join_with(&c, &pb);
+    let a = joined(&join(&c, "g", Some(&a.member_id)));
+    let b = joined(&sb);
+    assert_eq!(b.leader_id, a.member_id);
+    let before = c.held_bytes();
+    c.leave_group("g", &a.member_id).unwrap();
+    let group = c.get_group_state("g").unwrap();
+    assert_eq!(group.leader.as_deref(), Some(b.member_id.as_str()));
+    assert_eq!(c.held_bytes(), counted_afresh(&c));
+    assert!(
+        c.held_bytes() < before,
+        "a LeaveGroup grew the count from {before} to {}",
+        c.held_bytes()
+    );
+}
+
+#[test]
+fn test_a_stale_generation_sync_forgets_no_empty_group() {
+    // A leader SyncGroup with assignments that need room, at a generation that is not the
+    // group's: it is answered ILLEGAL_GENERATION and must change nothing, not even forget
+    // the Empty groups the room would have come from.
+    let c = GroupCoordinator::new();
+    let e = "e".repeat(60_000);
+    join_and_leave(&c, &e).unwrap();
+    let a = joined(&join(&c, "g", None));
+    let sb = join(&c, "g", None);
+    let a = joined(&join(&c, "g", Some(&a.member_id)));
+    joined(&sb);
+    assert_eq!(state(&c, "g"), GroupState::CompletingRebalance);
+    c.set_memory_limit(c.held_bytes() + 50_000);
+    let stale = c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id - 1,
+        vec![(a.member_id.clone(), vec![1; 80_000])],
+    );
+    assert_eq!(
+        stale.unwrap_err().to_kafka_error_code(),
+        crate::kafka::constants::ERROR_ILLEGAL_GENERATION
+    );
+    assert!(
+        c.get_group_state(&e).is_some(),
+        "the Empty group was forgotten"
+    );
+    // At its generation the same SyncGroup makes room by forgetting it.
+    c.sync_now(
+        "g".into(),
+        a.member_id.clone(),
+        a.generation_id,
+        vec![(a.member_id.clone(), vec![1; 80_000])],
+    )
+    .unwrap();
+    assert!(c.get_group_state(&e).is_none());
+}
+
+/// A one-member "sticky" group "g" subscribed to topic "t", whose member's stored previous
+/// assignment is `previous`; returns the member id.
+fn sticky_member_with_previous(c: &GroupCoordinator, previous: Vec<u8>) -> String {
+    let member = joined(&join_with(
+        c,
+        &params("g", None, &[("sticky", &subscription(&["t"]))]),
+    ))
+    .member_id;
+    let mut groups = c.groups.write().unwrap();
+    groups
+        .get_mut("g")
+        .unwrap()
+        .previous_assignments
+        .insert(member.clone(), previous);
+    member
+}
+
+/// An encoded MemberAssignment (v0) of `entries` entries named by `name` with an empty
+/// partition list, after one entry of topic "t" holding partition 0.
+fn padded_previous(entries: usize, name: impl Fn(usize) -> Option<String>) -> Vec<u8> {
+    let mut b = vec![0, 0];
+    b.extend_from_slice(&i32::try_from(entries + 1).unwrap().to_be_bytes());
+    b.extend_from_slice(&1_i16.to_be_bytes());
+    b.push(b't');
+    b.extend_from_slice(&1_i32.to_be_bytes());
+    b.extend_from_slice(&0_i32.to_be_bytes());
+    for i in 0..entries {
+        match name(i) {
+            Some(name) => {
+                b.extend_from_slice(&i16::try_from(name.len()).unwrap().to_be_bytes());
+                b.extend_from_slice(name.as_bytes());
+                b.extend_from_slice(&0_i32.to_be_bytes());
+            }
+            None => b.extend_from_slice(&(-1_i16).to_be_bytes()),
+        }
+    }
+    b.extend_from_slice(&(-1_i32).to_be_bytes());
+    b
+}
+
+/// Previous-assignment entries count toward the work limit whatever they hold: an entry
+/// with a null name, a name of no existing topic or no partitions costs a parse and a
+/// lookup, so a leader storing millions of them (2 bytes each, within max_group_memory)
+/// must not make the sticky assignor parse them all.
+#[test]
+fn test_previous_assignment_entries_count_toward_the_work_limit() {
+    let max = crate::kafka::limits::MAX_ASSIGNMENT_WORK;
+    let topics = HashMap::from([("t".to_string(), 2)]);
+    let c = GroupCoordinator::new();
+    sticky_member_with_previous(&c, padded_previous(max, |_| None));
+    assert_eq!(
+        c.compute_assignments("g", &topics)
+            .unwrap_err()
+            .to_kafka_error_code(),
+        crate::kafka::constants::ERROR_POLICY_VIOLATION
+    );
+
+    // Within the limit it is computed, and the member keeps its previous partition.
+    let c = GroupCoordinator::new();
+    let member = sticky_member_with_previous(&c, padded_previous(1000, |_| None));
+    let computed = c.compute_assignments("g", &topics).unwrap();
+    let assignment = MemberAssignment::parse(&computed[&member]).unwrap();
+    assert_eq!(assignment.partitions("t"), vec![0, 1]);
+}
+
+/// The previous assignment is parsed keeping only entries for existing topics with
+/// partitions: 200,000 entries naming topics that do not exist (about 2 MB stored) take
+/// no memory beyond the kept entry, where parsing them all held a name and a map slot each
+/// (about 15 MB here, 584 MB for the 6,000,000 entries max_group_memory allows).
+#[test]
+fn test_previous_assignment_parse_keeps_only_existing_topics() {
+    let topics = HashMap::from([("t".to_string(), 1)]);
+    let c = GroupCoordinator::new();
+    let member =
+        sticky_member_with_previous(&c, padded_previous(200_000, |i| Some(format!("{i:x}"))));
+    let (computed, peak) = crate::testing::heap_peak(|| c.compute_assignments("g", &topics));
+    let assignment = MemberAssignment::parse(&computed.unwrap()[&member]).unwrap();
+    assert_eq!(assignment.partitions("t"), vec![0]);
+    assert!(peak < 1 << 20, "computing the assignment held {peak} bytes");
+}
+
+/// A refused server-side assignment is remembered for its generation, so the leader's
+/// retries are answered without computing; the next generation computes again.
+#[test]
+fn test_refused_assignment_is_remembered_for_its_generation() {
+    let c = GroupCoordinator::new();
+    let (leader, _, gen) = completing_pair(&c, "g");
+    assert!(c.assignment_refused("g", gen).is_none());
+    c.refuse_assignment("g", gen);
+    assert_eq!(
+        c.assignment_refused("g", gen),
+        Some(AssignmentRefusal::TooLarge)
+    );
+    assert!(
+        c.assignment_refused("g", gen + 1).is_none(),
+        "another generation"
+    );
+    assert!(
+        c.assignment_refused("other", gen).is_none(),
+        "another group"
+    );
+    // A refusal for a generation the group is no longer at is not recorded.
+    c.refuse_assignment("g", gen - 1);
+    assert!(c.assignment_refused("g", gen).is_some());
+    assert!(
+        c.awaits_leader_sync("g", &leader, gen),
+        "the group stays in its sync phase"
+    );
+}
+
+/// The subscriptions a server-side assignment reads keep no member's user data: no assignor
+/// reads it, and each member's metadata may carry up to about a megabyte of it, which was
+/// copied into the assignor's input (and once more for the subscribed topics) on every
+/// computation.
+#[test]
+fn test_assignment_input_keeps_no_user_data() {
+    let c = GroupCoordinator::new();
+    let metadata = MemberSubscription {
+        version: 0,
+        topics: vec!["t".to_string()],
+        user_data: Some(vec![7; 512 * 1024]),
+    }
+    .encode()
+    .unwrap();
+    joined(&join_with(&c, &params("g", None, &[("range", &metadata)])));
+    let groups = c.groups.read().unwrap();
+    let subscriptions = member_subscriptions(&groups["g"]);
+    assert_eq!(subscriptions.len(), 1);
+    for subscription in subscriptions.values() {
+        assert_eq!(subscription.topics, ["t"]);
+        assert!(subscription.user_data.is_none(), "user data copied");
+    }
+}
+
+// ----- request cost independent of the number of groups -----
+
+/// The time of `ops` JoinGroups naming an unknown member of an existing group (answered
+/// UNKNOWN_MEMBER_ID) and `ops` that create a group and leave it, on a coordinator that holds
+/// `groups` Stable groups besides.
+fn join_cost(groups: usize, ops: usize) -> Duration {
+    let c = GroupCoordinator::new();
+    c.set_limits(groups + ops + 10, 10);
+    for i in 0..groups {
+        stable_single(&c, &format!("g{i}"));
+    }
+    let started = Instant::now();
+    for i in 0..ops {
+        assert_eq!(
+            join_error_code(&join(&c, "g0", Some("bogus"))),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+        let group = format!("new{i}");
+        let member = joined(&join(&c, &group, None)).member_id;
+        c.leave_group(&group, &member).unwrap();
+    }
+    started.elapsed()
+}
+
+#[test]
+fn test_join_cost_is_independent_of_the_number_of_groups() {
+    // The review's reproduction: every JoinGroup, also one answered UNKNOWN_MEMBER_ID, ran the
+    // TTL and rebalance timeouts of every group and summed what all of them hold (27 ms per
+    // JoinGroup at 85 000 groups). Only the named group's state is visited now, so 500 times
+    // more groups cost about the same.
+    let small = join_cost(100, 500);
+    let large = join_cost(50_000, 500);
+    println!("100 groups: {small:?}; 50 000 groups: {large:?}");
+    assert!(
+        large < small * 5 + Duration::from_millis(20),
+        "1000 JoinGroups took {large:?} beside 50 000 groups and {small:?} beside 100"
+    );
+}
+
+/// A small deterministic generator for the randomized sequences below.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(n.max(1)).unwrap()).unwrap()
+    }
+}
+
+/// The running totals, the Empty-group index, the id index and every group's supported-protocol
+/// counts agree with a recount from every group.
+fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
+    let groups = c.groups.read().unwrap();
+    let (running, running_empty) = groups.running();
+    let (counted, counted_empty) = groups.recounted();
+    assert_eq!(running, counted, "totals after step {step} (op {op})");
+    assert_eq!(
+        running_empty, counted_empty,
+        "Empty index after step {step} (op {op})"
+    );
+    assert!(groups.ids_exact(), "id index after step {step} (op {op})");
+    for (id, group) in groups.iter() {
+        assert!(
+            group.supported_protocols_exact(),
+            "supported-protocol counts of {id} after step {step} (op {op})"
+        );
+    }
+}
+
+#[test]
+fn test_running_totals_stay_exact_under_random_operations() {
+    for seed in 1..=6_u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let c = GroupCoordinator::new();
+        let ids: Vec<String> = (0..8)
+            .map(|i| format!("g{i}-{}", "x".repeat(i * 7)))
+            .collect();
+        let mut slots: Vec<Slot> = Vec::new();
+        for step in 0..1_500 {
+            let group = ids[rng.below(ids.len())].clone();
+            let snapshot = c.get_group_state(&group);
+            let members: Vec<String> = snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |g| g.members.keys().cloned().collect());
+            let member = (!members.is_empty()).then(|| members[rng.below(members.len())].clone());
+            let op = rng.below(11);
+            match op {
+                0 | 1 => {
+                    let metadata = vec![7_u8; rng.below(300)];
+                    let protocol = ["range", "roundrobin"][rng.below(2)];
+                    slots.push(join_with(
+                        &c,
+                        &params(&group, None, &[(protocol, &metadata)]),
+                    ));
+                }
+                2 => {
+                    if let Some(m) = &member {
+                        let metadata = vec![1_u8; rng.below(50)];
+                        slots.push(join_with(
+                            &c,
+                            &params(&group, Some(m), &[("range", &metadata)]),
+                        ));
+                    }
+                }
+                3 => {
+                    if let Some(m) = &member {
+                        let _ = c.leave_group(&group, m);
+                    }
+                }
+                4 => {
+                    if let Some(g) = &snapshot {
+                        if let Some(leader) = g.leader.clone() {
+                            let assignments = g
+                                .members
+                                .keys()
+                                .map(|m| (m.clone(), vec![3_u8; rng.below(400)]))
+                                .collect();
+                            c.sync_park(group.clone(), leader, g.generation_id, assignments);
+                        }
+                    }
+                }
+                5 => {
+                    if let (Some(m), Some(g)) = (&member, &snapshot) {
+                        let _ = c.heartbeat(&group, m, g.generation_id);
+                        c.sync_park(group.clone(), m.clone(), g.generation_id, Vec::new());
+                    }
+                }
+                6 => {
+                    if let Some(m) = &member {
+                        age_member(&c, &group, m, Duration::from_secs(31));
+                    }
+                    c.check_and_remove_timed_out_members();
+                }
+                7 => {
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|g| g.state == GroupState::Empty)
+                    {
+                        c.groups
+                            .write()
+                            .unwrap()
+                            .get_mut(&group)
+                            .unwrap()
+                            .last_activity = ago(Duration::from_secs(EMPTY_GROUP_TTL_SECS + 1));
+                        if rng.below(2) == 0 {
+                            c.check_and_remove_timed_out_members();
+                        } else {
+                            join(&c, &group, None);
+                        }
+                    }
+                }
+                8 => {
+                    // A tight memory budget, so the join forgets Empty groups to fit.
+                    let held = c.held_bytes();
+                    c.set_memory_limit(held.saturating_sub(rng.below(3_000)) + 1_500);
+                    slots.push(join(&c, &format!("mem{step}"), None));
+                    c.set_memory_limit(crate::kafka::limits::DEFAULT_MAX_GROUP_MEMORY_BYTES);
+                }
+                9 => {
+                    // A lowered group cap, so a new group forgets Empty groups.
+                    c.set_limits(1 + rng.below(6), 10);
+                    slots.push(join(&c, &format!("cap{step}"), None));
+                    c.set_limits(100, 10);
+                }
+                _ => {
+                    if snapshot
+                        .as_ref()
+                        .is_some_and(|g| g.rebalance_started_at.is_some())
+                    {
+                        age_rebalance(&c, &group, Duration::from_secs(61));
+                        c.check_and_remove_timed_out_members();
+                    } else if rng.below(4) == 0 {
+                        c.remove_group(&group);
+                    }
+                }
+            }
+            assert_totals_exact(&c, step, op);
+        }
+        drop(slots);
+    }
+}
+
+#[test]
+fn test_logged_ids_are_bounded() {
+    assert_eq!(shown("g").to_string(), "g");
+    let exact = "x".repeat(SHOWN_ID_BYTES);
+    assert_eq!(shown(&exact).to_string(), exact);
+    let long = "y".repeat(32 * 1024);
+    let logged = shown(&long).to_string();
+    assert_eq!(logged, format!("{}...(32768 bytes)", "y".repeat(64)));
+    // Cut at a character boundary: 'é' is two bytes, so 64 bytes would split the 33rd.
+    let accented = format!("a{}", "é".repeat(100));
+    let logged = shown(&accented).to_string();
+    assert!(
+        logged.starts_with(&format!("a{}...", "é".repeat(31))),
+        "{logged}"
+    );
+    assert!(logged.ends_with("(201 bytes)"));
+}
+
+/// `len`-byte protocol names that differ only in their last bytes, so every comparison reads
+/// them whole.
+fn long_names(indexes: impl Iterator<Item = usize>, len: usize) -> Vec<(String, Vec<u8>)> {
+    indexes
+        .map(|i| (format!("{}{i:04}", "a".repeat(len - 4)), Vec::new()))
+        .collect()
+}
+
+#[test]
+fn test_protocol_checks_cost_what_the_joiner_sends() {
+    // The review's shape: members listing many long names (each member lacks a different
+    // one, and lists the rest in reverse), and a joiner whose every name is lacked by some
+    // member. Matching each joiner name against every member's list cost O(p_joiner x sum p x
+    // len) per JoinGroup (100-270 ms per 1 MiB JoinGroup), also for a refused one, and the same
+    // again when a join phase completed.
+    let (members, p, len) = (40, 16, 1_000);
+    let mut g = ConsumerGroup::new("g".to_string());
+    for k in 0..members {
+        let mut m = params("g", None, &[]);
+        m.protocols = long_names((0..p).rev().filter(|i| *i != k % p), len);
+        g.upsert_member(&format!("m{k:03}"), &m);
+    }
+    let joiner = long_names(0..p, len);
+    take_work();
+    assert!(!g.supports_protocols(None, "consumer", &joiner));
+    let refused = take_work();
+    // A known member's rejoin with its own list: its old list is looked at once.
+    assert!(!g.supports_protocols(Some("m000"), "consumer", &joiner));
+    let rejoined = take_work();
+    let joiner_bytes = p * len;
+    println!("refused join: {refused} units, rejoin: {rejoined} units");
+    assert!(
+        refused <= 2 * joiner_bytes,
+        "{refused} units for a {joiner_bytes}-byte joiner"
+    );
+    assert!(
+        rejoined <= 4 * joiner_bytes,
+        "{rejoined} units for a rejoin"
+    );
+
+    // Completion: every member supports the names but the last of each; the vote reads each
+    // member's list once.
+    let mut g = ConsumerGroup::new("g".to_string());
+    for k in 0..members {
+        let mut m = params("g", None, &[]);
+        m.protocols = long_names((0..p).rev(), len);
+        g.upsert_member(&format!("m{k:03}"), &m);
+    }
+    take_work();
+    let chosen = g.select_group_protocol();
+    let selected = take_work();
+    assert_eq!(
+        chosen,
+        Some(long_names(std::iter::once(p - 1), len)[0].0.clone())
+    );
+    let group_bytes = members * p * len;
+    println!("completion: {selected} units for {group_bytes} bytes of names");
+    assert!(
+        selected <= 3 * group_bytes,
+        "{selected} units at completion"
+    );
+}
+
+#[test]
+fn test_remove_group_looks_only_at_its_own_pending_answers() {
+    // The review's shape: DeleteGroups of many Empty groups while other groups hold many
+    // JoinGroups. Each removal scanned every held JoinGroup and parked SyncGroup (23 s for 50 000
+    // deletes beside 32 000 held), although an Empty group holds none.
+    let c = GroupCoordinator::new();
+    c.set_limits(10_000, 5_000);
+    let first = joined(&join(&c, "busy", None)).member_id;
+    let held: Vec<Slot> = (0..2_000).map(|_| join(&c, "busy", None)).collect();
+    assert!(held.iter().all(is_pending));
+    assert_eq!(c.pending_join_count(), 2_000);
+    c.add_empty_groups("empty-", 500);
+    take_work();
+    for i in 0..500 {
+        c.remove_group(&format!("empty-{i}"));
+    }
+    let work = take_work();
+    assert!(
+        work <= 500,
+        "{work} pending answers looked at for 500 Empty groups"
+    );
+    assert_eq!(
+        c.pending_join_count(),
+        2_000,
+        "the other group's answers are kept"
+    );
+
+    // A group removed with held answers (a non-empty group) still answers them.
+    let mut leaver = c.get_group_state("busy").unwrap().members.into_keys();
+    assert!(leaver.any(|m| m != first));
+    c.remove_group("busy");
+    assert_eq!(c.pending_join_count(), 0);
+    for slot in &held {
+        assert_eq!(
+            join_error_code(slot),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+    }
 }

@@ -2,10 +2,10 @@
 //!
 //! Tests for replaying historical messages to external Kafka.
 
-use crate::common::{create_producer, create_transactional_producer, TestResult};
+use crate::common::{create_db_client, create_producer, create_transactional_producer, TestResult};
 use crate::setup::TestContext;
 use rdkafka::producer::{FutureRecord, Producer};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::assertions::{assert_external_message_count, assert_message_in_external_kafka};
 use super::external_client::verify_external_kafka_ready;
@@ -214,5 +214,218 @@ pub async fn test_replay_skips_aborted_records() -> TestResult {
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED: Replay Skips Aborted Records\n");
+    Ok(())
+}
+
+/// `kafka.replay_shadow_messages` re-queues its rows with one INSERT .. ON CONFLICT DO
+/// UPDATE and holds them until its caller commits. The worker's outbox tick (the
+/// forward acks of rows in flight, then the claim of due rows) waited for such a row up
+/// to `pg_kafka.worker_lock_timeout_ms` (5 s) per statement, at every tick while the
+/// replay stayed open, and the whole DB thread with it: every client's requests stood.
+///
+/// The claim and the acks also went over every partition in one statement each, so a
+/// held row failed the whole tick: no topic was forwarded while the replay stayed open,
+/// and the failed ticks backed off exponentially (up to 30 s), so forwarding resumed up
+/// to 30 s after the replay ended. A held row now stops only its own partition at that
+/// row, and a tick that found rows held does not back off.
+///
+/// Asserts: a shadow topic with 200 forwarded records; one replay of all of them
+/// committed (the rows due again) and a second held open in another session (holding
+/// them, as the claim or the acks reach them); meanwhile five Produce requests to
+/// another shadow topic, 300 ms apart, are each answered within 1 s, and that topic's
+/// records are forwarded within 5 s while the replay is still open (it stays open
+/// about 8 s); after the replay rolls back, the first topic's rows are forwarded again
+/// within 3 s.
+pub async fn test_replay_held_open_does_not_stall_the_db_thread() -> TestResult {
+    println!("=== Test: an open replay does not stall the DB thread ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("replay-held").await;
+    let other = ctx.unique_topic("replay-held-other").await;
+    let records = 200;
+    verify_external_kafka_ready().await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+    enable_shadow_mode(
+        ctx.db(),
+        &other,
+        &ShadowTopicConfig {
+            mode: ShadowMode::Shadow,
+            forward_percentage: 100,
+            external_topic_name: None,
+            sync_mode: SyncMode::Async,
+            write_mode: WriteMode::DualWrite,
+        },
+    )
+    .await?;
+    let topic_id: i32 = ctx
+        .db()
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
+        .await?
+        .get(0);
+    let other_id: i32 = ctx
+        .db()
+        .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&other])
+        .await?
+        .get(0);
+
+    let producer = create_producer()?;
+    for i in 0..records {
+        producer
+            .send(
+                FutureRecord::to(&topic)
+                    .key(format!("k{i}").as_bytes())
+                    .payload(format!("v{i}").as_bytes()),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+    }
+    // Warm the other topic up (creation, metadata) before the replay holds anything.
+    producer
+        .send(
+            FutureRecord::to(&other).key("warm").payload("up"),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let forwarded: i64 = ctx
+            .db()
+            .query_one(
+                "SELECT count(*) FROM kafka.shadow_tracking
+                 WHERE topic_id = $1 AND external_offset IS NOT NULL",
+                &[&topic_id],
+            )
+            .await?
+            .get(0);
+        if forwarded >= records {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("only {forwarded} of {records} records forwarded").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("Step 1: {records} records produced to {topic} and forwarded");
+
+    let holder = create_db_client().await?;
+    holder
+        .batch_execute("SET statement_timeout = '30s'")
+        .await?;
+    ctx.db()
+        .query_one(
+            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+            &[&topic_id],
+        )
+        .await?;
+    holder.batch_execute("BEGIN").await?;
+    let held: i64 = holder
+        .query_one(
+            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
+            &[&topic_id],
+        )
+        .await?
+        .get(0);
+    println!("Step 2: one replay committed; a second re-queued {held} rows and holds them");
+
+    let mut slowest = Duration::ZERO;
+    for i in 0..5 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        producer
+            .send(
+                FutureRecord::to(&other)
+                    .key(format!("probe{i}").as_bytes())
+                    .payload("x"),
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+        let took = started.elapsed();
+        println!("   Produce {i} to {other} answered in {took:?}");
+        slowest = slowest.max(took);
+    }
+    // The other topic keeps forwarding while the replay holds the first topic's rows.
+    let forwarding = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending: i64 = ctx
+                .db()
+                .query_one(
+                    "SELECT count(*) FROM kafka.shadow_tracking
+                     WHERE topic_id = $1 AND external_offset IS NULL",
+                    &[&other_id],
+                )
+                .await?
+                .get(0);
+            if pending == 0 {
+                return Ok::<bool, Box<dyn std::error::Error>>(true);
+            }
+            if Instant::now() >= deadline {
+                println!("   {pending} record(s) of {other} still not forwarded");
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    .await?;
+    // Keep the replay open long enough for an exponential backoff to grow well past
+    // the 3 s the resumption below is given.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    holder.batch_execute("ROLLBACK").await?;
+    let released = Instant::now();
+    println!("Step 3: the replay rolled back; slowest Produce {slowest:?}");
+    if slowest >= Duration::from_secs(1) {
+        return Err(format!(
+            "a Produce to another topic waited {slowest:?} while a replay held the outbox rows"
+        )
+        .into());
+    }
+    if !forwarding {
+        return Err(
+            format!("{other} was not forwarded while a replay held rows of {topic} only").into(),
+        );
+    }
+    println!("   {other} was forwarded while the replay was open");
+
+    let deadline = released + Duration::from_secs(3);
+    loop {
+        let pending: i64 = ctx
+            .db()
+            .query_one(
+                "SELECT count(*) FROM kafka.shadow_tracking
+                 WHERE topic_id = $1 AND external_offset IS NULL",
+                &[&topic_id],
+            )
+            .await?
+            .get(0);
+        if pending == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{pending} replayed rows not forwarded within 3 s of the replay's end"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!(
+        "Step 4: the committed replay's rows were forwarded again {:?} after its end",
+        released.elapsed()
+    );
+    ctx.cleanup().await?;
+    println!("✅ the DB thread kept answering while the replay held its rows");
     Ok(())
 }

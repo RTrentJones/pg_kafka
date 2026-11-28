@@ -309,17 +309,23 @@ fn test_end_txn_commit_success() {
     mock.expect_commit_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
+    mock.expect_transaction_partitions()
+        .withf(|id| id == "txn-1")
+        .times(1)
+        .returning(|_| Ok(vec![("t".to_string(), vec![0, 3])]));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = transaction::handle_end_txn(
+    let (response, ended) = transaction::end_txn(
         &ctx, "txn-1", 1000, 0, true, // committed
     )
     .unwrap();
 
     assert_eq!(response.error_code, ERROR_NONE);
+    // The transaction's partitions, whose read_committed long polls the end wakes.
+    assert_eq!(ended, vec![("t".to_string(), vec![0, 3])]);
 }
 
 #[test]
@@ -333,26 +339,32 @@ fn test_end_txn_abort_success() {
     mock.expect_abort_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
+    mock.expect_transaction_partitions()
+        .withf(|id| id == "txn-1")
+        .times(1)
+        .returning(|_| Ok(vec![("t".to_string(), vec![0, 3])]));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = transaction::handle_end_txn(
+    let (response, ended) = transaction::end_txn(
         &ctx, "txn-1", 1000, 0, false, // abort
     )
     .unwrap();
 
     assert_eq!(response.error_code, ERROR_NONE);
+    // The transaction's partitions, whose read_committed long polls the end wakes.
+    assert_eq!(ended, vec![("t".to_string(), vec![0, 3])]);
 }
 
 #[test]
-fn test_end_txn_empty_noop() {
+fn test_end_txn_empty_is_invalid_txn_state() {
     let mut mock = MockKafkaStore::new();
 
     mock.expect_validate_transaction()
         .returning(|_, _, _| Ok(()));
-    // State is Empty - should be a no-op
+    // State is Empty: Kafka 3.7 answers INVALID_TXN_STATE for a commit and an abort.
     mock.expect_get_transaction_state()
         .returning(|_| Ok(Some(TransactionState::Empty)));
 
@@ -363,9 +375,10 @@ fn test_end_txn_empty_noop() {
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, true).unwrap();
-
-    assert_eq!(response.error_code, ERROR_NONE);
+    for committed in [true, false] {
+        let err = transaction::handle_end_txn(&ctx, "txn-1", 1000, 0, committed).unwrap_err();
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TXN_STATE);
+    }
 }
 
 #[test]
@@ -929,4 +942,63 @@ fn test_txn_offset_commit_refusal_costs_nothing_per_partition_for_the_name() {
         growth < 2.0,
         "4x the name length took {growth:.1}x the time"
     );
+}
+
+/// Kafka 3.7 (offset.metadata.max.bytes = 4096) answers a transactional offset commit with
+/// longer metadata OFFSET_METADATA_TOO_LARGE and stores the request's other partitions.
+#[test]
+fn test_txn_offset_commit_metadata_too_large() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_validate_transaction()
+        .returning(|_, _, _| Ok(()));
+    mock.expect_get_transaction_state()
+        .returning(|_| Ok(Some(TransactionState::Ongoing)));
+    mock.expect_txn_has_group().returning(|_, _| Ok(true));
+    crate::testing::expect_topics(&mut mock, |_| Ok(Some((1, 3))));
+    mock.expect_store_txn_pending_offset()
+        .withf(|_, _, _, partition, _, _| *partition != 1)
+        .times(2)
+        .returning(|_, _, _, _, _, _| Ok(()));
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let topics = vec![(
+        "t".to_string(),
+        vec![
+            (0, 1i64, Some("x".repeat(OFFSET_METADATA_MAX_LENGTH))),
+            (1, 1i64, Some("x".repeat(OFFSET_METADATA_MAX_LENGTH + 1))),
+            (2, 1i64, None),
+        ],
+    )];
+    let response =
+        transaction::handle_txn_offset_commit(&ctx, "txn-1", 1000, 0, "g", -1, "", topics).unwrap();
+    let codes: Vec<i16> = response.topics[0]
+        .partitions
+        .iter()
+        .map(|p| p.error_code)
+        .collect();
+    assert_eq!(
+        codes,
+        [ERROR_NONE, ERROR_OFFSET_METADATA_TOO_LARGE, ERROR_NONE]
+    );
+}
+
+/// A retried EndTxn answered from the finished state ends nothing: it names no
+/// partitions to wake and reads no registry (no expectation for it).
+#[test]
+fn test_end_txn_retry_names_no_partitions() {
+    for (state, committed) in [
+        (TransactionState::CompleteCommit, true),
+        (TransactionState::CompleteAbort, false),
+    ] {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(move |_| Ok(Some(state.clone())));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let (response, ended) = transaction::end_txn(&ctx, "txn-1", 1000, 0, committed).unwrap();
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(ended, crate::kafka::storage::TxnPartitions::new());
+    }
 }

@@ -9,9 +9,11 @@
 #   3. creates database B at 0.0.0, writes some data, runs
 #      `ALTER EXTENSION pg_kafka UPDATE`;
 #   4. fails unless B reports the current version, kept its data, and its kafka
-#      schema (columns, indexes, CHECK/foreign-key constraints, table/column/schema/function
-#      ACLs, function bodies, views, comments, roles, the partitioning of kafka.messages) is
-#      identical to A's;
+#      schema (columns with their collations, indexes, CHECK/foreign-key constraints,
+#      table/column/schema/function ACLs, function bodies, views, comments, roles, the
+#      partitioning of kafka.messages) is
+#      identical to A's (function arguments with their defaults, strictness and owner;
+#      relation storage parameters, persistence and owner; sequence parameters);
 #   5. checks the time partitions work on both (ADR-001): maintenance creates leaves,
 #      the converted 0.0.0 leaf drops whole, and pg_dump emits no kafka table (pg_dump
 #      must be present: PG_DUMP names it when it is not in `pg_config --bindir`).
@@ -28,6 +30,7 @@ EXT_DIR="$("$PG_CONFIG" --sharedir)/extension"
 OLD_SCRIPT="${OLD_SCRIPT:-$ROOT/sql/upgrade-test/pg_kafka--0.0.0.sql}"
 FRESH_DB="pgkafka_upgrade_fresh_$$"
 OLD_DB="pgkafka_upgrade_old_$$"
+ZONE_DB="pgkafka_upgrade_zone_$$"
 PSQL=(psql -X -q -v ON_ERROR_STOP=1 -At)
 
 NEW_VERSION="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
@@ -44,6 +47,7 @@ cp "$OLD_SCRIPT" "$EXT_DIR/pg_kafka--0.0.0.sql"
 cleanup() {
   "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $FRESH_DB" || true
   "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $OLD_DB" || true
+  "${PSQL[@]}" -d postgres -c "DROP DATABASE IF EXISTS $ZONE_DB" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -55,8 +59,12 @@ trap cleanup EXIT
 "${PSQL[@]}" -d "$OLD_DB" <<'SQL'
 CREATE EXTENSION pg_kafka VERSION '0.0.0';
 INSERT INTO kafka.topics (name, partitions) VALUES ('upgrade-check', 1);
-INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-SELECT id, 0, g, 'v'::bytea FROM kafka.topics, generate_series(0, 99) AS g
+-- Offset 0 has headers as an ordered array, offset 1 as a {key: hex} object (older
+-- rows), the rest none.
+INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, headers)
+SELECT id, 0, g, 'v'::bytea,
+       CASE g WHEN 0 THEN '[["h", "0102"]]'::jsonb WHEN 1 THEN '{"ab": "ff"}'::jsonb END
+FROM kafka.topics, generate_series(0, 99) AS g
 WHERE name = 'upgrade-check';
 INSERT INTO kafka.partition_offsets (topic_id, partition_id, next_offset)
 SELECT id, 0, 100 FROM kafka.topics WHERE name = 'upgrade-check';
@@ -82,6 +90,7 @@ SELECT 'default-leaf ' || c.relname FROM pg_class c
 WHERE c.oid IN (SELECT oid FROM leaves) AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT';
 SELECT 'column ' || table_name || '.' || column_name || ' ' || data_type || ' '
        || is_nullable || ' ' || coalesce(column_default, '')
+       || coalesce(' collate ' || collation_name, '')
 FROM information_schema.columns WHERE table_schema = 'kafka'
   AND table_name NOT IN (SELECT relname FROM leaves)
 ORDER BY 1;
@@ -92,6 +101,32 @@ SELECT DISTINCT 'leaf-index ' || regexp_replace(regexp_replace(indexdef,
            '\s+', ' ', 'g')
 FROM pg_indexes WHERE schemaname = 'kafka' AND tablename IN (SELECT relname FROM leaves)
 ORDER BY 1;
+-- Storage parameters, persistence (UNLOGGED/TEMP) and owner of every relation (tables,
+-- indexes, sequences, views) outside the leaves, and of the leaves normalized.
+SELECT 'relation ' || c.relname || ' kind=' || c.relkind::text
+       || ' persistence=' || c.relpersistence::text || ' owner=' || pg_get_userbyid(c.relowner)
+       || ' options=' || coalesce(array_to_string(c.reloptions, ','), '')
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'kafka' AND c.oid NOT IN (SELECT oid FROM leaves)
+  AND NOT EXISTS (SELECT 1 FROM pg_index x WHERE x.indexrelid = c.oid
+                  AND x.indrelid IN (SELECT oid FROM leaves))
+ORDER BY 1;
+SELECT DISTINCT 'leaf-relation kind=' || c.relkind::text
+       || ' persistence=' || c.relpersistence::text || ' owner=' || pg_get_userbyid(c.relowner)
+       || ' options=' || coalesce(array_to_string(c.reloptions, ','), '')
+FROM pg_class c
+WHERE c.oid IN (SELECT oid FROM leaves)
+   OR c.oid IN (SELECT indexrelid FROM pg_index WHERE indrelid IN (SELECT oid FROM leaves))
+ORDER BY 1;
+-- Sequence parameters (the producer-id sequence's start is time-based, checked below).
+SELECT 'sequence ' || c.relname || ' ' || format_type(s.seqtypid, NULL)
+       || ' start=' || CASE WHEN c.relname = 'producer_ids_producer_id_seq' THEN '<time>'
+                            ELSE s.seqstart::text END
+       || ' increment=' || s.seqincrement || ' min=' || s.seqmin || ' max=' || s.seqmax
+       || ' cache=' || s.seqcache || ' cycle=' || s.seqcycle
+FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'kafka' ORDER BY 1;
 SELECT 'acl ' || c.relname || ' ' || a.acl
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 CROSS JOIN LATERAL (SELECT unnest(coalesce(c.relacl, '{}'))::text AS acl) a
@@ -118,6 +153,9 @@ WHERE n.nspname = 'kafka' ORDER BY 1;
 SELECT 'function ' || p.oid::regprocedure::text || ' ' || coalesce(p.proacl::text, 'default')
        || ' secdef=' || p.prosecdef || ' ' || coalesce(array_to_string(p.proconfig, ','), '')
        || ' returns ' || pg_get_function_result(p.oid) || ' ' || p.provolatile::text
+       || ' args=(' || pg_get_function_arguments(p.oid) || ')'
+       || ' strict=' || p.proisstrict || ' parallel=' || p.proparallel::text
+       || ' owner=' || pg_get_userbyid(p.proowner)
        || ' src=' || md5(p.prosrc)
 FROM pg_proc p JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
 JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'pg_kafka'
@@ -193,6 +231,14 @@ if [ "$kept" != "100" ]; then
 fi
 rm -f "$FRESH_OUT" "$OLD_OUT"
 
+# The upgrade fills record_bytes for every 0.0.0 row: value, 84 per record, and each
+# header's key, value and 10 bytes.
+sized="$("${PSQL[@]}" -d "$OLD_DB" -c "SELECT count(*) FROM kafka.messages WHERE record_bytes IS DISTINCT FROM CASE partition_offset WHEN 0 THEN 1 + 84 + 1 + 2 + 10 WHEN 1 THEN 1 + 84 + 2 + 1 + 10 ELSE 1 + 84 END")"
+if [ "$sized" != "0" ]; then
+  echo "ERROR: $sized upgraded messages have a wrong or missing record_bytes" >&2
+  status=1
+fi
+
 # The converted 0.0.0 table is one leaf covering [MINVALUE, upgrade time).
 legacy="$("${PSQL[@]}" -d "$OLD_DB" -c "SELECT count(*) || ' ' || (lower_bound IS NULL) FROM kafka.messages_legacy, kafka.message_partitions() p WHERE p.partition_name = 'messages_legacy' GROUP BY lower_bound")"
 if [ "$legacy" != "100 true" ]; then
@@ -230,6 +276,39 @@ if [ "${out//$'\n'/ }" != "t t t" ]; then
   echo "ERROR: dropping the legacy leaf failed: $out" >&2
   status=1
 fi
+
+# The legacy leaf's upper bound survives the session's DateStyle and TimeZone. Under a
+# non-ISO DateStyle a timestamptz prints with a zone abbreviation that is read back
+# through timezone_abbreviations, not TimeZone: Europe/Dublin's summer IST as Israel's
+# +02 (the bound lands an hour before the newest row: the ATTACH fails), Asia/Kolkata's
+# IST likewise (3 h 30 off). Each upgrade must succeed and the bound must be exactly
+# one microsecond past the newest row (here written in the future, so it is the max).
+for setting in "Postgres, MDY|Europe/Dublin" "SQL, DMY|Asia/Kolkata"; do
+  datestyle="${setting%%|*}"
+  timezone="${setting##*|}"
+  "${PSQL[@]}" -d postgres -c "CREATE DATABASE $ZONE_DB"
+  if ! out="$("${PSQL[@]}" -d "$ZONE_DB" 2>&1 <<SQL
+CREATE EXTENSION pg_kafka VERSION '0.0.0';
+INSERT INTO kafka.topics (name, partitions) VALUES ('upgrade-zone', 1);
+INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, created_at)
+SELECT id, 0, 0, 'v'::bytea, timestamptz '2099-07-01 12:00:00+00' FROM kafka.topics;
+SET datestyle = '$datestyle';
+SET timezone = '$timezone';
+ALTER EXTENSION pg_kafka UPDATE;
+RESET datestyle;
+RESET timezone;
+SELECT p.upper_bound = (SELECT max(created_at) FROM kafka.messages) + INTERVAL '1 microsecond'
+FROM kafka.message_partitions() p WHERE p.partition_name = 'messages_legacy';
+SQL
+)"; then
+    echo "ERROR: the upgrade under DateStyle '$datestyle', TimeZone $timezone failed: $out" >&2
+    status=1
+  elif [ "$out" != "t" ]; then
+    echo "ERROR: under DateStyle '$datestyle', TimeZone $timezone the legacy leaf's upper bound is not the newest row + 1 us: $out" >&2
+    status=1
+  fi
+  "${PSQL[@]}" -d postgres -c "DROP DATABASE $ZONE_DB"
+done
 
 # Leaves are extension members: pg_dump leaves them out exactly like kafka.messages
 # itself (a dump holds CREATE EXTENSION only), so a restore never meets an orphan leaf.

@@ -11,9 +11,9 @@ mod store {
     use crate::kafka::error::Result;
     use crate::kafka::messages::Record;
     use crate::kafka::storage::{
-        CommittedOffset, FetchedMessage, IsolationLevel, LogStore, MaintenanceStore, OffsetStore,
-        ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata, TopicStore, TransactionState,
-        TransactionStore, TransactionalProducer,
+        CommittedOffset, FetchedMessage, FetchedRecords, IsolationLevel, LogStore,
+        MaintenanceStore, OffsetStore, ProducerBatch, ProducerStore, SequenceCheck, TopicMetadata,
+        TopicStore, TransactionState, TransactionStore, TransactionalProducer, TxnPartitions,
     };
     use mockall::mock;
     use mockall::predicate::*;
@@ -32,9 +32,10 @@ mod store {
             fn delete_topic(&self, topic_id: i32) -> Result<()>;
             fn get_topic_partition_count<'a>(&self, name: &'a str) -> Result<Option<i32>>;
             fn set_topic_partition_count<'a>(&self, name: &'a str, partition_count: i32) -> Result<()>;
-            fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+            fn get_topics_retention_ms(&self, topic_ids: &[i32]) -> Result<std::collections::HashMap<i32, Option<i64>>>;
             fn set_topic_retention_ms(&self, topic_id: i32, retention_ms: Option<i64>) -> Result<()>;
                 fn colliding_topics<'a>(&self, names: &'a [String]) -> Result<Vec<String>>;
+            fn total_partition_count(&self) -> Result<i64>;
         }
 
         impl LogStore for KafkaStore {
@@ -54,8 +55,9 @@ mod store {
                 partition_id: i32,
                 fetch_offset: i64,
                 max_bytes: i32,
+                whole_first_record: bool,
                 isolation_level: IsolationLevel,
-            ) -> Result<Vec<FetchedMessage>>;
+            ) -> Result<FetchedRecords>;
             fn get_high_watermark(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
             fn get_earliest_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
             fn get_log_start_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
@@ -78,10 +80,10 @@ mod store {
                 offset: i64,
                 metadata: Option<&'a str>,
             ) -> Result<()>;
-            fn fetch_all_offsets<'a>(&self, group_id: &'a str) -> Result<Vec<(String, i32, CommittedOffset)>>;
-            fn fetch_offsets<'a>(&self, group_id: &'a str, partitions: &'a [(i32, i32)]) -> Result<Vec<(i32, i32, CommittedOffset)>>;
+            fn fetch_all_offsets<'a>(&self, group_id: &'a str, max_metadata_bytes: usize) -> Result<Vec<crate::kafka::storage::GroupTopicOffsets>>;
+            fn fetch_offsets<'a>(&self, group_id: &'a str, partitions: &'a [(i32, i32)], max_metadata_bytes: usize) -> Result<Vec<(i32, i32, Option<CommittedOffset>)>>;
             fn delete_consumer_group_offsets<'a>(&self, group_id: &'a str) -> Result<()>;
-                fn list_offset_groups(&self) -> Result<Vec<String>>;
+            fn list_offset_groups(&self, max_bytes: usize) -> Result<crate::kafka::storage::OffsetGroupPage>;
             fn groups_with_offsets<'a>(&self, group_ids: &'a [String]) -> Result<std::collections::HashSet<String>>;
             fn pending_txn_offset_partitions<'a>(&self, group_id: &'a str, partitions: Option<&'a [(i32, i32)]>) -> Result<Vec<(String, i32)>>;
         }
@@ -190,6 +192,7 @@ mod store {
                 producer_epoch: i16,
             ) -> Result<()>;
             fn get_transaction_state<'a>(&self, transactional_id: &'a str) -> Result<Option<TransactionState>>;
+            fn transaction_partitions<'a>(&self, transactional_id: &'a str) -> Result<TxnPartitions>;
         }
 
         impl MaintenanceStore for KafkaStore {

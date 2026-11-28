@@ -12,11 +12,11 @@ use super::{internal, internal_unless, select_cached, PostgresStore, INT4OID, IN
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    decode_headers_json, encode_headers_json, FetchedMessage, IsolationLevel, PartitionBounds,
-    MAX_TIMESTAMP,
+    decode_headers_json, encode_headers_json, record_fetch_bytes, FetchedMessage, FetchedRecords,
+    IsolationLevel, PartitionBounds, MAX_TIMESTAMP,
 };
 use pgrx::prelude::*;
-use pgrx::spi::SpiClient;
+use pgrx::spi::{SpiClient, SpiTupleTable};
 
 /// The log-end offset of one partition (`$1` topic, `$2` partition): the next offset
 /// Produce assigns, which is also the high watermark.
@@ -27,40 +27,109 @@ const LOG_END_OFFSET_SQL: &str = "SELECT GREATEST(
                    WHERE topic_id = $1 AND partition_id = $2), 0)
      ) AS log_end_offset";
 
+/// A fetch query: the rows of one partition from `$3` in offset order, at most `$4` of
+/// them, each with the running total of the bytes it adds to a Fetch response
+/// (`cumulative_bytes`: the `record_bytes` Produce stored with the row, see
+/// `record_bytes_sql!` for rows without it); of those, only the rows whose running
+/// total is within `$5` bytes, and the first row whatever its size. The cut is made here so
+/// that the result set, which SPI holds whole, never holds the rows a byte budget leaves
+/// out. The running total reads no key, value or headers: a row's are read (from TOAST, when
+/// stored there) only when it is returned whole. The first row past the budget carries its
+/// key, value and headers only when `$6` is true (`whole`); otherwise they are NULL, so they
+/// are never read, and it only tells the caller that a record is there. `$filter` is the isolation level's extra
+/// condition.
+///
+/// `headers` is cast to text in the outer query, for the rows returned whole only.
+macro_rules! fetch_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT partition_offset,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN key END AS key,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN value END AS value,
+        CASE WHEN cumulative_bytes <= $5 OR $6 THEN headers::text END AS headers_json,
+        cumulative_bytes <= $5 OR $6 AS whole,
+        producer_id, producer_epoch, timestamp_ms, cumulative_bytes
+ FROM (
+   SELECT partition_offset, key, value, headers, producer_id, producer_epoch,
+          CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
+               ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
+          (SUM(COALESCE(record_bytes, ",
+            record_bytes_sql!(),
+            ")) OVER w)::bigint AS cumulative_bytes,
+          ROW_NUMBER() OVER w AS row_number
+   FROM kafka.messages
+   WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3",
+            $filter,
+            "
+   WINDOW w AS (ORDER BY partition_offset)
+   ORDER BY partition_offset
+   LIMIT $4
+ ) fetched
+ WHERE cumulative_bytes <= $5 OR row_number = 1
+ ORDER BY partition_offset"
+        )
+    };
+}
+
+/// The bytes one stored row adds to a Fetch response, as SQL over its key, value and
+/// headers, for rows stored without `record_bytes` (written by SQL outside the extension;
+/// the 0.0.0 -> 0.1.0 upgrade fills it for older rows with this expression): the
+/// uncompressed lengths of its key, value and header keys and values (`octet_length`
+/// reads a bytea's raw length from its TOAST header without decompressing it; the stored
+/// header value is hex, two characters a byte), plus 84 bytes per record and 10 per header
+/// for the record's framing in an uncompressed RecordBatch: a header's two varint lengths are
+/// at most 10 bytes, and a record alone in its batch (a run of one producer's consecutive
+/// offsets is one batch, so read_committed skipping aborted offsets or alternating producers
+/// make lone records) takes the whole 61-byte batch header plus at most 23 bytes of its own
+/// (length, key, value and header-count varints of at most 5 bytes, attributes and two zero
+/// deltas of one); a record that shares its batch takes at most 31 of its own plus half the
+/// batch header or less. So the count is never under what the record adds. Stored (compressed) sizes
+/// would let a highly compressible record count as a small fraction of what the response
+/// and the DB thread hold of it, and headers would not count at all. A header key stored
+/// as hex (one holding U+0000, marked `"hex"`, see `encode_headers_json`) counts half its
+/// stored length, as its value does. Rows written before headers were stored as an ordered
+/// array hold a `{key: hex}` object; `{}` is a record without headers. Any other JSON value
+/// (a scalar written out of band) counts no headers, as a fetch decodes none from it. [`record_fetch_bytes`], which Produce stores and the Fetch handler's
+/// `message_size_estimate` uses, counts the same. COALESCE evaluates it only for a row whose
+/// `record_bytes` is NULL; it reads the whole headers value, from TOAST when stored there.
+macro_rules! record_bytes_sql {
+    () => {
+        "COALESCE(octet_length(key), 0) + COALESCE(octet_length(value), 0) + 84
+            + CASE WHEN headers IS NULL OR headers = '{}'::jsonb THEN 0
+                   WHEN jsonb_typeof(headers) = 'array' THEN
+                     (SELECT COALESCE(SUM(COALESCE(octet_length(h ->> 0), 0)
+                                            / CASE WHEN h ->> 2 = 'hex' THEN 2 ELSE 1 END
+                                          + COALESCE(octet_length(h ->> 1), 0) / 2 + 10), 0)
+                      FROM jsonb_array_elements(headers) h)
+                   WHEN jsonb_typeof(headers) <> 'object' THEN 0
+                   ELSE
+                     (SELECT COALESCE(SUM(octet_length(k) + COALESCE(octet_length(v), 0) / 2 + 10), 0)
+                      FROM jsonb_each_text(headers) e(k, v))
+              END"
+    };
+}
+
 /// Fetch of committed records (ReadCommitted). RV-4: besides filtering uncommitted
 /// rows it stops below the last stable offset: a committed record above a still-open
 /// lower-offset transaction must not be returned, or the consumer moves past the
 /// pending offset and never re-reads it. With nothing pending the COALESCE default
-/// makes the bound a no-op.
-const FETCH_COMMITTED_SQL: &str =
-    "SELECT partition_offset, key, value, headers::text AS headers_json,
-        producer_id, producer_epoch,
-        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
-             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
-        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-            OVER (ORDER BY partition_offset) AS cumulative_bytes
- FROM kafka.messages
- WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
-   AND txn_state IS NULL
-   AND partition_offset < COALESCE(
-       (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
-        WHERE m2.topic_id = $1 AND m2.partition_id = $2
-          AND m2.txn_state = 'pending'),
-       partition_offset + 1)
- ORDER BY partition_offset
- LIMIT $4";
+/// (the largest bigint) makes the bound a no-op. The default is a constant, so the bound
+/// is a value computed once (an InitPlan) and ends the index scan at the last stable
+/// offset; a default naming `partition_offset` would make it a per-row filter, and the
+/// scan would read every committed row past an open transaction, as LIMIT counts only
+/// the rows that pass.
+const FETCH_COMMITTED_SQL: &str = fetch_sql!(
+    "
+     AND txn_state IS NULL
+     AND partition_offset < COALESCE(
+         (SELECT MIN(m2.partition_offset) FROM kafka.messages m2
+          WHERE m2.topic_id = $1 AND m2.partition_id = $2
+            AND m2.txn_state = 'pending'),
+         9223372036854775807)"
+);
 
 /// Fetch of every record (ReadUncommitted).
-const FETCH_ALL_SQL: &str = "SELECT partition_offset, key, value, headers::text AS headers_json,
-        producer_id, producer_epoch,
-        CASE WHEN timestamp_ms >= 0 THEN timestamp_ms
-             ELSE (EXTRACT(EPOCH FROM created_at) * 1000)::bigint END AS timestamp_ms,
-        SUM(COALESCE(pg_column_size(key), 0) + COALESCE(pg_column_size(value), 0) + 64)
-            OVER (ORDER BY partition_offset) AS cumulative_bytes
- FROM kafka.messages
- WHERE topic_id = $1 AND partition_id = $2 AND partition_offset >= $3
- ORDER BY partition_offset
- LIMIT $4";
+const FETCH_ALL_SQL: &str = fetch_sql!("");
 
 /// Rough size of one stored message, to turn a byte budget into a row LIMIT.
 const ESTIMATE_BYTES_PER_MESSAGE: i64 = 500;
@@ -87,6 +156,7 @@ struct MessageColumns<'a> {
     keys: Vec<Option<Vec<u8>>>,
     values: Vec<Option<Vec<u8>>>,
     headers: Vec<String>,
+    record_bytes: Vec<i32>,
     timestamps: Vec<i64>,
     producer_ids: Vec<Option<i64>>,
     producer_epochs: Vec<Option<i16>>,
@@ -113,6 +183,7 @@ impl MessageColumns<'_> {
                     )
                 })
                 .collect(),
+            record_bytes: records.iter().map(stored_record_bytes).collect(),
             // BUG-7: the producer's record timestamp is stored verbatim.
             timestamps: records
                 .iter()
@@ -123,6 +194,17 @@ impl MessageColumns<'_> {
             txn_states: vec![txn.map(|_| "pending"); n],
         }
     }
+}
+
+/// The `kafka.messages.record_bytes` of `record`: [`record_fetch_bytes`], saturated to the
+/// column's INT (no record a Produce frame can carry comes near it).
+fn stored_record_bytes(record: &Record) -> i32 {
+    let bytes = record_fetch_bytes(
+        record.key.as_ref().map_or(0, Vec::len),
+        record.value.as_ref().map_or(0, Vec::len),
+        record.headers.iter().map(|h| (h.key.len(), h.value.len())),
+    );
+    i32::try_from(bytes).unwrap_or(i32::MAX)
 }
 
 /// Take the partition's append lock and read its log-end offset, the base offset of
@@ -159,13 +241,13 @@ fn insert_message_rows(
         .update(
             "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, key, value,
                                          headers, producer_id, producer_epoch, txn_state,
-                                         timestamp_ms)
+                                         timestamp_ms, record_bytes)
              SELECT $1, $2, u.partition_offset, u.key, u.value, u.headers, u.producer_id,
-                    u.producer_epoch, u.txn_state, u.timestamp_ms
+                    u.producer_epoch, u.txn_state, u.timestamp_ms, u.record_bytes
              FROM unnest($3::bigint[], $4::bytea[], $5::bytea[], $6::jsonb[], $7::bigint[],
-                         $8::smallint[], $9::text[], $10::bigint[])
+                         $8::smallint[], $9::text[], $10::bigint[], $11::int[])
                   AS u(partition_offset, key, value, headers, producer_id, producer_epoch,
-                       txn_state, timestamp_ms)",
+                       txn_state, timestamp_ms, record_bytes)",
             None,
             &[
                 topic_id.into(),
@@ -178,6 +260,7 @@ fn insert_message_rows(
                 columns.producer_epochs.into(),
                 columns.txn_states.into(),
                 columns.timestamps.into(),
+                columns.record_bytes.into(),
             ],
         )
         .map_err(|e| KafkaError::Internal(format!("Failed to insert records: {e}")))?;
@@ -203,6 +286,82 @@ fn advance_next_offset(
         )
         .map_err(|e| KafkaError::Internal(format!("Failed to advance partition offset: {e}")))?;
     Ok(())
+}
+
+/// What a ListOffsets lookup by timestamp can match: a record with a timestamp that is
+/// not aborted. Also the predicate of the partial index `idx_messages_timestamp`
+/// (bootstrap.sql), which every statement below must repeat verbatim for the planner
+/// to use it.
+macro_rules! timestamp_lookup_rows {
+    () => {
+        "timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted'"
+    };
+}
+
+/// MAX_TIMESTAMP (-3): the record of partition `$1`/`$2` with the largest timestamp,
+/// the lowest offset among equal ones. A backward scan of `idx_messages_timestamp`
+/// (an incremental sort of the rows that share the largest timestamp).
+const MAX_TIMESTAMP_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM kafka.messages
+     WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+     ORDER BY timestamp_ms DESC, partition_offset ASC
+     LIMIT 1"
+);
+
+/// A lookup by timestamp `$3`, first step: the record of partition `$1`/`$2` with the
+/// smallest timestamp at or after `$3` (the lowest offset among equal ones), one
+/// descent of `idx_messages_timestamp`. None means no record matches. Its offset bounds
+/// the answer from above: timestamps need not grow with offsets, so a lower offset can
+/// still have a larger timestamp ([`TIMESTAMP_EARLIER_SQL`]).
+const TIMESTAMP_CANDIDATE_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM kafka.messages
+     WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+       AND timestamp_ms >= $3
+     ORDER BY timestamp_ms, partition_offset
+     LIMIT 1"
+);
+
+/// A lookup by timestamp, second step: the lowest offset below the candidate `$4` whose
+/// timestamp is at or after `$3`, if any (it is then the answer, else the candidate is).
+/// The rows it can match are those below the candidate (through the offset key) and
+/// those at or after `$3` (an index-only range of `idx_messages_timestamp`, the offset
+/// bound checked in the index); planned with the arguments, the planner reads the side
+/// its statistics estimate smaller. With timestamps that grow with offsets that is the
+/// smaller of the records before the answer and the records after it. The inner query
+/// is a fence: as `ORDER BY partition_offset LIMIT 1` over the table, the planner would
+/// expect a match early in an offset-order scan, which reads every row below the
+/// candidate when nothing matches (the usual case).
+const TIMESTAMP_EARLIER_SQL: &str = concat!(
+    "SELECT partition_offset, timestamp_ms
+     FROM (SELECT partition_offset, timestamp_ms
+           FROM kafka.messages
+           WHERE topic_id = $1 AND partition_id = $2 AND ",
+    timestamp_lookup_rows!(),
+    "
+             AND timestamp_ms >= $3 AND partition_offset < $4
+           ORDER BY timestamp_ms, partition_offset) AS earlier
+     ORDER BY partition_offset
+     LIMIT 1"
+);
+
+/// `(partition_offset, timestamp_ms)` of the first row of a timestamp lookup's result.
+fn offset_and_timestamp(table: SpiTupleTable<'_>) -> Result<Option<(i64, i64)>> {
+    // Reading the first row of an empty result is an error in SPI.
+    if table.is_empty() {
+        return Ok(None);
+    }
+    let row = table.first();
+    let Some(offset) = row.get_by_name::<i64, _>("partition_offset")? else {
+        return Ok(None);
+    };
+    let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(NO_TIMESTAMP);
+    Ok(Some((offset, timestamp)))
 }
 
 impl PostgresStore {
@@ -241,18 +400,25 @@ impl PostgresStore {
         }))
     }
 
-    /// Records from `fetch_offset` on, up to about `max_bytes` (always at least one
-    /// record, as Kafka does), for either isolation level (DR-24). Each query is
-    /// bounded to [`MAX_ROWS_PER_QUERY`] rows so a pass never holds a huge result set;
-    /// the loop runs until the byte budget is spent or the partition has no more rows
-    /// (DR-9). Sizes come from `pg_column_size()` in a window function (ADR-002).
+    /// Records from `fetch_offset` on, up to `max_bytes` of what they add to the response,
+    /// for either isolation level (DR-24). With `whole_first_record` the first record is
+    /// returned whatever its size, as Kafka returns the first record batch of the first
+    /// partition with data (KIP-74); without it a first record larger than `max_bytes` is not
+    /// read, only reported (`first_left_out`), so a partition that could not return it costs
+    /// the DB thread nothing of its size. Each query is bounded to [`MAX_ROWS_PER_QUERY`] rows
+    /// and returns only the rows within what is left of the budget, so neither a pass nor its
+    /// result set holds more than the budget (and the one first record); the loop runs until
+    /// the budget is spent or the partition has no more rows (DR-9). Sizes are the
+    /// uncompressed key, value and header lengths plus their framing, as Produce stored them
+    /// (`record_bytes`), summed by a window function (ADR-002).
     fn fetch_records_filtered(
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         let query = match isolation_level {
             IsolationLevel::ReadCommitted => FETCH_COMMITTED_SQL,
             IsolationLevel::ReadUncommitted => FETCH_ALL_SQL,
@@ -263,8 +429,9 @@ impl PostgresStore {
             let budget = i64::from(max_bytes.max(0));
             let mut consumed: i64 = 0;
             let mut next_offset = fetch_offset;
+            let mut first_left_out = None;
 
-            loop {
+            'passes: loop {
                 let remaining = budget - consumed;
                 if remaining <= 0 && !messages.is_empty() {
                     break;
@@ -275,28 +442,39 @@ impl PostgresStore {
                 let table = select_cached(
                     client,
                     query,
-                    &[INT4OID, INT4OID, INT8OID, INT8OID],
+                    &[
+                        INT4OID,
+                        INT4OID,
+                        INT8OID,
+                        INT8OID,
+                        INT8OID,
+                        PgBuiltInOids::BOOLOID,
+                    ],
                     &[
                         topic_id.into(),
                         partition_id.into(),
                         next_offset.into(),
                         limit.into(),
+                        remaining.into(),
+                        (whole_first_record && messages.is_empty()).into(),
                     ],
                 )?;
+                // The query leaves out every row past the budget: fewer rows than the
+                // limit means the budget is spent or the partition has no more rows.
                 let row_count = i64::try_from(table.len()).unwrap_or(i64::MAX);
-                let batch_base = consumed;
-                let mut budget_hit = false;
 
                 for row in table {
+                    // The first row of a pass past what is left of the budget, without its
+                    // key, value and headers: nothing more fits.
+                    let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
+                    if !row.get_by_name::<bool, _>("whole")?.unwrap_or(false) {
+                        if messages.is_empty() {
+                            first_left_out = Some(partition_offset);
+                        }
+                        break 'passes;
+                    }
                     // cumulative_bytes restarts per query; add the running total.
                     let batch_cumulative: i64 = row.get_by_name("cumulative_bytes")?.unwrap_or(0);
-                    let total = batch_base + batch_cumulative;
-                    if !messages.is_empty() && total > budget {
-                        budget_hit = true;
-                        break;
-                    }
-
-                    let partition_offset: i64 = row.get_by_name("partition_offset")?.unwrap_or(0);
                     let headers_json: Option<String> = row.get_by_name("headers_json")?;
                     messages.push(FetchedMessage {
                         partition_offset,
@@ -308,20 +486,22 @@ impl PostgresStore {
                         producer_epoch: row.get_by_name("producer_epoch")?,
                     });
                     next_offset = partition_offset + 1;
-                    consumed = total;
+                    consumed = budget - remaining + batch_cumulative;
                 }
 
-                // A short batch means no more matching rows past next_offset.
-                if budget_hit || row_count < limit {
+                if row_count < limit {
                     break;
                 }
             }
 
             crate::pg_debug!(
-                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?})",
+                "Fetched {} messages ({consumed} bytes of {budget} budget, {isolation_level:?}, first left out: {first_left_out:?})",
                 messages.len()
             );
-            Ok(messages)
+            Ok(FetchedRecords {
+                messages,
+                first_left_out,
+            })
         })
         .map_err(internal("fetch_records"))
     }
@@ -354,8 +534,10 @@ impl PostgresStore {
             partition_id,
             fetch_offset,
             max_bytes,
+            true,
             IsolationLevel::ReadUncommitted,
         )
+        .map(|fetched| fetched.messages)
     }
 
     pub(super) fn fetch_records_with_isolation(
@@ -363,16 +545,18 @@ impl PostgresStore {
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         crate::pg_debug!(
-            "PostgresStore::fetch_records_with_isolation: topic_id={topic_id}, partition_id={partition_id}, offset={fetch_offset}, isolation={isolation_level:?}"
+            "PostgresStore::fetch_records_with_isolation: topic_id={topic_id}, partition_id={partition_id}, offset={fetch_offset}, whole_first_record={whole_first_record}, isolation={isolation_level:?}"
         );
         Self::fetch_records_filtered(
             topic_id,
             partition_id,
             fetch_offset,
             max_bytes,
+            whole_first_record,
             isolation_level,
         )
     }
@@ -440,7 +624,7 @@ impl PostgresStore {
     pub(super) fn get_partition_bounds(
         topic_id: i32,
         partition_id: i32,
-        isolation_level: IsolationLevel,
+        _isolation_level: IsolationLevel,
     ) -> Result<PartitionBounds> {
         Spi::connect(|client| {
             let table = select_cached(
@@ -467,7 +651,6 @@ impl PostgresStore {
                 row.get_by_name("min_offset")?,
                 row.get_by_name("max_offset")?,
                 row.get_by_name("min_pending_offset")?,
-                isolation_level,
             ))
         })
         .map_err(internal("get_partition_bounds"))
@@ -478,49 +661,46 @@ impl PostgresStore {
     /// (the lowest offset among equal ones). Records without a timestamp and aborted
     /// records are excluded; pending records count, and the handler bounds the answer
     /// by the high watermark or the last stable offset, as Kafka does.
+    ///
+    /// Every statement runs through `idx_messages_timestamp` (see
+    /// [`TIMESTAMP_CANDIDATE_SQL`]); they are planned with their arguments
+    /// (`client.select`, not kept plans) so the planner can size both sides of
+    /// [`TIMESTAMP_EARLIER_SQL`].
     pub(super) fn get_offset_for_timestamp(
         topic_id: i32,
         partition_id: i32,
         timestamp_ms: i64,
     ) -> Result<Option<(i64, i64)>> {
         Spi::connect(|client| {
-            let table = if timestamp_ms == MAX_TIMESTAMP {
-                client.select(
-                    "SELECT partition_offset, timestamp_ms
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2
-                       AND timestamp_ms >= 0
-                       AND txn_state IS DISTINCT FROM 'aborted'
-                     ORDER BY timestamp_ms DESC, partition_offset ASC
-                     LIMIT 1",
+            if timestamp_ms == MAX_TIMESTAMP {
+                let table = client.select(
+                    MAX_TIMESTAMP_SQL,
                     None,
                     &[topic_id.into(), partition_id.into()],
-                )?
-            } else {
-                client.select(
-                    "SELECT partition_offset, timestamp_ms
-                     FROM kafka.messages
-                     WHERE topic_id = $1 AND partition_id = $2
-                       AND timestamp_ms >= 0 AND timestamp_ms >= $3
-                       AND txn_state IS DISTINCT FROM 'aborted'
-                     ORDER BY partition_offset ASC
-                     LIMIT 1",
-                    None,
-                    &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
-                )?
-            };
-
-            // No matching record (a timestamp after the last one, or an empty
-            // partition): reading the first row of an empty result is an error in SPI.
-            if table.is_empty() {
-                return Ok(None);
+                )?;
+                return offset_and_timestamp(table);
             }
-            let row = table.first();
-            let Some(offset) = row.get_by_name::<i64, _>("partition_offset")? else {
+            let table = client.select(
+                TIMESTAMP_CANDIDATE_SQL,
+                None,
+                &[topic_id.into(), partition_id.into(), timestamp_ms.into()],
+            )?;
+            // No record at or after the timestamp (it is past the last one, or the
+            // partition is empty): one descent per leaf, nothing else is read.
+            let Some((candidate, candidate_ts)) = offset_and_timestamp(table)? else {
                 return Ok(None);
             };
-            let timestamp: i64 = row.get_by_name("timestamp_ms")?.unwrap_or(NO_TIMESTAMP);
-            Ok(Some((offset, timestamp)))
+            let table = client.select(
+                TIMESTAMP_EARLIER_SQL,
+                None,
+                &[
+                    topic_id.into(),
+                    partition_id.into(),
+                    timestamp_ms.into(),
+                    candidate.into(),
+                ],
+            )?;
+            Ok(offset_and_timestamp(table)?.or(Some((candidate, candidate_ts))))
         })
         .map_err(internal("get_offset_for_timestamp"))
     }
@@ -614,7 +794,10 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageColumns, TxnStamp, NO_TIMESTAMP};
+    use super::{
+        MessageColumns, TxnStamp, MAX_TIMESTAMP_SQL, NO_TIMESTAMP, TIMESTAMP_CANDIDATE_SQL,
+        TIMESTAMP_EARLIER_SQL,
+    };
     use crate::kafka::messages::{Record, RecordHeader};
     use crate::kafka::storage::encode_headers_json;
 
@@ -657,6 +840,47 @@ mod tests {
         assert_eq!(columns.producer_ids, [None, None]);
         assert_eq!(columns.producer_epochs, [None, None]);
         assert_eq!(columns.txn_states, [None, None]);
+        // Key, value, header key and value, 84 per record and 10 per header.
+        assert_eq!(columns.record_bytes, [1 + 1 + 1 + 1 + 84 + 10, 84]);
+    }
+
+    /// Every header adds its key, value and 10 bytes of framing.
+    #[test]
+    fn stored_record_bytes_count_every_header() {
+        let mut record = records().remove(1);
+        record.headers = (0..3)
+            .map(|_| RecordHeader {
+                key: "k".into(),
+                value: vec![0; 3],
+            })
+            .collect();
+        assert_eq!(super::stored_record_bytes(&record), 84 + 3 * 14);
+    }
+
+    /// The upgrade fills `record_bytes` for 0.0.0 rows with the expression fetches use for
+    /// rows without it, so both count what Produce stores.
+    #[test]
+    fn upgrade_fills_record_bytes_with_the_fetch_expression() {
+        const UPGRADE_SQL: &str = include_str!("../../../../sql/pg_kafka--0.0.0--0.1.0.sql");
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            words(UPGRADE_SQL).contains(&words(record_bytes_sql!())),
+            "the upgrade's record_bytes expression differs from record_bytes_sql!"
+        );
+        assert!(super::FETCH_ALL_SQL.contains("COALESCE(record_bytes, "));
+        assert!(super::FETCH_COMMITTED_SQL.contains("COALESCE(record_bytes, "));
+    }
+
+    /// The read_committed bound's default is a constant: one naming `partition_offset` would
+    /// make the bound a per-row filter instead of the end of the index scan.
+    #[test]
+    fn the_last_stable_offset_bound_ends_the_scan() {
+        let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sql = words(super::FETCH_COMMITTED_SQL);
+        assert!(
+            sql.contains("AND m2.txn_state = 'pending'), 9223372036854775807)"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -670,5 +894,42 @@ mod tests {
         assert_eq!(columns.producer_ids, [Some(7), Some(7)]);
         assert_eq!(columns.producer_epochs, [Some(3), Some(3)]);
         assert_eq!(columns.txn_states, [Some("pending"), Some("pending")]);
+    }
+
+    /// The planner uses a partial index only for a query whose conditions imply its
+    /// predicate: every timestamp lookup repeats the predicate of `idx_messages_timestamp`,
+    /// and the index (in a fresh install and in the upgrade) is the one they are written for.
+    #[test]
+    fn timestamp_lookups_repeat_the_timestamp_index_predicate() {
+        let predicate = timestamp_lookup_rows!();
+        let index = format!(
+            "CREATE INDEX idx_messages_timestamp\n\
+             ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)\n\
+             WHERE {predicate};"
+        );
+        for (name, sql) in [
+            (
+                "bootstrap.sql",
+                include_str!("../../../../sql/bootstrap.sql"),
+            ),
+            (
+                "pg_kafka--0.0.0--0.1.0.sql",
+                include_str!("../../../../sql/pg_kafka--0.0.0--0.1.0.sql"),
+            ),
+        ] {
+            assert_eq!(sql.matches(index.as_str()).count(), 1, "{name}");
+        }
+        for sql in [
+            MAX_TIMESTAMP_SQL,
+            TIMESTAMP_CANDIDATE_SQL,
+            TIMESTAMP_EARLIER_SQL,
+        ] {
+            assert!(
+                sql.contains(&format!(
+                    "topic_id = $1 AND partition_id = $2 AND {predicate}"
+                )),
+                "{sql}"
+            );
+        }
     }
 }

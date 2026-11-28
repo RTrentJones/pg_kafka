@@ -2,19 +2,32 @@
 
 /// Encode record headers for the JSONB headers column: an array of `[key, hex(value)]`
 /// pairs, which keeps the producer's header order (a JSONB object would reorder its
-/// keys). No headers encode as `{}`.
+/// keys). No headers encode as `{}`. A key holding U+0000, which JSONB cannot store
+/// (it refuses the `\u0000` escape), is stored as hex too, marked by a third element:
+/// `[hex(key), hex(value), "hex"]`; [`decode_headers_json`] reverses it.
 pub fn encode_headers_json<'a>(
     headers: impl ExactSizeIterator<Item = (&'a str, &'a [u8])>,
 ) -> String {
     if headers.len() == 0 {
         return EMPTY_HEADERS.to_string();
     }
-    let pairs: Vec<(&str, String)> = headers.map(|(k, v)| (k, hex_encode(v))).collect();
-    serde_json::to_string(&pairs).unwrap_or_else(|_| EMPTY_HEADERS.to_string())
+    let entries: Vec<serde_json::Value> = headers
+        .map(|(k, v)| {
+            if k.contains('\0') {
+                serde_json::json!([hex_encode(k.as_bytes()), hex_encode(v), HEX_KEY])
+            } else {
+                serde_json::json!([k, hex_encode(v)])
+            }
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| EMPTY_HEADERS.to_string())
 }
 
 /// The headers column of a record without headers.
 const EMPTY_HEADERS: &str = "{}";
+
+/// The third element of a stored header whose key is hex.
+const HEX_KEY: &str = "hex";
 
 /// Lowercase hex of `bytes`.
 fn hex_encode(bytes: &[u8]) -> String {
@@ -28,8 +41,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode the JSONB headers column back into header pairs (DR-8). The column holds an
-/// ordered array of `[key, hex(value)]` pairs; rows written before that hold a
-/// `{key: hex(value)}` object, which is still accepted.
+/// ordered array of `[key, hex(value)]` pairs (`[hex(key), hex(value), "hex"]` for a key
+/// stored as hex); rows written before that hold a `{key: hex(value)}` object, which is
+/// still accepted.
 ///
 /// Pure function so the decoding logic is unit-testable even though its only
 /// caller lives in the coverage-ignored SPI layer (QA-1 pattern, like
@@ -40,20 +54,26 @@ pub fn decode_headers_json(json: Option<&str>) -> Vec<(String, Vec<u8>)> {
     let Some(json) = json else {
         return Vec::new();
     };
-    let pairs: Vec<(String, String)> = if let Ok(pairs) =
-        serde_json::from_str::<Vec<(String, String)>>(json)
-    {
-        pairs
-    } else if let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(json)
-    {
-        map.into_iter().collect()
-    } else {
-        return Vec::new();
-    };
-    pairs
-        .into_iter()
-        .filter_map(|(k, hex)| hex_decode(&hex).map(|v| (k, v)))
-        .collect()
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(serde_json::Value::Array(entries)) => entries.iter().filter_map(decode_entry).collect(),
+        Ok(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .filter_map(|(k, v)| hex_decode(v.as_str()?).map(|v| (k, v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One `[key, hex(value)]` or `[hex(key), hex(value), "hex"]` entry; `None` if malformed.
+fn decode_entry(entry: &serde_json::Value) -> Option<(String, Vec<u8>)> {
+    match entry.as_array()?.as_slice() {
+        [key, value] => Some((key.as_str()?.to_owned(), hex_decode(value.as_str()?)?)),
+        [key, value, marker] if marker.as_str() == Some(HEX_KEY) => {
+            let key = String::from_utf8(hex_decode(key.as_str()?)?).ok()?;
+            Some((key, hex_decode(value.as_str()?)?))
+        }
+        _ => None,
+    }
 }
 
 /// Decode a lowercase/uppercase hex string into bytes; `None` on malformed input.
@@ -89,6 +109,33 @@ mod tests {
             ]
         );
         assert_eq!(encode_headers_json(std::iter::empty()), "{}");
+    }
+
+    /// JSONB refuses `\u0000`: a key holding U+0000 is stored as hex and decodes back
+    /// unchanged; a value holding NUL bytes is hex like any other.
+    #[test]
+    fn a_key_with_nul_is_stored_as_hex_and_decodes_unchanged() {
+        let headers: [(&str, &[u8]); 3] = [("a\0b", b"\0v\0"), ("k", b"\0"), ("\0", b"")];
+        let json = encode_headers_json(headers.iter().copied());
+        assert_eq!(
+            json,
+            r#"[["610062","007600","hex"],["k","00"],["00","","hex"]]"#
+        );
+        assert!(!json.contains("\\u0000"));
+        assert_eq!(
+            decode_headers_json(Some(&json)),
+            headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        // A malformed entry is dropped, the others kept.
+        assert_eq!(
+            decode_headers_json(Some(
+                r#"[["zz","00","hex"],["6b","00","other"],["k","01"]]"#
+            )),
+            vec![("k".to_string(), vec![1u8])]
+        );
     }
 
     #[test]

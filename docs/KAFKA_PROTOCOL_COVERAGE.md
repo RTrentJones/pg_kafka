@@ -55,6 +55,7 @@ Version ranges below are the ones advertised in the ApiVersions response and enf
 **Implementation Notes:**
 - ✅ ListOffsets supports special timestamps (-2 = earliest, -1 = latest: the LSO for read_committed, -3 = max timestamp, KIP-734) and arbitrary timestamp lookup (earliest offset whose record timestamp ≥ target), bounded by the readable end like Kafka; an unknown partition is UNKNOWN_TOPIC_OR_PARTITION
 - ✅ OffsetFetch v7 `require_stable` (KIP-447): UNSTABLE_OFFSET_COMMIT for partitions with a pending transactional offset commit
+- ✅ A Fetch from before the log start or past the high watermark answers OFFSET_OUT_OF_RANGE with Kafka 3.7's partition entry (high watermark, last stable offset and log start offset -1, null aborted transactions, an empty records field, never a null one), so the consumer applies `auto.offset.reset`
 - ✅ Fetch returns records grouped into one RecordBatch per run of a producer's consecutive offsets, and a control batch over offsets a consumer cannot see (aborted, cleaned up) so its position reaches the end (see PROTOCOL_DEVIATIONS.md §7)
 - ✅ OffsetFetch limited to <!--gen:api-vversions:OffsetFetch-->v1-v7<!--/gen--> (v8+ requires different response format)
 - ✅ All consumer data access APIs fully functional
@@ -433,7 +434,10 @@ Consumer Flow (Current):
 ```
 
 **Implemented Features (Phase 4-5):**
-- ✅ **Automatic Partition Assignment**: Range, RoundRobin, Sticky (KIP-54) strategies
+- ✅ **Automatic Partition Assignment**: Range, RoundRobin, Sticky (KIP-54) strategies; the
+  server-side Sticky assignor can choose differently from Kafka's StickyAssignor
+  ([PROTOCOL_DEVIATIONS.md §5](PROTOCOL_DEVIATIONS.md#5-consumer-groups--fully-implemented),
+  "Deviation: server-side sticky assignment")
 - ✅ **Automatic Rebalancing**: Trigger on member join/leave
 - ✅ **Member Timeout Detection**: Background scanner removes dead members
 - ✅ **REBALANCE_IN_PROGRESS**: Error code 27 forces client rejoin
@@ -478,7 +482,6 @@ Consumer Flow (Current):
 
 - **Cooperative Rebalancing** (KIP-429)
 - **Static Group Membership** (KIP-345)
-- Table partitioning (time-based retention is already implemented)
 
 ---
 
@@ -501,7 +504,7 @@ Consumer Flow (Current):
 | Member tracking | Yes | Yes | ✅ In-memory |
 | Generation IDs | Yes | Yes | ✅ Implemented |
 | Heartbeats | Yes | Yes | ✅ Implemented |
-| Assignment strategies | Range, RR, Sticky | Range, RR, Sticky | ✅ Phase 4 |
+| Assignment strategies | Range, RR, Sticky | Range, RR, Sticky | ✅ Phase 4; ⚠️ server-side Sticky deviates ([PROTOCOL_DEVIATIONS.md §5](PROTOCOL_DEVIATIONS.md#5-consumer-groups--fully-implemented)) |
 | Auto-rebalance | Yes | Yes | ✅ Phase 5 |
 | Timeout detection | Yes | Yes | ✅ Phase 5 |
 | Group visibility | DescribeGroups, ListGroups | DescribeGroups, ListGroups | ✅ Phase 5 |
@@ -559,7 +562,6 @@ one place: [TEST_STRATEGY.md](TEST_STRATEGY.md#test-summary).
 **Future Phases**:
 1. Cooperative rebalancing (KIP-429)
 2. Static group membership (KIP-345)
-3. Table partitioning
 
 ---
 

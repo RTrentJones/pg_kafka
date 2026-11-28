@@ -3,10 +3,15 @@
 //! Tests for consumer error conditions including unknown topics,
 //! invalid partitions, and out-of-range offsets.
 
-use crate::common::{create_base_consumer, TestResult, POLL_TIMEOUT};
+use crate::common::{create_base_consumer, get_bootstrap_servers, TestResult, POLL_TIMEOUT};
+use crate::error_codes;
 use crate::fixtures::{generate_messages, TestTopicBuilder};
 use crate::setup::TestContext;
-use rdkafka::consumer::Consumer;
+use crate::wire::requests::fetch_request;
+use crate::wire::Wire;
+use kafka_protocol::messages::FetchResponse;
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message;
 use rdkafka::TopicPartitionList;
 use std::time::Duration;
@@ -126,73 +131,131 @@ pub async fn test_fetch_invalid_partition() -> TestResult {
     Ok(())
 }
 
-/// Test fetching from offset beyond high watermark
-///
-/// Should return empty results or OFFSET_OUT_OF_RANGE.
+/// A fetch outside the log is answered OFFSET_OUT_OF_RANGE with Kafka 3.7's entry
+/// (offsets -1, null aborted transactions, an empty but non-null records field), so an
+/// rdkafka consumer applies `auto.offset.reset`: from past the high watermark and from
+/// before a log start that DeleteRecords moved, `earliest` brings it to the first record
+/// still in the log, and it reads every record from there. A null records field makes
+/// librdkafka drop the whole response ("invalid MessageSetSize -1") without ever reading
+/// the error code, so the consumer refetches the same offset forever and gets nothing.
 pub async fn test_fetch_offset_out_of_range() -> TestResult {
     println!("=== Test: Fetch from Out-of-Range Offset ===\n");
 
     let ctx = TestContext::new().await?;
-
     let topic = TestTopicBuilder::new(&ctx, "out-of-range").build().await?;
-
-    // Produce 5 messages (offsets 0-4, high watermark = 5)
     let messages = generate_messages(5, "test");
     topic.produce(&messages).await?;
-
     println!(
-        "Created topic '{}' with 5 messages (offsets 0-4)",
+        "Step 1: topic '{}' with 5 messages (offsets 0-4)",
         topic.name
     );
 
-    let group_id = ctx.unique_group("out-of-range").await;
-    let consumer = create_base_consumer(&group_id)?;
+    let mut wire = Wire::connect().await?;
+    println!("\nStep 2: raw Fetch v4 and v11 from offset 100 (past the high watermark 5)");
+    check_out_of_range_entry(&mut wire, &topic.name, 100).await?;
 
-    // Try to fetch from offset 100 (way beyond high watermark)
-    let out_of_range_offset = 100;
-    let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(
-        &topic.name,
-        0,
-        rdkafka::Offset::Offset(out_of_range_offset),
-    )?;
-    consumer.assign(&assignment)?;
+    println!("\nStep 3: an rdkafka consumer assigned offset 100 resets to the earliest record");
+    consume_after_reset(&ctx, &topic.name, 100, 0..5).await?;
 
-    println!("Attempting to fetch from offset {out_of_range_offset}...");
-
-    let timeout = Duration::from_secs(3);
-    let start = std::time::Instant::now();
-    let mut received_any = false;
-
-    while start.elapsed() < timeout {
-        match consumer.poll(POLL_TIMEOUT) {
-            Some(Ok(msg)) => {
-                println!(
-                    "   Received message at offset {} (unexpected)",
-                    msg.offset()
-                );
-                received_any = true;
-            }
-            Some(Err(e)) => {
-                println!("   Error (expected): {e}");
-                break;
-            }
-            None => {
-                // Continue
-            }
-        }
+    println!("\nStep 4: DeleteRecords before offset 2, then fetch from offset 0");
+    let (error, low_watermark) = wire.delete_records(&topic.name, 0, 2).await?;
+    if (error, low_watermark) != (0, 2) {
+        return Err(
+            format!("DeleteRecords answered error {error}, low watermark {low_watermark}").into(),
+        );
     }
-
-    if !received_any {
-        println!("   No messages received (correct - offset is out of range)");
-    }
+    check_out_of_range_entry(&mut wire, &topic.name, 0).await?;
+    consume_after_reset(&ctx, &topic.name, 0, 2..5).await?;
 
     ctx.cleanup().await?;
-    // QA-3: starting at offset 100 with a high-watermark of 5, the only valid outcomes are an
-    // OFFSET_OUT_OF_RANGE error or a reset to the (default `latest`) end with no new data — never a
-    // phantom record at offset 100.
-    if received_any {
-        return Err("fetch from an out-of-range offset delivered a message".into());
+    println!("\n✅ Fetch out-of-range test PASSED\n");
+    Ok(())
+}
+
+/// Fetch partition 0 of `topic` from `offset`, outside its log, at v4 and v11: the entry
+/// must be Kafka 3.7's OFFSET_OUT_OF_RANGE entry with a non-null (length 0) records field
+/// (the crate decodes a length of -1 as None).
+async fn check_out_of_range_entry(wire: &mut Wire, topic: &str, offset: i64) -> TestResult {
+    let v4: FetchResponse = wire.call(4, &fetch_request(topic, 0, offset, 0)).await?;
+    let v11 = wire.fetch(topic, 0, offset, 0).await?;
+    for (version, p) in [(4, &v4.responses[0].partitions[0]), (11, &v11)] {
+        let records = p.records.as_ref().map(bytes::Bytes::len);
+        println!(
+            "   v{version}: error {}, hwm {}, lso {}, log start {}, aborted {:?}, records {:?}",
+            p.error_code,
+            p.high_watermark,
+            p.last_stable_offset,
+            p.log_start_offset,
+            p.aborted_transactions.as_ref().map(Vec::len),
+            records
+        );
+        if p.error_code != error_codes::OFFSET_OUT_OF_RANGE {
+            return Err(format!(
+                "v{version}: expected OFFSET_OUT_OF_RANGE, got {}",
+                p.error_code
+            )
+            .into());
+        }
+        if records != Some(0) {
+            return Err(format!(
+                "v{version}: an OFFSET_OUT_OF_RANGE entry must carry an empty, non-null records \
+                 field (length 0), got {records:?} (None is the null length -1)"
+            )
+            .into());
+        }
+        // log_start_offset is on the wire from v5.
+        let log_start = if version >= 5 { p.log_start_offset } else { -1 };
+        if (p.high_watermark, p.last_stable_offset, log_start) != (-1, -1, -1)
+            || p.aborted_transactions.is_some()
+        {
+            return Err(format!(
+                "v{version}: Kafka 3.7 answers OFFSET_OUT_OF_RANGE with offsets -1 and null \
+                 aborted transactions, got {p:?}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Assign an `auto.offset.reset=earliest` consumer partition 0 of `topic` at `offset`
+/// (outside the log) and require exactly the records at `expected` offsets, in order,
+/// within 20 s.
+async fn consume_after_reset(
+    ctx: &TestContext,
+    topic: &str,
+    offset: i64,
+    expected: std::ops::Range<i64>,
+) -> TestResult {
+    let group_id = ctx.unique_group("out-of-range").await;
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", get_bootstrap_servers())
+        .set("broker.address.family", "v4")
+        .set("group.id", &group_id)
+        .set("enable.auto.commit", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+    let mut assignment = TopicPartitionList::new();
+    assignment.add_partition_offset(topic, 0, rdkafka::Offset::Offset(offset))?;
+    consumer.assign(&assignment)?;
+
+    let want: Vec<i64> = expected.collect();
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while got.len() < want.len() && std::time::Instant::now() < deadline {
+        match consumer.poll(POLL_TIMEOUT) {
+            Some(Ok(msg)) => got.push(msg.offset()),
+            Some(Err(e)) => println!("   consumer error: {e}"),
+            None => {}
+        }
+    }
+    println!("   assigned offset {offset}: received offsets {got:?}");
+    if got != want {
+        return Err(format!(
+            "a consumer assigned out-of-range offset {offset} with auto.offset.reset=earliest \
+             must reset and receive offsets {want:?}, received {got:?}"
+        )
+        .into());
     }
     Ok(())
 }

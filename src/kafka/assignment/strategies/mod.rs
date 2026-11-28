@@ -29,18 +29,43 @@ pub use roundrobin::RoundRobinStrategy;
 pub use sticky::StickyStrategy;
 
 /// Input for partition assignment computation
+///
+/// The subscriptions come from the members' JoinGroup metadata, so a member may list a
+/// topic many times: [`AssignmentInput::new`] drops the repeats and indexes the members
+/// of every subscribed topic once, and the assignors look subscribers up in that index.
+/// Range and round-robin then cost about the subscription entries plus the partitions
+/// assigned, never their product (assignment runs on the single DB thread, where a slow
+/// assignment stalls every other request). Sticky also does in an ordinary rebalance; how
+/// much its balancing takes depends on the input's shape, so the coordinator runs it with a
+/// step budget ([`StickyStrategy::assign_within`]).
+///
+/// A member is its index in ascending member id order ([`Self::member_id`]). Member ids are
+/// `{client_id}-{uuid}` and the client id is the client's, up to 32 KB, so the assignors
+/// keep their per-member state in vectors by index and never copy, hash or compare an id
+/// per subscribed topic, per partition or per move: past the input itself an assignment
+/// copies each id once (into [`AssignmentOutput`]), and the only work proportional to the
+/// ids' lengths is sorting them, about `m log m` comparisons of up to the ids' length for
+/// `m` members, once per assignment.
 #[derive(Debug, Clone)]
 pub struct AssignmentInput {
-    /// Map of member_id -> parsed subscription
-    /// Contains each consumer's subscribed topics
-    pub subscriptions: HashMap<String, MemberSubscription>,
+    /// The members in ascending id order, each with its subscription (topics sorted and
+    /// without repeats).
+    members: Vec<(String, MemberSubscription)>,
 
     /// Available partitions per topic: topic_name -> partition_count
     pub topic_partitions: HashMap<String, i32>,
+
+    /// Per subscribed topic, its subscribers' indexes in ascending order.
+    topic_members: HashMap<String, Vec<usize>>,
 }
 
 impl AssignmentInput {
-    /// Create new assignment input
+    /// Create new assignment input.
+    ///
+    /// Cost: sorting the `m` member ids (`m log m` comparisons, each up to the ids' length),
+    /// sorting each member's topics, and one map lookup per subscription entry (hashing the
+    /// topic name); memory: one index per (member, distinct topic) plus one copy of each
+    /// distinct topic name.
     pub fn new(
         subscriptions: HashMap<String, MemberSubscription>,
         topic_partitions: HashMap<String, i32>,
@@ -50,34 +75,86 @@ impl AssignmentInput {
         let mut topic_partitions = topic_partitions;
         topic_partitions
             .retain(|_, count| crate::kafka::limits::sane_partition_count(*count).is_some());
-        Self {
-            subscriptions,
-            topic_partitions,
+        let mut members: Vec<(String, MemberSubscription)> = subscriptions.into_iter().collect();
+        members.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut topic_members: HashMap<String, Vec<usize>> = HashMap::new();
+        // Members are visited in index order, so every topic's list comes out ascending.
+        for (member, (_, subscription)) in members.iter_mut().enumerate() {
+            subscription.topics.sort_unstable();
+            subscription.topics.dedup();
+            for topic in &subscription.topics {
+                match topic_members.get_mut(topic.as_str()) {
+                    Some(subscribers) => subscribers.push(member),
+                    None => {
+                        topic_members.insert(topic.clone(), vec![member]);
+                    }
+                }
+            }
         }
+        Self {
+            members,
+            topic_partitions,
+            topic_members,
+        }
+    }
+
+    /// The number of members.
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    /// The id of member `member` (an index below [`Self::member_count`]).
+    pub fn member_id(&self, member: usize) -> &str {
+        &self.members[member].0
+    }
+
+    /// The subscription of member `member`: its topics sorted and without repeats.
+    pub fn subscription(&self, member: usize) -> &MemberSubscription {
+        &self.members[member].1
+    }
+
+    /// Every member's id and subscription, in ascending id order.
+    pub fn subscriptions(&self) -> impl Iterator<Item = (&str, &MemberSubscription)> {
+        self.members.iter().map(|(id, s)| (id.as_str(), s))
+    }
+
+    /// The index of the member `member_id`, if it is a member (a binary search: about
+    /// `log m` comparisons of the id).
+    pub fn member_index(&self, member_id: &str) -> Option<usize> {
+        self.members
+            .binary_search_by(|(id, _)| id.as_str().cmp(member_id))
+            .ok()
     }
 
     /// Get all unique topics that any member is subscribed to
     pub fn all_subscribed_topics(&self) -> Vec<String> {
-        let mut topics: Vec<String> = self
-            .subscriptions
-            .values()
-            .flat_map(|sub| sub.topics.iter().cloned())
-            .collect();
-        topics.sort();
-        topics.dedup();
+        let mut topics: Vec<String> = self.topic_members.keys().cloned().collect();
+        topics.sort_unstable();
         topics
     }
 
-    /// Get member IDs subscribed to a specific topic
-    pub fn members_for_topic(&self, topic: &str) -> Vec<String> {
-        let mut members: Vec<String> = self
-            .subscriptions
+    /// The indexes of the members subscribed to `topic`, in ascending order.
+    pub fn members_for_topic(&self, topic: &str) -> &[usize] {
+        self.topic_members.get(topic).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether member `member` subscribes to `topic`.
+    pub fn is_subscribed(&self, member: usize, topic: &str) -> bool {
+        self.members_for_topic(topic).binary_search(&member).is_ok()
+    }
+
+    /// An empty assignment per member, by index.
+    pub(super) fn empty_assignments(&self) -> Vec<MemberAssignment> {
+        vec![MemberAssignment::new(); self.members.len()]
+    }
+
+    /// The output for `assignments`, one per member by index: each member id is copied once.
+    pub(super) fn output(&self, assignments: Vec<MemberAssignment>) -> AssignmentOutput {
+        self.members
             .iter()
-            .filter(|(_, sub)| sub.topics.contains(&topic.to_string()))
             .map(|(id, _)| id.clone())
-            .collect();
-        members.sort(); // Deterministic order
-        members
+            .zip(assignments)
+            .collect()
     }
 }
 
@@ -211,14 +288,18 @@ mod tests {
 
         let input = AssignmentInput::new(subscriptions, HashMap::new());
 
-        assert_eq!(
-            input.members_for_topic("topic-a"),
-            vec!["member-1", "member-2"]
-        );
-        assert_eq!(
-            input.members_for_topic("topic-b"),
-            vec!["member-2", "member-3"]
-        );
-        assert_eq!(input.members_for_topic("topic-c"), [] as [String; 0]);
+        let ids = |topic: &str| -> Vec<&str> {
+            input
+                .members_for_topic(topic)
+                .iter()
+                .map(|&m| input.member_id(m))
+                .collect()
+        };
+        assert_eq!(ids("topic-a"), vec!["member-1", "member-2"]);
+        assert_eq!(ids("topic-b"), vec!["member-2", "member-3"]);
+        assert_eq!(ids("topic-c"), [] as [&str; 0]);
+        assert!(input.is_subscribed(input.member_index("member-2").unwrap(), "topic-b"));
+        assert!(!input.is_subscribed(input.member_index("member-1").unwrap(), "topic-b"));
+        assert_eq!(input.member_index("member-4"), None);
     }
 }

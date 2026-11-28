@@ -38,6 +38,31 @@ impl From<()> for RequestOutcome {
     }
 }
 
+/// The level a handler's `Err` is logged at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureLogLevel {
+    /// The client's own error: an unknown member or topic, a stale generation, a fenced
+    /// producer, an invalid request.
+    Debug,
+    /// The broker's failure: database, IO, internal.
+    Warning,
+}
+
+/// How a handler's `Err` is logged. Kafka 3.7 answers a client's error with its code and
+/// logs it at most at DEBUG or INFO (the coordinators answer UNKNOWN_MEMBER_ID or
+/// ILLEGAL_GENERATION without a line, `ReplicaManager` passes the known append exceptions
+/// back without one); only an unexpected failure (`KafkaApis.handle` catching a
+/// `Throwable`) is logged at ERROR. Logging every client error at WARNING let any client
+/// fill the server log with one line per request, each carrying the request's strings (a
+/// group id of up to 32 KB).
+pub fn failure_log_level(e: &KafkaError) -> FailureLogLevel {
+    if e.is_server_error() {
+        FailureLogLevel::Warning
+    } else {
+        FailureLogLevel::Debug
+    }
+}
+
 /// Run `handler`, wrap its result with `wrap_response` and send it on `response_tx`.
 ///
 /// A handler `Err` is answered with `wrap_error(code)` and returns
@@ -75,7 +100,14 @@ where
             RequestOutcome::Commit
         }
         Ok(Err(e)) => {
-            pg_warning!("Failed to handle {} request: {}", handler_name, e);
+            match failure_log_level(&e) {
+                FailureLogLevel::Warning => {
+                    pg_warning!("Failed to handle {} request: {}", handler_name, e);
+                }
+                FailureLogLevel::Debug => {
+                    pg_debug!("{} request answered with an error: {}", handler_name, e);
+                }
+            }
             let error_response = wrap_error(e.to_kafka_error_code());
             if let Err(send_err) = response_tx.send(error_response) {
                 pg_warning!("Failed to send error response: {}", send_err);
@@ -157,6 +189,40 @@ mod tests {
                 assert_eq!(error_code, -1);
             }
             _ => panic!("Expected error response"),
+        }
+    }
+
+    #[test]
+    fn test_client_errors_log_below_warning() {
+        for client_error in [
+            KafkaError::unknown_member("g", "m"),
+            KafkaError::illegal_generation("g", 1, 2),
+            KafkaError::RebalanceInProgress {
+                group_id: "g".into(),
+            },
+            KafkaError::unknown_topic("t"),
+            KafkaError::CoordinatorNotAvailable {
+                group_id: "g".into(),
+            },
+            KafkaError::PolicyViolation {
+                message: "too large".into(),
+            },
+        ] {
+            assert_eq!(
+                failure_log_level(&client_error),
+                FailureLogLevel::Debug,
+                "{client_error}"
+            );
+        }
+        for server_error in [
+            KafkaError::database("boom"),
+            KafkaError::Internal("lock poisoned".into()),
+        ] {
+            assert_eq!(
+                failure_log_level(&server_error),
+                FailureLogLevel::Warning,
+                "{server_error}"
+            );
         }
     }
 

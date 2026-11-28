@@ -27,7 +27,9 @@ pub use crate::kafka::handlers::JoinGroupRequestData;
 
 use crate::kafka::constants::ERROR_INVALID_GROUP_ID;
 use crate::kafka::handlers;
-use crate::kafka::messages::{JoinGroupProtocol, MemberIdentity, SyncGroupAssignment};
+use crate::kafka::messages::{
+    JoinGroupProtocol, LeavingMembers, MemberIdentity, SyncGroupAssignment,
+};
 use crate::kafka::response_builders as rb;
 
 /// Refuse an empty group id with INVALID_GROUP_ID, answered without touching any group.
@@ -165,7 +167,7 @@ impl KafkaApi for JoinGroupApi {
 
     /// The response may come from a later JoinGroup, a LeaveGroup or the timeout sweep, so
     /// it answers on the client's own sender through a `JoinGroupReply` (which answers
-    /// UNKNOWN_SERVER_ERROR if dropped unsent). JoinGroup writes nothing to the database.
+    /// COORDINATOR_NOT_AVAILABLE if dropped unsent). JoinGroup writes nothing to the database.
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         let (header, response_tx) = call.into_parts();
         let reply =
@@ -244,10 +246,8 @@ pub struct LeaveGroupApi;
 pub struct LeaveGroupRequestData {
     /// Consumer group id.
     pub group_id: String,
-    /// Leaving member (v0-2).
-    pub member_id: String,
-    /// Leaving members (v3+ batch).
-    pub members: Vec<MemberIdentity>,
+    /// The leaving members: the member id (v0-2) or the `members` batch (v3+).
+    pub leaving: LeavingMembers,
 }
 
 impl ApiSchema for LeaveGroupApi {
@@ -271,13 +271,19 @@ impl KafkaApi for LeaveGroupApi {
 
     fn decode(
         wire: LeaveGroupRequest,
-        _header: &RequestHeader,
+        header: &RequestHeader,
     ) -> Result<Self::Request, Rejection<()>> {
         require_group_id(&wire.group_id, || ())?;
+        // Kafka 3.7 (KafkaApis.handleLeaveGroupRequest) reads the member id below v3 and
+        // the members array from v3 on, even an empty one.
+        let leaving = if header.api_version < 3 {
+            LeavingMembers::Single(wire.member_id.to_string())
+        } else {
+            LeavingMembers::Batch(wire.members.into_iter().map(MemberIdentity::from).collect())
+        };
         Ok(LeaveGroupRequestData {
             group_id: wire.group_id.to_string(),
-            member_id: wire.member_id.to_string(),
-            members: wire.members.into_iter().map(MemberIdentity::from).collect(),
+            leaving,
         })
     }
 
@@ -285,7 +291,7 @@ impl KafkaApi for LeaveGroupApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_leave_group(&env.ctx, &r.group_id, &r.member_id, r.members)
+            handlers::handle_leave_group(&env.ctx, &r.group_id, r.leaving)
         })
     }
 }
@@ -658,6 +664,33 @@ mod tests {
         let response = LeaveGroupApi::error_response(None, 4, ERROR_INVALID_GROUP_ID);
         assert_eq!(response.error_code, ERROR_INVALID_GROUP_ID);
         assert_eq!(response.members.len(), 0);
+    }
+
+    /// The request version, not whether `members` is empty, frames LeaveGroup: v0-2 leave
+    /// the top-level member id, v3+ the `members` batch, an empty one included.
+    #[test]
+    fn leave_group_framing_follows_the_version() {
+        let decoded = |version: i16| {
+            let mut wire = LeaveGroupRequest::default();
+            wire.group_id = GroupId("g".to_string().into());
+            wire.member_id = "m".to_string().into();
+            let Ok(request) = LeaveGroupApi::decode(wire, &header(13, version)) else {
+                panic!("v{version} decodes");
+            };
+            request.leaving
+        };
+        for version in 0..=2 {
+            assert!(
+                matches!(decoded(version), LeavingMembers::Single(ref m) if m == "m"),
+                "v{version}"
+            );
+        }
+        for version in 3..=4 {
+            assert!(
+                matches!(decoded(version), LeavingMembers::Batch(ref ms) if ms.is_empty()),
+                "v{version}"
+            );
+        }
     }
 
     /// DescribeGroups, DeleteGroups and FindCoordinator decode the empty group id, as Kafka 3.7

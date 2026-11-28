@@ -108,6 +108,11 @@ CREATE TABLE kafka.messages (
     producer_id BIGINT,                -- Producer ID for transactional messages (NULL for non-transactional)
     producer_epoch SMALLINT,           -- Producer epoch for fencing
     txn_state TEXT,                    -- NULL (committed/non-txn), 'pending' (uncommitted), 'aborted'
+    -- What the record adds to a Fetch response (uncompressed key, value and headers plus
+    -- their framing), stored by Produce so a fetch sums the sizes of the rows it scans
+    -- without reading their keys, values or headers (from TOAST, when stored there). NULL
+    -- for a row written by SQL outside the extension: fetches then compute it.
+    record_bytes INT,
     -- DR-7 (DEEP-REVIEW-2026-07): reject negative partition ids at the storage layer too
     -- (handlers validate range against topics.partitions; this is the schema backstop).
     CHECK (partition_id >= 0),
@@ -131,6 +136,38 @@ ON kafka.messages USING brin (created_at) WITH (autosummarize = on);
 CREATE INDEX idx_messages_txn_pending
 ON kafka.messages(topic_id, partition_id, partition_offset)
 WHERE txn_state = 'pending';
+
+-- A transactional producer's pending rows, for the statements that end its
+-- transaction (EndTxn's commit and abort, the abort of a fenced epoch or a timed-out
+-- transaction, the shadow outbox's commit enqueue). idx_messages_txn_pending leads
+-- with the partition, so those statements read every pending row of every producer;
+-- this one reads only the producer's own. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_pending_producer
+ON kafka.messages(producer_id, producer_epoch)
+WHERE txn_state = 'pending';
+
+-- Aborted transactional rows, for the retention sweep's aborted-row cleanup (every
+-- pass, whatever the retention settings): without it that DELETE read every block of
+-- every leaf (the BRIN on created_at matches nearly all of them), on the single worker
+-- DB thread. Partial, so only aborted rows are indexed: a non-transactional or
+-- committed write never touches it. Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_txn_aborted
+ON kafka.messages(created_at)
+WHERE txn_state = 'aborted';
+
+-- Records by producer timestamp, for ListOffsets by timestamp and MAX_TIMESTAMP (-3):
+-- the record with the largest timestamp is one descent, and the earliest offset whose
+-- timestamp is at or after T is found among the rows that match from either side, the
+-- rows below the first match in timestamp order (through the offset key) or the rows at
+-- or after T (index only, partition_offset is a key column), whichever the planner
+-- estimates smaller; without it either lookup read every row of the partition.
+-- Partial on what a lookup can match (rows with a timestamp, not aborted). It costs
+-- every Produce one more btree entry per record (about 40 bytes, and its WAL) and a
+-- transaction commit one more per record (its UPDATE of txn_state is not HOT anyway:
+-- txn_state is in the partial indexes' predicates). Partitioned index: every leaf gets one.
+CREATE INDEX idx_messages_timestamp
+ON kafka.messages(topic_id, partition_id, timestamp_ms, partition_offset)
+WHERE timestamp_ms >= 0 AND txn_state IS DISTINCT FROM 'aborted';
 
 -- The catch-all leaf. Normally empty: it only holds rows that arrived before their
 -- time partition existed (or rows written out of band with a created_at outside every
@@ -245,14 +282,23 @@ BEGIN
 END;
 $$;
 
--- Lock kafka.topics in SHARE ROW EXCLUSIVE mode and then kafka.messages in ACCESS
--- EXCLUSIVE mode, what partition DDL needs (internal). Worker transactions lock these
--- tables in either order (a batch can fetch, then auto-create a topic), so a DDL that
--- waited for one while holding the other could deadlock with them. Each attempt
--- therefore waits at most 50 ms (well below deadlock_timeout), in a subtransaction
--- whose failure releases both locks, and the attempts repeat with a random pause
--- until the caller's lock_timeout has passed; then lock_not_available is raised.
-CREATE FUNCTION kafka.lock_message_tables()
+-- Lock what partition DDL on one leaf needs (internal): kafka.topics in SHARE ROW
+-- EXCLUSIVE mode (the leaf's foreign key), then ACCESS EXCLUSIVE on kafka.messages
+-- itself (ONLY), the leaf p_leaf (the one a DROP removes; NULL for a leaf being
+-- created) and kafka.messages_default (whose partition constraint every CREATE ...
+-- PARTITION OF and every DROP of another leaf changes). Exactly what CREATE TABLE ...
+-- PARTITION OF, ATTACH PARTITION and DROP TABLE of a leaf lock, parent first, the order
+-- every statement through the parent takes them in. Not the other leaves: a LOCK TABLE
+-- without ONLY locks every leaf too, and a SHARE UPDATE EXCLUSIVE holder on any leaf
+-- (autovacuum, VACUUM, ANALYZE) then made every leaf creation and drop time out. A
+-- session that reaches another leaf directly (by its name) holds only that leaf, which
+-- this DDL neither reads nor changes. Worker transactions lock these tables in either
+-- order (a batch can fetch, then auto-create a topic), so a DDL that waited for one
+-- while holding another could deadlock with them. Each attempt therefore waits at most
+-- 50 ms (well below deadlock_timeout), in a subtransaction whose failure releases every
+-- lock it took, and the attempts repeat with a random pause until the caller's
+-- lock_timeout has passed; then lock_not_available is raised.
+CREATE FUNCTION kafka.lock_message_tables(p_leaf REGCLASS DEFAULT NULL)
 RETURNS VOID
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -266,7 +312,11 @@ BEGIN
         BEGIN
             PERFORM set_config('lock_timeout', '50ms', true);
             LOCK TABLE kafka.topics IN SHARE ROW EXCLUSIVE MODE;
-            LOCK TABLE kafka.messages IN ACCESS EXCLUSIVE MODE;
+            LOCK TABLE ONLY kafka.messages IN ACCESS EXCLUSIVE MODE;
+            IF p_leaf IS NOT NULL THEN
+                EXECUTE format('LOCK TABLE ONLY %s IN ACCESS EXCLUSIVE MODE', p_leaf);
+            END IF;
+            LOCK TABLE ONLY kafka.messages_default IN ACCESS EXCLUSIVE MODE;
             PERFORM set_config('lock_timeout', v_saved, true);
             RETURN;
         EXCEPTION WHEN lock_not_available THEN
@@ -295,7 +345,6 @@ RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 SET datestyle = 'ISO, YMD'
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     -- messages_pYYYYMMDD_HHMMSS (UTC lower bound), plus _microseconds for a bound
@@ -306,6 +355,12 @@ DECLARE
     v_moved BIGINT := 0;
     v_move BOOLEAN;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     IF p_lower IS NULL OR p_upper IS NULL OR p_lower >= p_upper THEN
         RAISE EXCEPTION 'invalid partition range [%, %)', p_lower, p_upper;
     END IF;
@@ -325,9 +380,10 @@ BEGIN
             RAISE WARNING 'pg_kafka: could not create time partition kafka.% (rows of kafka.messages_default to move, schema lock taken); will retry', v_name;
             RETURN 0;
         END IF;
-        -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages and, to clone
-        -- the topic_id foreign key, kafka.topics: take both first, without ever
-        -- waiting long enough to deadlock with a worker transaction.
+        -- CREATE ... PARTITION OF / ATTACH PARTITION lock kafka.messages, the DEFAULT
+        -- leaf (its partition constraint changes) and, to clone the topic_id foreign
+        -- key, kafka.topics: take them first, without ever waiting long enough to
+        -- deadlock with a worker transaction.
         PERFORM kafka.lock_message_tables();
         -- Rows can reach the DEFAULT leaf while lock_message_tables waits, and CREATE
         -- ... PARTITION OF fails (check_violation) on any of the new leaf's range. With
@@ -401,7 +457,6 @@ CREATE FUNCTION kafka.ensure_message_partitions(p_width_minutes INT, p_ahead INT
 RETURNS INT
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     v_width_s BIGINT;
@@ -412,6 +467,12 @@ DECLARE
     v_ov RECORD;
     v_created INT := 0;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     IF p_width_minutes IS NULL OR p_width_minutes < 1 THEN
         RAISE EXCEPTION 'partition width must be at least 1 minute, got %', p_width_minutes;
     END IF;
@@ -493,33 +554,53 @@ $$;
 -- Returns whether it dropped the leaf, the (topic_id, partition_id) pairs the leaf
 -- held and, for each, the offset after the last one it held (MAX + 1, one btree descent
 -- per pair), so the caller advances their log_start_offset and keeps their offset
--- counter past the dropped offsets even where no counter row existed. Dropping a leaf
--- is equivalent to deleting its rows, which the worker may already do; the function
--- grants no more.
+-- counter past the dropped offsets even where no counter row existed. lock_timed_out
+-- says the leaf was kept because a lock wait ran out (the maintenance lock, or the
+-- locks the DROP needs, within the 2 s lock_timeout): a caller dropping several leaves
+-- stops there, since the session holding the lock blocks the next drop just as long.
+-- Only under READ COMMITTED: the re-check reads the snapshot, and a REPEATABLE READ or
+-- SERIALIZABLE one predates the lock wait, so rows committed during the wait would be
+-- invisible to it and dropped with the leaf. Under those levels the leaf is kept with a
+-- WARNING (dropped and lock_timed_out false) and a READ COMMITTED pass drops it.
+-- Dropping a leaf is equivalent to deleting its rows, which the worker may already do;
+-- the function grants no more.
 CREATE FUNCTION kafka.drop_message_partition(
     p_partition REGCLASS,
     p_expired_topics INT[],
     OUT dropped BOOLEAN,
     OUT topic_ids INT[],
     OUT partition_ids INT[],
-    OUT next_offsets BIGINT[]
+    OUT next_offsets BIGINT[],
+    OUT lock_timed_out BOOLEAN
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
-SET lock_timeout = '2s'
 AS $$
 DECLARE
     v_contents RECORD;
 BEGIN
+    -- Lock waits: at most 2 s each, or the caller's lock_timeout when that is lower
+    -- (the worker bounds its own maintenance far below its 5 s); the function's SET
+    -- clauses make every setting changed here revert when it returns.
+    PERFORM set_config('lock_timeout',
+        CASE WHEN NULLIF(current_setting('lock_timeout'), '0')::INTERVAL < INTERVAL '2s'
+             THEN current_setting('lock_timeout') ELSE '2s' END, true);
     dropped := false;
+    lock_timed_out := false;
     -- Already gone (a concurrent sweep dropped it): nothing to do, not an error.
     IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = p_partition) THEN
+        RETURN;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE WARNING 'pg_kafka: did not drop time partition % (a % snapshot cannot see rows committed while the drop waits for its locks); a READ COMMITTED sweep drops it',
+            p_partition, upper(current_setting('transaction_isolation'));
         RETURN;
     END IF;
     -- The maintenance lock first, before this call locks any table (the leaf check
     -- below opens every leaf). A retention sweep already holds it.
     IF NOT kafka.try_maintenance_lock() THEN
         RAISE WARNING 'pg_kafka: could not drop time partition % (another session holds the maintenance lock); will retry', p_partition;
+        lock_timed_out := true;
         RETURN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM kafka.message_partitions() p
@@ -535,11 +616,16 @@ BEGIN
         -- Every lock wait is inside this block, so a lock timeout skips this leaf
         -- (the next sweep retries) instead of failing the caller's whole sweep.
         -- DROP takes ACCESS EXCLUSIVE on the parent and, to drop the leaf's foreign
-        -- key, SHARE ROW EXCLUSIVE on kafka.topics; take both first (parent, then leaf,
-        -- the order inserts use) so the contents check below cannot race a writer.
-        PERFORM kafka.lock_message_tables();
+        -- key, SHARE ROW EXCLUSIVE on kafka.topics, and ACCESS EXCLUSIVE on the leaf and
+        -- on kafka.messages_default (whose partition constraint the drop changes); take
+        -- them first (parent, then leaves, the order inserts use) so the contents check
+        -- below cannot race a writer, which reaches the leaf through the parent or by
+        -- its name.
+        PERFORM kafka.lock_message_tables(p_partition);
         -- Re-check under the locks: a concurrent drop of the same leaf may have
-        -- committed while this call waited for them.
+        -- committed while this call waited for them. Each statement here takes a new
+        -- snapshot (READ COMMITTED, checked above), so the contents check sees every
+        -- row committed during the wait.
         IF NOT EXISTS (SELECT 1 FROM pg_inherits
                        WHERE inhrelid = p_partition AND inhparent = 'kafka.messages'::regclass) THEN
             RETURN;
@@ -547,8 +633,14 @@ BEGIN
         SELECT * INTO v_contents FROM kafka.message_partition_contents(p_partition);
         topic_ids := v_contents.topic_ids;
         partition_ids := v_contents.partition_ids;
+        -- Some topic in the leaf that is not listed: a hashed EXCEPT, linear in both
+        -- arrays (one entry per (topic, partition) pair, one per expired topic, each
+        -- up to the partition cap), not the array operator <@, which compares every
+        -- element of one with every element of the other (40,000 of each: 1.5 s,
+        -- holding the locks taken above).
         IF v_contents.has_pending
-           OR NOT (v_contents.topic_ids <@ COALESCE(p_expired_topics, '{}'::INT[])) THEN
+           OR EXISTS (SELECT unnest(v_contents.topic_ids)
+                      EXCEPT SELECT unnest(p_expired_topics)) THEN
             RETURN;
         END IF;
         IF EXISTS (SELECT 1 FROM pg_depend
@@ -566,6 +658,7 @@ BEGIN
     EXCEPTION WHEN lock_not_available THEN
         RAISE WARNING 'pg_kafka: could not drop time partition % (lock timeout); will retry', p_partition;
         dropped := false;
+        lock_timed_out := true;
         topic_ids := NULL;
         partition_ids := NULL;
         next_offsets := NULL;
@@ -576,7 +669,7 @@ $$;
 -- Functions are executable by PUBLIC by default: these are for the worker role only.
 REVOKE EXECUTE ON FUNCTION kafka.message_partition_contents(REGCLASS) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.try_maintenance_lock() FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION kafka.lock_message_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION kafka.lock_message_tables(REGCLASS) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.create_message_partition(TIMESTAMPTZ, TIMESTAMPTZ) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.ensure_message_partitions(INT, INT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION kafka.drop_message_partition(REGCLASS, INT[]) FROM PUBLIC;
@@ -605,9 +698,13 @@ CREATE TABLE IF NOT EXISTS kafka.partition_offsets (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
--- Committed offsets per consumer group, topic and partition.
+-- Committed offsets per consumer group, topic and partition. group_id sorts by its bytes
+-- (COLLATE "C"), whatever the database's collation: ListGroups walks the distinct ids of the
+-- primary key in that order up to its response bound and lists them, with the groups the
+-- coordinator holds, in byte order; under a linguistic collation the index could not serve
+-- that walk, and an ORDER BY in the database's order cut a different set of groups.
 CREATE TABLE kafka.consumer_offsets (
-    group_id TEXT NOT NULL,
+    group_id TEXT COLLATE "C" NOT NULL,
     topic_id INT NOT NULL,
     partition_id INT NOT NULL,
     committed_offset BIGINT NOT NULL,
@@ -618,8 +715,16 @@ CREATE TABLE kafka.consumer_offsets (
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_consumer_offsets_group ON kafka.consumer_offsets(group_id);
-CREATE INDEX idx_consumer_offsets_timestamp ON kafka.consumer_offsets(commit_timestamp);
+-- Only the primary key (which leads with group_id, so it serves the lookups by group)
+-- and the topic index below: an offset commit updates committed_offset, metadata and
+-- commit_timestamp, none of them indexed, so the update can be HOT (no index entries at
+-- all); an index on commit_timestamp, which nothing reads, made every commit write an
+-- entry in every index.
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_consumer_offsets_topic ON kafka.consumer_offsets(topic_id);
 
 GRANT SELECT ON kafka.topics TO pgkafka_reader;
 GRANT SELECT ON kafka.messages TO pgkafka_reader;
@@ -630,9 +735,11 @@ GRANT USAGE ON SEQUENCE kafka.topics_id_seq TO pgkafka_worker;
 GRANT SELECT, INSERT, UPDATE, DELETE ON kafka.messages TO pgkafka_worker;
 GRANT USAGE ON SEQUENCE kafka.messages_global_offset_seq TO pgkafka_worker;
 -- Time partitions (ADR-001): the worker reads and writes the leaves only through
--- kafka.messages, except the retention sweep's row delete in the DEFAULT leaf; all
--- partition DDL goes through these SECURITY DEFINER functions.
-GRANT SELECT, DELETE ON kafka.messages_default TO pgkafka_worker;
+-- kafka.messages, except the retention sweep's row delete in the DEFAULT leaf (UPDATE
+-- for the FOR UPDATE SKIP LOCKED it takes its rows with, no more than kafka.messages
+-- grants on the same rows); all partition DDL goes through these SECURITY DEFINER
+-- functions.
+GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.message_partition_contents(regclass) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.ensure_message_partitions(int, int) TO pgkafka_worker;
 GRANT EXECUTE ON FUNCTION kafka.drop_message_partition(regclass, int[]) TO pgkafka_worker;
@@ -656,13 +763,14 @@ COMMENT ON COLUMN kafka.messages.key IS 'Optional message key (nullable). Used f
 
 COMMENT ON COLUMN kafka.messages.value IS 'Message payload (nullable for tombstone messages in log compaction)';
 
-COMMENT ON COLUMN kafka.messages.headers IS 'Optional message headers as JSONB. Kafka headers are key-value pairs (binary values base64-encoded).';
+COMMENT ON COLUMN kafka.messages.headers IS 'Record headers as JSONB: an array of [key, hex(value)] pairs in record order ([hex(key), hex(value), ''hex''] for a key holding U+0000), or ''{}'' when the record has none. Rows from before 0.1.0 may hold a {key: hex(value)} object.';
 
 COMMENT ON COLUMN kafka.messages.producer_id IS 'Producer ID for transactional messages. NULL for non-transactional messages. (Phase 10)';
 
 COMMENT ON COLUMN kafka.messages.producer_epoch IS 'Producer epoch for fencing. Used with producer_id to identify unique producer instance. (Phase 10)';
 
 COMMENT ON COLUMN kafka.messages.txn_state IS 'Transaction state: NULL (committed or non-transactional), ''pending'' (uncommitted), ''aborted'' (rolled back). (Phase 10)';
+COMMENT ON COLUMN kafka.messages.record_bytes IS 'Bytes the record adds to a Fetch response: uncompressed key, value and header lengths, 84 per record and 10 per header. NULL for rows written outside the extension (fetches compute it).';
 
 COMMENT ON TABLE kafka.consumer_offsets IS 'Consumer offset tracking per group/topic/partition. Stores committed offsets for Kafka consumers (Phase 3).';
 
@@ -692,6 +800,12 @@ CREATE TABLE kafka.producer_ids (
 CREATE INDEX idx_producer_ids_txn_id
 ON kafka.producer_ids(transactional_id) WHERE transactional_id IS NOT NULL;
 
+-- Producer ids by idleness: the retention sweep prunes the ones idle past the
+-- expiration window through it, resuming at (last_active_at, producer_id) from pass to
+-- pass, so a pass with none idle costs one descent.
+CREATE INDEX idx_producer_ids_last_active
+ON kafka.producer_ids(last_active_at, producer_id);
+
 -- Producer sequences table: Tracks sequence numbers for idempotent deduplication
 CREATE TABLE kafka.producer_sequences (
     producer_id BIGINT NOT NULL,
@@ -703,6 +817,11 @@ CREATE TABLE kafka.producer_sequences (
     PRIMARY KEY (producer_id, topic_id, partition_id),
     FOREIGN KEY (topic_id) REFERENCES kafka.topics(id) ON DELETE CASCADE
 );
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_producer_sequences_topic ON kafka.producer_sequences(topic_id);
 
 GRANT SELECT ON kafka.producer_ids TO pgkafka_reader;
 GRANT SELECT ON kafka.producer_sequences TO pgkafka_reader;
@@ -774,6 +893,8 @@ CREATE TABLE kafka.transactions (
     -- NOW() in the timeout sweep (`started_at < NOW() - (timeout_ms||'ms')::interval`),
     -- so a naive column skews the abort deadline by the session/DST offset.
     started_at TIMESTAMPTZ,
+    -- When the row last changed state (an Ongoing transaction's later
+    -- AddPartitionsToTxn/AddOffsetsToTxn leave it, so those updates stay HOT).
     last_updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -789,11 +910,26 @@ CREATE INDEX idx_transactions_ongoing_producer
 ON kafka.transactions(producer_id)
 WHERE state = 'Ongoing';
 
+-- Every transaction row by producer id, for the foreign key on producer_ids: the
+-- retention sweep deletes idle producer ids, and each delete checks that no transaction
+-- row references the id. Without an index on the referencing column that check reads
+-- the whole table once per deleted id.
+CREATE INDEX idx_transactions_producer
+ON kafka.transactions(producer_id);
+
+-- Terminal transactions oldest first: the retention sweep deletes the ones idle past
+-- the transactional-id expiration through it, reading only those. last_updated_at
+-- changes only with the state, so indexing it costs the updates that continue an Ongoing
+-- transaction nothing (they change no indexed column and stay HOT).
+CREATE INDEX idx_transactions_terminal
+ON kafka.transactions(last_updated_at)
+WHERE state IN ('CompleteCommit', 'CompleteAbort', 'Empty');
+
 -- Pending transactional offsets table: Stores offset commits within an active transaction
 -- These offsets are moved to consumer_offsets on commit, deleted on abort
 CREATE TABLE kafka.txn_pending_offsets (
     transactional_id TEXT NOT NULL REFERENCES kafka.transactions(transactional_id) ON DELETE CASCADE,
-    group_id TEXT NOT NULL,
+    group_id TEXT COLLATE "C" NOT NULL,  -- byte order, as in kafka.consumer_offsets
     topic_id INT NOT NULL REFERENCES kafka.topics(id) ON DELETE CASCADE,
     partition_id INT NOT NULL,
     pending_offset BIGINT NOT NULL,
@@ -808,6 +944,11 @@ CREATE TABLE kafka.txn_pending_offsets (
 -- with the transactional id, so without this every group's pending rows would be scanned.
 CREATE INDEX idx_txn_pending_offsets_group
 ON kafka.txn_pending_offsets(group_id, topic_id, partition_id);
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_txn_pending_offsets_topic ON kafka.txn_pending_offsets(topic_id);
 
 -- Unique index for transactional_id lookup (fencing - one producer per transactional_id)
 CREATE UNIQUE INDEX idx_producer_ids_txn_id_unique
@@ -844,6 +985,11 @@ CREATE TABLE kafka.txn_partitions (
     partition_id INT NOT NULL CHECK (partition_id >= 0),
     PRIMARY KEY (transactional_id, topic_id, partition_id)
 );
+
+-- Rows by topic, for the foreign key on kafka.topics: DeleteTopics deletes each topic in
+-- turn and the ON DELETE CASCADE finds that topic's rows here, which without an index
+-- leading on topic_id reads the whole table once per deleted topic.
+CREATE INDEX idx_txn_partitions_topic ON kafka.txn_partitions(topic_id);
 
 GRANT SELECT ON kafka.txn_partitions TO pgkafka_reader;
 GRANT SELECT, INSERT, DELETE ON kafka.txn_partitions TO pgkafka_worker;
@@ -923,6 +1069,14 @@ WHERE external_offset IS NULL;
 CREATE INDEX idx_shadow_tracking_retrying
 ON kafka.shadow_tracking(topic_id, partition_id, dead, retry_count, local_offset)
 WHERE external_offset IS NULL AND (retry_count > 0 OR dead);
+
+-- Delivered rows, for the retention sweep's reaping of rows delivered more than a day
+-- ago (walked per partition in offset order instead of scanning the outbox). Its key
+-- columns never change and external_offset already keys the pending indexes, so the
+-- outbox's claims stay HOT; an ack adds one entry.
+CREATE INDEX idx_shadow_tracking_delivered
+ON kafka.shadow_tracking(topic_id, partition_id, local_offset)
+WHERE external_offset IS NOT NULL;
 
 CREATE INDEX idx_shadow_tracking_errors
 ON kafka.shadow_tracking(topic_id, partition_id)

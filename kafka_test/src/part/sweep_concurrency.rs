@@ -37,6 +37,7 @@ pub async fn test_concurrent_sweeps_and_maintenance_do_not_deadlock() -> TestRes
 async fn concurrent_sweeps() -> SendResult<()> {
     println!("=== Test: concurrent retention sweeps and maintenance do not deadlock ===\n");
     let db = session().await?;
+    super::drain_droppable_leaves(&db).await?;
     let topic = unique("sweep-race");
     let topic_id: i32 = db
         .query_one(
@@ -47,7 +48,7 @@ async fn concurrent_sweeps() -> SendResult<()> {
         .await
         .map_err(boxed)?
         .get(0);
-    // A random hour range in 2001-2010 that no other test's leaf covers.
+    // A random hour range in 2003-2012, years no other test's leaves or rows use.
     let base_hour: i32 = db
         .query_one("SELECT (random() * 80000)::int", &[])
         .await
@@ -93,7 +94,7 @@ async fn concurrent_sweeps() -> SendResult<()> {
             let hour = base_hour + round * LEAVES_PER_ROUND + k;
             db.query_one(
                 "SELECT kafka.create_message_partition(lo, lo + INTERVAL '1 hour')
-                 FROM (SELECT timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
+                 FROM (SELECT timestamptz '2003-01-01 00:00+00' + $1::int * INTERVAL '1 hour') AS b(lo)",
                 &[&hour],
             )
             .await
@@ -101,7 +102,7 @@ async fn concurrent_sweeps() -> SendResult<()> {
             let leaf: String = db
                 .query_one(
                     "SELECT partition_oid::regclass::text FROM kafka.message_partitions()
-                     WHERE lower_bound = timestamptz '2001-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
+                     WHERE lower_bound = timestamptz '2003-01-01 00:00+00' + $1::int * INTERVAL '1 hour'",
                     &[&hour],
                 )
                 .await
@@ -114,7 +115,7 @@ async fn concurrent_sweeps() -> SendResult<()> {
                 "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value,
                                              created_at, txn_state)
                  SELECT $1, 0, $2::bigint + g, 'v'::bytea,
-                        timestamptz '2001-01-01 00:00+00' + $3::int * INTERVAL '1 hour'
+                        timestamptz '2003-01-01 00:00+00' + $3::int * INTERVAL '1 hour'
                             + g * INTERVAL '1 second',
                         CASE WHEN g % 2 = 0 THEN NULL ELSE 'aborted' END
                  FROM generate_series(0::bigint, $4::bigint - 1) AS g",

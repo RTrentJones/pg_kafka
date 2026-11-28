@@ -15,8 +15,11 @@
 //!   topic's `write_mode`. Each record that percentage routing selects then
 //!   gets a pending `kafka.shadow_tracking` row in the SAME transaction: the
 //!   durable outbox, exactly consistent with what was persisted. No payload is
-//!   copied; it stays in `kafka.messages`. Transactional records are buffered
-//!   and enqueued at commit.
+//!   copied; it stays in `kafka.messages`. Nothing is kept for an open
+//!   transaction: its commit enqueues the records it selects straight from
+//!   `kafka.messages` (an `INSERT ... SELECT` over the producer's pending rows;
+//!   a sampled topic's rows are routed a chunk at a time through a cursor), in
+//!   the commit's own transaction.
 //! - **The outbox tick** (driven by the worker) claims due rows, joins
 //!   `kafka.messages` for the payload, and hands them to the network thread,
 //!   which owns the idempotent rdkafka producer (`forwarder_task`). Its acks
@@ -39,9 +42,7 @@
 
 use super::config::{SyncMode, TopicConfigCache, TopicShadowConfig, WriteMode};
 use super::license::LicenseValidator;
-use super::outbox::{
-    OutboxClaim, PendingForwardRecord, ShadowDb, SpiShadowDb, OUTBOX_MAX_BACKOFF_MS,
-};
+use super::outbox::{OutboxClaim, ShadowDb, SpiShadowDb, OUTBOX_MAX_BACKOFF_MS};
 use super::primary::PrimaryStatus;
 use super::routing::{make_forward_decision, ForwardDecision};
 use super::{
@@ -51,47 +52,15 @@ use super::{
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
 use crate::kafka::storage::{
-    delegate_offset_store, delegate_producer_store, delegate_topic_store, FetchedMessage,
-    IsolationLevel, KafkaStore, LogStore, MaintenanceStore, OffsetStore, ProducerStore, TopicStore,
-    TransactionState, TransactionStore,
+    delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
+    delegate_topic_store, FetchedMessage, FetchedRecords, IsolationLevel, KafkaStore, LogStore,
+    MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionState, TransactionStore,
+    TxnPartitions,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
-
-/// Key of a transaction's forward buffer: `(producer_id, producer_epoch)`.
-type TxnKey = (i64, i16);
-
-/// Buffered transactional forward records plus when the buffer was first
-/// created. The timeout sweep drops the buffers of transactions that are no
-/// longer open (`ShadowStore::evict_ended_txn_buffers`); `first_buffered` is
-/// its fallback when the open transactions cannot be read.
-struct PendingTxnBuffer {
-    records: Vec<PendingForwardRecord>,
-    first_buffered: Instant,
-}
-
-impl Default for PendingTxnBuffer {
-    fn default() -> Self {
-        Self {
-            records: Vec::new(),
-            first_buffered: Instant::now(),
-        }
-    }
-}
-
-impl From<Vec<PendingForwardRecord>> for PendingTxnBuffer {
-    fn from(records: Vec<PendingForwardRecord>) -> Self {
-        Self {
-            records,
-            first_buffered: Instant::now(),
-        }
-    }
-}
-
-/// Pending transactional records awaiting commit, by producer.
-type PendingTxnMessages = RwLock<HashMap<TxnKey, PendingTxnBuffer>>;
 
 /// In-memory forwarding counters since the last [`ShadowStore::flush_metrics_to_db`]
 /// (the durable per-partition counts are in `kafka.shadow_metrics`).
@@ -172,8 +141,6 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// the durable outbox. Drained on the DB thread by the outbox tick to
     /// finalize `kafka.shadow_tracking` rows.
     forward_ack_rx: RwLock<Option<crossbeam_channel::Receiver<ForwardAck>>>,
-    /// Pending transactional records awaiting commit for shadow forwarding
-    pending_txn_messages: PendingTxnMessages,
     /// License validator for shadow mode (Commercial License)
     license: RwLock<Option<LicenseValidator>>,
     /// Outbox rows dispatched to the network thread whose ack has not yet
@@ -212,6 +179,12 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
     /// `commit_applied_acks` once its transaction committed (as the acks are), so
     /// no transaction's status is ever looked up after the fact.
     staged_dead_flags: Mutex<Option<i64>>,
+    /// The schema epoch: moved by [`forget_dropped_schema`](Self::forget_dropped_schema).
+    /// Acks of another epoch answer forwards of a dropped schema and are ignored.
+    epoch: AtomicU64,
+    /// The forwarder has not been told of the current epoch yet
+    /// ([`ForwardRequest::Reset`]): nothing else is sent before it.
+    reset_pending: AtomicBool,
 }
 
 /// The effects of one ack application that must wait for its transaction's
@@ -220,7 +193,8 @@ pub struct ShadowStore<S: KafkaStore, D: ShadowDb = SpiShadowDb> {
 /// and nothing is counted or logged (a rolled-back tick would count twice).
 #[derive(Debug, Default)]
 struct StagedAcks {
-    /// The acks whose statement failed: still to apply after the commit.
+    /// The acks whose statement failed, or whose row another transaction holds
+    /// (`AcksApplied::held`): still to apply after the commit.
     retry: Vec<ForwardAck>,
     /// Rows whose ack was applied: they leave the in-flight set.
     resolved: Vec<RowKey>,
@@ -239,8 +213,25 @@ struct StagedAcks {
 struct TickFailures {
     /// Failed ticks in a row.
     consecutive: u32,
+    /// Ticks in a row that gave up a lock wait (see [`TickOutcome::LockTimedOut`]).
+    lock_timeouts: u32,
     /// No tick runs before this instant.
     paused_until: Option<Instant>,
+}
+
+/// How an outbox tick ended ([`ShadowStore::note_outbox_tick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    Ok,
+    /// A statement ran out of the tick's short lock_timeout: another session holds a
+    /// lock the tick needs (an open transaction's row of kafka.shadow_metrics, DDL on
+    /// an outbox table). That is no fault of the outbox, and it ends as soon as the
+    /// holder commits, so the next tick comes after the usual interval instead of an
+    /// exponential backoff, which kept forwarding stopped up to 30 s after the holder
+    /// was gone.
+    LockTimedOut,
+    /// Any other failure (a dropped schema, a failed statement): exponential backoff.
+    Failed,
 }
 
 /// One sync-mode outbox row waiting for its request's commit.
@@ -271,7 +262,6 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             metrics: ShadowMetrics::default(),
             forward_tx: RwLock::new(None),
             forward_ack_rx: RwLock::new(None),
-            pending_txn_messages: RwLock::new(HashMap::new()),
             license: RwLock::new(None),
             inflight: super::inflight::InflightTracker::new(INFLIGHT_EVICT_AFTER),
             current_slot: AtomicU64::new(0),
@@ -283,6 +273,8 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             staged_acks: Mutex::new(None),
             dead_flags: Mutex::new(None),
             staged_dead_flags: Mutex::new(None),
+            epoch: AtomicU64::new(0),
+            reset_pending: AtomicBool::new(false),
         }
     }
 
@@ -345,15 +337,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// write_mode with forwarding active. Such a topic is written and
     /// forwarded exactly like DualWrite, but its local reads are suppressed so
     /// consumers must read from the external broker. The config loader forces
-    /// `forward_percentage = 100` for these topics, so every record is
-    /// guaranteed to be forwarded (a sampled-out record would be readable
-    /// nowhere).
+    /// `forward_percentage = 100` for these topics, so every record produced
+    /// while the topic is external-primary is enqueued (a sampled-out record
+    /// would be readable nowhere). Records written before (the topic local-only
+    /// or sampled) or while `pg_kafka.shadow_mode_enabled` was off have no outbox
+    /// row and are suppressed all the same until `kafka.replay_shadow_messages`
+    /// queues them (SHADOW_MODE_FLOW_DIAGRAM.md, "Read Path").
     ///
     /// Read suppression depends only on the global shadow GUC + the per-topic
-    /// config, not on primary/standby: a standby must suppress these reads
-    /// too, since the external broker — not the local copy — is the source of
-    /// truth for an external-primary topic. (Forwarding itself is still
-    /// primary-only; that gate lives on the write path.)
+    /// config.
     fn is_external_primary(&self, topic_id: i32) -> bool {
         if !self.is_enabled() {
             return false;
@@ -440,48 +432,44 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         }
     }
 
-    /// Enqueue the records of a just-committed transaction into the durable
-    /// outbox.
+    /// Enqueue the records of a transaction about to commit into the durable
+    /// outbox, in the commit's own transaction.
     ///
-    /// Each record the topic's current configuration selects gets a pending
-    /// `shadow_tracking` row written inside the commit transaction; the outbox
-    /// poll then forwards it like a plain produce: non-blocking, at-least-once,
-    /// re-partitioned by key, and durably retried (which matters most for
-    /// external-primary topics, whose local reads are suppressed).
-    fn enqueue_committed_txn_outbox(&self, records: &[PendingForwardRecord]) {
-        if records.is_empty() {
-            return;
-        }
-        self.check_license();
-
-        let mut rows: Vec<RowKey> = Vec::with_capacity(records.len());
-        let mut skipped: HashMap<(i32, i32), u64> = HashMap::new();
-        for r in records {
-            // The topic may have stopped forwarding since the records were
-            // buffered (config reload): decide at commit time.
-            let percentage = match self.topic_cache.get(r.row.topic_id) {
-                Some(c) if c.should_forward() => c.forward_percentage,
-                _ => continue,
-            };
-            match make_forward_decision(r.key.as_deref(), r.row.local_offset, percentage) {
-                ForwardDecision::Skip => *skipped.entry(r.row.partition()).or_default() += 1,
-                ForwardDecision::Forward => rows.push(r.row),
+    /// The records are found in `kafka.messages` (the producer's pending rows), not
+    /// in worker memory: nothing is held per record while the transaction is open,
+    /// so its size does not matter, and a worker restart or a retried EndTxn loses
+    /// nothing. Each record the topic's configuration at commit time selects gets a
+    /// pending `shadow_tracking` row (an existing one is left alone, so nothing is
+    /// enqueued twice); the outbox poll then forwards it like a plain produce:
+    /// non-blocking, at-least-once, re-partitioned by key, and durably retried
+    /// (which matters most for external-primary topics, whose local reads are
+    /// suppressed). This must run before the inner commit, which makes the rows
+    /// visible and so no longer tells them apart.
+    fn enqueue_committed_txn_outbox(&self, producer_id: i64, producer_epoch: i16) -> Result<()> {
+        let mut forward_all = Vec::new();
+        let mut sampled = Vec::new();
+        for (topic_id, percentage) in self.topic_cache.forwarding_topics() {
+            if percentage >= 100 {
+                forward_all.push(topic_id);
+            } else {
+                sampled.push((topic_id, percentage));
             }
         }
+        if forward_all.is_empty() && sampled.is_empty() {
+            return Ok(());
+        }
+        self.check_license();
+        let skipped = self.db.enqueue_pending_txn_records(
+            producer_id,
+            producer_epoch,
+            &forward_all,
+            &sampled,
+        )?;
         let metrics_enabled = self.db.settings().metrics_enabled;
         for (partition, n) in skipped {
             self.count_skipped(partition, n, metrics_enabled);
         }
-
-        if rows.is_empty() {
-            return;
-        }
-        if let Err(e) = self.db.insert_outbox_rows(&rows) {
-            tracing::warn!(
-                "Shadow: failed to enqueue {} committed txn outbox row(s): {e:?}",
-                rows.len()
-            );
-        }
+        Ok(())
     }
 
     /// Write durable outbox rows for a freshly-produced batch.
@@ -584,6 +572,10 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     /// not blocked: the forwarder releases the response. If the hold cannot be
     /// handed over (no forwarder, full channel) the response is released now.
     pub fn hold_response(&self, keys: Vec<RowKey>, release: HeldRelease) {
+        if !self.send_pending_reset() {
+            release.release();
+            return;
+        }
         let timeout = Duration::from_millis(self.db.settings().sync_timeout_ms);
         let hold = ForwardRequest::Hold(SyncHold {
             keys,
@@ -632,62 +624,34 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
     }
 
     /// Record how an outbox tick ended. A failure pauses the tick exponentially
-    /// (up to `OUTBOX_FAILURE_BACKOFF_MAX`); returns whether this failure should
-    /// be logged (the first, then at the 2nd, 4th, 8th... in a row).
-    pub fn note_outbox_tick(&self, ok: bool) -> bool {
+    /// (up to `OUTBOX_FAILURE_BACKOFF_MAX`); a lock timeout pauses it one
+    /// `OUTBOX_POLL_INTERVAL` and leaves the failure count alone
+    /// ([`TickOutcome::LockTimedOut`]). Returns whether this outcome should be logged
+    /// (the first failure or lock timeout, then at the 2nd, 4th, 8th... in a row).
+    pub fn note_outbox_tick(&self, outcome: TickOutcome) -> bool {
         let mut failures = lock(&self.outbox_failures);
-        if ok {
-            *failures = TickFailures::default();
-            return false;
-        }
-        failures.consecutive = failures.consecutive.saturating_add(1);
-        let n = failures.consecutive;
-        let pause = OUTBOX_POLL_INTERVAL
-            .saturating_mul(1u32 << (n - 1).min(10))
-            .min(OUTBOX_FAILURE_BACKOFF_MAX);
-        failures.paused_until = Some(Instant::now() + pause);
+        let n = match outcome {
+            TickOutcome::Ok => {
+                *failures = TickFailures::default();
+                return false;
+            }
+            TickOutcome::LockTimedOut => {
+                failures.lock_timeouts = failures.lock_timeouts.saturating_add(1);
+                failures.paused_until = Some(Instant::now() + OUTBOX_POLL_INTERVAL);
+                failures.lock_timeouts
+            }
+            TickOutcome::Failed => {
+                failures.consecutive = failures.consecutive.saturating_add(1);
+                let n = failures.consecutive;
+                let pause = OUTBOX_POLL_INTERVAL
+                    .saturating_mul(1u32 << (n - 1).min(10))
+                    .min(OUTBOX_FAILURE_BACKOFF_MAX);
+                failures.paused_until = Some(Instant::now() + pause);
+                n
+            }
+        };
         self.poll_requested.store(false, Ordering::Relaxed);
         n.is_power_of_two()
-    }
-
-    /// Drop the forward buffers of transactions that are no longer open.
-    ///
-    /// The storage-layer timeout sweep force-aborts a transaction directly in
-    /// `kafka.transactions` and never routes through `abort_transaction()`, and
-    /// a produce rolled back after buffering leaves its records here too, so
-    /// without this a producer that opened a transaction and vanished would
-    /// keep its buffer for the life of the worker. A buffer whose
-    /// `(producer_id, producer_epoch)` has no Ongoing transaction can never be
-    /// committed (a commit is looked up by that key) and goes. If the lookup
-    /// fails, buffers older than `max_age` (the sweep's timeout) go instead.
-    /// Returns how many were dropped.
-    pub fn evict_ended_txn_buffers(&self, max_age: Duration) -> usize {
-        let keys: std::collections::HashSet<TxnKey> = read_lock(&self.pending_txn_messages)
-            .keys()
-            .copied()
-            .collect();
-        if keys.is_empty() {
-            return 0;
-        }
-        let looked_up: Vec<TxnKey> = keys.iter().copied().collect();
-        let ongoing = self.db.ongoing_transactions(&looked_up);
-        let mut pending = write_lock(&self.pending_txn_messages);
-        let before = pending.len();
-        match ongoing {
-            Some(ongoing) => {
-                let ongoing: std::collections::HashSet<TxnKey> = ongoing.into_iter().collect();
-                // A buffer created after the lookup is kept: it was not looked up.
-                pending.retain(|key, _| ongoing.contains(key) || !keys.contains(key));
-            }
-            None => pending.retain(|_, buf| buf.first_buffered.elapsed() < max_age),
-        }
-        let evicted = before - pending.len();
-        if evicted > 0 {
-            crate::pg_log!(
-                "Shadow: dropped {evicted} forward buffer(s) of transactions that are no longer open"
-            );
-        }
-        evicted
     }
 
     /// Claim a batch of due outbox rows and hand them to the network thread
@@ -702,6 +666,11 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             if guard.is_none() {
                 return Ok(0);
             }
+        }
+        // The forwarder must forget the dropped schema's forwards before it
+        // gets a record of the new one; the next tick tries again.
+        if !self.send_pending_reset() {
+            return Ok(0);
         }
         // The forwarder answers every record NotAttempted without an external
         // broker, which leaves it due again: claiming it would only churn the
@@ -762,6 +731,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 "Shadow: forward channel unavailable, {} row(s) left pending",
                 not_sent.len()
             );
+            // These rows were claimed (and locked) by this transaction: none is held.
             self.db
                 .apply_not_attempted(&not_sent)
                 .map_err(|e| super::error::ShadowError::DatabaseError(e.to_string()))?;
@@ -774,6 +744,43 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             self.request_poll();
         }
         Ok(dispatched)
+    }
+
+    /// The extension was dropped (and possibly re-created) under the worker. Its
+    /// outbox is gone, and a re-created one reuses row keys (`kafka.topics.id`
+    /// starts again), so nothing kept for the old rows may touch the new ones:
+    /// forget the in-flight forwards (their keys would keep new rows from being
+    /// claimed), the acks not applied yet, the staged application and dead-flag
+    /// sync, and the sync rows of the batch; move to a new epoch, so the acks
+    /// still coming for the old forwards are ignored (a late delivery ack would
+    /// mark a new, never-sent row delivered; a failure would charge it an
+    /// attempt); and tell the forwarder, before anything else is sent, to drop
+    /// the old forwards' fences, records and holds.
+    pub fn forget_dropped_schema(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inflight.clear();
+        lock(&self.unapplied_acks).clear();
+        lock(&self.staged_acks).take();
+        lock(&self.sync_pending).clear();
+        self.forget_dead_flags_sync();
+        self.acks_only_not_attempted.store(false, Ordering::Relaxed);
+        self.reset_pending.store(true, Ordering::Relaxed);
+        tracing::debug!("Shadow: schema dropped, outbox state reset (epoch {epoch})");
+        self.send_pending_reset();
+    }
+
+    /// Tell the forwarder of the current epoch if it has not been told yet.
+    /// Returns whether it has been (false: no channel, or a full one).
+    fn send_pending_reset(&self) -> bool {
+        if !self.reset_pending.load(Ordering::Relaxed) {
+            return true;
+        }
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if self.try_send_forward(ForwardRequest::Reset(epoch)).is_err() {
+            return false;
+        }
+        self.reset_pending.store(false, Ordering::Relaxed);
+        true
     }
 
     /// Whether `kafka.shadow_tracking.dead` agrees with `cap` on every pending row,
@@ -816,10 +823,13 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
         let acks: Vec<ForwardAck> = {
             let mut unapplied = lock(&self.unapplied_acks);
             let guard = read_lock(&self.forward_ack_rx);
+            let epoch = self.epoch.load(Ordering::Relaxed);
             if let Some(rx) = guard.as_ref() {
                 while unapplied.len() < MAX_ACKS_PER_TICK {
                     match rx.try_recv() {
-                        Ok(ack) => unapplied.push(ack),
+                        Ok(ack) if ack.epoch == epoch => unapplied.push(ack),
+                        // A forward of a dropped schema (see `forget_dropped_schema`).
+                        Ok(_) => {}
                         Err(_) => break,
                     }
                 }
@@ -908,12 +918,18 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
 
+        // Rows another transaction holds: their acks were skipped, not applied, and
+        // stay queued with their rows in flight until a later tick applies them.
+        let mut held: HashSet<RowKey> = HashSet::new();
         let mut delivered_ok = true;
         match self
             .db
             .apply_delivered(&delivered, settings.metrics_enabled)
         {
-            Ok(n) => staged.forwarded = n as u64,
+            Ok(applied) => {
+                staged.forwarded = applied.transitioned as u64;
+                held.extend(applied.held);
+            }
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply delivery acks (retried): {:?}", e);
                 delivered_ok = false;
@@ -935,6 +951,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             Ok(applied) => {
                 staged.failed = applied.transitioned as u64;
                 staged.dead_lettered = applied.dead_lettered;
+                held.extend(applied.held);
             }
             Err(e) => {
                 tracing::warn!("Shadow: failed to apply failure acks (retried): {:?}", e);
@@ -942,12 +959,15 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
             }
         }
         let mut not_attempted_ok = true;
-        if let Err(e) = self.db.apply_not_attempted(&not_attempted) {
-            tracing::warn!(
-                "Shadow: failed to apply not-attempted acks (retried): {:?}",
-                e
-            );
-            not_attempted_ok = false;
+        match self.db.apply_not_attempted(&not_attempted) {
+            Ok(applied) => held.extend(applied.held),
+            Err(e) => {
+                tracing::warn!(
+                    "Shadow: failed to apply not-attempted acks (retried): {:?}",
+                    e
+                );
+                not_attempted_ok = false;
+            }
         }
 
         for ack in acks {
@@ -956,7 +976,7 @@ impl<S: KafkaStore, D: ShadowDb> ShadowStore<S, D> {
                 ForwardOutcome::Failed(_) => failed_ok,
                 ForwardOutcome::NotAttempted(_) => not_attempted_ok,
             };
-            if applied {
+            if applied && !held.contains(&ack.row) {
                 staged.resolved.push(ack.row);
             } else {
                 staged.retry.push(ack.clone());
@@ -1082,17 +1102,19 @@ impl<S: KafkaStore, D: ShadowDb> LogStore for ShadowStore<S, D> {
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>> {
+    ) -> Result<FetchedRecords> {
         // External-primary read suppression (see fetch_records).
         if self.suppress_external_primary_reads(topic_id) {
-            return Ok(Vec::new());
+            return Ok(FetchedRecords::default());
         }
         self.inner.fetch_records_with_isolation(
             topic_id,
             partition_id,
             fetch_offset,
             max_bytes,
+            whole_first_record,
             isolation_level,
         )
     }
@@ -1166,7 +1188,7 @@ impl<S: KafkaStore, D: ShadowDb> LogStore for ShadowStore<S, D> {
     }
 }
 
-// Transactions: transactional writes are buffered and forwarded on commit.
+// Transactions: a transaction's records are enqueued for forwarding when it commits.
 impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
     fn get_or_create_transactional_producer(
         &self,
@@ -1174,21 +1196,11 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         transaction_timeout_ms: i32,
         client_id: Option<&str>,
     ) -> Result<(i64, i16)> {
-        let (producer_id, new_epoch) = self.inner.get_or_create_transactional_producer(
+        self.inner.get_or_create_transactional_producer(
             transactional_id,
             transaction_timeout_ms,
             client_id,
-        )?;
-        // A re-init bumps the producer epoch and fences the
-        // old-epoch DB rows, but the in-RAM forward buffer keyed
-        // (producer_id, old_epoch) would otherwise linger until the age sweep
-        // because commit/abort look it up by the NEW epoch. Drop any stale-epoch
-        // buffer for this producer now (no-op when the epoch didn't change).
-        {
-            let mut pending = write_lock(&self.pending_txn_messages);
-            pending.retain(|&(pid, ep), _| pid != producer_id || ep == new_epoch);
-        }
-        Ok((producer_id, new_epoch))
+        )
     }
 
     fn begin_transaction(
@@ -1229,57 +1241,16 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<i64> {
-        // Only the primary forwards, and only while shadow mode is on.
-        if !self.is_enabled() || !self.is_primary() {
-            return self.inner.insert_transactional_records(
-                topic_id,
-                partition_id,
-                records,
-                producer_id,
-                producer_epoch,
-            );
-        }
-
-        // As in insert_records, write_mode does not change the write: persist
-        // locally and buffer the records for forward-on-commit.
-        let should_forward = self
-            .topic_cache
-            .get(topic_id)
-            .is_some_and(|config| config.should_forward());
-
-        // Always write locally first (real offset).
-        let base_offset = self.inner.insert_transactional_records(
+        // Written locally only; commit_transaction enqueues the records for
+        // forwarding (an aborted transaction's never are), finding them in
+        // kafka.messages, so nothing is kept here per record.
+        self.inner.insert_transactional_records(
             topic_id,
             partition_id,
             records,
             producer_id,
             producer_epoch,
-        )?;
-
-        // Buffer the committed offsets so commit_transaction forwards them.
-        if should_forward {
-            let pending_records =
-                (base_offset..)
-                    .zip(records)
-                    .map(|(local_offset, r)| PendingForwardRecord {
-                        row: RowKey::new(topic_id, partition_id, local_offset),
-                        key: r.key.clone(),
-                    });
-
-            let key = (producer_id, producer_epoch);
-            let mut pending = write_lock(&self.pending_txn_messages);
-            let buf = pending.entry(key).or_default();
-            buf.records.extend(pending_records);
-
-            tracing::trace!(
-                "ShadowStore: buffered {} txn records for topic {} partition {} (forward on commit)",
-                records.len(),
-                topic_id,
-                partition_id
-            );
-        }
-
-        Ok(base_offset)
+        )
     }
 
     fn store_txn_pending_offset(
@@ -1307,44 +1278,24 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        // 1. Get pending records BEFORE commit
-        let key = (producer_id, producer_epoch);
-        let pending_records = {
-            let mut pending = write_lock(&self.pending_txn_messages);
-            pending.remove(&key)
-        };
+        // 1. Enqueue the records about to be committed, routed by the topics'
+        // configuration now. Only while shadow mode is on and this node is primary,
+        // the gate a plain produce applies: records committed while forwarding is
+        // off are not queued (kafka.replay_shadow_messages forwards them later).
+        // A failure fails the EndTxn, whose request then rolls back whole, so the
+        // client's retry commits and enqueues again rather than committing records
+        // that are never forwarded.
+        if self.is_enabled() && self.is_primary() {
+            self.enqueue_committed_txn_outbox(producer_id, producer_epoch)?;
+        }
 
-        // 2. The records about to be committed. Read them from kafka.messages, in
-        // this transaction, rather than trusting the in-RAM buffer: the buffer is
-        // empty after a worker restart, and it is removed above even if the commit
-        // below then fails and the client retries, either of which committed the
-        // transaction without ever forwarding it.
-        //
-        // Only while shadow mode is on and this node is primary, the same gate
-        // insert_transactional_records applies when buffering: records produced
-        // while forwarding was off must not be queued (and later forwarded) here.
-        let forwarding = self.is_enabled() && self.is_primary();
-        let records = if forwarding {
-            self.db
-                .pending_txn_records(producer_id, producer_epoch)
-                .unwrap_or_else(|| pending_records.map_or_default(|buf| buf.records))
-        } else {
-            Vec::new()
-        };
-
-        // 3. Commit the inner transaction unconditionally. Even with zero
-        // forwarded records, the kafka.transactions state row must transition to
-        // committed and any pending consumer offsets (TxnOffsetCommit) must be
-        // applied — otherwise the transaction lingers as Ongoing until the
-        // timeout sweeper force-aborts it.
+        // 2. Commit the inner transaction, whatever was enqueued: the
+        // kafka.transactions state row must transition to committed and any
+        // pending consumer offsets (TxnOffsetCommit) must be applied, or the
+        // transaction lingers as Ongoing until the timeout sweeper force-aborts it.
+        // The outbox rows written above are claimed only once this commits.
         self.inner
-            .commit_transaction(transactional_id, producer_id, producer_epoch)?;
-
-        // 4. Enqueue the committed records into the durable outbox in this same
-        // commit transaction; the poll forwards them like any other record.
-        self.enqueue_committed_txn_outbox(&records);
-
-        Ok(())
+            .commit_transaction(transactional_id, producer_id, producer_epoch)
     }
 
     fn abort_transaction(
@@ -1353,45 +1304,22 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
         producer_id: i64,
         producer_epoch: i16,
     ) -> Result<()> {
-        // An aborted transaction's buffered records are never forwarded.
-        let pending_records =
-            write_lock(&self.pending_txn_messages).remove(&(producer_id, producer_epoch));
-
-        // Abort the inner transaction unconditionally, whatever was buffered:
-        // the transaction's state row must transition to aborted and its
-        // pending offsets must be discarded, or it lingers as Ongoing until the
-        // timeout sweeper force-aborts it.
+        // Nothing was enqueued for an open transaction, so nothing is undone here.
         self.inner
-            .abort_transaction(transactional_id, producer_id, producer_epoch)?;
-
-        if let Some(buf) = &pending_records {
-            if !buf.records.is_empty() {
-                tracing::debug!(
-                    "Shadow txn abort: discarded {} buffered forward record(s)",
-                    buf.records.len()
-                );
-            }
-        }
-
-        Ok(())
+            .abort_transaction(transactional_id, producer_id, producer_epoch)
     }
 
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
         self.inner.get_transaction_state(transactional_id)
     }
+
+    fn transaction_partitions(&self, transactional_id: &str) -> Result<TxnPartitions> {
+        self.inner.transaction_partitions(transactional_id)
+    }
 }
 
-// Maintenance: the timeout sweep also evicts stale forward buffers.
 impl<S: KafkaStore, D: ShadowDb> MaintenanceStore for ShadowStore<S, D> {
-    fn abort_timed_out_transactions(&self, timeout: Duration) -> Result<Vec<String>> {
-        let aborted = self.inner.abort_timed_out_transactions(timeout)?;
-        self.evict_ended_txn_buffers(timeout);
-        Ok(aborted)
-    }
-
-    fn cleanup_aborted_messages(&self, older_than: Duration) -> Result<u64> {
-        self.inner.cleanup_aborted_messages(older_than)
-    }
+    delegate_maintenance_store!(MaintenanceStore, inner);
 }
 
 #[cfg(test)]

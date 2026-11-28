@@ -226,15 +226,22 @@ pub async fn test_fetch_isolation_level_enforcement() -> TestResult {
 
     // 6. Verify isolation
     println!("=== Verification ===\n");
-    // read_committed should only see non-transactional message
-    assert!(
-        committed_msgs.contains(&"non-txn-message".to_string()),
-        "read_committed should see non-txn message"
+    // read_committed stops at the open transaction: only the non-transactional
+    // message, never the pending one (as in Kafka, its LSO is the pending record).
+    assert_eq!(
+        committed_msgs,
+        ["non-txn-message"],
+        "read_committed must see the non-transactional message and not the pending one"
     );
-    println!("✅ read_committed correctly saw non-transactional message");
+    println!("✅ read_committed saw only the non-transactional message");
 
-    // Note: read_uncommitted behavior may vary based on implementation
-    println!("   read_uncommitted behavior verified\n");
+    // read_uncommitted reads up to the high watermark, the pending record included.
+    assert_eq!(
+        uncommitted_msgs,
+        ["non-txn-message", "pending-txn-message"],
+        "read_uncommitted must see both messages, the pending one included"
+    );
+    println!("✅ read_uncommitted saw the pending message too\n");
 
     ctx.cleanup().await?;
     println!("✅ Test: Fetch Isolation Level Enforcement PASSED\n");

@@ -572,3 +572,71 @@ pub async fn test_non_transactional_batch_inside_an_open_transaction_is_refused(
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A plain batch to partition -1 next to a transactional batch in one Produce: its record
+/// would route to the transactional batch's partition (a one-partition topic) and be
+/// written under that batch's producer metadata, pending in its transaction and counted
+/// in its sequence range. Kafka 3.7 never routes -1; the -1 entry is answered
+/// UNKNOWN_TOPIC_OR_PARTITION, nothing of it is written, and the producer's next batch
+/// continues its own sequence.
+pub async fn test_routed_records_do_not_join_a_transactional_batch() -> TestResult {
+    use crate::wire::records::{encode, plain_record};
+    use kafka_protocol::records::Compression;
+    println!("=== Test: partition -1 next to a transactional batch ===\n");
+    let ctx = TestContext::new().await?;
+    let t = topic(&ctx, "txn-route", 1).await?;
+    let tx = ctx.unique_topic("txn-route-tx").await;
+    let mut w = Wire::connect().await?;
+    let (err, pid, ep) = w.init_producer_id(Some(&tx), 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    assert_eq!(
+        w.add_partitions(&tx, pid, ep, &[(&t, &[0])]).await?[0].2,
+        error_codes::NONE
+    );
+
+    println!("Step 1: one Produce: transactional seq 0 to partition 0, plain to -1...");
+    let routed = encode(&[plain_record(0, Some("k"), b"plain")], Compression::None);
+    let answers = w
+        .produce_many(
+            &[(
+                &t,
+                vec![(0, batch(&["txn-0"], pid, ep, 0, true, None)), (-1, routed)],
+            )],
+            Some(&tx),
+        )
+        .await?;
+    let codes: Vec<(i32, i16)> = answers.iter().map(|(_, p, code, _)| (*p, *code)).collect();
+    assert_eq!(
+        codes,
+        [
+            (-1, error_codes::UNKNOWN_TOPIC_OR_PARTITION),
+            (0, error_codes::NONE)
+        ],
+        "{answers:?}"
+    );
+
+    println!("Step 2: the producer's next batch (seq 1) continues its sequence...");
+    assert_eq!(
+        w.produce(&t, 0, batch(&["txn-1"], pid, ep, 1, true, None), Some(&tx))
+            .await?,
+        (error_codes::NONE, 1)
+    );
+    assert_eq!(w.end_txn(&tx, pid, ep, true).await?, error_codes::NONE);
+
+    let values: Vec<String> = ctx
+        .db()
+        .query(
+            "SELECT convert_from(m.value, 'UTF8') FROM kafka.messages m
+             JOIN kafka.topics t ON m.topic_id = t.id
+             WHERE t.name = $1 ORDER BY m.partition_offset",
+            &[&t],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(values, ["txn-0", "txn-1"], "the -1 record is not written");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

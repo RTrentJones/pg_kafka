@@ -6,8 +6,8 @@
 //! - a record that waits behind a full queue is answered within the delivery
 //!   timeout of its dispatch, so its in-flight entry never expires while it is
 //!   still held (no lost attempt counted, no second copy sent);
-//! - the transaction-timeout sweep drops the forward buffers of the
-//!   transactions it aborts;
+//! - a transaction the timeout sweep aborts is never forwarded (a commit
+//!   enqueues from kafka.messages, so an open transaction has no outbox rows);
 //! - an ERROR while applying forward acks loses no ack (no lost-attempt count,
 //!   no duplicate delivery);
 //! - a failed COMMIT of the transaction that applied forward acks loses no
@@ -27,7 +27,8 @@
 
 use crate::common::{create_db_client, create_producer, TestResult};
 use crate::setup::TestContext;
-use crate::worker::ServerLog;
+use crate::wire::Wire;
+use kafka_protocol::messages::metadata_request::MetadataRequest;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::time::{Duration, Instant};
@@ -127,8 +128,11 @@ pub async fn test_shadow_max_retries_refuses_zero() -> TestResult {
 }
 
 /// A topic with a large outbox backlog (here a replay) shares each claim with
-/// the other partitions: another topic's new record is forwarded while most of
-/// the backlog is still waiting, not after it.
+/// the other partitions: another topic's record, queued with the backlog, is
+/// forwarded while most of the backlog is still waiting, not after it. Both are
+/// queued by the two replays of one statement, so the backlog has no head start: a
+/// record produced only after the replay would let the forwarder drain rounds of
+/// the backlog before the other topic had anything to send.
 pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     const BACKLOG: usize = 30_000;
     println!("=== Test: a backlog does not starve other topics ===\n");
@@ -137,14 +141,16 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     let backlog_topic = ctx.unique_topic("shadow-backlog").await;
     let other_topic = ctx.unique_topic("shadow-not-starved").await;
     verify_external_kafka_ready().await?;
-    enable_shadow_mode(
-        ctx.db(),
-        &backlog_topic,
-        &config(ShadowMode::LocalOnly, SyncMode::Async),
-    )
-    .await?;
+    for topic in [&backlog_topic, &other_topic] {
+        enable_shadow_mode(
+            ctx.db(),
+            topic,
+            &config(ShadowMode::LocalOnly, SyncMode::Async),
+        )
+        .await?;
+    }
 
-    println!("Step 1: {BACKLOG} records stored locally, not forwarded...");
+    println!("Step 1: {BACKLOG} records and one other record stored locally, not forwarded...");
     let producer = bulk_producer()?;
     let payload = [b'b'; 100];
     let mut sends = Vec::with_capacity(BACKLOG);
@@ -159,6 +165,17 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     for send in sends {
         send.await?.map_err(|(e, _)| e)?;
     }
+    let single = create_producer()?;
+    single
+        .send(
+            FutureRecord::to(&other_topic)
+                .key("k")
+                .payload("not starved")
+                .partition(0),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(e, _)| e)?;
 
     enable_shadow_mode(
         ctx.db(),
@@ -176,27 +193,20 @@ pub async fn test_shadow_backlog_does_not_starve_other_topics() -> TestResult {
     let other_id = topic_id(ctx.db(), &other_topic).await?;
     assert!(backlog_id < other_id);
 
-    println!("Step 2: replay the backlog, then produce one record to the other topic...");
-    let queued: i64 = ctx
-        .db()
-        .query_one(
-            "SELECT kafka.replay_shadow_messages($1, 0, NULL)",
-            &[&backlog_id],
-        )
-        .await?
-        .get(0);
-    assert_eq!(queued, i64::try_from(BACKLOG)?);
-    let single = create_producer()?;
-    single
-        .send(
-            FutureRecord::to(&other_topic)
-                .key("k")
-                .payload("not starved")
-                .partition(0),
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|(e, _)| e)?;
+    println!("Step 2: replay the backlog and the other record in one statement...");
+    let (queued_backlog, queued_other): (i64, i64) = {
+        let row = ctx
+            .db()
+            .query_one(
+                "SELECT kafka.replay_shadow_messages($1, 0, NULL), \
+                        kafka.replay_shadow_messages($2, 0, NULL)",
+                &[&backlog_id, &other_id],
+            )
+            .await?;
+        (row.get(0), row.get(1))
+    };
+    assert_eq!(queued_backlog, i64::try_from(BACKLOG)?);
+    assert_eq!(queued_other, 1);
 
     let start = Instant::now();
     let backlog_left = loop {
@@ -652,11 +662,11 @@ pub async fn test_shadow_backlogged_records_are_answered_before_their_in_flight_
 }
 
 /// A transaction left open by a producer that went away is aborted by the
-/// timeout sweep; the sweep also drops the records the shadow store buffered
-/// for it (they can never be committed), instead of keeping them for the life
-/// of the worker. Needs the server log (the listener's stderr as a file).
-pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult {
-    println!("=== Test: the timeout sweep drops an abandoned transaction's buffer ===\n");
+/// timeout sweep, and nothing of it is ever forwarded: the shadow store keeps
+/// nothing for an open transaction (its records are enqueued at commit, from
+/// kafka.messages), so the abort leaves no outbox row and nothing to drop.
+pub async fn test_shadow_timed_out_transaction_is_not_forwarded() -> TestResult {
+    println!("=== Test: an abandoned transaction's records are never forwarded ===\n");
     let ctx = TestContext::new().await?;
     let topic = ctx.unique_topic("shadow-txn-abandoned").await;
     verify_external_kafka_ready().await?;
@@ -666,11 +676,6 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
         &config(ShadowMode::Shadow, SyncMode::Async),
     )
     .await?;
-    let log = ServerLog::open(ctx.db())
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("the server log is not readable (listener stderr is not a regular file)")?;
-    let log_from = log.end();
 
     println!("Step 1: a transactional produce, never committed (transaction.timeout.ms=2000)...");
     let txn_id = format!("shadow-abandoned-{}", uuid::Uuid::new_v4());
@@ -691,12 +696,7 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
         .await
         .map_err(|(e, _)| e)?;
 
-    // The log line does not name the transaction (a sweep can drop the buffer of
-    // another test's abandoned transaction too), so this transaction's abort is
-    // awaited as well: once the sweep that aborted it has run, its buffer is gone,
-    // and the line is in the log.
-    println!("Step 2: wait for the sweep (every 10 s) to abort it and drop its buffer...");
-    let needle = "forward buffer(s) of transactions that are no longer open";
+    println!("Step 2: wait for the sweep (every 10 s) to abort it...");
     let start = Instant::now();
     loop {
         let state: Option<String> = ctx
@@ -707,27 +707,38 @@ pub async fn test_shadow_timed_out_transaction_buffer_is_dropped() -> TestResult
             )
             .await?
             .map(|row| row.get(0));
-        let aborted = state.as_deref() == Some("CompleteAbort");
-        if aborted && log.since(log_from).contains(needle) {
+        if state.as_deref() == Some("CompleteAbort") {
             break;
         }
         if start.elapsed() > Duration::from_secs(40) {
             drop(producer);
             ctx.cleanup().await?;
-            return Err(format!(
-                "within 40 s the transaction is {state:?} (expected CompleteAbort) and \
-                 \"{needle}\" is {}in the server log",
-                if log.since(log_from).contains(needle) {
-                    ""
-                } else {
-                    "not "
-                }
-            )
-            .into());
+            return Err(
+                format!("within 40 s the transaction is {state:?}, not CompleteAbort").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    println!("  buffer dropped after {:?}", start.elapsed());
+    println!("  aborted after {:?}", start.elapsed());
+
+    let row = ctx
+        .db()
+        .query_one(
+            "SELECT
+               (SELECT COUNT(*) FROM kafka.messages m WHERE m.topic_id = t.id
+                  AND m.txn_state = 'aborted'),
+               (SELECT COUNT(*) FROM kafka.shadow_tracking s WHERE s.topic_id = t.id)
+             FROM kafka.topics t WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    let (aborted, enqueued): (i64, i64) = (row.get(0), row.get(1));
+    assert_eq!(aborted, 1, "the record is aborted");
+    assert_eq!(
+        enqueued, 0,
+        "nothing of the aborted transaction is enqueued"
+    );
+    super::assertions::assert_external_kafka_empty(&topic, Duration::from_secs(3)).await?;
 
     drop(producer);
     ctx.cleanup().await?;
@@ -1507,6 +1518,165 @@ pub async fn test_shadow_claims_are_not_jit_compiled() -> TestResult {
         },
     )
     .await
+}
+
+/// Delivered outbox rows of a topic.
+async fn delivered(db: &Client, topic_id: i32) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(db
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.shadow_tracking \
+             WHERE topic_id = $1 AND external_offset IS NOT NULL",
+            &[&topic_id],
+        )
+        .await?
+        .get(0))
+}
+
+/// Write a backlog of 10 000 records while no broker is configured, hold acks back 3 s
+/// (`pg_kafka.test_forward_ack_delay_ms`) so the worker's whole in-flight window (8 192
+/// rows) is claimed before the first ack arrives, set `settings`, configure the broker,
+/// and time the acks: the slowest answer to Metadata requests sent every 5 ms until
+/// 8 192 rows are delivered (the DB thread answers them between its statements). Then
+/// reset everything and let the backlog drain.
+async fn time_acks(
+    label: &str,
+    settings: &[(&str, &str)],
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    const RECORDS: usize = 10_000;
+    const WINDOW: i64 = 8_192;
+    let ctx = TestContext::new().await?;
+    let topic = ctx.unique_topic("shadow-ack-time").await;
+    enable_shadow_mode(
+        ctx.db(),
+        &topic,
+        &config(ShadowMode::Shadow, SyncMode::Async),
+    )
+    .await?;
+    let topic_id = topic_id(ctx.db(), &topic).await?;
+    let db = create_db_client().await?;
+    let result = async {
+        alter_system(
+            &db,
+            "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = ''",
+        )
+        .await?;
+        let producer = bulk_producer()?;
+        let mut pending = Vec::with_capacity(RECORDS);
+        for i in 0..RECORDS {
+            let key = format!("k{}", i % 97);
+            pending.push(
+                producer
+                    .send_result(FutureRecord::to(&topic).key(key.as_bytes()).payload("v"))
+                    .map_err(|(e, _)| e)?,
+            );
+        }
+        for f in pending {
+            f.await?.map_err(|(e, _)| e)?;
+        }
+        db.execute(
+            "ALTER SYSTEM SET pg_kafka.test_forward_ack_delay_ms = 3000",
+            &[],
+        )
+        .await?;
+        for (setting, value) in settings {
+            db.execute(&format!("ALTER SYSTEM SET {setting} = '{value}'"), &[])
+                .await?;
+        }
+        db.execute("SELECT pg_reload_conf()", &[]).await?;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        alter_system(
+            &db,
+            &format!(
+                "ALTER SYSTEM SET pg_kafka.shadow_bootstrap_servers = '{}'",
+                get_internal_bootstrap_servers()
+            ),
+        )
+        .await?;
+        // The DB thread applies a window of acks in a statement or a few; a Metadata
+        // request waits for them, so the slowest answer while they arrive is their cost.
+        let mut wire = Wire::connect().await?;
+        let metadata = MetadataRequest::default();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut took = Duration::ZERO;
+        loop {
+            let t = Instant::now();
+            wire.call(9, &metadata).await?;
+            took = took.max(t.elapsed());
+            let done = delivered(ctx.db(), topic_id).await?;
+            if done >= WINDOW {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(
+                    format!("{label}: only {done} of {WINDOW} rows delivered after 60 s").into(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        println!(
+            "  {label}: the slowest Metadata answer while {WINDOW} acks were applied: {took:?}"
+        );
+        for (setting, _) in settings {
+            db.execute(&format!("ALTER SYSTEM RESET {setting}"), &[])
+                .await?;
+        }
+        alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await?;
+        drained_within(ctx.db(), topic_id, Duration::from_secs(120)).await?;
+        Ok::<Duration, Box<dyn std::error::Error>>(took)
+    }
+    .await
+    .map_err(|e| e.to_string());
+    for (setting, _) in settings {
+        if let Err(e) = db
+            .execute(&format!("ALTER SYSTEM RESET {setting}"), &[])
+            .await
+        {
+            eprintln!("⚠️  cleanup: failed to reset {setting}: {e}");
+        }
+    }
+    if let Err(e) = alter_system(&db, "ALTER SYSTEM RESET pg_kafka.test_forward_ack_delay_ms").await
+    {
+        eprintln!("⚠️  cleanup: failed to reset pg_kafka.test_forward_ack_delay_ms: {e}");
+    }
+    if let Err(e) = restore_bootstrap_servers(&db).await {
+        eprintln!("⚠️  cleanup: failed to restore pg_kafka.shadow_bootstrap_servers: {e}");
+    }
+    ctx.cleanup().await?;
+    Ok(result?)
+}
+
+/// An ack batch first locks its outbox rows, and finds the acks whose rows it could not
+/// lock (held by another transaction). That was `NOT IN` the locked rows, which Postgres
+/// hashes only while they fit in `work_mem`; with a tiny `work_mem` it compared every
+/// ack with every locked row, and a full in-flight window of acks (8 192) took about 3 s
+/// on the DB thread, every client waiting. The longest a Metadata request waits while a
+/// window of acks is applied is measured with the default `work_mem` and with 64 kB (JIT
+/// off in both).
+///
+/// Asserts: at 64 kB that wait is at most twice the default's plus 500 ms.
+pub async fn test_shadow_acks_stay_fast_with_a_tiny_work_mem() -> TestResult {
+    println!("=== Test: acks stay fast with a tiny work_mem ===\n");
+    verify_external_kafka_ready().await?;
+    println!("Step 1: acks of a full in-flight window at the default work_mem...");
+    let hashed = time_acks("default work_mem", &[("jit", "off")]).await?;
+    println!("Step 2: the same at work_mem = 64kB...");
+    let tiny = time_acks("work_mem 64kB", &[("work_mem", "64kB"), ("jit", "off")]).await?;
+    let bound = hashed * 2 + Duration::from_millis(500);
+    println!(
+        "SHADOW_ACK_TIME_MS default={} tiny={}",
+        hashed.as_millis(),
+        tiny.as_millis()
+    );
+    if tiny > bound {
+        return Err(format!(
+            "a Metadata request waited {tiny:?} for a window of acks at work_mem = 64kB, \
+             {hashed:?} at the default (bound {bound:?}): the ack statement's cost grows \
+             with the acks squared"
+        )
+        .into());
+    }
+    println!("✅ Test PASSED\n");
+    Ok(())
 }
 
 /// The share of a CPU the process `pid` uses over `window`; `None` if its `/proc`

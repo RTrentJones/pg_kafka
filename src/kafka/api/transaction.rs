@@ -24,6 +24,7 @@ use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::TxnOffsetCommitTopics;
 use crate::kafka::notifications::InternalNotification;
+use crate::kafka::storage::TxnPartitions;
 
 /// The code a fenced producer epoch is answered with at `version`. KIP-588 (Kafka 2.7)
 /// answers it PRODUCER_FENCED from the version each transaction API took for it,
@@ -112,14 +113,17 @@ impl KafkaApi for InitProducerIdApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, header| {
-            handlers::handle_init_producer_id(
+            handlers::init_producer(
                 &env.ctx,
                 r.transactional_id.as_deref(),
                 r.transaction_timeout_ms,
                 r.presented,
                 header.client_id.as_deref(),
             )
-            .map(|mut response| {
+            .map(|(mut response, aborted)| {
+                // An open transaction it aborted moves the last stable offset of its
+                // partitions; nothing else an InitProducerId does changes a Fetch.
+                emit_txn_end_notification(env.notify_tx, aborted);
                 response.error_code = fenced_code(
                     response.error_code,
                     header.api_version,
@@ -393,25 +397,36 @@ impl KafkaApi for EndTxnApi {
 
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
-            handlers::handle_end_txn(
+            handlers::end_txn(
                 &env.ctx,
                 &r.transactional_id,
                 r.producer_id,
                 r.producer_epoch,
                 r.committed,
             )
-            // Wake read_committed long polls: commit/abort moves the last stable offset.
-            .inspect(|_| emit_txn_end_notification(env.notify_tx))
+            // Wake the read_committed long polls of the transaction's partitions: commit
+            // and abort move their last stable offset.
+            .map(|(response, ended)| {
+                emit_txn_end_notification(env.notify_tx, ended);
+                response
+            })
         })
     }
 }
 
-/// Wake `read_committed` long-poll consumers after a successful EndTxn (commit or abort).
-/// Best effort: a dropped wake-up only delays delivery to the fallback poll.
+/// Wake the `read_committed` long polls of `partitions`, the partitions of a transaction
+/// that ended (commit, abort, a fencing InitProducerId or its timeout); nothing when it
+/// names none. Best effort (see [`notify_best_effort`]).
 pub(crate) fn emit_txn_end_notification(
     notify_tx: &crossbeam_channel::Sender<InternalNotification>,
+    partitions: TxnPartitions,
 ) {
-    notify_best_effort(notify_tx, InternalNotification::TransactionEnded);
+    if !partitions.is_empty() {
+        notify_best_effort(
+            notify_tx,
+            InternalNotification::TransactionEnded { partitions },
+        );
+    }
 }
 
 /// TxnOffsetCommit: commit offsets as part of a transaction.

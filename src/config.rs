@@ -31,6 +31,11 @@ pub const MAX_WORKER_LOCK_TIMEOUT_MS: i32 = 600_000;
 /// Upper bound of `pg_kafka.shutdown_timeout_ms`.
 const MAX_SHUTDOWN_TIMEOUT_MS: i32 = 60_000;
 
+/// Default of `pg_kafka.fetch_max_bytes`: Kafka's `fetch.max.bytes` (55 MiB).
+pub const DEFAULT_FETCH_MAX_BYTES: i32 = 55 * 1024 * 1024;
+/// Lower bound of `pg_kafka.fetch_max_bytes` (Kafka's `fetch.max.bytes` is at least 1024).
+pub const MIN_FETCH_MAX_BYTES: i32 = 1024;
+
 /// The Rust type of a GUC kind in [`gucs!`].
 macro_rules! guc_type {
     (int) => { i32 };
@@ -198,9 +203,35 @@ gucs! {
     /// Safety-net re-check interval of a waiting (long-poll) fetch.
     int FETCH_POLL_INTERVAL_MS = DEFAULT_FETCH_POLL_INTERVAL_MS => c"pg_kafka.fetch_poll_interval_ms" {
         short: c"Polling interval for long polling fallback (milliseconds)",
-        long: c"A waiting FetchRequest re-runs when new data is signalled (Produce, EndTxn) or max_wait_ms expires; this interval is only the safety-net re-check for a missed signal. Default: 1000ms.",
+        long: c"A waiting FetchRequest re-reads the partitions a change notification names (Produce, DeleteRecords, DeleteTopics, the end of a transaction that added them) and reads once more at max_wait_ms, unless nothing was notified and its last read of every partition is younger than this interval. This interval is also the safety-net re-check for a change no notification names, which re-reads every partition of a waiting fetch and runs only within an allowance of 256 partitions per interval for all waiting fetches together; such a change is in a fetch's answer once it is one interval old. Default: 1000ms.",
         context: Postmaster,
         range: (MIN_FETCH_POLL_INTERVAL_MS, MAX_FETCH_POLL_INTERVAL_MS),
+    }
+
+    /// The most a Fetch response may hold, whatever the request's `max_bytes` (Kafka's
+    /// broker `fetch.max.bytes`). Read by the network thread through the `Config` snapshot.
+    int FETCH_MAX_BYTES = DEFAULT_FETCH_MAX_BYTES => c"pg_kafka.fetch_max_bytes" {
+        short: c"Most bytes a Fetch response returns, whatever the request asks (Kafka's fetch.max.bytes)",
+        long: c"Each Fetch request's max_bytes is lowered to this, and its min_bytes to the result, \
+          as Kafka's broker fetch.max.bytes does. Records are still returned if the first \
+          record of the first partition with data is larger, so a consumer always makes \
+          progress; later partitions return only what fits. The per-partition limit is the \
+          request's partition_max_bytes, within what is left of this. Sizes count each record's \
+          uncompressed key, value and header bytes plus 84 bytes per record and 10 per \
+          header for its framing, or the encoded size of the record batches when \
+          pg_kafka.compression_type encodes them larger. It is also each connection's budget for responses not yet written: past it the connection reads no \
+          further request until its client reads. It also bounds the responses that grow with \
+          server-side state: in DescribeGroups a group whose description would take the \
+          response past it is answered COORDINATOR_NOT_AVAILABLE (retriable), except the first \
+          group described; ListGroups lists the groups that fit, in id order and the first \
+          always, and leaves the rest out (with a WARNING in the server log); OffsetFetch \
+          returns offset metadata up to it and answers a partition past it \
+          COORDINATOR_NOT_AVAILABLE, except the first (a partition without metadata is always \
+          answered). Default: \
+          57671680 (55 MiB). Reloadable via SIGHUP: the caps apply to requests read after \
+          the reload, the budget to connections opened after it.",
+        context: Sighup,
+        range: (MIN_FETCH_MAX_BYTES, i32::MAX),
     }
 
     /// DR-2: time-based retention of kafka.messages, enforced by the retention sweep
@@ -208,8 +239,11 @@ gucs! {
     /// terminal transactions, delivered shadow-outbox rows) always runs.
     pub(crate) int MESSAGE_RETENTION_HOURS = 0 => c"pg_kafka.message_retention_hours" {
         short: c"Delete messages older than this many hours (0 = keep forever)",
-        long: c"Time-based retention for kafka.messages, enforced by the worker's periodic \
-          retention sweep. 0 (default) disables the sweep. Pending transactional \
+        long: c"Default time-based retention for kafka.messages, enforced by the worker's \
+          retention sweep (every 60 s). 0 (default) keeps messages forever unless the topic \
+          sets retention.ms, which overrides this setting either way. The sweep runs \
+          whatever this is: it also deletes aborted transactional rows and prunes stale \
+          producers, terminal transactions and the shadow outbox. Pending transactional \
           messages are never deleted regardless of age. Reloadable via SIGHUP.",
         context: Sighup,
         range: (0, 87_600),
@@ -224,8 +258,13 @@ gucs! {
           UTC. The worker creates the current leaf and the next two ahead of time; the \
           retention sweep drops a whole leaf once every row in it is expired under its \
           topic's retention. Topics whose retention window is shorter than one width are \
-          still expired row by row. A change applies to leaves created afterwards (existing \
-          leaves keep their bounds). Reloadable via SIGHUP.",
+          still expired row by row. Only leaves the retention empties or expires are dropped: \
+          with message_retention_hours = 0 (the default) and no topic setting retention.ms, \
+          a leaf that holds any row is kept forever, so the number of leaves grows by one \
+          per width and every Fetch, ListOffsets and high-watermark lookup probes them all; \
+          set message_retention_hours (or retention.ms on every topic) to bound it. A change \
+          applies to leaves created afterwards (existing leaves keep their bounds). \
+          Reloadable via SIGHUP.",
         context: Sighup,
         range: (crate::kafka::storage::retention::MIN_PARTITION_MINUTES, crate::kafka::storage::retention::MAX_PARTITION_MINUTES),
     }
@@ -270,6 +309,35 @@ gucs! {
           Reloadable via SIGHUP.",
         context: Sighup,
         range: (0, 10_000),
+    }
+
+    /// Test-only: the retention sweep's pass budget in milliseconds, so the E2E suite
+    /// can run passes in which every bounded step makes exactly one statement (0) and
+    /// check what such passes still reach. -1 keeps the built-in 1.5 s. Read by the
+    /// worker's sweep and by `pg_kafka_run_retention_sweep()`. Never set in production.
+    pub(crate) int TEST_RETENTION_PASS_BUDGET_MS = -1 => c"pg_kafka.test_retention_pass_budget_ms" {
+        short: c"TEST ONLY: retention sweep pass budget (ms); -1 = the built-in 1500 ms",
+        long: c"Fault-injection knob for the retention-sweep E2E tests: the wall-clock \
+          budget of one sweep pass. 0 makes every bounded step of a pass run exactly \
+          one statement. -1 (default) keeps the built-in 1500 ms. Do not set in \
+          production. Reloadable via SIGHUP.",
+        context: Sighup,
+        range: (-1, 1500),
+    }
+
+    /// TEST ONLY: a pause (milliseconds) inside the retention sweep's stale-producer
+    /// prune statement, after its snapshot and before it locks its victims, so an E2E
+    /// test can commit a producer's revival in between and check that the lock re-checks
+    /// the idle window on the committed row. 0 (default): no pause, and the statement is
+    /// the production one. Never set in production.
+    pub(crate) int TEST_PRODUCER_PRUNE_PAUSE_MS = 0 => c"pg_kafka.test_producer_prune_pause_ms" {
+        short: c"TEST ONLY: pause inside the sweep's producer prune before it locks (ms)",
+        long: c"Fault-injection knob for the retention-sweep E2E tests: the stale-producer \
+          prune statement sleeps this long after taking its snapshot and before locking \
+          the producers it deletes. 0 (default) means no pause. Do not set in \
+          production. Superuser SET.",
+        context: Suset,
+        range: (0, 10000),
     }
 
     /// Let a FetchRequest wait up to its max_wait_ms for data.
@@ -357,7 +425,7 @@ gucs! {
     /// librdkafka linger.ms of the shadow producer.
     int SHADOW_LINGER_MS = DEFAULT_SHADOW_LINGER_MS => c"pg_kafka.shadow_linger_ms" {
         short: c"Batching delay for shadow forwarding (milliseconds)",
-        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Default: 10ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka linger.ms: how long to wait for more messages before sending a batch. Every sync-mode response waits for it too: a linger near pg_kafka.shadow_sync_timeout_ms makes held responses time out (their records are forwarded later). Default: 10ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_LINGER_MS, MAX_SHADOW_LINGER_MS),
     }
@@ -365,7 +433,7 @@ gucs! {
     /// Base of the shadow retry back-off (librdkafka and the outbox).
     int SHADOW_RETRY_BACKOFF_MS = DEFAULT_SHADOW_RETRY_BACKOFF_MS => c"pg_kafka.shadow_retry_backoff_ms" {
         short: c"Retry backoff for shadow forwarding (milliseconds)",
-        long: c"librdkafka retry.backoff.ms, and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
+        long: c"librdkafka retry.backoff.ms, capped at 10 s (its first retry backoff inside one delivery attempt, doubling up to retry.backoff.max.ms, which is set to the larger of that and 1000 ms; the cap keeps librdkafka's own retries well inside the forwarder's 120 s delivery timeout), and the base of the outbox re-attempt backoff after a failed delivery (doubling per failure, capped at 30 s). Default: 100ms. Reloadable with pg_reload_conf().",
         context: Sighup,
         range: (MIN_SHADOW_RETRY_BACKOFF_MS, MAX_SHADOW_RETRY_BACKOFF_MS),
     }
@@ -450,7 +518,7 @@ pub fn init() {
         GucContext::Sighup,
         GucFlags::default(),
     );
-    pgrx::log!("pg_kafka GUC parameters initialized (including shadow mode)");
+    crate::pg_log!("pg_kafka GUC parameters initialized (including shadow mode)");
 }
 
 /// The value of a string GUC, `None` when unset.
@@ -480,6 +548,18 @@ pub fn shadow_outbox_settings() -> crate::kafka::shadow::outbox::OutboxSettings 
     }
 }
 
+/// `pg_kafka.fetch_max_bytes` read on the DB thread: also the bound of the responses whose
+/// size grows with server-side state rather than with the request (DescribeGroups, ListGroups,
+/// OffsetFetch's metadata), as it is each connection's budget for responses not yet written.
+/// Unit tests (no backend, many threads) see the default.
+pub fn response_max_bytes() -> usize {
+    #[cfg(not(test))]
+    let bytes = FETCH_MAX_BYTES.get();
+    #[cfg(test)]
+    let bytes = DEFAULT_FETCH_MAX_BYTES;
+    usize::try_from(bytes.max(MIN_FETCH_MAX_BYTES)).unwrap_or(usize::MAX)
+}
+
 /// A snapshot of the pg_kafka GUCs the worker and the network thread read
 /// ([`crate::kafka::RuntimeContext`] holds the current one).
 pub struct Config {
@@ -491,6 +571,8 @@ pub struct Config {
     pub default_partitions: i32,
     /// Polling interval for long polling fallback (milliseconds)
     pub fetch_poll_interval_ms: i32,
+    /// `pg_kafka.fetch_max_bytes`: the broker-side cap of a Fetch response.
+    pub fetch_max_bytes: i32,
     /// Whether long polling is enabled
     pub enable_long_polling: bool,
     /// Compression type for FetchResponse encoding (none, gzip, snappy, lz4, zstd)
@@ -541,6 +623,7 @@ impl std::fmt::Debug for Config {
             .field("shutdown_timeout_ms", &self.shutdown_timeout_ms)
             .field("default_partitions", &self.default_partitions)
             .field("fetch_poll_interval_ms", &self.fetch_poll_interval_ms)
+            .field("fetch_max_bytes", &self.fetch_max_bytes)
             .field("enable_long_polling", &self.enable_long_polling)
             .field("compression_type", &self.compression_type)
             .field("log_timing", &self.log_timing)
@@ -579,6 +662,7 @@ impl Config {
             shutdown_timeout_ms: SHUTDOWN_TIMEOUT_MS.get(),
             default_partitions: DEFAULT_PARTITIONS.get(),
             fetch_poll_interval_ms: FETCH_POLL_INTERVAL_MS.get(),
+            fetch_max_bytes: FETCH_MAX_BYTES.get(),
             enable_long_polling: ENABLE_LONG_POLLING.get(),
             compression_type: guc_string(&COMPRESSION_TYPE)
                 .unwrap_or_else(|| DEFAULT_COMPRESSION_TYPE.to_string()),
@@ -615,6 +699,7 @@ impl Config {
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
             default_partitions: DEFAULT_TOPIC_PARTITIONS,
             fetch_poll_interval_ms: DEFAULT_FETCH_POLL_INTERVAL_MS,
+            fetch_max_bytes: DEFAULT_FETCH_MAX_BYTES,
             enable_long_polling: true,
             compression_type: DEFAULT_COMPRESSION_TYPE.to_string(),
             log_timing: false,
@@ -694,6 +779,7 @@ mod tests {
         assert!(MIN_SHUTDOWN_TIMEOUT_MS > 0);
         assert!(DEFAULT_SHUTDOWN_TIMEOUT_MS <= MAX_SHUTDOWN_TIMEOUT_MS);
         assert!(DEFAULT_WORKER_LOCK_TIMEOUT_MS <= MAX_WORKER_LOCK_TIMEOUT_MS);
+        assert!(MIN_FETCH_MAX_BYTES <= DEFAULT_FETCH_MAX_BYTES);
     };
 
     #[test]
@@ -791,7 +877,7 @@ mod tests {
             ("MIN_SHADOW_BATCH_SIZE", MIN_SHADOW_BATCH_SIZE, 1),
             ("MAX_SHADOW_BATCH_SIZE", MAX_SHADOW_BATCH_SIZE, 100_000),
             ("MIN_SHADOW_LINGER_MS", MIN_SHADOW_LINGER_MS, 0),
-            ("MAX_SHADOW_LINGER_MS", MAX_SHADOW_LINGER_MS, 60_000),
+            ("MAX_SHADOW_LINGER_MS", MAX_SHADOW_LINGER_MS, 5_000),
             (
                 "MIN_SHADOW_RETRY_BACKOFF_MS",
                 MIN_SHADOW_RETRY_BACKOFF_MS,

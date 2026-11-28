@@ -4,102 +4,128 @@
 //! `kafka.broker_api_stats` / `kafka.broker_gauges` (views `kafka.api_metrics`,
 //! `kafka.broker_metrics`) at most once per second.
 
-use crate::common::{create_base_consumer, create_producer, TestResult, POLL_TIMEOUT};
+use crate::common::{create_base_consumer, create_producer, TestResult};
+use crate::error_codes;
+use crate::fixtures::topic_with_partitions;
 use crate::setup::TestContext;
+use crate::wire::records::plain_batch;
+use crate::wire::Wire;
+use bytes::Bytes;
+use kafka_protocol::records::Compression;
 use rdkafka::consumer::{CommitMode, Consumer};
 use rdkafka::producer::FutureRecord;
 use rdkafka::TopicPartitionList;
 use std::time::{Duration, Instant};
 
-async fn api_requests(ctx: &TestContext, api: &str) -> Result<i64, Box<dyn std::error::Error>> {
+/// `(requests, errors, latency_us_sum)` of one API in `kafka.api_metrics`.
+async fn api_counters(
+    ctx: &TestContext,
+    api: &str,
+) -> Result<(i64, i64, i64), Box<dyn std::error::Error>> {
     let row = ctx
         .db()
         .query_opt(
-            "SELECT requests FROM kafka.api_metrics WHERE api_name = $1",
+            "SELECT requests, errors, latency_us_sum FROM kafka.api_metrics WHERE api_name = $1",
             &[&api],
         )
         .await?;
-    Ok(row.map_or(0, |r| r.get::<_, i64>(0)))
+    Ok(row.map_or((0, 0, 0), |r| (r.get(0), r.get(1), r.get(2))))
 }
 
-/// After a produce and a fetch, `kafka.api_metrics` shows the Produce and Fetch request
-/// counters increased, and `kafka.broker_metrics` shows the connection gauges.
+/// Produce requests this test sends that succeed, that fail, and its Fetch requests.
+const PRODUCES_OK: i64 = 5;
+const PRODUCES_FAILED: i64 = 3;
+const FETCHES: i64 = 4;
+
+/// The counters of `kafka.api_metrics` count exactly the requests sent: five Produce
+/// requests that succeed, three to a partition that does not exist (errors), and four
+/// Fetch requests move Produce's requests by 8 and errors by 3, Fetch's requests by 4 and
+/// errors by none, with their latency recorded; `kafka.broker_metrics` shows the connection
+/// gauges. Sequential, so no other test's requests move the counters meanwhile.
 pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
     println!("=== Test: Broker Metrics Count Produce And Fetch ===\n");
 
     let ctx = TestContext::new().await?;
-    let topic = ctx.unique_topic("metrics-produce-fetch").await;
+    let topic = topic_with_partitions(&ctx, "metrics-produce-fetch", 1).await?;
+    let mut w = Wire::connect().await?;
+    // Whatever earlier requests counted is flushed (at most once per second) before the
+    // counters are read.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let produce_before = api_counters(&ctx, "Produce").await?;
+    let fetch_before = api_counters(&ctx, "Fetch").await?;
+    println!("Before: Produce={produce_before:?}, Fetch={fetch_before:?}");
 
-    let produce_before = api_requests(&ctx, "Produce").await?;
-    let fetch_before = api_requests(&ctx, "Fetch").await?;
-    println!("Before: Produce={produce_before}, Fetch={fetch_before}");
-
-    println!("Step 1: produce one record...");
-    let producer = create_producer()?;
-    let (partition, offset) = producer
-        .send(
-            FutureRecord::<(), _>::to(&topic).payload("metrics"),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|(e, _)| e)?;
-
-    println!("Step 2: fetch it back...");
-    let consumer = create_base_consumer(&ctx.unique_group("metrics-fetch").await)?;
-    let mut assignment = TopicPartitionList::new();
-    assignment.add_partition_offset(&topic, partition, rdkafka::Offset::Offset(offset))?;
-    consumer.assign(&assignment)?;
-    let start = Instant::now();
-    let mut received = false;
-    while start.elapsed() < Duration::from_secs(15) {
-        if let Some(Ok(_)) = consumer.poll(POLL_TIMEOUT) {
-            received = true;
-            break;
-        }
+    println!("Step 1: {PRODUCES_OK} produces, {PRODUCES_FAILED} to a missing partition, {FETCHES} fetches...");
+    for i in 0..PRODUCES_OK {
+        let (code, _) = w
+            .produce(
+                &topic,
+                0,
+                plain_batch(&[Bytes::from(format!("m{i}"))], Compression::None),
+                None,
+            )
+            .await?;
+        assert_eq!(code, error_codes::NONE);
     }
-    assert!(received, "the produced record must be fetched");
+    for i in 0..PRODUCES_FAILED {
+        let (code, _) = w
+            .produce(
+                &topic,
+                99,
+                plain_batch(&[Bytes::from(format!("x{i}"))], Compression::None),
+                None,
+            )
+            .await?;
+        assert_eq!(code, error_codes::UNKNOWN_TOPIC_OR_PARTITION);
+    }
+    for _ in 0..FETCHES {
+        let p = w.fetch(&topic, 0, 0, 0).await?;
+        assert_eq!(p.error_code, error_codes::NONE);
+    }
 
-    println!("Step 3: wait for the worker's metrics flush (<= 1 s interval)...");
+    println!("Step 2: wait for the worker's metrics flush (<= 1 s interval)...");
+    let delta = |before: (i64, i64, i64), after: (i64, i64, i64)| {
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2)
+    };
     let start = Instant::now();
-    let (mut produce_after, mut fetch_after) = (produce_before, fetch_before);
     while start.elapsed() < Duration::from_secs(15) {
-        produce_after = api_requests(&ctx, "Produce").await?;
-        fetch_after = api_requests(&ctx, "Fetch").await?;
-        if produce_after > produce_before && fetch_after > fetch_before {
+        let produce = delta(produce_before, api_counters(&ctx, "Produce").await?);
+        let fetch = delta(fetch_before, api_counters(&ctx, "Fetch").await?);
+        if produce.0 >= PRODUCES_OK + PRODUCES_FAILED && fetch.0 >= FETCHES {
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    println!("After: Produce={produce_after}, Fetch={fetch_after}");
-    assert!(
-        produce_after > produce_before,
-        "Produce request counter must increase ({produce_before} -> {produce_after})"
+    // One more flush interval: nothing beyond this test's requests may arrive.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let produce = delta(produce_before, api_counters(&ctx, "Produce").await?);
+    let fetch = delta(fetch_before, api_counters(&ctx, "Fetch").await?);
+    println!("Deltas (requests, errors, latency_us_sum): Produce={produce:?}, Fetch={fetch:?}");
+    assert_eq!(
+        (produce.0, produce.1),
+        (PRODUCES_OK + PRODUCES_FAILED, PRODUCES_FAILED),
+        "Produce requests and errors"
+    );
+    assert_eq!(
+        (fetch.0, fetch.1),
+        (FETCHES, 0),
+        "Fetch requests and errors"
     );
     assert!(
-        fetch_after > fetch_before,
-        "Fetch request counter must increase ({fetch_before} -> {fetch_after})"
+        produce.2 > 0 && fetch.2 > 0,
+        "latency is recorded with the counts"
     );
-
-    // Latency is recorded alongside the count.
-    let row = ctx
+    let max: i64 = ctx
         .db()
         .query_one(
-            "SELECT latency_us_sum, latency_us_max, errors FROM kafka.api_metrics
-             WHERE api_name = 'Produce'",
+            "SELECT latency_us_max FROM kafka.api_metrics WHERE api_name = 'Produce'",
             &[],
         )
-        .await?;
-    let (sum, max, errors): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
-    assert!(
-        sum > 0 && max > 0,
-        "Produce latency must be recorded (sum={sum}, max={max})"
-    );
-    assert!(
-        errors >= 0 && max <= sum,
-        "max ({max}) cannot exceed sum ({sum})"
-    );
+        .await?
+        .get(0);
+    assert!(max > 0, "Produce latency max is recorded ({max})");
 
-    // Gauges are published with every flush; our producer/consumer connections are open.
+    // Gauges are published with every flush; this test's connection is open.
     let rows = ctx
         .db()
         .query(
@@ -123,7 +149,7 @@ pub async fn test_metrics_count_produce_and_fetch() -> TestResult {
         "accepted total ({accepted}) >= open ({open})"
     );
 
-    drop(consumer);
+    drop(w);
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");
     Ok(())

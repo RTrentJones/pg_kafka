@@ -3,7 +3,7 @@
 //! `kafka.topics` columns are NOT NULL except `retention_ms`, so the `unwrap_or`
 //! fallbacks on rows that exist are unreachable; they never mask a real NULL.
 
-use super::{internal, PostgresStore};
+use super::{internal, internal_unless, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::storage::{order_topic_metadata, TopicMetadata};
 use pgrx::prelude::*;
@@ -22,7 +22,33 @@ fn topic_rows(table: SpiTupleTable<'_>) -> Result<Vec<(String, i32, i32)>> {
     Ok(rows)
 }
 
+fn is_policy_violation(e: &KafkaError) -> bool {
+    matches!(e, KafkaError::PolicyViolation { .. })
+}
+
+/// The error of an auto-create that `pg_kafka.max_total_partitions` refuses.
+fn total_partitions_exceeded(topics: usize, partitions_each: i32) -> KafkaError {
+    KafkaError::PolicyViolation {
+        message: format!(
+            "creating {topics} topic(s) of {partitions_each} partition(s) would exceed pg_kafka.max_total_partitions ({})",
+            crate::kafka::limits::max_total_partitions()
+        ),
+    }
+}
+
 impl PostgresStore {
+    pub(super) fn total_partition_count() -> Result<i64> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT coalesce(sum(partitions), 0)::int8 AS total FROM kafka.topics",
+                Some(1),
+                &[],
+            )?;
+            Ok(table.first().get_by_name::<i64, _>("total")?.unwrap_or(0))
+        })
+        .map_err(internal("total_partition_count"))
+    }
+
     pub(super) fn get_or_create_topic(name: &str, default_partitions: i32) -> Result<(i32, i32)> {
         crate::pg_debug!(
             "PostgresStore::get_or_create_topic: '{name}' (default_partitions={default_partitions})"
@@ -35,18 +61,28 @@ impl PostgresStore {
             let lookup = "SELECT id, partitions FROM kafka.topics WHERE name = $1";
             let mut table = client.select(lookup, Some(1), &[name.into()])?;
             if table.is_empty() {
+                // Only within pg_kafka.max_total_partitions; the sum and the insert are one
+                // statement, and only the worker's DB thread creates topics.
                 table = client.update(
                     "INSERT INTO kafka.topics (name, partitions)
-                     VALUES ($1, $2)
+                     SELECT $1, $2
+                     WHERE (SELECT coalesce(sum(partitions), 0) FROM kafka.topics) + $2 <= $3
                      ON CONFLICT (name) DO NOTHING
                      RETURNING id, partitions",
                     None,
-                    &[name.into(), default_partitions.into()],
+                    &[
+                        name.into(),
+                        default_partitions.into(),
+                        crate::kafka::limits::max_total_partitions().into(),
+                    ],
                 )?;
             }
             if table.is_empty() {
-                // Created by another session since the lookup.
+                // Created by another session since the lookup, or refused by the cap.
                 table = client.select(lookup, Some(1), &[name.into()])?;
+            }
+            if table.is_empty() {
+                return Err(total_partitions_exceeded(1, default_partitions));
             }
 
             let row = table.first();
@@ -60,7 +96,7 @@ impl PostgresStore {
             crate::pg_debug!("Topic '{name}' has id={topic_id}, partitions={partition_count}");
             Ok((topic_id, partition_count))
         })
-        .map_err(internal("get_or_create_topic"))
+        .map_err(internal_unless("get_or_create_topic", is_policy_violation))
     }
 
     pub(super) fn get_or_create_topics(
@@ -72,11 +108,19 @@ impl PostgresStore {
         }
         Spi::connect_mut(|client| {
             // The insert's snapshot does not see its own rows, so the topics it created come
-            // from RETURNING and the ones that already existed from the table.
+            // from RETURNING and the ones that already existed from the table. The missing
+            // names are created together or not at all: only if they all fit
+            // pg_kafka.max_total_partitions (checked in the same statement; only the worker's
+            // DB thread creates topics).
             let table = client.update(
-                "WITH created AS (
+                "WITH missing AS (
+                     SELECT n FROM unnest($1::text[]) AS n
+                     WHERE NOT EXISTS (SELECT 1 FROM kafka.topics t WHERE t.name = n)
+                 ), created AS (
                      INSERT INTO kafka.topics (name, partitions)
-                     SELECT n, $2 FROM unnest($1::text[]) AS n
+                     SELECT n, $2 FROM missing
+                     WHERE (SELECT coalesce(sum(partitions), 0) FROM kafka.topics)
+                           + $2::int8 * (SELECT count(*) FROM missing) <= $3
                      ON CONFLICT (name) DO NOTHING
                      RETURNING id, name, partitions
                  )
@@ -85,7 +129,11 @@ impl PostgresStore {
                  SELECT id, name, partitions FROM kafka.topics
                  WHERE name = ANY($1::text[])",
                 None,
-                &[names.to_vec().into(), partition_count.into()],
+                &[
+                    names.to_vec().into(),
+                    partition_count.into(),
+                    crate::kafka::limits::max_total_partitions().into(),
+                ],
             )?;
             let mut rows = topic_rows(table)?;
             // A name another session inserted and committed while the insert waited on it
@@ -109,6 +157,10 @@ impl PostgresStore {
                 )?;
                 rows.extend(topic_rows(table)?);
             }
+            let still_missing = names.len().saturating_sub(rows.len());
+            if still_missing > 0 {
+                return Err(total_partitions_exceeded(still_missing, partition_count));
+            }
             Ok(rows
                 .into_iter()
                 .map(|(name, id, partition_count)| TopicMetadata {
@@ -118,7 +170,7 @@ impl PostgresStore {
                 })
                 .collect())
         })
-        .map_err(internal("get_or_create_topics"))
+        .map_err(internal_unless("get_or_create_topics", is_policy_violation))
     }
 
     /// The named topics in request order (one statement, not one per name), or every
@@ -281,21 +333,29 @@ impl PostgresStore {
         .map_err(internal("colliding_topics"))
     }
 
-    pub(super) fn get_topic_retention_ms(topic_id: i32) -> Result<Option<i64>> {
+    /// One statement for every id: a DescribeConfigs may name thousands of topics, and a
+    /// statement per topic held the DB thread, which serves every client, for each of them.
+    pub(super) fn get_topics_retention_ms(
+        topic_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Option<i64>>> {
+        let mut retention = std::collections::HashMap::new();
+        if topic_ids.is_empty() {
+            return Ok(retention);
+        }
         Spi::connect(|client| {
             let table = client.select(
-                "SELECT retention_ms FROM kafka.topics WHERE id = $1",
-                Some(1),
-                &[topic_id.into()],
+                "SELECT id, retention_ms FROM kafka.topics WHERE id = ANY($1::int4[])",
+                None,
+                &[topic_ids.to_vec().into()],
             )?;
-            if table.is_empty() {
-                return Err(KafkaError::Internal(format!(
-                    "topic id {topic_id} not found"
-                )));
+            for row in table {
+                if let Some(id) = row.get_by_name::<i32, _>("id")? {
+                    retention.insert(id, row.get_by_name::<i64, _>("retention_ms")?);
+                }
             }
-            Ok(table.first().get_by_name::<i64, _>("retention_ms")?)
+            Ok(retention)
         })
-        .map_err(internal("get_topic_retention_ms"))
+        .map_err(internal("get_topics_retention_ms"))
     }
 
     pub(super) fn set_topic_retention_ms(topic_id: i32, retention_ms: Option<i64>) -> Result<()> {

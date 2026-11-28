@@ -10,7 +10,7 @@ use kafka_protocol::messages::produce_request::{
 use kafka_protocol::messages::produce_response::{
     PartitionProduceResponse, ProduceResponse, TopicProduceResponse,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::{
     ApiEnv, ApiSchema, Call, Decoded, KafkaApi, Rejection, RequestBody, RequestHeader,
@@ -33,6 +33,7 @@ use crate::kafka::protocol::decode_budget::{
     INLINE_DECODE_BYTES, INLINE_DECODE_TIME, INLINE_DECODE_WORK_BYTES, LARGE_DECODES,
     MAX_DECODED_REQUEST_BYTES, SLOT_DECODE_TIME, SLOT_DECODE_WORK_BYTES,
 };
+use crate::kafka::protocol::decode_meter::unmetered;
 use crate::kafka::protocol::{
     first_batch_is_transactional, least_decoded_memory, parse_record_batch_with_metadata,
     validate_produce_records, ParsedRecordBatch,
@@ -61,6 +62,17 @@ pub struct ProduceRequestData {
     /// Records still to decode, once there is room: `topic_data` is empty until
     /// [`finish_decode`] decoded them. Only the network thread sees a request that has them.
     pub pending: Option<Box<PendingRecords>>,
+}
+
+impl ProduceRequestData {
+    /// End the wait of records still to decode by `deadline` at the latest: a request that
+    /// already waited (for room for its decoded request) has only what is left of its
+    /// `decode_wait`, counted from when its frame was read.
+    pub fn bound_decode_wait(&mut self, deadline: tokio::time::Instant) {
+        if let Some(pending) = &mut self.pending {
+            pending.deadline = pending.deadline.min(deadline);
+        }
+    }
 }
 
 /// The records of a Produce request that could not decode at once: it waits for a
@@ -174,7 +186,8 @@ impl KafkaApi for ProduceApi {
         // INVALID_REQUIRED_ACKS and nothing is written, once the checks Kafka makes before
         // the log append passed (`invalid_acks_answers`).
         if !valid_acks(acks) {
-            warn!("Rejecting Produce with invalid acks={acks}");
+            // A client error, answered in the response: not worth a WARNING per request.
+            debug!("Rejecting Produce with invalid acks={acks}");
             let refused = with_refused_entries(
                 invalid_acks_answers(&wire.topic_data, zstd_allowed),
                 refused_entries,
@@ -190,7 +203,8 @@ impl KafkaApi for ProduceApi {
             });
         }
 
-        let decode = decode_all_records(&wire.topic_data, zstd_allowed);
+        // The records' memory is charged to their own budget, not to the request's meter.
+        let decode = unmetered(|| decode_all_records(&wire.topic_data, zstd_allowed));
         let transactional_id = wire.transactional_id.map(|s| s.to_string());
         let (DecodedTopics(topic_data, refused, decoded), pending) = match decode {
             Ok(Decode::Done(DecodedTopics(topic_data, refused, decoded))) => (
@@ -559,7 +573,7 @@ impl<'a> Refusals<'a> {
 impl Drop for Refusals<'_> {
     fn drop(&mut self) {
         if let Some((partition, error_code)) = self.first_invalid {
-            warn!(
+            debug!(
                 "Refusing the records of {} partition(s) of topic={} (partition={partition}: error {error_code})",
                 self.invalid,
                 log_name(self.name)
@@ -600,14 +614,14 @@ fn check_first_batches(
             match first_batch_is_transactional(batch) {
                 Ok(true) if has_transactional_id => return Ok(()),
                 Ok(true) => {
-                    warn!("Refusing a transactional Produce request without a transactional id");
+                    debug!("Refusing a transactional Produce request without a transactional id");
                     return Err(DecodeFailure::Rejected(
                         ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
                     ));
                 }
                 Ok(false) => {}
                 Err(code) => {
-                    warn!(
+                    debug!(
                         "Refusing a Produce request: the first batch of topic={}, partition={} cannot be sized",
                         log_name(topic.name.0.as_str()),
                         partition.index
@@ -1074,17 +1088,16 @@ pub(crate) fn extract_producer_metadata(
 }
 
 /// Send a best-effort notification to the network thread without blocking the single DB
-/// thread: the notify channel is bounded and `try_send` drops on full. Waiting
-/// fetches fall back to their poll interval, so a dropped wake-up only adds latency.
+/// thread (see [`crate::kafka::notifications::send_best_effort`]).
 pub(crate) fn notify_best_effort(
     tx: &crossbeam_channel::Sender<InternalNotification>,
     notification: InternalNotification,
 ) {
-    let _ = tx.try_send(notification);
+    crate::kafka::notifications::send_best_effort(tx, notification);
 }
 
 /// Wake long-poll consumers for every partition a produce appended to. A missing topic id,
-/// a failed high-watermark read or a full notify channel skips that wake-up.
+/// a failed high-watermark read skips that wake-up.
 fn emit_produce_notifications<S: TopicStore + LogStore + ?Sized>(
     response: &ProduceResponse,
     store: &S,
@@ -1699,6 +1712,7 @@ mod tests {
                 pending: Some(Box::new(pending)),
             }),
             response_tx,
+            decode_charge: DecodedCharge::default(),
         };
         (request, rx)
     }
@@ -1717,6 +1731,24 @@ mod tests {
         assert_eq!(produce.topic_data[0].partitions.len(), 2);
         assert_eq!(produce.topic_data[0].partitions[1].records.len(), 1);
         assert!(produce.decoded.bytes() > 0, "the decode is charged");
+    }
+
+    #[tokio::test]
+    async fn a_bounded_wait_ends_at_the_earlier_deadline() {
+        // Records that would wait 30 s end at the request's own deadline, 100 ms from now.
+        let (mut request, _rx) = pending_request(
+            1,
+            Wait::Budget(usize::MAX),
+            std::time::Duration::from_secs(30),
+        );
+        let RequestBody::Produce(produce) = &mut request.body else {
+            panic!("expected a Produce request");
+        };
+        produce
+            .bound_decode_wait(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert!(matches!(finish_decode(request).await, Decoded::Answered));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]

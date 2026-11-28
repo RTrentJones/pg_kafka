@@ -56,8 +56,8 @@ GUCs (all reloadable with `pg_reload_conf()` unless noted; the forwarder reads t
 | `pg_kafka.shadow_sasl_username` / `_password` | '' | Superuser-only, hidden from SHOW ALL. |
 | `pg_kafka.shadow_ssl_ca_location` | '' | CA file for SSL. |
 | `pg_kafka.shadow_batch_size` | 1000 | Records per outbox claim, and librdkafka `batch.num.messages`. |
-| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms`. |
-| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
+| `pg_kafka.shadow_linger_ms` | 10 | librdkafka `linger.ms` (0-5000). A sync-mode response waits for it as well: a linger near `shadow_sync_timeout_ms` (default 5000 too) makes held responses time out. |
+| `pg_kafka.shadow_retry_backoff_ms` | 100 | librdkafka `retry.backoff.ms`, capped at 10 s so that librdkafka's own retries stay well inside the 120 s delivery timeout (`retry.backoff.max.ms` is set to the larger of it and 1000 ms, librdkafka's default, which would otherwise cap it; the two also space librdkafka's leader queries after a partition loses its leader; `topic.metadata.refresh.fast.interval.ms`, the threshold at which a new leader loss restarts that query at once and which would follow `retry.backoff.ms`, is pinned to librdkafka's default 100 ms), and the base of the outbox re-attempt backoff (doubling per failure, capped at 30 s). |
 | `pg_kafka.shadow_max_retries` | 10 | Failed delivery attempts after which a row is a dead letter. |
 | `pg_kafka.shadow_sync_timeout_ms` | 5000 | How long a sync-mode produce response is held for the external ack (0 = not held). |
 | `pg_kafka.shadow_metrics_enabled` | true | Write `kafka.shadow_metrics`. |
@@ -69,13 +69,24 @@ Every shadow GUC except the license key is `Sighup`: it is set in `postgresql.co
 Any change to a producer setting (servers, protocol, SASL, CA, batch size, linger, backoff) makes the forwarder rebuild its producer, on the next record or
 within about 0.5 s; the old producer's outstanding records are purged and re-sent by the new one
 without counting as failures. The config goes through `ShadowConfig::validate()` first; an invalid
-or unbuildable config is logged once per distinct error and every record fails (and is eventually
-dead-lettered) until it is fixed.
+or unbuildable config is logged once per distinct error and, until it is fixed, nothing is sent:
+the record each partition waits on (the first one the fence admits) fails, a `Failed` attempt that
+counts against its retry budget and leads to a dead letter, also when the change retired a working
+producer or the producer went fatal and cannot be rebuilt; the failure fences the partition, so
+the records behind it are `NotAttempted` (not charged, as for the delivery timeout) and wait for
+its retry, and once a producer can be built again nothing later of the partition goes out ahead of
+it. So one bad setting dead-letters each partition's records one at a time, after
+`shadow_max_retries` backoffs each, not a whole backlog at once (which with `external_only` topics
+would also switch their consumers to local reads).
 
 Per-topic settings are rows of `kafka.shadow_config` (`mode`, `forward_percentage`,
 `external_topic_name`, `sync_mode`, `write_mode`), reloaded into the `TopicConfigCache` on SIGHUP or
-every `pg_kafka.config_reload_interval_ms`. The reload replaces the cache (a deleted row stops
-forwarding) only when the query succeeds. A row with `write_mode = 'external_only'` and
+every `pg_kafka.config_reload_interval_ms`. The reload replaces the cache only when the query succeeds.
+Setting `mode = 'local_only'` (or `forward_percentage = 0`) or deleting the row stops queueing the
+topic's new records; rows already in the outbox are still forwarded (the claim does not consult
+the topic's config). To drop them as well, delete them:
+`DELETE FROM kafka.shadow_tracking WHERE topic_id = ... AND external_offset IS NULL` (an attempt
+in flight then has its ack match nothing). A row with `write_mode = 'external_only'` and
 `forward_percentage <> 100` is forced to 100% with a warning, because a sampled-out record would
 otherwise be readable nowhere.
 
@@ -90,11 +101,38 @@ previous delivery); a full librdkafka queue pauses intake briefly, keeping order
 headers and the timestamp are forwarded (`kafka.messages.timestamp_ms`, or the insert time when the
 producer sent none, which is what local consumers see). `partition` is left to the partitioner
 (`murmur2_random`, the Java client's), so the external cluster re-partitions by key.
+Header keys go to librdkafka with their length (`rd_kafka_header_add`), so a key holding U+0000,
+which Kafka allows and pg_kafka stores, is forwarded byte for byte (rdkafka's `OwnedHeaders::insert`
+would pass it as a C string and panic on it).
+
+### Panics
+
+The forwarder runs detached on the network thread, so a panic in it would stop forwarding for
+every shadow topic with nothing to notice. Sending one record runs under `catch_unwind`: a panic
+there fails that record (a counted attempt, so a record that always panics is dead-lettered after
+`shadow_max_retries`) and fences its partition. The loop itself is supervised: after a panic
+anywhere else, the records it held (on a producer, waiting in its backlog, or the one whose
+delivery report was being handled, unless its ack was already queued) are answered
+`NotAttempted` and fence their partitions, its producers are dropped (which purges them), and it
+runs again after 1 s, keeping its fences, held sync responses and queued acks. A record that was
+delivered but whose report was being handled is so sent again (a duplicate, as after any lost
+ack), and no later record of its partition goes out ahead of it.
 
 ### Ordering
 
-The records of one local partition reach the external topic in local-offset order (the first copy
-of each; see duplicates below). That rests on:
+The forwarder sends the records of one local partition in local-offset order among those in the
+outbox, and none of them goes out ahead of an earlier one's retry. A transaction's outbox rows are
+written only when it commits (`ShadowStore::commit_transaction`), so records of different
+producers are forwarded in commit order: a later offset written meanwhile by another producer (a
+non-transactional one, or a transaction that commits first) can be forwarded before an open
+transaction's earlier offsets. What the external topic keeps of the sending order is per
+external partition: the partitioner (`murmur2_random`) places each record by its key, so the
+records of one local partition that land in the same external partition (for keyed records, the
+records of one key) are in sending order there (the first copy of each; see duplicates
+below), while records with different keys, and records with a null key (placed at random), may
+land in different external partitions with no order between them. A record that is dead-lettered
+lets its partition move on: if it is replayed later, it lands after the records that followed it.
+The sending order rests on:
 
 1. **The claim.** Each claim takes up to an equal share of `shadow_batch_size` from every partition with a row due (its lowest due offsets; partitions holding only dead letters or rows in flight or backing off take no share), round-robin across partitions, and dispatches them in row-key order over one FIFO channel. A claim that leaves rows due is followed by the next one at once (5 ms at the earliest). A row is
    never claimed behind an earlier row of its partition that is backing off after a failure.
@@ -118,9 +156,11 @@ of each; see duplicates below). That rests on:
    stays in order.
 3. **The fence.** Once a record of a partition fails, every later record of that partition the
    forwarder receives is answered `NotAttempted` without being sent, until the partition restarts:
-   a record at or below the failed offset, or one the claim marks as the partition head (`restart`,
-   the lowest pending row, which is how a partition moves on after its failed record is
-   dead-lettered). When a producer is replaced (settings change) or goes fatal, every partition
+   the failed record's retry, or a record above it that the claim marks as the partition head
+   (`restart`, the lowest pending row, which is how a partition moves on after its failed record
+   is delivered or dead-lettered). A record below the failed offset (one a replay made due) is
+   sent but leaves the fence in place, so the later records of its claim cannot overtake the
+   failed record's retry. When a producer is replaced (settings change) or goes fatal, every partition
    with a record still outstanding on it is fenced at once, at its lowest outstanding offset:
    those records fail later, and nothing of their partitions may go out on the replacement ahead
    of their retry. A replaced producer's queued and in-flight records are purged, the fatal one's
@@ -131,8 +171,9 @@ Failures are classified: a real delivery failure is `Failed` (counts against
 `shadow_max_retries`); a record fenced, failed only because the producer went fatal on another
 record's error (the first failure of a fatal producer generation is taken as its cause), purged by a
 settings change, or received while shadow mode is off is `NotAttempted` and does not consume its
-retry budget. Of the records purged by the delivery timeout, the lowest outstanding record of each
-local partition that has been held for at least half the timeout is `Failed` (the record the
+retry budget. A record no producer can be built for (see Configuration) is `Failed` if it is
+the record its partition waits on and `NotAttempted` behind it. Of the
+records purged by the delivery timeout, the lowest outstanding record of each local partition that has been held for at least half the timeout is `Failed` (the record the
 partition waits on); the records behind it, and a head received less than half a timeout ago (a
 partition that was flowing), are `NotAttempted`. A record that runs out of time in the backlog is
 `Failed` if it is the record its partition waits on and `NotAttempted` behind an earlier failure. In a persistent outage each stuck partition's head
@@ -167,18 +208,37 @@ the skipped ones in `kafka.shadow_metrics.messages_skipped`, and inserts one pen
 `external_only` marks a topic as **external-primary**. Its writes are forwarded as above, but local
 reads are suppressed so consumers cut over to the external broker: fetches return no records and the
 offset bounds report an empty partition. Suppression depends only on the global GUC plus the
-per-topic config, so a standby suppresses these reads too. If any forward of the topic is
-dead-lettered (`external_offset IS NULL` and `retry_count >= pg_kafka.shadow_max_retries`),
-suppression is lifted and the topic is served locally again, so a record is never readable nowhere;
+per-topic config. If any forward of the topic is dead-lettered (`external_offset IS NULL` and
+`retry_count >= pg_kafka.shadow_max_retries`), suppression is lifted and the topic is served
+locally again, so a dead-lettered record is not readable nowhere;
 `pg_kafka.shadow_external_primary_strict = true` keeps full suppression.
+
+Suppression does not check that every local record of the topic was forwarded, so some records
+are readable nowhere (suppressed locally, never sent) until they are replayed:
+
+- records produced while `pg_kafka.shadow_mode_enabled` was off (the topic is read locally then,
+  and nothing is queued; once the GUC is back on, its reads are suppressed again);
+- records produced before the topic became `external_only`: while it was `local_only`, or
+  `dual_write` with `forward_percentage` below 100 (the records routing sampled out then);
+- a dead-lettered record under `pg_kafka.shadow_external_primary_strict`.
+
+The remedy is `kafka.replay_shadow_messages(topic_id, from_offset, to_offset)` over the affected
+offset range (or the whole topic) before or right after switching a topic to `external_only`, and
+after a period with `shadow_mode_enabled` off; a record already delivered is sent again
+(at-least-once).
 
 ### Transactional Produce
 
-`insert_transactional_records()` writes locally and, if the topic forwards, buffers the records'
-keys in RAM. `commit_transaction()` reads the transaction's records from `kafka.messages` (falling
-back to the RAM buffer), commits, re-checks the topic config, routes them and inserts their outbox
-rows in the commit transaction. An abort discards them. Transactional records are forwarded by the
-outbox tick (they are never held as sync).
+`insert_transactional_records()` only writes locally; nothing is kept in worker memory for an
+open transaction. `commit_transaction()`, before the inner commit and in the same transaction,
+enqueues the producer's pending records of every forwarding topic, routed by the topic config at
+commit time: for a topic at 100% one `INSERT INTO kafka.shadow_tracking ... SELECT ... FROM
+kafka.messages` (no record passes through the worker), for a sampled topic a cursor read
+`TXN_ENQUEUE_CHUNK` rows at a time, routed by `make_forward_decision` as a plain produce is. An
+existing outbox row is left alone (`ON CONFLICT DO NOTHING`), so a retried EndTxn or a worker
+restart neither loses nor duplicates a record; a failed enqueue fails the EndTxn, whose request
+rolls back whole. An abort enqueues nothing. Transactional records are forwarded by the outbox tick
+(they are never held as sync).
 
 ## Sync vs Async Forwarding
 
@@ -199,8 +259,22 @@ What sync guarantees: an OK response means the record was committed locally, and
 expired first, delivered externally. It does not stall the broker: only that client's response
 waits (and the responses behind it on the same connection, which Kafka orders), the worker and every
 other client carry on. The old design waited on the DB thread for up to 5 s per batch, stalling all
-clients while the external cluster was slow or down. With `shadow_sync_timeout_ms = 0` sync topics
-behave like async ones.
+clients while the external cluster was slow or down.
+
+These sync-mode responses are not held, so their OK says only that the records are committed
+locally:
+
+- an idempotent producer's retry of a batch already appended (Kafka answers it with the original
+  offsets, nothing is inserted, so no outbox row is written for it), even while the original's
+  records are not delivered yet; the original's own response was held, and its rows are forwarded
+  as usual;
+- the records of a group-commit batch beyond the first 10 000 sync rows awaiting the commit
+  (`SYNC_PENDING_CAP` in `store.rs`, a bound on the worker's memory): a response whose records are
+  all beyond it goes out at once, one with some of them waits only for those within it; all of
+  them are forwarded as usual;
+- transactional records (see Transactional Produce).
+
+With `shadow_sync_timeout_ms = 0` sync topics behave like async ones.
 
 ## Outbox Rows, Retries and Dead Letters
 
@@ -247,12 +321,52 @@ within one producer session. A record re-sent by a new producer (rebuilt after a
 settings change) or after a lost ack can land twice. Consumers that need exactly-once should
 deduplicate on an application id.
 
+`DROP EXTENSION` takes the outbox with it. A re-created extension starts `kafka.topics.id` again,
+so its first rows reuse the keys of rows the old outbox had dispatched: when the worker finds the
+schema again it forgets every forward still in flight, moves to a new schema epoch and tells the
+forwarder first, which drops the old forwards' fences and queued records, releases the produce
+responses it holds for them (`sync` mode: they are sent without waiting any longer for the external
+ack; their records are committed locally) and stamps its acks with the epoch. A late ack of an old forward is then ignored instead of finalizing (or
+charging an attempt to) the new row that shares its key; the old records may still reach the
+external broker.
+
 ### Replay
 
 `kafka.replay_shadow_messages(p_topic_id INT, p_from_offset BIGINT DEFAULT 0, p_to_offset BIGINT DEFAULT NULL)`
 inserts (or resets to pending, closing any open attempt) a `kafka.shadow_tracking` row for every
 committed or non-transactional message of that topic in `[p_from_offset, p_to_offset)` (`NULL` = to
 the end), across all partitions, and returns the number of rows re-queued.
+
+The re-queued rows stay locked until the caller's transaction ends. The outbox tick never waits
+for such a row: the claim locks its candidates `FOR UPDATE SKIP LOCKED` (one primary-key probe
+each) and takes, in each partition, only the candidates below that partition's first row another
+transaction holds, so a held row stops its own partition at that row (its records still go out in
+offset order) and every other partition is claimed as usual; the ack statements skip held rows too,
+and an ack they skip stays queued, its row in flight, until a tick after the replay ends applies it.
+The dead-flag sync skips held rows and runs again at the next claim. So an open replay delays the
+partitions whose rows it holds, from their first held row on, and nothing else; once it commits
+or rolls back, the next tick (within about 250 ms) forwards them.
+
+The tick runs with a transaction-local `lock_timeout` of 50 ms (or `pg_kafka.worker_lock_timeout_ms`,
+if lower) for the waits that remain: a relation lock (DDL on an outbox table, or a `LOCK TABLE`) or
+a `kafka.shadow_metrics` row another session holds. Each of the tick's statements waits at most
+that long; a wait that runs out ends its subtransaction (the acks, or the poll), and the tick runs
+those two, so a tick stops the DB thread for at most about 2 x 50 ms of lock waits (plus a wait
+that ended just short of the timeout in an earlier statement of the same subtransaction). A tick
+that ran out of a lock wait keeps its acks (their rows in flight) and is followed by the next one
+after the usual 250 ms: it does not back off, since the wait ends when its holder commits, not
+when the outbox recovers. The tick cannot stay in a lock cycle with a session that locks the
+same rows in another order: its wait ends within the timeout, long before that session's deadlock
+check.
+
+A held `kafka.shadow_metrics` row stops more than its own partition. Each kind of ack (delivered,
+failed, not attempted) is applied for every topic by one set of statements in one subtransaction,
+and the metrics upsert, which cannot skip a row, is part of it: while another session holds one
+partition's metrics row (an operator's `SELECT ... FOR UPDATE` or `UPDATE` in an open
+transaction), every tick's delivery acks time out on it and are rolled back, every topic's. Their
+rows stay in flight, so forwarding goes on until the worker's in-flight window (8 192 rows) is full
+and then stops for every topic, until that transaction ends; the next tick then applies them all.
+Do not hold `kafka.shadow_metrics` rows open; read them without a locking clause.
 
 ```sql
 SELECT kafka.replay_shadow_messages(
@@ -271,7 +385,7 @@ SELECT kafka.replay_shadow_messages(
   `last_forwarded_offset`, `last_forwarded_at`, written only while `shadow_metrics_enabled`.
 - `kafka.metrics`, category `shadow`: `forwarded`, `failed`, `lag` (all pending rows, dead letters
   included).
-- Logs: no per-produce lines; a failing outbox tick (for example after `DROP EXTENSION`) pauses up to 30 s and logs at the
+- Logs: no per-produce lines; a failing outbox tick (for example after `DROP EXTENSION`; not a lock wait that ran out, which retries every tick) pauses up to 30 s and logs at the
   1st, 2nd, 4th, 8th... failure in a row.
 
 ## E2E Test Setup Sequence

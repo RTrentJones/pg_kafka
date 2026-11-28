@@ -10,9 +10,9 @@ use crate::kafka::constants::{
     ERROR_COORDINATOR_NOT_AVAILABLE, ERROR_CORRUPT_MESSAGE, ERROR_DUPLICATE_SEQUENCE_NUMBER,
     ERROR_ILLEGAL_GENERATION, ERROR_INVALID_PARTITIONS, ERROR_INVALID_PRODUCER_ID_MAPPING,
     ERROR_INVALID_RECORD, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_INVALID_TXN_STATE,
-    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_PRODUCER_FENCED, ERROR_REBALANCE_IN_PROGRESS,
-    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_OUT_OF_ORDER_SEQUENCE_NUMBER, ERROR_POLICY_VIOLATION, ERROR_PRODUCER_FENCED,
+    ERROR_REBALANCE_IN_PROGRESS, ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 /// A failed request, typed by what went wrong; [`KafkaError::to_kafka_error_code`] gives the
@@ -44,6 +44,11 @@ pub enum KafkaError {
     /// Invalid partition count (e.g., negative or zero)
     #[error("Invalid partition count: {count}")]
     InvalidPartitions { count: i32 },
+
+    /// A request over a broker-wide limit (POLICY_VIOLATION): the total partition count
+    /// (`pg_kafka.max_total_partitions`), or the size of a server-side group assignment.
+    #[error("Policy violation: {message}")]
+    PolicyViolation { message: String },
 
     // ===== Consumer Group Coordinator Errors =====
     /// Consumer group coordinator is not available
@@ -161,6 +166,7 @@ impl KafkaError {
                 ERROR_UNKNOWN_TOPIC_OR_PARTITION
             }
             KafkaError::InvalidPartitions { .. } => ERROR_INVALID_PARTITIONS,
+            KafkaError::PolicyViolation { .. } => ERROR_POLICY_VIOLATION,
 
             KafkaError::CoordinatorNotAvailable { .. } => ERROR_COORDINATOR_NOT_AVAILABLE,
             KafkaError::UnknownMemberId { .. } => ERROR_UNKNOWN_MEMBER_ID,
@@ -464,6 +470,14 @@ mod tests {
                 42,
                 false,
                 "Kafka error 42: m",
+            ),
+            (
+                KafkaError::PolicyViolation {
+                    message: s("over the limit"),
+                },
+                ERROR_POLICY_VIOLATION,
+                false,
+                "Policy violation: over the limit",
             ),
             (
                 KafkaError::Internal(s("internal failure")),

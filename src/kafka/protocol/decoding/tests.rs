@@ -7,7 +7,8 @@ use kafka_protocol::protocol::{Encodable, Request, StrBytes};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::*;
-use crate::kafka::api::RequestBody;
+use crate::kafka::api::{RequestBody, ResponseBody};
+use crate::kafka::constants::ERROR_UNSUPPORTED_VERSION;
 use crate::kafka::constants::{
     API_KEY_DELETE_RECORDS, API_KEY_DESCRIBE_CONFIGS, API_KEY_FETCH,
     API_KEY_INCREMENTAL_ALTER_CONFIGS, ERROR_CORRUPT_MESSAGE,
@@ -151,7 +152,7 @@ fn corrupt_produce_frame(acks: i16, unsizable: bool) -> BytesMut {
         let last = batch.len() - 1;
         batch[last] ^= 1;
     }
-    p.records = Some(bytes::Bytes::from(batch));
+    p.records = Some(Bytes::from(batch));
     let mut t = TopicProduceData::default();
     t.name = topic("t");
     t.partition_data = vec![p];
@@ -178,7 +179,7 @@ fn one_record_batch(value: Vec<u8>, compression: kafka_protocol::records::Compre
         sequence: -1,
         timestamp: 0,
         key: None,
-        value: Some(bytes::Bytes::from(value)),
+        value: Some(Bytes::from(value)),
         headers: kafka_protocol::indexmap::IndexMap::default(),
     };
     let mut batch = BytesMut::new();
@@ -260,7 +261,7 @@ fn test_produce_decoding_past_the_request_limit_is_refused() {
 }
 
 /// A Produce frame of `partitions` partitions, each carrying `batch`.
-fn produce_frame_of(batch: &bytes::Bytes, partitions: i32, acks: i16) -> BytesMut {
+fn produce_frame_of(batch: &Bytes, partitions: i32, acks: i16) -> BytesMut {
     use kafka_protocol::messages::produce_request::{
         PartitionProduceData, ProduceRequest, TopicProduceData,
     };
@@ -565,22 +566,14 @@ fn test_client_id_none() {
 
 // ========== Version enforcement and unknown APIs ==========
 
-/// An API key the crate knows but pg_kafka does not serve (29 = DescribeAcls) is answered
-/// with the generic error frame.
+/// An API key the crate knows but pg_kafka does not serve (29 = DescribeAcls) closes the
+/// connection unanswered, as Kafka 3.7 does for an API that is not enabled.
 #[test]
 fn test_parse_unsupported_api_key() {
     let (tx, mut rx) = channel();
     let request = DescribeAclsRequest::default();
-    assert!(parse_request(frame(&request, 1, 9999), tx)
-        .unwrap()
-        .is_none());
-    match rx.try_recv() {
-        Ok(KafkaResponse {
-            body: ResponseBody::UnknownApi { error_code },
-            ..
-        }) => assert_eq!(error_code, ERROR_UNSUPPORTED_VERSION),
-        other => panic!("expected the generic error frame, got {other:?}"),
-    }
+    assert!(parse_request(frame(&request, 1, 9999), tx).is_err());
+    assert!(rx.try_recv().is_err(), "nothing is answered");
 }
 
 /// A version above the advertised maximum (Metadata v11; max 10) is rejected before the
@@ -678,6 +671,67 @@ fn test_parse_metadata_request_specific_topics() {
     assert_eq!(data.topics, Some(vec!["test-topic".to_string()]));
 }
 
+/// Metadata v10 makes a topic's name nullable and adds its topic id, which Kafka 3.7 serves
+/// only from v12: a null name or a non-zero topic id is refused INVALID_REQUEST on every
+/// requested topic, a null name echoed as "" and every topic id as sent (checked against
+/// Kafka 3.7). It used to drop a nameless topic, answering zero topics without an error.
+#[test]
+fn test_metadata_v10_null_name_or_topic_id_is_invalid_request() {
+    let id = uuid::Uuid::from_bytes([0x11; 16]);
+    let entry = |name: Option<&'static str>, topic_id: uuid::Uuid| {
+        let mut t = metadata_request::MetadataRequestTopic::default();
+        t.name = name.map(topic);
+        t.topic_id = topic_id;
+        t
+    };
+    for topics in [
+        vec![entry(None, id)],
+        vec![entry(None, uuid::Uuid::nil())],
+        vec![entry(Some("foo"), id)],
+        vec![entry(Some("foo"), uuid::Uuid::nil()), entry(None, id)],
+    ] {
+        let expected: Vec<(String, uuid::Uuid)> = topics
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_ref().map_or_default(|n| n.to_string()),
+                    t.topic_id,
+                )
+            })
+            .collect();
+        let mut request = MetadataRequest::default();
+        request.topics = Some(topics);
+        let (tx, mut rx) = channel();
+        let parsed = parse_request(frame(&request, 10, 31), tx).unwrap();
+        assert!(parsed.is_none(), "answered on the network thread");
+        let Ok(KafkaResponse {
+            body: ResponseBody::Metadata(response),
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("expected a Metadata response");
+        };
+        let got: Vec<(String, uuid::Uuid)> = response
+            .topics
+            .iter()
+            .map(|t| {
+                assert_eq!(t.error_code, crate::kafka::constants::ERROR_INVALID_REQUEST);
+                assert_eq!(t.partitions.len(), 0);
+                (
+                    t.name.as_ref().map_or_default(|n| n.to_string()),
+                    t.topic_id,
+                )
+            })
+            .collect();
+        assert_eq!(got, expected);
+    }
+    // A name with the zero topic id is served.
+    let mut request = MetadataRequest::default();
+    request.topics = Some(vec![entry(Some("foo"), uuid::Uuid::nil())]);
+    let data = expect_body!(decode(&request, 10), Metadata);
+    assert_eq!(data.topics, Some(vec!["foo".to_string()]));
+}
+
 /// At v1+ an empty topics array means "no topics", not "all topics".
 #[test]
 fn test_parse_metadata_empty_array_v9_means_no_topics() {
@@ -772,7 +826,10 @@ fn test_parse_leave_group_request() {
     request.member_id = str("leaving-member");
     let data = expect_body!(decode(&request, 2), LeaveGroup);
     assert_eq!(data.group_id, "leave-group");
-    assert_eq!(data.member_id, "leaving-member");
+    assert!(matches!(
+        data.leaving,
+        crate::kafka::messages::LeavingMembers::Single(ref m) if m == "leaving-member"
+    ));
 }
 
 #[test]
@@ -1227,3 +1284,5 @@ fn test_parse_txn_offset_commit_request() {
         )]
     );
 }
+
+mod decode_limits;

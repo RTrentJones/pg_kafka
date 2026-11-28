@@ -109,7 +109,7 @@ fn sent_records(h: &Harness) -> Vec<ForwardRecord> {
         .try_iter()
         .filter_map(|m| match m {
             ForwardRequest::Record(r) => Some(r),
-            ForwardRequest::Hold(_) => None,
+            ForwardRequest::Hold(_) | ForwardRequest::Reset(_) => None,
         })
         .collect()
 }
@@ -189,6 +189,83 @@ fn outbox_row_is_only_written_for_an_existing_message() {
 }
 
 #[test]
+fn acks_from_a_dropped_schema_do_not_touch_its_successors_rows() {
+    let h = async_harness(16);
+    let delivered = RowKey::new(T, 0, 0);
+    let failed = RowKey::new(T, 0, 1);
+    seed_rows(&h.store, &[delivered, failed]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    sent_records(&h);
+
+    // DROP + CREATE EXTENSION: the new schema's first rows reuse the keys.
+    {
+        let mut state = h.store.db().state();
+        state.tracking.clear();
+        state.messages.clear();
+    }
+    h.store.forget_dropped_schema();
+    seed_rows(&h.store, &[delivered, failed]);
+
+    // The forwarder is told first, then the new rows go out: their keys are
+    // not in flight any more.
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 2);
+    let sent: Vec<ForwardRequest> = h.forwards.try_iter().collect();
+    assert!(
+        matches!(sent.first(), Some(ForwardRequest::Reset(1))),
+        "{sent:?}"
+    );
+    assert_eq!(sent.len(), 3);
+
+    // Late acks of the old forwards (epoch 0) are ignored.
+    h.acks.send(ok_ack(delivered, 9)).unwrap();
+    h.acks.send(err_ack(failed)).unwrap();
+    assert_eq!(drain(&h), 0);
+    let row = h.store.db().row(delivered).unwrap();
+    assert_eq!(row.external_offset, None);
+    assert_eq!(h.store.db().row(failed).unwrap().retry_count, 0);
+
+    // The new forwards' own acks are applied.
+    let mut ack = ok_ack(delivered, 3);
+    ack.epoch = 1;
+    h.acks.send(ack).unwrap();
+    assert_eq!(drain(&h), 1);
+    assert_eq!(
+        h.store.db().row(delivered).unwrap().external_offset,
+        Some(3)
+    );
+}
+
+#[test]
+fn a_reset_the_forward_channel_refused_goes_out_before_any_record() {
+    let h = async_harness(1);
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    // The channel is full: the reset waits, and so does every record.
+    h.store.forget_dropped_schema();
+    {
+        let mut state = h.store.db().state();
+        state.tracking.clear();
+        state.messages.clear();
+    }
+    seed_rows(&h.store, &[RowKey::new(T, 0, 0)]);
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Record(_))
+    ));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 0);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Reset(1))
+    ));
+    assert_eq!(h.store.poll_and_forward_outbox().unwrap(), 1);
+    assert!(matches!(
+        h.forwards.try_recv(),
+        Ok(ForwardRequest::Record(_))
+    ));
+}
+
+#[test]
 fn duplicate_success_ack_counts_once() {
     let h = async_harness(16);
     seed_rows(&h.store, &[RowKey::new(T, 0, 1)]);
@@ -255,7 +332,8 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
         },
     );
 
-    // No RAM buffer (e.g. after a worker restart): the DB read still finds them.
+    // The store keeps nothing for the transaction: the commit finds its records
+    // in kafka.messages.
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
     assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());
@@ -263,30 +341,124 @@ fn commit_enqueues_the_transactions_records_read_from_messages() {
     assert!(h.store.db().row(RowKey::new(T, 0, 7)).is_none());
 }
 
+/// A pending record of producer 100's transaction (epoch 0) on `topic_id`.
+fn pending_txn_message(h: &Harness, row: RowKey, key: Option<&[u8]>) {
+    h.store.db().state().messages.insert(
+        row,
+        crate::kafka::shadow::outbox::fake::FakeMessage {
+            key: key.map(<[u8]>::to_vec),
+            txn: Some((100, 0)),
+            txn_pending: true,
+            ..Default::default()
+        },
+    );
+}
+
 #[test]
-fn commit_falls_back_to_the_ram_buffer_when_the_lookup_fails() {
+fn commit_fails_whole_when_the_enqueue_fails() {
+    // The EndTxn fails (and its request rolls back) rather than committing records
+    // that would never be forwarded; the inner commit does not run.
+    let mut mock = MockKafkaStore::new();
+    mock.expect_commit_transaction().never();
+    let h = harness(
+        mock,
+        vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
+        16,
+    );
+    pending_txn_message(&h, RowKey::new(T, 0, 5), None);
+    h.store.db().state().fail_txn_enqueue = true;
+
+    assert!(h.store.commit_transaction("txn", 100, 0).is_err());
+    assert!(h.store.db().state().tracking.is_empty());
+}
+
+#[test]
+fn commit_routes_a_sampled_topic_like_a_plain_produce() {
+    // A topic below 100% forwards exactly the records make_forward_decision selects
+    // (keyed by murmur2, keyless by offset) and counts the others skipped.
     let mut mock = MockKafkaStore::new();
     mock.expect_commit_transaction()
         .times(1)
+        .returning(|_, _, _| Ok(()));
+    let mut sampled = topic_config(SyncMode::Async, WriteMode::DualWrite);
+    sampled.forward_percentage = 50;
+    let h = harness(mock, vec![sampled], 16);
+    let mut expected = Vec::new();
+    for off in 0..200i64 {
+        let key = (off % 2 == 0).then(|| format!("k{off}").into_bytes());
+        pending_txn_message(&h, RowKey::new(T, 0, off), key.as_deref());
+        if make_forward_decision(key.as_deref(), off, 50) == ForwardDecision::Forward {
+            expected.push(RowKey::new(T, 0, off));
+        }
+    }
+
+    h.store.commit_transaction("txn", 100, 0).unwrap();
+
+    let s = h.store.db().state();
+    let enqueued: Vec<RowKey> = s.tracking.keys().copied().collect();
+    assert_eq!(enqueued, expected);
+    assert!(!expected.is_empty() && expected.len() < 200);
+    assert_eq!(
+        s.metrics[&(T, 0)].messages_skipped,
+        200 - i64::try_from(expected.len()).unwrap()
+    );
+}
+
+#[test]
+fn commit_enqueues_only_the_forwarding_topics() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_commit_transaction()
+        .times(1)
+        .returning(|_, _, _| Ok(()));
+    let mut local = topic_config(SyncMode::Async, WriteMode::DualWrite);
+    local.topic_id = T + 1;
+    local.mode = ShadowMode::LocalOnly;
+    let h = harness(
+        mock,
+        vec![topic_config(SyncMode::Async, WriteMode::DualWrite), local],
+        16,
+    );
+    pending_txn_message(&h, RowKey::new(T, 0, 1), None);
+    pending_txn_message(&h, RowKey::new(T + 1, 0, 1), None);
+    pending_txn_message(&h, RowKey::new(T + 2, 0, 1), None);
+
+    h.store.commit_transaction("txn", 100, 0).unwrap();
+
+    let enqueued: Vec<RowKey> = h.store.db().state().tracking.keys().copied().collect();
+    assert_eq!(enqueued, vec![RowKey::new(T, 0, 1)]);
+}
+
+#[test]
+fn a_repeated_enqueue_leaves_one_row_per_record() {
+    // ON CONFLICT DO NOTHING: an enqueue that runs again (a retried EndTxn whose
+    // first attempt rolled back after enqueueing) adds no second row.
+    let mut mock = MockKafkaStore::new();
+    mock.expect_commit_transaction()
+        .times(2)
         .returning(|_, _, _| Ok(()));
     let h = harness(
         mock,
         vec![topic_config(SyncMode::Async, WriteMode::DualWrite)],
         16,
     );
-    h.store.db().add_message(RowKey::new(T, 0, 5), b"k", b"v");
-    h.store.db().state().fail_pending_txn_lookup = true;
-    h.store.pending_txn_messages.write().unwrap().insert(
-        (100, 0),
-        PendingTxnBuffer::from(vec![PendingForwardRecord {
-            row: RowKey::new(T, 0, 5),
-            key: None,
-        }]),
-    );
-
+    pending_txn_message(&h, RowKey::new(T, 0, 3), None);
+    h.store.commit_transaction("txn", 100, 0).unwrap();
+    h.store
+        .db()
+        .state()
+        .tracking
+        .get_mut(&RowKey::new(T, 0, 3))
+        .unwrap()
+        .retry_count = 2;
     h.store.commit_transaction("txn", 100, 0).unwrap();
 
-    assert!(h.store.db().row(RowKey::new(T, 0, 5)).is_some());
+    let s = h.store.db().state();
+    assert_eq!(s.tracking.len(), 1);
+    assert_eq!(
+        s.tracking[&RowKey::new(T, 0, 3)].retry_count,
+        2,
+        "left alone"
+    );
 }
 
 #[test]
@@ -1036,14 +1208,115 @@ fn metrics_disabled_still_finalizes_rows() {
 fn outbox_failures_back_off_and_log_sparsely() {
     let h = async_harness(16);
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
-    assert!(h.store.note_outbox_tick(false), "first failure is logged");
+    assert!(
+        h.store.note_outbox_tick(TickOutcome::Failed),
+        "first failure is logged"
+    );
     assert!(!h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL), "paused");
-    assert!(h.store.note_outbox_tick(false), "2nd");
-    assert!(!h.store.note_outbox_tick(false), "3rd is not logged");
-    assert!(h.store.note_outbox_tick(false), "4th");
+    assert!(h.store.note_outbox_tick(TickOutcome::Failed), "2nd");
+    assert!(
+        !h.store.note_outbox_tick(TickOutcome::Failed),
+        "3rd is not logged"
+    );
+    assert!(h.store.note_outbox_tick(TickOutcome::Failed), "4th");
     // Success resets.
-    assert!(!h.store.note_outbox_tick(true));
+    assert!(!h.store.note_outbox_tick(TickOutcome::Ok));
     assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+/// A tick that ran out of a lock wait (another session holds a lock it needs) pauses
+/// one poll interval however often it happens in a row: an exponential backoff kept
+/// forwarding stopped up to 30 s after the holder was gone.
+#[test]
+fn lock_timeouts_do_not_grow_the_backoff() {
+    let h = async_harness(16);
+    for n in 1..=12u32 {
+        let logged = h.store.note_outbox_tick(TickOutcome::LockTimedOut);
+        assert_eq!(
+            logged,
+            n.is_power_of_two(),
+            "lock timeout {n} logged sparsely"
+        );
+        let until = lock(&h.store.outbox_failures)
+            .paused_until
+            .expect("a lock timeout pauses the tick");
+        assert!(
+            until <= Instant::now() + OUTBOX_POLL_INTERVAL,
+            "lock timeout {n} paused the tick past one poll interval"
+        );
+    }
+    assert_eq!(lock(&h.store.outbox_failures).consecutive, 0);
+    // Real failures still back off exponentially, lock timeouts beside them or not.
+    for _ in 0..4 {
+        h.store.note_outbox_tick(TickOutcome::Failed);
+    }
+    let until = lock(&h.store.outbox_failures).paused_until.unwrap();
+    assert!(until > Instant::now() + OUTBOX_POLL_INTERVAL * 7);
+    assert!(!h.store.note_outbox_tick(TickOutcome::Ok));
+    assert!(h.store.outbox_tick_due(OUTBOX_POLL_INTERVAL));
+}
+
+/// Rows another transaction holds (an open replay) stop only their own partition, at
+/// the first held row, so its records still go out in order; the other partitions are
+/// claimed as usual. An ack of a held row is not applied: it stays queued with its row
+/// in flight (so the row is not claimed again) until a tick after the holder is gone.
+#[test]
+fn held_rows_stop_only_their_partition_and_their_acks_wait() {
+    let h = async_harness(64);
+    let a: Vec<RowKey> = (0..4).map(|o| RowKey::new(T, 0, o)).collect();
+    let b: Vec<RowKey> = (0..3).map(|o| RowKey::new(T, 1, o)).collect();
+    seed_rows(&h.store, &a);
+    seed_rows(&h.store, &b);
+    h.store.db().state().held.insert(RowKey::new(T, 0, 2));
+
+    h.store.poll_and_forward_outbox().unwrap();
+    let sent = sent_records(&h);
+    let by_partition = |p: i32| -> Vec<i64> {
+        sent.iter()
+            .filter(|r| r.row.partition_id == p)
+            .map(|r| r.row.local_offset)
+            .collect()
+    };
+    assert_eq!(
+        by_partition(0),
+        vec![0, 1],
+        "partition 0 cut at its held row 2"
+    );
+    assert_eq!(
+        by_partition(1),
+        vec![0, 1, 2],
+        "partition 1 claimed in full"
+    );
+
+    // Row 1 of partition 0 becomes held after its claim: its ack waits.
+    h.store.db().state().held.insert(RowKey::new(T, 0, 1));
+    h.acks.send(ok_ack(RowKey::new(T, 0, 0), 100)).unwrap();
+    h.acks.send(ok_ack(RowKey::new(T, 0, 1), 101)).unwrap();
+    h.acks.send(err_ack(RowKey::new(T, 1, 0))).unwrap();
+    h.store.db().state().held.insert(RowKey::new(T, 1, 0));
+    h.acks.send(skipped_ack(RowKey::new(T, 1, 1))).unwrap();
+    h.store.db().state().held.insert(RowKey::new(T, 1, 1));
+    assert_eq!(drain(&h), 1, "only the free row's ack is applied");
+    let row = |p: i32, o: i64| h.store.db().row(RowKey::new(T, p, o)).unwrap();
+    assert_eq!(row(0, 0).external_offset, Some(100));
+    assert_eq!(row(0, 1).external_offset, None);
+    assert_eq!(row(1, 0).retry_count, 0);
+    assert!(row(1, 1).attempt_open, "the not-attempted ack waits too");
+    // The held rows are still in flight: nothing is claimed twice.
+    h.store.db().state().held.clear();
+    h.store.poll_and_forward_outbox().unwrap();
+    let again = offsets(&sent_records(&h));
+    assert_eq!(
+        again,
+        vec![2, 3],
+        "only the rows the hold stopped are claimed now"
+    );
+
+    // The holder is gone: the next tick applies the kept acks.
+    assert_eq!(drain(&h), 3);
+    assert_eq!(row(0, 1).external_offset, Some(101));
+    assert_eq!(row(1, 0).retry_count, 1);
+    assert!(!row(1, 1).attempt_open);
 }
 
 fn sync_harness() -> Harness {
@@ -1130,7 +1403,7 @@ fn hold_goes_to_the_forwarder_or_is_released_at_once() {
             assert_eq!(released.load(Ordering::SeqCst), 0);
             hold.release.release();
         }
-        ForwardRequest::Record(record) => panic!("expected a hold, got {record:?}"),
+        other => panic!("expected a hold, got {other:?}"),
     }
     assert_eq!(released.load(Ordering::SeqCst), 1);
 

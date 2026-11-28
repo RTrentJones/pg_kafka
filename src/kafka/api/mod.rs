@@ -25,7 +25,7 @@
 //! Decoding (`decode_body`) and encoding run on the network thread and must not touch
 //! pgrx. [`dispatch`] runs on the DB thread.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use crossbeam_channel::Sender;
 use kafka_protocol::messages::ResponseHeader;
 use kafka_protocol::protocol::{
@@ -40,6 +40,7 @@ use crate::kafka::error::KafkaError;
 use crate::kafka::handler_context::HandlerContext;
 use crate::kafka::messages::{KafkaRequest, KafkaResponse};
 use crate::kafka::notifications::InternalNotification;
+use crate::kafka::protocol::decode_meter::{self, MeteredBuf};
 
 mod admin;
 mod configs;
@@ -141,6 +142,11 @@ pub trait ApiSchema: Sized + 'static {
 
     /// Whether `response` carries any non-zero error code (metrics).
     fn response_has_error(response: &ResponseOf<Self>) -> bool;
+
+    /// Adjust `response` to what a client of `version` understands, just before it is
+    /// encoded at that version (the one place every response of the API passes, whoever
+    /// built it: the handler, an error path or a refused batch). Default: nothing.
+    fn for_version(_response: &mut ResponseOf<Self>, _version: i16) {}
 }
 
 /// An API the DB thread serves: requests are decoded on the network thread into
@@ -286,6 +292,9 @@ pub enum Decoded {
     Answered,
     /// No response can be shaped for this request: close the connection.
     Close(String),
+    /// The decode passed its memory limit (`protocol::decode_meter`); nothing was
+    /// answered.
+    OverLimit,
 }
 
 /// Decode the body of a request for API `A` whose header has been parsed.
@@ -301,7 +310,7 @@ pub enum Decoded {
 ///   INVALID_REQUEST;
 /// - [`KafkaApi::decode`] may reject a decoded body with its own code and echo.
 fn decode_api<A: KafkaApi>(
-    buf: &mut BytesMut,
+    buf: &mut MeteredBuf<Bytes>,
     header: RequestHeader,
     response_tx: UnboundedSender<KafkaResponse>,
     wrap_request: fn(A::Request) -> RequestBody,
@@ -318,6 +327,12 @@ fn decode_api<A: KafkaApi>(
     };
 
     let parsed = decode_wire::<A>(buf, &header);
+    // A decode the meter stopped (its body then looks truncated) or that holds more than
+    // its limit is answered nothing: the caller decodes it again under a larger limit, or
+    // closes the connection.
+    if buf.stopped() || decode_meter::over_limit() {
+        return Decoded::OverLimit;
+    }
 
     if !(A::MIN_VERSION..=A::MAX_VERSION).contains(&version) {
         return reject_unsupported_version::<A>(parsed.as_ref(), version, reply);
@@ -328,6 +343,8 @@ fn decode_api<A: KafkaApi>(
             body: wrap_request(request),
             header,
             response_tx,
+            // Charged by the network thread once it knows what the decode holds.
+            decode_charge: crate::kafka::protocol::DecodedCharge::default(),
         }),
         Some(Err(Rejection::Reply { error_code, echo })) => {
             reply(
@@ -355,7 +372,7 @@ fn decode_api<A: KafkaApi>(
 /// body, so the decode runs under `catch_unwind`: a malformed body after a valid header is
 /// answered with an error response instead of tearing the connection down.
 fn decode_wire<A: KafkaApi>(
-    buf: &mut BytesMut,
+    buf: &mut MeteredBuf<Bytes>,
     header: &RequestHeader,
 ) -> Option<Result<A::Request, Rejection<A::Echo>>> {
     let version = header.api_version;
@@ -367,6 +384,8 @@ fn decode_wire<A: KafkaApi>(
         A::Wire::decode(buf, version)
     })) {
         Ok(Ok(wire)) => Some(A::decode(wire, header)),
+        // A decode the meter stopped looks truncated; the caller reports it.
+        Ok(Err(_)) | Err(_) if buf.stopped() => None,
         Ok(Err(e)) => {
             warn!("Failed to decode {} v{version} body: {e}", A::NAME);
             None
@@ -422,11 +441,12 @@ fn reject_unsupported_version<A: KafkaApi>(
 
 /// Encode `response` (header + body) at `version`.
 fn encode_frame<A: ApiSchema>(
-    response: &ResponseOf<A>,
+    response: &mut ResponseOf<A>,
     correlation_id: i32,
     version: i16,
     buf: &mut BytesMut,
 ) -> crate::kafka::error::Result<()> {
+    A::for_version(response, version);
     let header = ResponseHeader::default().with_correlation_id(correlation_id);
     header.encode(
         buf,
@@ -517,8 +537,10 @@ macro_rules! kafka_apis {
                 #[doc = concat!("A ", stringify!($net_variant), " response.")]
                 $net_variant(ResponseOf<$net_api>),
             )*
-            /// The generic error frame for an API key pg_kafka does not serve (there is no
-            /// response schema to answer in): correlation id, error code, null message.
+            /// A schema-less frame: correlation id, error code, null message. No request is
+            /// answered with it (a request for an API key pg_kafka does not serve closes the
+            /// connection, as in Kafka 3.7); it is the response of no API, which the tests of
+            /// the request plumbing use.
             UnknownApi {
                 /// Kafka error code.
                 error_code: i16,
@@ -598,9 +620,9 @@ macro_rules! kafka_apis {
                     Self::CloseConnection => true,
                 }
             }
-            /// Encode header and body.
+            /// Encode header and body, after [`ApiSchema::for_version`].
             pub(crate) fn encode_frame(
-                &self,
+                &mut self,
                 correlation_id: i32,
                 version: i16,
                 buf: &mut BytesMut,
@@ -641,7 +663,7 @@ macro_rules! kafka_apis {
         /// Decode the body of a request whose header has been parsed; `None` for an API
         /// pg_kafka does not serve.
         pub(crate) fn decode_body(
-            buf: &mut BytesMut,
+            buf: &mut MeteredBuf<Bytes>,
             header: RequestHeader,
             response_tx: UnboundedSender<KafkaResponse>,
         ) -> Result<Decoded, (RequestHeader, UnboundedSender<KafkaResponse>)> {
@@ -669,9 +691,10 @@ macro_rules! kafka_apis {
             Err((header, response_tx))
         }
 
-        /// Run `request` on the DB thread.
+        /// Run `request` on the DB thread. What the decoded request holds of the
+        /// decoded-request budget is given back once its handler returns.
         pub fn dispatch(request: KafkaRequest, env: &ApiEnv<'_>) -> RequestOutcome {
-            let KafkaRequest { header, body, response_tx } = request;
+            let KafkaRequest { header, body, response_tx, decode_charge: _held } = request;
             match body {
                 $(RequestBody::$variant(r) => <$api as KafkaApi>::handle(
                     r,
@@ -683,9 +706,8 @@ macro_rules! kafka_apis {
     };
 }
 
-/// The generic error frame for an unknown API key: response header v0, error code, null
-/// error message. Strict clients cannot parse it, but there is no schema to answer an
-/// unknown API in; a client that sends one is not negotiating through ApiVersions.
+/// The schema-less frame of [`ResponseBody::UnknownApi`]: response header v0, error code,
+/// null error message.
 fn encode_unknown_api_frame(
     correlation_id: i32,
     error_code: i16,

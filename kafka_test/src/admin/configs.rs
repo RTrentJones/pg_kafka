@@ -103,7 +103,11 @@ async fn alter_topic_config(
 
 /// Send a DeleteRecords v1 request for one partition and return
 /// (error_code, low_watermark).
-async fn delete_records(topic: &str, partition: i32, offset: i64) -> Result<(i16, i64), String> {
+pub(crate) async fn delete_records(
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(i16, i64), String> {
     let request = DeleteRecordsRequest::default()
         .with_timeout_ms(10_000)
         .with_topics(vec![DeleteRecordsTopic::default()
@@ -435,6 +439,116 @@ pub async fn test_per_topic_retention_override_enforced_by_sweep() -> TestResult
         "partition the sweep did not touch must keep log_start = 0"
     );
     println!("✅ Log start advanced on the swept partition; sibling unchanged\n");
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Kafka 3.7 answers an IncrementalAlterConfigs SET without a value INVALID_REQUEST (a
+/// malformed request), whatever the key, where pg_kafka answered INVALID_CONFIG; and its
+/// DescribeConfigs reports cleanup.policy as a LIST config (type 7), not STRING (2).
+pub async fn test_config_api_answers_match_kafka() -> TestResult {
+    use kafka_protocol::messages::describe_configs_request::{
+        DescribeConfigsRequest, DescribeConfigsResource,
+    };
+    println!("=== Test: IncrementalAlterConfigs null SET, DescribeConfigs config types ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::topic_with_partitions(&ctx, "configs-parity", 1).await?;
+    for (key, op) in [("retention.ms", OP_SET), ("max.message.bytes", OP_SET)] {
+        let (code, _) = alter_topic_config(&topic, key, op, None).await?;
+        assert_eq!(code, error_codes::INVALID_REQUEST, "SET {key} = null");
+    }
+    assert_eq!(db_topic_retention(ctx.db(), &topic).await?, None);
+    let request =
+        DescribeConfigsRequest::default().with_resources(vec![DescribeConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_TOPIC)
+            .with_resource_name(StrBytes::from_string(topic.clone()))
+            .with_configuration_keys(None)]);
+    let response = call(4, 7003, &request).await?;
+    let types: Vec<(String, i8)> = response.results[0]
+        .configs
+        .iter()
+        .map(|c| (c.name.to_string(), c.config_type))
+        .collect();
+    assert!(
+        types.contains(&("cleanup.policy".to_string(), 7)),
+        "{types:?}"
+    );
+    assert!(
+        types.contains(&("retention.ms".to_string(), 5)),
+        "{types:?}"
+    );
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Kafka 3.7 (`ConfigAdminManager.preprocess`) answers a resource that names one config key
+/// twice INVALID_REQUEST "Error due to duplicate config keys" and applies none of it, and
+/// it checks that, and a SET without a value, before it looks the topic up: a malformed
+/// resource for an unknown topic is INVALID_REQUEST, not UNKNOWN_TOPIC_OR_PARTITION.
+pub async fn test_incremental_alter_configs_duplicate_keys() -> TestResult {
+    const OP_DELETE: i8 = 1;
+    println!("=== Test: IncrementalAlterConfigs duplicate config keys ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::topic_with_partitions(&ctx, "configs-dup", 1).await?;
+    let missing = ctx.unique_topic("configs-dup-missing").await;
+    let config = |op: i8, value: Option<&str>| {
+        AlterableConfig::default()
+            .with_name(StrBytes::from_static_str("retention.ms"))
+            .with_config_operation(op)
+            .with_value(value.map(|v| StrBytes::from_string(v.to_string())))
+    };
+    let resource = |name: &str, configs: Vec<AlterableConfig>| {
+        AlterConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_TOPIC)
+            .with_resource_name(StrBytes::from_string(name.to_string()))
+            .with_configs(configs)
+    };
+
+    println!("Step 1: SET then DELETE retention.ms in one resource of an existing topic...");
+    let (code, message) = alter_topic_config(&topic, "retention.ms", OP_SET, Some("5000")).await?;
+    assert_eq!(code, error_codes::NONE, "{message:?}");
+    let request = IncrementalAlterConfigsRequest::default().with_resources(vec![resource(
+        &topic,
+        vec![config(OP_SET, Some("1000")), config(OP_DELETE, None)],
+    )]);
+    let response = call(0, 7004, &request).await?;
+    let r = &response.responses[0];
+    assert_eq!(r.error_code, error_codes::INVALID_REQUEST, "{r:?}");
+    assert_eq!(
+        r.error_message.as_deref(),
+        Some("Error due to duplicate config keys")
+    );
+    assert_eq!(
+        db_topic_retention(ctx.db(), &topic).await?,
+        Some(5000),
+        "nothing of the refused resource is applied"
+    );
+    println!("✅ Duplicate keys refused, retention.ms unchanged\n");
+
+    println!("Step 2: duplicate keys and a null SET for an unknown topic...");
+    for (configs, expected) in [
+        (
+            vec![config(OP_SET, Some("1")), config(OP_SET, Some("2"))],
+            "Error due to duplicate config keys",
+        ),
+        (
+            vec![config(OP_SET, None)],
+            "Null value not supported for : retention.ms",
+        ),
+    ] {
+        let request = IncrementalAlterConfigsRequest::default()
+            .with_resources(vec![resource(&missing, configs)]);
+        let response = call(0, 7005, &request).await?;
+        let r = &response.responses[0];
+        assert_eq!(r.error_code, error_codes::INVALID_REQUEST, "{r:?}");
+        assert_eq!(r.error_message.as_deref(), Some(expected));
+    }
+    let (code, _) = alter_topic_config(&missing, "retention.ms", OP_SET, Some("1")).await?;
+    assert_eq!(code, error_codes::UNKNOWN_TOPIC_OR_PARTITION);
+    println!("✅ Malformed resources refused before the topic lookup\n");
 
     ctx.cleanup().await?;
     println!("✅ Test PASSED\n");

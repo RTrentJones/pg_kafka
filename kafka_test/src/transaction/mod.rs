@@ -12,8 +12,12 @@ mod atomicity;
 mod basic;
 mod coordinator_codes;
 mod eos;
+mod hot_updates;
 mod invisible_offsets;
 mod isolation;
+mod kafka_parity;
+mod lso_reads;
+pub(crate) mod pending_reads;
 mod producer_epochs;
 mod timeouts;
 mod validation;
@@ -46,15 +50,27 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         invisible_offsets::test_consumers_pass_cleaned_up_aborted_rows: sequential,
         invisible_offsets::test_consumers_pass_delete_records_gap,
         invisible_offsets::test_read_committed_consumer_stops_at_open_transaction,
+        invisible_offsets::test_invisible_offsets_before_a_record_that_does_not_fit_are_passed,
         validation::test_transactional_requests_are_validated,
         validation::test_transactional_produce_is_validated_per_partition,
         validation::test_transactional_batches_of_two_producers_are_refused,
         validation::test_non_transactional_batch_inside_an_open_transaction_is_refused,
+        validation::test_routed_records_do_not_join_a_transactional_batch,
         coordinator_codes::test_fenced_epoch_code_follows_the_request_version,
         coordinator_codes::test_unknown_transactional_id_is_invalid_producer_id_mapping,
         coordinator_codes::test_txn_offset_commit_needs_the_group_added,
         timeouts::test_second_transaction_gets_its_own_timeout,
         timeouts::test_timeout_abort_fences_an_exhausted_epoch,
         producer_epochs::test_init_producer_id_checks_the_presented_epoch,
+        producer_epochs::test_init_producer_id_during_an_ongoing_transaction,
+        kafka_parity::test_end_txn_of_an_empty_transaction_is_invalid_txn_state,
+        kafka_parity::test_txn_offset_commit_metadata_longer_than_4096_is_refused,
+        kafka_parity::test_read_uncommitted_fetch_reports_the_last_stable_offset,
+        kafka_parity::test_delete_groups_drops_pending_txn_offsets,
+        hot_updates::test_continuing_a_transaction_changes_no_indexed_column,
+        // Sequential: it ends the worker twice to flush its statistics.
+        pending_reads::test_ending_a_transaction_reads_only_its_own_pending_rows: sequential,
+        // Sequential: it ends the worker twice to flush its statistics.
+        lso_reads::test_read_committed_fetch_reads_only_to_the_last_stable_offset: sequential,
     ]
 }

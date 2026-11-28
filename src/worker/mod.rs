@@ -75,13 +75,15 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
     // SPI needs the database where CREATE EXTENSION was run.
     BackgroundWorker::connect_worker_to_spi(Some(&config.database), None);
     if !wait_for_schema(&config.database) {
-        log!("Shutdown signal received while waiting for schema");
+        pg_log!("Shutdown signal received while waiting for schema");
         exit_for_restart();
     }
     // Drop from the bootstrap superuser to pg_kafka.run_as_role.
     crate::kafka::storage::postgres::apply_worker_role();
     // Bounded lock waits for every worker transaction.
     apply_worker_lock_timeout();
+    // A fresh snapshot per statement in every worker transaction.
+    txn::apply_worker_isolation();
 
     // Whether the schema is current (an older extension version is not served until
     // ALTER EXTENSION pg_kafka UPDATE; the main loop waits for it).
@@ -94,7 +96,7 @@ pub extern "C-unwind" fn pg_kafka_listener_main(_arg: pg_sys::Datum) {
         run_partition_maintenance();
     }
 
-    log!(
+    pg_log!(
         "pg_kafka background worker started (port: {}, host: {}, database: {})",
         config.port,
         config.host,
@@ -155,7 +157,7 @@ fn new_shadow_store(config: &Config) -> ShadowStore<PostgresStore> {
     let shadow_store = ShadowStore::new(PostgresStore::new());
     shadow_store.set_license_key(&config.shadow_license_key);
     if config.shadow_mode_enabled {
-        log!(
+        pg_log!(
             "Shadow mode enabled, configured to forward to: {}",
             config.shadow_bootstrap_servers
         );
@@ -251,7 +253,7 @@ impl MainLoop<'_> {
     /// from starting.
     fn exit_if_stopping(&self) {
         if sigterm_received() {
-            log!("pg_kafka background worker shutting down");
+            pg_log!("pg_kafka background worker shutting down");
             shutdown_and_exit(
                 &self.network.shutdown_tx,
                 &self.network.handle,
@@ -271,6 +273,10 @@ impl MainLoop<'_> {
             return;
         }
         reapply_worker_role();
+        // The old outbox is gone and a re-created one reuses its row keys.
+        self.env.shadow_store.forget_dropped_schema();
+        // The re-created broker tables are empty: the next flush writes every API.
+        self.metrics_flusher.forget_published();
         self.schema = SchemaState::default();
         refresh_schema_state(&mut self.schema);
         self.resume_on_current_schema();
@@ -354,8 +360,8 @@ impl MainLoop<'_> {
     /// DR-12: the liveness lane is drained before the next main-lane request.
     /// Heartbeats are served from the in-memory coordinator in microseconds, and those
     /// that arrive while a main-lane batch runs are answered between its requests, so
-    /// a heartbeat waits behind at most one in-flight request (plus RECV_TIMEOUT when
-    /// idle), never behind the main queue. One liveness batch per iteration, not "until
+    /// a heartbeat waits behind at most one in-flight request, never behind the main
+    /// queue; one arriving while the worker waits wakes it. One liveness batch per iteration, not "until
     /// empty", so a flood of heartbeats cannot starve the main lane.
     fn serve_requests(&self) {
         let inbox = &self.network.inbox;
@@ -372,6 +378,15 @@ impl MainLoop<'_> {
         let wait = requested.map_or(RECV_TIMEOUT, |w| w.min(RECV_TIMEOUT));
         let received = crossbeam_channel::select! {
             recv(inbox.requests) -> r => r.map_err(|_| RecvTimeoutError::Disconnected),
+            // A Heartbeat arriving during the wait is served at once, not after the
+            // wait and the next iteration's liveness check (up to RECV_TIMEOUT late on
+            // an idle broker).
+            recv(inbox.liveness) -> h => {
+                if let Ok(first) = h {
+                    execute_batch(first, &inbox.liveness, None, self.env);
+                }
+                Err(RecvTimeoutError::Timeout)
+            },
             recv(inbox.credentials) -> c => {
                 if let Ok(first) = c {
                     serve_credential_requests(first, &inbox.credentials);
@@ -407,7 +422,7 @@ impl MainLoop<'_> {
             self.txn_timeouts.ran();
         }
         if self.retention_sweep.is_due() {
-            run_retention_sweep();
+            run_retention_sweep(self.env.notify_tx);
             self.retention_sweep.ran();
         }
         flush_broker_metrics(&mut self.metrics_flusher, &self.network.inbox);

@@ -2,18 +2,19 @@
 //! re-deciding the worker's role when it changes, and detecting a schema older than the
 //! library (not served until `ALTER EXTENSION pg_kafka UPDATE`).
 
-use pgrx::bgworkers::BackgroundWorker;
 use pgrx::prelude::*;
-use pgrx::{spi, Spi};
+use pgrx::Spi;
 use std::time::{Duration, Instant};
 
 use super::batch::reject_request;
 use super::lifecycle::{postmaster_alive, sigterm_received};
 use super::network::Inbox;
-use super::txn::{schema_found_again, schema_lost, worker_transaction};
+use super::txn::{
+    discard_idle_cancel, guarded_transaction, schema_found_again, schema_lost, worker_transaction,
+};
 use super::RECV_TIMEOUT;
 use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
-use crate::pg_warning;
+use crate::{pg_log, pg_warning};
 
 /// How often the schema waits re-check for the kafka schema.
 const SCHEMA_CHECK_INTERVAL: Duration = Duration::from_millis(500);
@@ -43,9 +44,10 @@ const REQUIRED_TABLES: [&str; 11] = [
 /// 0.0.0 schema has none of them: every idempotent Produce reads kafka.producer_batches,
 /// transactions use kafka.txn_partitions and kafka.txn_groups, SASL logins read kafka.sasl_credentials and
 /// kafka.sasl_server_secret, the shadow outbox claims through
-/// kafka.shadow_tracking.attempt_open, and partition maintenance and the metrics flush
-/// need the time partitions and the broker metrics tables.
-const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 9] = [
+/// kafka.shadow_tracking.attempt_open, every Produce writes kafka.messages.record_bytes,
+/// and partition maintenance and the metrics flush need the time partitions and the broker
+/// metrics tables.
+const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 10] = [
     (
         "kafka.producer_batches",
         "to_regclass('kafka.producer_batches') IS NOT NULL",
@@ -71,6 +73,12 @@ const CURRENT_SCHEMA_OBJECTS: [(&str, &str); 9] = [
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
                  WHERE attrelid = to_regclass('kafka.shadow_tracking')
                    AND attname = 'attempt_open' AND NOT attisdropped)",
+    ),
+    (
+        "kafka.messages.record_bytes",
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                 WHERE attrelid = to_regclass('kafka.messages')
+                   AND attname = 'record_bytes' AND NOT attisdropped)",
     ),
     (
         "time partitions of kafka.messages",
@@ -151,30 +159,60 @@ pub(super) fn refresh_schema_state(state: &mut SchemaState) -> bool {
     }
     if now.is_current() {
         if !state.version.is_empty() {
-            log!(
+            pg_log!(
                 "pg_kafka schema is now version {}: serving Kafka clients",
                 now.version
             );
         }
     } else {
         pg_warning!(
-            "pg_kafka: running against an older pg_kafka schema (version {}, library {}): \
-             answering Kafka requests with KAFKA_STORAGE_ERROR and running no maintenance \
-             until ALTER EXTENSION pg_kafka UPDATE (missing: {})",
-            now.version,
-            env!("CARGO_PKG_VERSION"),
-            now.missing.join(", ")
+            "{}",
+            unserved_schema_warning(&now, env!("CARGO_PKG_VERSION"))
         );
     }
     *state = now;
     true
 }
 
+/// The WARNING for a schema the worker does not serve (`state` is not current) under a
+/// library of version `library`. ALTER EXTENSION pg_kafka UPDATE helps only from an
+/// older extension version: at the library's own version (a 0.1.0 schema created by an
+/// earlier build, before one of the objects existed) it does nothing, so the warning
+/// names what does.
+fn unserved_schema_warning(state: &SchemaState, library: &str) -> String {
+    let missing = state.missing.join(", ");
+    if state.version == library {
+        format!(
+            "pg_kafka: the pg_kafka schema (version {library}, the library's own) lacks \
+             objects the library uses: answering Kafka requests with KAFKA_STORAGE_ERROR \
+             and running no maintenance until they exist. ALTER EXTENSION pg_kafka UPDATE \
+             changes nothing at the same version: re-create the extension (DROP EXTENSION \
+             pg_kafka CASCADE; CREATE EXTENSION pg_kafka, which deletes its data) or create \
+             the missing objects as sql/bootstrap.sql defines them (missing: {missing})"
+        )
+    } else {
+        format!(
+            "pg_kafka: running against an older pg_kafka schema (version {}, library \
+             {library}): answering Kafka requests with KAFKA_STORAGE_ERROR and running no \
+             maintenance until ALTER EXTENSION pg_kafka UPDATE (missing: {missing})",
+            state.version
+        )
+    }
+}
+
 /// Go back to the bootstrap superuser (`SET ROLE NONE`), in a transaction of its own.
-fn reset_worker_role() -> Result<(), spi::Error> {
-    BackgroundWorker::transaction(|| {
-        Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")
-    })
+fn reset_worker_role() -> Result<(), String> {
+    match guarded_transaction(|| Spi::run("SELECT pg_catalog.set_config('role', 'none', false)")) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// [`verify_schema`] in a transaction of its own; a Postgres ERROR in it (a cancel) counts as
+/// a failed check.
+fn verify_schema_now(database: &str) -> Result<(), String> {
+    guarded_transaction(|| verify_schema(database)).unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// Re-decide the worker's role after the schema changed under it (DROP + CREATE
@@ -239,10 +277,10 @@ pub(super) fn wait_for_schema(database: &str) -> bool {
     let mut last_logged: Option<Duration> = None;
     loop {
         // SPI calls require a transaction context
-        match BackgroundWorker::transaction(|| verify_schema(database)) {
+        match verify_schema_now(database) {
             Ok(()) => {
                 if last_logged.is_some() {
-                    log!(
+                    pg_log!(
                         "pg_kafka schema found after waiting {} ms",
                         waited.as_millis()
                     );
@@ -251,21 +289,55 @@ pub(super) fn wait_for_schema(database: &str) -> bool {
             }
             Err(e) => {
                 if schema_wait_should_log(waited, last_logged) {
-                    log!(
+                    pg_log!(
                         "Waiting for pg_kafka schema (run 'CREATE EXTENSION pg_kafka' in database '{database}'): {e}"
                     );
                     last_logged = Some(waited);
                 }
             }
         }
-        // wait_latch returns false once SIGTERM has been received (it consumes the
-        // flag) or the postmaster has died. Our own SIGTERM handler replaces pgrx's
-        // flag, so check ours too.
-        if !BackgroundWorker::wait_latch(Some(SCHEMA_CHECK_INTERVAL)) || sigterm_received() {
+        if !wait_on_latch(SCHEMA_CHECK_INTERVAL) {
             return false;
         }
         waited = waited.saturating_add(SCHEMA_CHECK_INTERVAL);
     }
+}
+
+/// Sleep on the process latch for up to `timeout` (SIGTERM and SIGHUP set it). Returns false
+/// once SIGTERM has been received or the postmaster has died.
+///
+/// pgrx's `BackgroundWorker::wait_latch` runs CHECK_FOR_INTERRUPTS after the wait, outside any
+/// error boundary: a cancel (`pg_cancel_backend()`) arriving during the wait would raise its
+/// ERROR there and exit the worker. Here the wait has no statement to cancel, so a cancel is
+/// dropped ([`discard_idle_cancel`]); other interrupts are served at the next transaction's
+/// checks. O(1).
+fn wait_on_latch(timeout: Duration) -> bool {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "the WL_* flags are small bit constants"
+    )]
+    let events = (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32;
+    let timeout_ms =
+        std::ffi::c_long::try_from(timeout.as_millis()).unwrap_or(std::ffi::c_long::MAX);
+    // SAFETY: on the main thread, with MyLatch set (signal handlers are attached before the
+    // worker waits); WaitLatch and ResetLatch raise no error for these arguments.
+    let rc = unsafe {
+        let rc = pg_sys::WaitLatch(
+            pg_sys::MyLatch,
+            events,
+            timeout_ms,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+        rc
+    };
+    discard_idle_cancel();
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "WL_POSTMASTER_DEATH is a small bit constant"
+    )]
+    let postmaster_died = rc & pg_sys::WL_POSTMASTER_DEATH as i32 != 0;
+    !postmaster_died && !sigterm_received()
 }
 
 /// Keep the listener up while the worker cannot serve: answer every request with a
@@ -307,7 +379,7 @@ fn refuse_requests_until(inbox: &Inbox, refusal: &str, mut ready: impl FnMut() -
 /// the schema exists again. Returns true once it exists, false on SIGTERM or
 /// postmaster death (the caller's loop handles those).
 pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bool {
-    log!(
+    pg_log!(
         "pg_kafka extension is gone from database '{database}' (DROP EXTENSION?); answering requests \
          with KAFKA_STORAGE_ERROR until CREATE EXTENSION pg_kafka"
     );
@@ -317,11 +389,11 @@ pub(super) fn wait_for_schema_while_serving(database: &str, inbox: &Inbox) -> bo
     let _ = reset_worker_role();
     let started = Instant::now();
     refuse_requests_until(inbox, "pg_kafka schema is missing", || {
-        if BackgroundWorker::transaction(|| verify_schema(database)).is_err() {
+        if verify_schema_now(database).is_err() {
             return false;
         }
         schema_found_again();
-        log!(
+        pg_log!(
             "pg_kafka schema found again after {} ms; resuming",
             started.elapsed().as_millis()
         );
@@ -367,6 +439,7 @@ mod tests {
             "kafka.sasl_credentials",
             "kafka.sasl_server_secret",
             "kafka.shadow_tracking.attempt_open",
+            "kafka.messages.record_bytes",
         ] {
             assert!(
                 old.missing.contains(&name),
@@ -417,5 +490,49 @@ mod tests {
             Duration::from_secs(150),
             Some(Duration::from_secs(120))
         ));
+    }
+    /// An older extension version is told to update; the library's own version, where
+    /// ALTER EXTENSION UPDATE is a no-op, is told to re-create the extension or add the
+    /// objects instead.
+    #[test]
+    fn test_unserved_schema_warning_fits_the_version() {
+        let mut checks = [true; CURRENT_SCHEMA_OBJECTS.len()];
+        let record_bytes = CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .position(|(name, _)| *name == "kafka.messages.record_bytes")
+            .expect("record_bytes is checked");
+        checks[record_bytes] = false;
+
+        let same =
+            unserved_schema_warning(&SchemaState::from_checks("0.1.0".into(), &checks), "0.1.0");
+        assert!(same.contains("version 0.1.0, the library's own"), "{same}");
+        assert!(
+            same.contains("changes nothing at the same version"),
+            "{same}"
+        );
+        assert!(same.contains("CREATE EXTENSION pg_kafka"), "{same}");
+        assert!(
+            !same.contains("until ALTER EXTENSION pg_kafka UPDATE"),
+            "{same}"
+        );
+        assert!(
+            same.ends_with("(missing: kafka.messages.record_bytes)"),
+            "{same}"
+        );
+
+        let old = unserved_schema_warning(
+            &SchemaState::from_checks("0.0.0".into(), &[false; CURRENT_SCHEMA_OBJECTS.len()]),
+            "0.1.0",
+        );
+        assert!(
+            old.starts_with(
+                "pg_kafka: running against an older pg_kafka schema (version 0.0.0, library 0.1.0)"
+            ),
+            "{old}"
+        );
+        assert!(
+            old.contains("until ALTER EXTENSION pg_kafka UPDATE (missing: kafka.producer_batches,"),
+            "{old}"
+        );
     }
 }

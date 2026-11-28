@@ -43,8 +43,8 @@ const CONFIG_SOURCE_DYNAMIC_TOPIC: i8 = 1;
 const CONFIG_SOURCE_DEFAULT: i8 = 5;
 
 /// Kafka `ConfigType` ordinals (subset used here).
-const CONFIG_TYPE_STRING: i8 = 2;
 const CONFIG_TYPE_LONG: i8 = 5;
+const CONFIG_TYPE_LIST: i8 = 7;
 
 /// `AlterConfigOpType` wire values.
 const OP_SET: i8 = 0;
@@ -66,11 +66,9 @@ struct TopicConfigEntry {
 /// -1 = infinite, matching Kafka's convention). `cleanup.policy` is always
 /// "delete" — pg_kafka has no compaction.
 fn effective_topic_configs(
-    ctx: &HandlerContext,
-    topic_id: i32,
+    override_ms: Option<i64>,
     global_retention_hours: i32,
-) -> Result<Vec<TopicConfigEntry>> {
-    let override_ms = ctx.store.get_topic_retention_ms(topic_id)?;
+) -> Vec<TopicConfigEntry> {
     let (retention_value, retention_source) = match override_ms {
         Some(ms) if ms >= 0 => (ms.to_string(), CONFIG_SOURCE_DYNAMIC_TOPIC),
         Some(_) => ("-1".to_string(), CONFIG_SOURCE_DYNAMIC_TOPIC),
@@ -84,7 +82,7 @@ fn effective_topic_configs(
         }
     };
 
-    Ok(vec![
+    vec![
         TopicConfigEntry {
             name: "retention.ms",
             value: retention_value,
@@ -95,9 +93,10 @@ fn effective_topic_configs(
             name: "cleanup.policy",
             value: "delete".to_string(),
             source: CONFIG_SOURCE_DEFAULT,
-            config_type: CONFIG_TYPE_STRING,
+            // A list-valued config (Kafka 3.7 reports LIST).
+            config_type: CONFIG_TYPE_LIST,
         },
-    ])
+    ]
 }
 
 /// Handle DescribeConfigs (API 32).
@@ -121,8 +120,18 @@ pub fn handle_describe_configs(
             .filter(|(resource_type, _, _)| *resource_type == RESOURCE_TYPE_TOPIC)
             .map(|(_, name, _)| name.as_str()),
     );
-    let mut configs_of: HashMap<i32, std::result::Result<Vec<TopicConfigEntry>, (i16, String)>> =
-        HashMap::new();
+    // Every named topic's retention override in one statement, so the cost is one lookup
+    // however many topics the request names (each named topic costs O(1) after it).
+    let retention = match &topics {
+        Ok(found) if !found.is_empty() => {
+            let ids: Vec<i32> = found.values().map(|&(id, _)| id).collect();
+            ctx.store.get_topics_retention_ms(&ids).map_err(|e| {
+                warn_if_server_error("describe configs for", "the requested topics", &e);
+                (e.to_kafka_error_code(), e.to_string())
+            })
+        }
+        _ => Ok(HashMap::new()),
+    };
 
     for (resource_type, resource_name, requested_keys) in resources {
         let mut result = DescribeConfigsResult::default()
@@ -139,22 +148,17 @@ pub fn handle_describe_configs(
         }
 
         // A storage failure is reported on this resource only (error_code + message);
-        // a handler `Err` would reach the client as an empty, error-free response.
+        // a handler `Err` would reach the client as an empty, error-free response. A topic
+        // deleted between the two lookups is unknown.
         let lookup = match &topics {
-            Ok(found) => match found.get(&resource_name) {
-                Some(&(topic_id, _)) => configs_of
-                    .entry(topic_id)
-                    .or_insert_with(|| {
-                        effective_topic_configs(ctx, topic_id, global_retention_hours).map_err(
-                            |e| {
-                                warn_if_server_error("describe configs for", &resource_name, &e);
-                                (e.to_kafka_error_code(), e.to_string())
-                            },
-                        )
-                    })
-                    .clone()
-                    .map(Some),
-                None => Ok(None),
+            Ok(found) => match (found.get(&resource_name), &retention) {
+                (Some((topic_id, _)), Ok(retention)) => {
+                    Ok(retention.get(topic_id).map(|&override_ms| {
+                        effective_topic_configs(override_ms, global_retention_hours)
+                    }))
+                }
+                (Some(_), Err(e)) => Err(e.clone()),
+                (None, _) => Ok(None),
             },
             Err(code) => Err((*code, format!("Failed to look up topic '{resource_name}'"))),
         };
@@ -290,6 +294,7 @@ fn alter_topic_configs(
         name: resource_name,
         topic,
     } = resource;
+    malformed_alterations(configs).map_or(Ok(()), |msg| Err((ERROR_INVALID_REQUEST, msg)))?;
     if resource_type != RESOURCE_TYPE_TOPIC {
         return Err((
             ERROR_INVALID_REQUEST,
@@ -321,6 +326,27 @@ fn alter_topic_configs(
     Ok(())
 }
 
+/// Why a resource's alterations are a malformed request, if they are. Kafka 3.7
+/// (`ConfigAdminManager.preprocess`) refuses, before it looks at the resource type or the
+/// topic and before it validates any config, a resource that names one key twice and then
+/// a SET, APPEND or SUBTRACT without a value, whatever the key, each INVALID_REQUEST.
+fn malformed_alterations(configs: &[(String, i8, Option<String>)]) -> Option<String> {
+    let mut names = HashSet::with_capacity(configs.len());
+    if !configs
+        .iter()
+        .all(|(name, _, _)| names.insert(name.as_str()))
+    {
+        return Some("Error due to duplicate config keys".to_string());
+    }
+    let null_updates: Vec<&str> = configs
+        .iter()
+        .filter(|(_, op, value)| *op != OP_DELETE && value.is_none())
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+    (!null_updates.is_empty())
+        .then(|| format!("Null value not supported for : {}", null_updates.join(", ")))
+}
+
 /// An IncrementalAlterConfigs resource: its type, its name and, for a topic, the topic's
 /// id (`None` for a topic that does not exist) or the error code of a failed lookup.
 #[derive(Clone, Copy)]
@@ -338,8 +364,8 @@ enum RetentionChange {
 }
 
 /// Validate a resource's alterations before any is applied (all-or-nothing per resource):
-/// the `retention.ms` change (`None` for no change), or why they are refused. Every supported alteration targets the same column, so applying them in
-/// order is the same as applying the last one, and the resource is applied with one write.
+/// the `retention.ms` change (`None` for no change), or why they are refused. A resource
+/// names each key at most once ([`malformed_alterations`]), so it has at most one change.
 fn plan_retention_change(
     configs: &[(String, i8, Option<String>)],
 ) -> std::result::Result<Option<RetentionChange>, String> {

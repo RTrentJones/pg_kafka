@@ -88,3 +88,127 @@ pub async fn test_consumer_receives_headers() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// A header key holding U+0000 is any other key to Kafka 3.7. JSONB cannot hold the
+/// `\u0000` escape, so storing such a key as JSON text failed the whole Produce with
+/// UNKNOWN_SERVER_ERROR, which a Java producer does not retry.
+///
+/// Asserts: a record whose header keys are "a\0b" and "\0" (values with NUL bytes)
+/// next to a plain "k" header is produced with error 0, and a fetch returns the record
+/// with those three headers, keys and values byte for byte; the stored `record_bytes`
+/// counts the keys at their own lengths.
+pub async fn test_header_key_with_nul_roundtrips() -> TestResult {
+    use crate::setup::TestContext;
+    use crate::wire::records::{encode, plain_record};
+    use crate::wire::Wire;
+    use bytes::Bytes;
+    use kafka_protocol::protocol::StrBytes;
+    use kafka_protocol::records::{Compression, RecordBatchDecoder};
+    println!("=== Test: a header key holding U+0000 roundtrips ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "headers-nul")
+        .build()
+        .await?
+        .name;
+    let headers: [(&str, &[u8]); 3] = [("a\0b", b"\0v\0"), ("k", b"plain"), ("\0", b"")];
+    let mut record = plain_record(0, None, b"value");
+    for (k, v) in headers {
+        record.headers.insert(
+            StrBytes::from_string(k.to_string()),
+            Some(Bytes::copy_from_slice(v)),
+        );
+    }
+    let mut wire = Wire::connect().await?;
+    let produced = wire
+        .produce(&topic, 0, encode(&[record], Compression::None), None)
+        .await?;
+    assert_eq!(produced, (0, 0), "the record is stored at offset 0");
+    println!("Step 1: produced a record with header keys \"a\\0b\", \"k\" and \"\\0\"");
+
+    let p = wire.fetch(&topic, 0, 0, 0).await?;
+    assert_eq!(p.error_code, 0);
+    let mut records = p.records.unwrap_or_default();
+    let batches = RecordBatchDecoder::decode_all(&mut records)?;
+    let fetched: Vec<(String, Vec<u8>)> = batches
+        .iter()
+        .flat_map(|b| b.records.iter())
+        .flat_map(|r| {
+            r.headers.iter().map(|(k, v)| {
+                (
+                    k.to_string(),
+                    v.as_ref().map_or_else(Vec::new, |v| v.to_vec()),
+                )
+            })
+        })
+        .collect();
+    let expected: Vec<(String, Vec<u8>)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+        .collect();
+    assert_eq!(fetched, expected, "every header, byte for byte");
+    println!("Step 2: fetched the record with its three headers unchanged");
+
+    let stored: i32 = ctx
+        .db()
+        .query_one(
+            "SELECT m.record_bytes FROM kafka.messages m
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    // Value 5, header keys and values ("a\0b" 3 + 3, "k" 1 + 5, "\0" 1 + 0), 84 per record
+    // and 10 per header.
+    assert_eq!(stored, 5 + 6 + 6 + 1 + 84 + 3 * 10);
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
+/// Rows written by SQL outside the extension carry no `record_bytes`, and a fetch sizes
+/// them from their columns. A headers value that is neither an array nor an object (a
+/// JSON scalar) went to `jsonb_each_text`, which refuses a non-object, so the fetch query
+/// failed and every Fetch reaching the row failed with it.
+///
+/// Asserts: rows at offsets 0..3 whose headers are `null`, `"s"` and `5` (JSONB scalars)
+/// and whose `record_bytes` is NULL are fetched with error 0, all three, without headers.
+pub async fn test_rows_with_scalar_headers_are_fetched() -> TestResult {
+    use crate::setup::TestContext;
+    use crate::wire::Wire;
+    use kafka_protocol::records::RecordBatchDecoder;
+    println!("=== Test: rows whose headers are JSON scalars are fetched ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = crate::fixtures::TestTopicBuilder::new(&ctx, "headers-scalar")
+        .build()
+        .await?
+        .name;
+    let inserted = ctx
+        .db()
+        .execute(
+            "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value, headers)
+             SELECT t.id, 0, h.o, 'v'::bytea, h.headers
+             FROM kafka.topics t,
+                  (VALUES (0, 'null'::jsonb), (1, '\"s\"'::jsonb), (2, '5'::jsonb))
+                      AS h(o, headers)
+             WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    assert_eq!(inserted, 3);
+    println!("Step 1: three rows of headers null, \"s\" and 5, without record_bytes");
+
+    let mut wire = Wire::connect().await?;
+    let p = wire.fetch(&topic, 0, 0, 0).await?;
+    assert_eq!(p.error_code, 0, "the fetch is answered");
+    let mut records = p.records.unwrap_or_default();
+    let fetched: Vec<(i64, usize)> = RecordBatchDecoder::decode_all(&mut records)?
+        .iter()
+        .flat_map(|b| b.records.iter())
+        .map(|r| (r.offset, r.headers.len()))
+        .collect();
+    assert_eq!(fetched, vec![(0, 0), (1, 0), (2, 0)]);
+    println!("✅ fetched all three without headers");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}

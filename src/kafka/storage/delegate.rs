@@ -61,11 +61,11 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_partition_count(name, partition_count)
         }
-        fn get_topic_retention_ms(
+        fn get_topics_retention_ms(
             &self,
-            topic_id: i32,
-        ) -> $crate::kafka::error::Result<Option<i64>> {
-            $via::get_topic_retention_ms(topic_id)
+            topic_ids: &[i32],
+        ) -> $crate::kafka::error::Result<::std::collections::HashMap<i32, Option<i64>>> {
+            $via::get_topics_retention_ms(topic_ids)
         }
         fn set_topic_retention_ms(
             &self,
@@ -76,6 +76,9 @@ macro_rules! delegate_topic_store {
         }
         fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
             $via::colliding_topics(names)
+        }
+        fn total_partition_count(&self) -> $crate::kafka::error::Result<i64> {
+            $via::total_partition_count()
         }
     };
     ($via:ident, $field:ident) => {
@@ -128,11 +131,11 @@ macro_rules! delegate_topic_store {
         ) -> $crate::kafka::error::Result<()> {
             $via::set_topic_partition_count(&self.$field, name, partition_count)
         }
-        fn get_topic_retention_ms(
+        fn get_topics_retention_ms(
             &self,
-            topic_id: i32,
-        ) -> $crate::kafka::error::Result<Option<i64>> {
-            $via::get_topic_retention_ms(&self.$field, topic_id)
+            topic_ids: &[i32],
+        ) -> $crate::kafka::error::Result<::std::collections::HashMap<i32, Option<i64>>> {
+            $via::get_topics_retention_ms(&self.$field, topic_ids)
         }
         fn set_topic_retention_ms(
             &self,
@@ -143,6 +146,9 @@ macro_rules! delegate_topic_store {
         }
         fn colliding_topics(&self, names: &[String]) -> $crate::kafka::error::Result<Vec<String>> {
             $via::colliding_topics(&self.$field, names)
+        }
+        fn total_partition_count(&self) -> $crate::kafka::error::Result<i64> {
+            $via::total_partition_count(&self.$field)
         }
     };
 }
@@ -177,13 +183,15 @@ macro_rules! delegate_log_store {
             partition_id: i32,
             fetch_offset: i64,
             max_bytes: i32,
+            whole_first_record: bool,
             isolation_level: $crate::kafka::storage::IsolationLevel,
-        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::FetchedRecords> {
             $via::fetch_records_with_isolation(
                 topic_id,
                 partition_id,
                 fetch_offset,
                 max_bytes,
+                whole_first_record,
                 isolation_level,
             )
         }
@@ -270,14 +278,16 @@ macro_rules! delegate_log_store {
             partition_id: i32,
             fetch_offset: i64,
             max_bytes: i32,
+            whole_first_record: bool,
             isolation_level: $crate::kafka::storage::IsolationLevel,
-        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::FetchedMessage>> {
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::FetchedRecords> {
             $via::fetch_records_with_isolation(
                 &self.$field,
                 topic_id,
                 partition_id,
                 fetch_offset,
                 max_bytes,
+                whole_first_record,
                 isolation_level,
             )
         }
@@ -343,48 +353,117 @@ pub(crate) use delegate_log_store;
 /// same names.
 macro_rules! delegate_offset_store {
     (assoc $via:ident) => {
-        fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
+        fn commit_offset(
+            &self,
+            group_id: &str,
+            topic_id: i32,
+            partition_id: i32,
+            offset: i64,
+            metadata: Option<&str>,
+        ) -> $crate::kafka::error::Result<()> {
             $via::commit_offset(group_id, topic_id, partition_id, offset, metadata)
         }
-        fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
-            $via::fetch_all_offsets(group_id)
+        fn fetch_all_offsets(
+            &self,
+            group_id: &str,
+            max_metadata_bytes: usize,
+        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::GroupTopicOffsets>> {
+            $via::fetch_all_offsets(group_id, max_metadata_bytes)
         }
-        fn fetch_offsets(&self, group_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<Vec<(i32, i32, $crate::kafka::storage::CommittedOffset)>> {
-            $via::fetch_offsets(group_id, partitions)
+        fn fetch_offsets(
+            &self,
+            group_id: &str,
+            partitions: &[(i32, i32)],
+            max_metadata_bytes: usize,
+        ) -> $crate::kafka::error::Result<
+            Vec<(i32, i32, Option<$crate::kafka::storage::CommittedOffset>)>,
+        > {
+            $via::fetch_offsets(group_id, partitions, max_metadata_bytes)
         }
-        fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
+        fn delete_consumer_group_offsets(
+            &self,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(group_id)
         }
-        fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
-            $via::list_offset_groups()
+        fn list_offset_groups(
+            &self,
+            max_bytes: usize,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::OffsetGroupPage> {
+            $via::list_offset_groups(max_bytes)
         }
-        fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
+        fn groups_with_offsets(
+            &self,
+            group_ids: &[String],
+        ) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
             $via::groups_with_offsets(group_ids)
         }
-        fn pending_txn_offset_partitions(&self, group_id: &str, partitions: Option<&[(i32, i32)]>) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
+        fn pending_txn_offset_partitions(
+            &self,
+            group_id: &str,
+            partitions: Option<&[(i32, i32)]>,
+        ) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
             $via::pending_txn_offset_partitions(group_id, partitions)
         }
     };
     ($via:ident, $field:ident) => {
-        fn commit_offset(&self, group_id: &str, topic_id: i32, partition_id: i32, offset: i64, metadata: Option<&str>) -> $crate::kafka::error::Result<()> {
-            $via::commit_offset(&self.$field, group_id, topic_id, partition_id, offset, metadata)
+        fn commit_offset(
+            &self,
+            group_id: &str,
+            topic_id: i32,
+            partition_id: i32,
+            offset: i64,
+            metadata: Option<&str>,
+        ) -> $crate::kafka::error::Result<()> {
+            $via::commit_offset(
+                &self.$field,
+                group_id,
+                topic_id,
+                partition_id,
+                offset,
+                metadata,
+            )
         }
-        fn fetch_all_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<Vec<(String, i32, $crate::kafka::storage::CommittedOffset)>> {
-            $via::fetch_all_offsets(&self.$field, group_id)
+        fn fetch_all_offsets(
+            &self,
+            group_id: &str,
+            max_metadata_bytes: usize,
+        ) -> $crate::kafka::error::Result<Vec<$crate::kafka::storage::GroupTopicOffsets>> {
+            $via::fetch_all_offsets(&self.$field, group_id, max_metadata_bytes)
         }
-        fn fetch_offsets(&self, group_id: &str, partitions: &[(i32, i32)]) -> $crate::kafka::error::Result<Vec<(i32, i32, $crate::kafka::storage::CommittedOffset)>> {
-            $via::fetch_offsets(&self.$field, group_id, partitions)
+        fn fetch_offsets(
+            &self,
+            group_id: &str,
+            partitions: &[(i32, i32)],
+            max_metadata_bytes: usize,
+        ) -> $crate::kafka::error::Result<
+            Vec<(i32, i32, Option<$crate::kafka::storage::CommittedOffset>)>,
+        > {
+            $via::fetch_offsets(&self.$field, group_id, partitions, max_metadata_bytes)
         }
-        fn delete_consumer_group_offsets(&self, group_id: &str) -> $crate::kafka::error::Result<()> {
+        fn delete_consumer_group_offsets(
+            &self,
+            group_id: &str,
+        ) -> $crate::kafka::error::Result<()> {
             $via::delete_consumer_group_offsets(&self.$field, group_id)
         }
-        fn list_offset_groups(&self) -> $crate::kafka::error::Result<Vec<String>> {
-            $via::list_offset_groups(&self.$field)
+        fn list_offset_groups(
+            &self,
+            max_bytes: usize,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::OffsetGroupPage> {
+            $via::list_offset_groups(&self.$field, max_bytes)
         }
-        fn groups_with_offsets(&self, group_ids: &[String]) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
+        fn groups_with_offsets(
+            &self,
+            group_ids: &[String],
+        ) -> $crate::kafka::error::Result<std::collections::HashSet<String>> {
             $via::groups_with_offsets(&self.$field, group_ids)
         }
-        fn pending_txn_offset_partitions(&self, group_id: &str, partitions: Option<&[(i32, i32)]>) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
+        fn pending_txn_offset_partitions(
+            &self,
+            group_id: &str,
+            partitions: Option<&[(i32, i32)]>,
+        ) -> $crate::kafka::error::Result<Vec<(String, i32)>> {
             $via::pending_txn_offset_partitions(&self.$field, group_id, partitions)
         }
     };
@@ -688,6 +767,12 @@ macro_rules! delegate_transaction_store {
         ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
             $via::get_transaction_state(transactional_id)
         }
+        fn transaction_partitions(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::TxnPartitions> {
+            $via::transaction_partitions(transactional_id)
+        }
     };
     ($via:ident, $field:ident) => {
         fn get_or_create_transactional_producer(
@@ -789,6 +874,12 @@ macro_rules! delegate_transaction_store {
             transactional_id: &str,
         ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
             $via::get_transaction_state(&self.$field, transactional_id)
+        }
+        fn transaction_partitions(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::TxnPartitions> {
+            $via::transaction_partitions(&self.$field, transactional_id)
         }
     };
 }

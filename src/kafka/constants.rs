@@ -234,6 +234,8 @@ pub const ERROR_OFFSET_OUT_OF_RANGE: i16 = 1;
 pub const ERROR_CORRUPT_MESSAGE: i16 = 2;
 /// UNKNOWN_TOPIC_OR_PARTITION.
 pub const ERROR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+/// NOT_LEADER_OR_FOLLOWER (retriable): what Fetch v4-5 answers in place of KAFKA_STORAGE_ERROR.
+pub const ERROR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 /// REQUEST_TIMED_OUT (retriable): the request timed out, e.g. waiting on a lock.
 pub const ERROR_REQUEST_TIMED_OUT: i16 = 7;
 /// MESSAGE_TOO_LARGE (Java's RecordTooLargeException): a batch, or a Produce request's
@@ -278,6 +280,24 @@ pub const ERROR_INVALID_PARTITIONS: i16 = 37;
 /// INVALID_REPLICATION_FACTOR: a replication factor other than 1 or -1 on this
 /// single-broker cluster.
 pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
+/// POLICY_VIOLATION: the request exceeds a broker-wide limit (Kafka's answer when a
+/// broker policy refuses a request).
+pub const ERROR_POLICY_VIOLATION: i16 = 44;
+/// OFFSET_METADATA_TOO_LARGE: committed offset metadata longer than
+/// [`OFFSET_METADATA_MAX_LENGTH`].
+pub const ERROR_OFFSET_METADATA_TOO_LARGE: i16 = 12;
+/// Kafka's default `offset.metadata.max.bytes`: the longest offset commit metadata stored, in
+/// UTF-16 code units (Java `String.length()`, which Kafka compares).
+pub const OFFSET_METADATA_MAX_LENGTH: usize = 4096;
+
+/// Whether commit metadata is too long to store (Kafka's `validateOffsetMetadataLength`).
+pub fn offset_metadata_too_large(metadata: Option<&str>) -> bool {
+    metadata.is_some_and(|m| {
+        m.len() > OFFSET_METADATA_MAX_LENGTH
+            && m.encode_utf16().count() > OFFSET_METADATA_MAX_LENGTH
+    })
+}
+
 /// INVALID_CONFIG: a configuration key or value that is invalid or unsupported.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// INVALID_REQUEST: a malformed request, or one that targets an unsupported entity.
@@ -359,8 +379,12 @@ pub const DEFAULT_SHADOW_LINGER_MS: i32 = 10;
 /// Minimum shadow linger time.
 pub const MIN_SHADOW_LINGER_MS: i32 = 0;
 
-/// Maximum shadow linger time.
-pub const MAX_SHADOW_LINGER_MS: i32 = 60_000;
+/// Maximum shadow linger time: what the shadow producer applies (`ShadowConfig::validate`
+/// clamps to it). It equals the sync-mode hold timeout's default
+/// ([`DEFAULT_SHADOW_SYNC_TIMEOUT_MS`]): librdkafka holds each record for up to the linger
+/// before sending it, so a linger near `pg_kafka.shadow_sync_timeout_ms` makes held
+/// sync-mode responses time out (their records stay pending and are forwarded later).
+pub const MAX_SHADOW_LINGER_MS: i32 = 5_000;
 
 /// Default shadow retry backoff (milliseconds).
 pub const DEFAULT_SHADOW_RETRY_BACKOFF_MS: i32 = 100;
@@ -441,6 +465,7 @@ mod tests {
         assert_eq!(ERROR_INVALID_TIMESTAMP, 32);
         assert_eq!(ERROR_UNSUPPORTED_VERSION, 35);
         assert_eq!(ERROR_INVALID_PARTITIONS, 37);
+        assert_eq!(ERROR_POLICY_VIOLATION, 44);
 
         // Idempotent-producer and transaction codes, as in Apache Kafka's
         // org.apache.kafka.common.protocol.Errors.

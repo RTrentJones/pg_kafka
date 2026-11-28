@@ -286,6 +286,110 @@ pub async fn test_shadow_forwards_headers_and_timestamps() -> TestResult {
     Ok(())
 }
 
+/// The value and the headers of each fetched record.
+type Fetched = Vec<(Vec<u8>, Vec<(String, Vec<u8>)>)>;
+
+/// A header key holding U+0000 is an ordinary key to Kafka 3.7 (pg_kafka stores it, see
+/// `consumer::headers`). The forwarder handed header keys to librdkafka as C strings, and
+/// rdkafka's `OwnedHeaders::insert` panics on an interior NUL: the panic ended the
+/// forwarder task, and with it the forwarding of every shadow topic until the worker
+/// restarted (where the same row panicked again).
+///
+/// Asserts: after a record with header keys "a\0b", "k" and "\0" on topic A, a plain
+/// record on A and one on another shadow topic B are delivered (every outbox row of
+/// both topics gets an external offset), and a raw Fetch of the external topic A
+/// returns the first record with its three headers byte for byte, then the second.
+pub async fn test_shadow_forwards_a_header_key_holding_nul() -> TestResult {
+    use crate::wire::records::{encode, plain_record};
+    use crate::wire::Wire;
+    use bytes::Bytes;
+    use kafka_protocol::protocol::StrBytes;
+    use kafka_protocol::records::{Compression, RecordBatchDecoder};
+    println!("=== Test: shadow forwards a header key holding U+0000 ===\n");
+    let ctx = TestContext::new().await?;
+    let topic_a = ctx.unique_topic("shadow-nul-key").await;
+    let topic_b = ctx.unique_topic("shadow-after-nul").await;
+    verify_external_kafka_ready().await?;
+    let admin = external_admin()?;
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let new_topics = [
+        NewTopic::new(&topic_a, 1, TopicReplication::Fixed(1)),
+        NewTopic::new(&topic_b, 1, TopicReplication::Fixed(1)),
+    ];
+    for r in admin.create_topics(&new_topics, &opts).await? {
+        r.map_err(|(t, e)| format!("create {t}: {e}"))?;
+    }
+    enable_shadow_mode(ctx.db(), &topic_a, &async_config(None)).await?;
+    enable_shadow_mode(ctx.db(), &topic_b, &async_config(None)).await?;
+
+    let headers: [(&str, &[u8]); 3] = [("a\0b", b"\0v\0"), ("k", b"plain"), ("\0", b"")];
+    let mut record = plain_record(0, None, b"with-nul-key");
+    for (k, v) in headers {
+        record.headers.insert(
+            StrBytes::from_string(k.to_string()),
+            Some(Bytes::copy_from_slice(v)),
+        );
+    }
+    let mut wire = Wire::connect().await?;
+    let produced = wire
+        .produce(&topic_a, 0, encode(&[record], Compression::None), None)
+        .await?;
+    assert_eq!(produced, (0, 0), "the record is stored at offset 0");
+    println!("Step 1: produced a record with header keys \"a\\0b\", \"k\" and \"\\0\" to A");
+    // The forwarder handles the first record before the next ones arrive.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let plain = || encode(&[plain_record(0, None, b"plain")], Compression::None);
+    assert_eq!(wire.produce(&topic_a, 0, plain(), None).await?, (0, 1));
+    assert_eq!(wire.produce(&topic_b, 0, plain(), None).await?, (0, 0));
+    println!("Step 2: produced a plain record to A and one to B");
+
+    wait_all_forwarded(ctx.db(), &topic_a, 2, Duration::from_secs(30)).await?;
+    wait_all_forwarded(ctx.db(), &topic_b, 1, Duration::from_secs(30)).await?;
+    println!("Step 3: every outbox row of A and B is delivered");
+
+    let mut external = Wire::connect_to(&get_external_bootstrap_servers()).await?;
+    let p = external.fetch(&topic_a, 0, 0, 0).await?;
+    assert_eq!(p.error_code, 0);
+    let mut records = p.records.unwrap_or_default();
+    let fetched: Fetched = RecordBatchDecoder::decode_all(&mut records)?
+        .iter()
+        .flat_map(|b| b.records.iter())
+        .map(|r| {
+            let headers = r
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        v.as_ref().map_or_else(Vec::new, |v| v.to_vec()),
+                    )
+                })
+                .collect();
+            (
+                r.value.as_ref().map_or_else(Vec::new, |v| v.to_vec()),
+                headers,
+            )
+        })
+        .collect();
+    let expected_headers: Vec<(String, Vec<u8>)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+        .collect();
+    assert_eq!(
+        fetched,
+        vec![
+            (b"with-nul-key".to_vec(), expected_headers),
+            (b"plain".to_vec(), Vec::new()),
+        ],
+        "the external topic holds both records, the headers byte for byte"
+    );
+    println!("Step 4: the external topic holds the record with its headers unchanged");
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
 /// A record that fails is retried BEFORE any later record of its partition is
 /// delivered, so the external topic keeps the local order. Failure injection:
 /// the external topic's max.message.bytes is below one (large) record until the
@@ -574,17 +678,17 @@ pub async fn test_shadow_order_preserved_across_a_delivery_timeout() -> TestResu
 
 /// The external broker, paused until [`BrokerPause::resume`] (or the drop,
 /// so a failing test never leaves it stopped).
-struct BrokerPause {
+pub(super) struct BrokerPause {
     resumed: bool,
 }
 
 impl BrokerPause {
-    fn new() -> Result<Self, String> {
+    pub(super) fn new() -> Result<Self, String> {
         run_shell("EXTERNAL_KAFKA_PAUSE_CMD", "docker pause external_kafka")?;
         Ok(Self { resumed: false })
     }
 
-    fn resume(mut self) -> Result<(), String> {
+    pub(super) fn resume(mut self) -> Result<(), String> {
         self.resumed = true;
         run_shell("EXTERNAL_KAFKA_RESUME_CMD", "docker unpause external_kafka")
     }

@@ -259,3 +259,38 @@ fn test_handle_produce_key_based_routing() {
         assert!((0..3).contains(&pr.index));
     }
 }
+
+/// A Produce whose topic auto-create `pg_kafka.max_total_partitions` refuses is answered
+/// POLICY_VIOLATION on that topic's partitions, and nothing is written.
+#[test]
+fn test_handle_produce_auto_create_over_the_total_partition_cap() {
+    let mut mock = MockKafkaStore::new();
+    mock.expect_get_or_create_topic()
+        .times(1)
+        .returning(|_, _| {
+            Err(KafkaError::PolicyViolation {
+                message: "over pg_kafka.max_total_partitions".to_string(),
+            })
+        });
+    mock.expect_insert_records().times(0);
+    let topic_data = vec![TopicProduceData {
+        name: "new-topic".to_string(),
+        partitions: vec![PartitionProduceData {
+            partition_index: 0,
+            records: vec![Record {
+                key: None,
+                value: Some(b"v".to_vec()),
+                headers: vec![],
+                timestamp: None,
+            }],
+            producer_metadata: None,
+        }],
+    }];
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let response = produce::handle_produce(&ctx, topic_data, None, None).unwrap();
+    assert_eq!(
+        response.responses[0].partition_responses[0].error_code,
+        ERROR_POLICY_VIOLATION
+    );
+}

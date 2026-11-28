@@ -11,11 +11,9 @@ use crate::kafka::messages::KafkaResponse;
 /// The response header version (v1 = flexible, with tagged fields) and the body encoding
 /// both come from the API's kafka-protocol response type (see
 /// `api::ResponseBody::encode_frame`).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a response is sent once: encoding consumes it so the caller cannot send it again"
-)]
-pub fn encode_response(response: KafkaResponse) -> Result<BytesMut> {
+/// It consumes the response: a response is sent once, and the API's
+/// `ApiSchema::for_version` adjusts it for its version first.
+pub fn encode_response(mut response: KafkaResponse) -> Result<BytesMut> {
     let mut buf = BytesMut::new();
     response
         .body
@@ -180,5 +178,87 @@ mod tests {
     #[test]
     fn test_close_connection_is_not_a_frame() {
         assert!(encode_response(KafkaResponse::new(1, 0, ResponseBody::CloseConnection)).is_err());
+    }
+
+    /// A Fetch partition answered KAFKA_STORAGE_ERROR reaches a v4-5 client as
+    /// NOT_LEADER_OR_FOLLOWER, as Kafka 3.7 answers it, and a v6+ client unchanged; other codes
+    /// are left alone.
+    #[test]
+    fn fetch_storage_error_is_down_converted_for_v4_and_v5() {
+        use crate::kafka::constants::{ERROR_KAFKA_STORAGE_ERROR, ERROR_NOT_LEADER_OR_FOLLOWER};
+        use bytes::Buf;
+        use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+        use kafka_protocol::protocol::{Decodable, HeaderVersion, StrBytes};
+        let response = || {
+            let partitions = [ERROR_KAFKA_STORAGE_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION]
+                .iter()
+                .zip(0..)
+                .map(|(&code, index)| {
+                    let mut p = PartitionData::default();
+                    p.partition_index = index;
+                    p.error_code = code;
+                    p
+                })
+                .collect();
+            let mut topic = FetchableTopicResponse::default();
+            topic.topic = TopicName(StrBytes::from_static_str("t"));
+            topic.partitions = partitions;
+            let mut fetch = FetchResponse::default();
+            fetch.error_code = ERROR_KAFKA_STORAGE_ERROR;
+            fetch.responses = vec![topic];
+            ResponseBody::Fetch(fetch)
+        };
+        for (version, storage) in [
+            (4, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (5, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (6, ERROR_KAFKA_STORAGE_ERROR),
+            (11, ERROR_KAFKA_STORAGE_ERROR),
+        ] {
+            let mut frame = encode(1, version, response()).freeze();
+            frame.advance(4); // correlation id
+            if FetchResponse::header_version(version) > 0 {
+                frame.advance(1); // no tagged fields
+            }
+            let decoded = FetchResponse::decode(&mut frame, version).unwrap();
+            let codes: Vec<i16> = decoded.responses[0]
+                .partitions
+                .iter()
+                .map(|p| p.error_code)
+                .collect();
+            assert_eq!(
+                codes,
+                vec![storage, ERROR_UNKNOWN_TOPIC_OR_PARTITION],
+                "v{version}"
+            );
+        }
+    }
+
+    /// A ListOffsets leader epoch reaches a v4+ client and is left out below v4, where the
+    /// response has no such field (setting it there would fail the encode).
+    #[test]
+    fn list_offsets_leader_epoch_is_encoded_from_v4() {
+        use bytes::Buf;
+        use kafka_protocol::messages::list_offsets_response::{
+            ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+        };
+        use kafka_protocol::protocol::{Decodable, HeaderVersion, StrBytes};
+        for version in [1i16, 3, 4, 7] {
+            let mut partition = ListOffsetsPartitionResponse::default();
+            partition.offset = 5;
+            partition.leader_epoch = 0;
+            let mut topic = ListOffsetsTopicResponse::default();
+            topic.name = TopicName(StrBytes::from_static_str("t"));
+            topic.partitions = vec![partition];
+            let mut response = ListOffsetsResponse::default();
+            response.topics = vec![topic];
+            let mut frame = encode(1, version, ResponseBody::ListOffsets(response)).freeze();
+            frame.advance(4);
+            if ListOffsetsResponse::header_version(version) > 0 {
+                frame.advance(1);
+            }
+            let decoded = ListOffsetsResponse::decode(&mut frame, version).unwrap();
+            let epoch = decoded.topics[0].partitions[0].leader_epoch;
+            assert_eq!(epoch, if version >= 4 { 0 } else { -1 }, "v{version}");
+        }
     }
 }

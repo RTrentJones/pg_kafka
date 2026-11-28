@@ -15,40 +15,120 @@ mod worker;
 #[cfg(test)]
 pub mod testing;
 
-/// Log at LOG level through `pgrx::log!`. In unit tests (no Postgres to log to) the
-/// arguments are only formatted, so they stay type-checked and used.
+/// Log at LOG level through `pgrx::log!`, with interrupts held ([`InterruptsHeld`]). In unit
+/// tests (no Postgres to log to) the arguments are only formatted, so they stay type-checked
+/// and used.
+///
+/// Every log line of the extension goes through this macro, [`pg_warning!`] or
+/// [`pg_debug!`] (clippy's `disallowed_macros` refuses pgrx's own logging macros): Postgres's
+/// `errfinish` runs CHECK_FOR_INTERRUPTS after writing a message below ERROR, and pgrx calls it
+/// without an error boundary, so a pending query cancel (`pg_cancel_backend()`) would raise its
+/// ERROR from inside the macro and longjmp past the Rust frames of the caller (their
+/// destructors, lock guards included, never run, and in the worker the ERROR reaches the
+/// top-level handler, which exits). With interrupts held the cancel stays pending and is
+/// served at the next CHECK_FOR_INTERRUPTS outside the macro, which in the worker is inside an
+/// error boundary or discarded between transactions (`worker::txn::discard_idle_cancel`).
 #[macro_export]
 macro_rules! pg_log {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
-        pgrx::log!($($arg)*);
+        {
+            let _held = $crate::InterruptsHeld::hold();
+            #[expect(clippy::disallowed_macros, reason = "the one sanctioned use, interrupts held")]
+            let () = pgrx::log!($($arg)*);
+        }
         #[cfg(test)]
         let _ = ::std::format!($($arg)*);
     }};
 }
 
-/// Log a WARNING through `pgrx::warning!` (only formatted in unit tests, see
-/// [`pg_log!`]).
+/// Log a WARNING through `pgrx::warning!`, with interrupts held (see [`pg_log!`]; only
+/// formatted in unit tests).
 #[macro_export]
 macro_rules! pg_warning {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
-        pgrx::warning!($($arg)*);
+        {
+            let _held = $crate::InterruptsHeld::hold();
+            #[expect(clippy::disallowed_macros, reason = "the one sanctioned use, interrupts held")]
+            let () = pgrx::warning!($($arg)*);
+        }
         #[cfg(test)]
         let _ = ::std::format!($($arg)*);
     }};
 }
 
-/// Log at DEBUG1 through `pgrx::debug1!` (only formatted in unit tests, see
-/// [`pg_log!`]).
+/// Log at DEBUG1 through `pgrx::debug1!`, with interrupts held (see [`pg_log!`]; only
+/// formatted in unit tests). The message is formatted only when DEBUG1 goes anywhere
+/// ([`debug1_is_logged`]): `pgrx::debug1!` formats it before Postgres decides to drop it, and
+/// with the default `log_min_messages` (WARNING) every call would otherwise cost the
+/// formatting of arguments that may hold client strings of up to 32 KB.
 #[macro_export]
 macro_rules! pg_debug {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
-        pgrx::debug1!($($arg)*);
+        if $crate::debug1_is_logged() {
+            let _held = $crate::InterruptsHeld::hold();
+            #[expect(clippy::disallowed_macros, reason = "the one sanctioned use, interrupts held")]
+            let () = pgrx::debug1!($($arg)*);
+        }
         #[cfg(test)]
         let _ = ::std::format!($($arg)*);
     }};
+}
+
+/// Postgres's HOLD_INTERRUPTS() for as long as the value lives, RESUME_INTERRUPTS() when it is
+/// dropped (also when the code it guards panics). While held, CHECK_FOR_INTERRUPTS leaves a
+/// pending cancel or termination request pending instead of raising it. The logging macros
+/// ([`pg_log!`]) hold interrupts around each message.
+#[doc(hidden)]
+#[cfg(not(test))]
+pub struct InterruptsHeld(());
+
+#[cfg(not(test))]
+impl InterruptsHeld {
+    /// HOLD_INTERRUPTS(). Only on the backend's main thread (where pgrx's logging macros run).
+    pub fn hold() -> Self {
+        // SAFETY: InterruptHoldoffCount is a plain counter of this backend, read and written
+        // only by its main thread (the caller's contract); signal handlers do not touch it.
+        unsafe {
+            let count = &raw mut pg_sys::InterruptHoldoffCount;
+            count.write_volatile(count.read_volatile().saturating_add(1));
+        }
+        Self(())
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for InterruptsHeld {
+    fn drop(&mut self) {
+        // SAFETY: as in `hold`. Saturating: an ERROR raised while the count was held resets it
+        // to 0 (errfinish does), and the count must not wrap to "held forever".
+        unsafe {
+            let count = &raw mut pg_sys::InterruptHoldoffCount;
+            count.write_volatile(count.read_volatile().saturating_sub(1));
+        }
+    }
+}
+
+/// Whether a DEBUG1 message would be written to the server log or sent to a client (the
+/// test [`pg_debug!`] runs first). Two comparisons of GUC values; like every `pg_debug!`, it
+/// runs on the backend's main thread.
+#[doc(hidden)]
+#[cfg(not(test))]
+pub fn debug1_is_logged() -> bool {
+    #[cfg(not(feature = "pg13"))]
+    {
+        // SAFETY: reads the log_min_messages / client_min_messages globals and the output
+        // destination; no allocation and no error path. pg_debug! runs only on the main
+        // thread (pgrx refuses Postgres calls from others, debug1! included).
+        unsafe {
+            pg_sys::message_level_is_interesting(i32::try_from(pg_sys::DEBUG1).unwrap_or(i32::MAX))
+        }
+    }
+    // PostgreSQL 13 has no message_level_is_interesting: format as before.
+    #[cfg(feature = "pg13")]
+    true
 }
 
 ::pgrx::pg_module_magic!();
@@ -63,9 +143,9 @@ macro_rules! pg_debug {
 pub unsafe extern "C-unwind" fn _PG_init() {
     use pgrx::bgworkers::BgWorkerStartTime;
 
-    pgrx::log!("pg_kafka: _PG_init() called - extension loading");
+    pg_log!("pg_kafka: _PG_init() called - extension loading");
     config::init();
-    pgrx::log!("pg_kafka: GUC configuration initialized");
+    pg_log!("pg_kafka: GUC configuration initialized");
 
     // - start_time RecoveryFinished: the worker needs a database connection (SPI),
     //   which Postgres allows only once recovery has finished (pgrx's
@@ -77,7 +157,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
     //   WORKER_RESTART_INTERVAL, so the Kafka port does not stay dead until Postgres
     //   restarts. The worker exits with code 1 on SIGTERM for this reason; during a
     //   server shutdown the postmaster does not restart workers.
-    pgrx::log!("pg_kafka: Registering background worker 'pg_kafka_listener'");
+    pg_log!("pg_kafka: Registering background worker 'pg_kafka_listener'");
     BackgroundWorkerBuilder::new("pg_kafka_listener")
         .set_function("pg_kafka_listener_main")
         .set_library("pg_kafka")
@@ -86,8 +166,8 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         .enable_spi_access()
         .load();
 
-    pgrx::log!("pg_kafka: Background worker registered successfully");
-    pgrx::log!("pg_kafka: _PG_init() completed");
+    pg_log!("pg_kafka: Background worker registered successfully");
+    pg_log!("pg_kafka: _PG_init() completed");
 }
 
 /// Smoke test: `SELECT hello_pg_kafka()` answers when the library is loaded.
@@ -110,7 +190,13 @@ fn hello_pg_kafka() -> &'static str {
 /// partition-maintenance lock (bounded by the session's `lock_timeout`), so a
 /// concurrent pass (another session's, or the worker's) finishes first. Call it in a
 /// transaction of its own: a transaction that already locked kafka.messages could
-/// deadlock with the pass it waits for.
+/// deadlock with the pass it waits for. Only a READ COMMITTED call drops time
+/// partitions: under REPEATABLE READ or SERIALIZABLE the snapshot predates the drop's
+/// lock wait, so the pass skips its drops with a WARNING and does the rest.
+/// Produce, InitProducerId and EndTxn are not serialized with it: a statement of the pass
+/// that waits for one of their rows decides on the committed row (ADR-001, "A manual
+/// sweep decides on committed rows"); at REPEATABLE READ or SERIALIZABLE such a wait
+/// fails the call with a serialization error instead.
 ///
 /// Superusers only: EXECUTE is revoked from PUBLIC (`sql/bootstrap.sql`), since a caller
 /// that waits here holds the extension lock, and any role can hold the maintenance lock.
@@ -144,6 +230,7 @@ fn pg_kafka_run_retention_sweep(
         ("stale_producers", stats.stale_producers),
         ("terminal_transactions", stats.terminal_transactions),
         ("shadow_delivered_rows", stats.shadow_delivered_rows),
+        ("shadow_orphaned_rows", stats.shadow_orphaned_rows),
     ];
     TableIterator::new(rows.map(|(category, deleted)| {
         (

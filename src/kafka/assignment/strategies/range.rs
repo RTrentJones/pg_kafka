@@ -25,10 +25,7 @@
 //! - **Pros**: Simple, predictable, co-locates partitions (good for ordered processing)
 //! - **Cons**: Can be unbalanced when number of partitions doesn't divide evenly
 
-use std::collections::HashMap;
-
 use super::{AssignmentInput, AssignmentOutput, AssignmentStrategy};
-use crate::kafka::assignment::MemberAssignment;
 
 /// Range partition assignment strategy
 #[derive(Debug, Clone, Default)]
@@ -46,17 +43,15 @@ impl AssignmentStrategy for RangeStrategy {
         "range"
     }
 
+    /// Cost: one step per (topic, subscriber) plus one per partition assigned, with a copy of
+    /// the topic name (at most 249 bytes) per (topic, subscriber) given partitions; members
+    /// are indexes, so no member id is hashed or copied besides once into the output.
     fn assign(&self, input: &AssignmentInput) -> AssignmentOutput {
-        let mut result: AssignmentOutput = HashMap::new();
-
-        // Initialize empty assignments for all members
-        for member_id in input.subscriptions.keys() {
-            result.insert(member_id.clone(), MemberAssignment::new());
-        }
+        let mut assignments = input.empty_assignments();
 
         // Process each topic independently
         for (topic, partition_count) in &input.topic_partitions {
-            // Get members subscribed to this topic, sorted by ID
+            // Members subscribed to this topic, in member id order
             let subscribed_members = input.members_for_topic(topic);
 
             if subscribed_members.is_empty() || *partition_count <= 0 {
@@ -74,7 +69,7 @@ impl AssignmentStrategy for RangeStrategy {
 
             let mut current_partition = 0;
 
-            for (member_idx, member_id) in subscribed_members.iter().enumerate() {
+            for (member_idx, &member) in subscribed_members.iter().enumerate() {
                 // First `extra_partitions` members get one additional partition
                 let range_size = base_range
                     + i32::from(i32::try_from(member_idx).is_ok_and(|i| i < extra_partitions));
@@ -84,17 +79,14 @@ impl AssignmentStrategy for RangeStrategy {
                         (current_partition..current_partition + range_size).collect();
                     current_partition += range_size;
 
-                    // Add to this member's assignment
-                    if let Some(assignment) = result.get_mut(member_id) {
-                        assignment
-                            .topic_partitions
-                            .insert(topic.clone(), partitions);
-                    }
+                    assignments[member]
+                        .topic_partitions
+                        .insert(topic.clone(), partitions);
                 }
             }
         }
 
-        result
+        input.output(assignments)
     }
 }
 
@@ -102,6 +94,7 @@ impl AssignmentStrategy for RangeStrategy {
 mod tests {
     use super::*;
     use crate::kafka::assignment::MemberSubscription;
+    use std::collections::HashMap;
 
     fn make_input(members: Vec<(&str, Vec<&str>)>, topics: Vec<(&str, i32)>) -> AssignmentInput {
         let subscriptions: HashMap<String, MemberSubscription> = members

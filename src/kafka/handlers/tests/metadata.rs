@@ -192,3 +192,43 @@ fn test_handle_metadata_no_auto_create_invalid_name_is_invalid_topic() {
         ]
     );
 }
+
+/// A Metadata auto-create that `pg_kafka.max_total_partitions` refuses reports
+/// POLICY_VIOLATION on the names it would have created; a requested topic that exists is
+/// still answered.
+#[test]
+fn test_handle_metadata_auto_create_over_the_total_partition_cap() {
+    let mut mock = MockKafkaStore::new();
+    crate::testing::expect_topics(&mut mock, |name| Ok((name == "there").then_some((1, 2))));
+    mock.expect_get_or_create_topics()
+        .withf(|names, _| names == ["new-a", "new-b"])
+        .times(1)
+        .returning(|_, _| {
+            Err(KafkaError::PolicyViolation {
+                message: "over pg_kafka.max_total_partitions".to_string(),
+            })
+        });
+    let env = TestEnv::new();
+    let ctx = env.ctx(&mock);
+    let names = ["new-a", "there", "new-b"].map(str::to_string).to_vec();
+    let response = metadata::handle_metadata(&ctx, Some(names), true).unwrap();
+    let codes: Vec<(String, i16, usize)> = response
+        .topics
+        .iter()
+        .map(|t| {
+            (
+                t.name.as_ref().unwrap().to_string(),
+                t.error_code,
+                t.partitions.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            ("new-a".to_string(), ERROR_POLICY_VIOLATION, 0),
+            ("there".to_string(), ERROR_NONE, 2),
+            ("new-b".to_string(), ERROR_POLICY_VIOLATION, 0),
+        ]
+    );
+}

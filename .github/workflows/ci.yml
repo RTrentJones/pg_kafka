@@ -98,6 +98,8 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          # The `unit` flag codecov.yml configures.
+          flags: unit
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
 
@@ -121,6 +123,10 @@ jobs:
           workspaces: kafka_test -> kafka_test/target
       - name: Build
         run: cd kafka_test && cargo build --release --locked
+      # The runner's own unit tests (registry, timeouts, guards); the ones that need a
+      # database are #[ignore]d.
+      - name: Unit tests (kafka_test)
+        run: cd kafka_test && cargo test --release --locked --lib --bin kafka_test
       - uses: actions/upload-artifact@v4
         with:
           name: kafka_test
@@ -135,8 +141,8 @@ jobs:
     name: E2E pg${{ matrix.pg }}
     runs-on: ubuntu-24.04
     needs: [lint, kafka-test-build]
-    # Cold build ~20 min + suite (~5 min measured on 4 cores, 223 functional tests including
-    # listener restarts) + shadow (~13 min locally) and performance on pg14.
+    # Cold build ~20 min + functional suite (9.6 min measured on 4 shared cores, including
+    # listener restarts) + shadow (~16 min locally) and performance on pg14.
     timeout-minutes: 100
     strategy:
       fail-fast: false
@@ -189,7 +195,8 @@ jobs:
         run: scripts/ci-pg.sh start "$RUNNER_TEMP/pg"
 
       - name: Functional E2E tests
-        # Measured 4.5 min on PG18 in a 4-core sandbox; the margin covers slow runners.
+        # Measured 9.6 min on PG16 in a 4-core sandbox shared with two other builds;
+        # the margin covers slow runners.
         timeout-minutes: 25
         working-directory: kafka_test
         run: '"$KAFKA_TEST_BIN" --exclude performance --exclude shadow --timeout-secs 300'
@@ -209,10 +216,13 @@ jobs:
 
       - name: Generated test counts are current (docs/TEST_STRATEGY.md)
         if: matrix.pg == 14
-        timeout-minutes: 20
+        # Lists the unit and property test binaries the steps above built (the same features
+        # and the same empty RUSTFLAGS, so nothing is rebuilt) and the kafka_test artifact.
+        timeout-minutes: 5
         run: python3 scripts/gen-docs.py --check --only tests
         env:
           GEN_DOCS_FEATURES: ${{ env.FEATURES }}
+          RUSTFLAGS: ""
 
       - name: Start external Kafka (shadow tests)
         if: matrix.pg == 14
@@ -231,8 +241,9 @@ jobs:
         run: docker compose down -v || true
 
       - name: Performance E2E tests
-        # Blocking. The thresholds are conservative floors (~5-10x below dev-machine
-        # measurements), so this fails only on order-of-magnitude regressions.
+        # Blocking. Every test in the category gates on a throughput floor or a latency, time
+        # or CPU ceiling 5-100x from dev-machine measurements, so this fails only on
+        # order-of-magnitude regressions.
         if: matrix.pg == 14
         timeout-minutes: 10
         working-directory: kafka_test
@@ -264,7 +275,9 @@ jobs:
   # Real Kafka clients against pg_kafka: the Apache Kafka 3.7 Java tools (interop/run-java-checks.sh)
   # and the differential harness that replays the same raw requests against pg_kafka and a real
   # Kafka broker (interop/diff/). Known failures are listed in the scripts (XFAIL in
-  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS and fails the job.
+  # java_checks.py, KNOWN in diff/run.py); one that passes is reported as XPASS (DEV-GONE for a
+  # deviation that went away) without failing the job, so its entry can be removed. An
+  # unlisted failure or difference fails the job.
   interop:
     name: Interop (Java clients, differential vs Kafka)
     runs-on: ubuntu-24.04

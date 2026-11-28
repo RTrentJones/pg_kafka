@@ -8,11 +8,17 @@
 //! - Coordinator state machine transitions
 
 mod coordinator_state;
+mod describe_size;
 mod group_cap;
 mod lifecycle;
+mod list_order;
+mod list_size;
+mod member_memory;
 mod protocol_rules;
 mod rebalance;
 mod rebalance_edge_cases;
+mod state_reporting;
+mod sync_assignment;
 mod sync_liveness;
 
 /// The `consumer_group` tests, in run order.
@@ -35,8 +41,25 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         coordinator_state::test_group_state_transitions,
         protocol_rules::test_join_group_protocol_and_member_id_rules,
         protocol_rules::test_join_with_no_common_assignor_is_refused,
+        protocol_rules::test_leave_group_v3_with_no_members_is_none,
         protocol_rules::test_offsets_only_group_is_listed_after_restart: sequential, // restarts the listener worker
         sync_liveness::test_slow_leader_sync_keeps_silent_follower: sequential, // Has sleep delays
         group_cap::test_lowered_group_cap_still_admits_new_groups: sequential, // changes a GUC
+        member_memory::test_member_state_beyond_the_memory_budget_is_refused: sequential, // changes a GUC
+        describe_size::test_describe_groups_of_a_repeated_group_is_bounded: sequential, // changes a GUC
+        list_size::test_list_groups_is_bounded_by_fetch_max_bytes: sequential, // changes a GUC
+        list_order::test_list_groups_reads_only_the_listed_groups: sequential, // ends the worker to flush its statistics
+        list_order::test_list_groups_is_a_byte_order_prefix: sequential, // changes a GUC
+        list_order::test_list_groups_state_filter_lists_a_prefix: sequential, // changes a GUC
+        member_memory::test_empty_groups_do_not_exhaust_the_memory_budget: sequential, // changes a GUC
+        member_memory::test_a_rejoin_is_priced_with_the_protocol_it_selects: sequential, // changes a GUC
+        sync_liveness::test_member_that_never_syncs_is_removed: sequential, // Has sleep delays
+        state_reporting::test_describe_groups_reports_metadata_only_when_stable,
+        state_reporting::test_list_groups_state_filter_is_case_sensitive,
+        state_reporting::test_find_coordinator_unknown_key_type_is_invalid_request,
+        sync_assignment::test_server_side_assignment_is_bounded: sequential, // timed; stalls the DB thread when it fails
+        sync_assignment::test_sticky_rebalance_of_nested_subscriptions_is_bounded: sequential, // timed; stalls the DB thread when it fails
+        sync_assignment::test_refused_sticky_assignment_is_not_recomputed,
+        sync_assignment::test_assignment_read_failure_is_retriable: sequential, // locks kafka.topics
     ]
 }

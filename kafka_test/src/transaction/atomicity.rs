@@ -7,125 +7,125 @@ use crate::common::{
     create_db_client, create_producer, create_read_committed_consumer,
     create_transactional_producer, TestResult,
 };
+use crate::error_codes;
+use crate::fixtures::topic_with_partitions;
+use crate::setup::TestContext;
+use crate::wire::records::batch;
+use crate::wire::Wire;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureRecord, Producer};
+use rdkafka::Message;
 use rdkafka::TopicPartitionList;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Test transaction timeout auto-abort behavior
-///
-/// This test verifies:
-/// 1. Begin a transaction but don't complete it
-/// 2. Wait for transaction.timeout.ms to expire
-/// 3. Verify transaction is automatically aborted
-/// 4. Verify messages are not visible to consumers
+/// The broker aborts a transaction that outlives its `transaction.timeout.ms` on its own,
+/// as Kafka's coordinator does: a transaction whose clock has run out (its start backdated
+/// past a 1 s timeout) is aborted by the timeout sweep without the producer asking, its
+/// record becomes aborted and invisible, the producer is fenced (its epoch bumped), and its
+/// late commit fails.
 pub async fn test_transaction_timeout_auto_abort() -> TestResult {
     println!("=== Test: Transaction Timeout Auto-Abort ===\n");
 
-    // Use a short timeout for testing
     let txn_id = format!("txn-timeout-{}", Uuid::new_v4());
     let topic = format!("txn-timeout-test-{}", Uuid::new_v4());
-
-    println!("Connecting to PostgreSQL...");
     let client = create_db_client().await?;
-    println!("  Connected to database\n");
 
-    // Create transactional producer
-    println!("Creating transactional producer...");
+    println!("Step 1: a transaction produces one record...");
     let producer = create_transactional_producer(&txn_id)?;
     producer.init_transactions(Duration::from_secs(10))?;
-    println!("  Producer initialized\n");
-
-    // Begin transaction
-    println!("Beginning transaction...");
     producer.begin_transaction()?;
-    println!("  Transaction started\n");
-
-    // Produce a message (will be pending)
-    let key = "timeout-key";
-    let payload = "Message for timeout test";
-    println!("Producing message...");
-
     let (_partition, offset) = producer
         .send(
-            FutureRecord::to(&topic).payload(payload).key(key),
+            FutureRecord::to(&topic)
+                .payload("Message for timeout test")
+                .key("timeout-key"),
             Duration::from_secs(5),
         )
         .await
         .map_err(|(err, _msg)| err)?;
-    println!("  Message queued at offset {offset}\n");
-
-    // Get the topic ID
-    let topic_row = client
+    let topic_id: i32 = client
         .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
-        .await?;
-    let topic_id: i32 = topic_row.get(0);
-
-    // Verify message is pending
-    let msg_row = client
+        .await?
+        .get(0);
+    let state_of_record = || async {
+        let state: Option<String> = client
+            .query_one(
+                "SELECT txn_state FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
+                &[&topic_id, &offset],
+            )
+            .await?
+            .get(0);
+        Ok::<_, Box<dyn std::error::Error>>(state)
+    };
+    assert_eq!(state_of_record().await?.as_deref(), Some("pending"));
+    let epoch_before: i16 = client
         .query_one(
-            "SELECT txn_state FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
-            &[&topic_id, &offset],
+            "SELECT producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+            &[&txn_id],
+        )
+        .await?
+        .get(0);
+    println!("  record pending at offset {offset}, epoch {epoch_before}\n");
+
+    println!("Step 2: its clock runs out (started 90 s ago, timeout 1 s)...");
+    client
+        .execute(
+            "UPDATE kafka.transactions
+             SET started_at = NOW() - INTERVAL '90 seconds', timeout_ms = 1000
+             WHERE transactional_id = $1",
+            &[&txn_id],
         )
         .await?;
-    let txn_state: Option<String> = msg_row.get(0);
-    assert_eq!(txn_state, Some("pending".to_string()));
-    println!("  Message confirmed as pending\n");
-
-    // Note: In production Kafka, the transaction coordinator would auto-abort
-    // after transaction.timeout.ms. Since we can't easily test the actual timeout
-    // mechanism, we verify the state remains pending and manually abort.
-    //
-    // The test validates that:
-    // 1. Pending transactions don't auto-commit
-    // 2. Messages in pending transactions remain invisible
-
-    // Verify message is NOT visible to read_committed
-    let visible_count: i64 = client
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    let epoch_after: i16 = loop {
+        let row = client
+            .query_one(
+                "SELECT state, producer_epoch FROM kafka.transactions WHERE transactional_id = $1",
+                &[&txn_id],
+            )
+            .await?;
+        let state: Option<String> = row.get(0);
+        if state.as_deref() == Some("CompleteAbort") {
+            break row.get(1);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(
+                format!("the timeout sweep never aborted the transaction ({state:?})").into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    println!("  aborted by the broker; epoch {epoch_before} -> {epoch_after}\n");
+    assert!(
+        epoch_after > epoch_before,
+        "the timed-out producer is fenced"
+    );
+    assert_eq!(
+        state_of_record().await?.as_deref(),
+        Some("aborted"),
+        "the timed-out transaction's record is aborted"
+    );
+    let visible: i64 = client
         .query_one(
             "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state IS NULL",
             &[&topic_id],
         )
         .await?
         .get(0);
-    println!("  Visible messages (read_committed): {visible_count}");
     assert_eq!(
-        visible_count, 0,
-        "Pending transaction messages should not be visible"
+        visible, 0,
+        "nothing of the timed-out transaction is visible"
     );
 
-    // Abort transaction for cleanup
-    println!("\nAborting transaction for cleanup...");
-    producer.abort_transaction(Duration::from_secs(10))?;
-
-    // Brief delay to allow abort to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify abort succeeded - state should be aborted or message deleted
-    let final_row = client
-        .query_opt(
-            "SELECT txn_state FROM kafka.messages WHERE topic_id = $1 AND partition_offset = $2",
-            &[&topic_id, &offset],
-        )
-        .await?;
-
-    match final_row {
-        Some(row) => {
-            let final_state: Option<String> = row.get(0);
-            // After abort, message should be marked as aborted (not pending or NULL)
-            println!("  Final message state: {final_state:?}");
-            assert!(
-                final_state == Some("aborted".to_string())
-                    || final_state == Some("pending".to_string()),
-                "Message should be aborted or still pending (async abort)"
-            );
-        }
-        None => {
-            println!("  Message was cleaned up after abort");
-        }
-    }
-    println!("  Transaction aborted\n");
+    println!("Step 3: the producer's late commit fails...");
+    let commit = producer.commit_transaction(Duration::from_secs(10));
+    println!("  commit: {commit:?}");
+    assert!(
+        commit.is_err(),
+        "a commit after the timeout abort must fail"
+    );
+    assert_eq!(state_of_record().await?.as_deref(), Some("aborted"));
 
     println!("Transaction timeout auto-abort test PASSED\n");
     Ok(())
@@ -133,9 +133,9 @@ pub async fn test_transaction_timeout_auto_abort() -> TestResult {
 
 /// Test concurrent transactions with same producer ID
 ///
-/// This test verifies:
-/// 1. Starting a new transaction before completing the previous one
-/// 2. Kafka should abort the old transaction or return CONCURRENT_TRANSACTIONS
+/// A begin while a transaction is open either fails (librdkafka refuses it) or implicitly
+/// aborts the open one; either way the first transaction's record ends aborted and
+/// invisible, and a later transaction of the producer commits.
 pub async fn test_concurrent_transactions_same_producer() -> TestResult {
     println!("=== Test: Concurrent Transactions Same Producer ===\n");
 
@@ -195,34 +195,70 @@ pub async fn test_concurrent_transactions_same_producer() -> TestResult {
             producer.commit_transaction(Duration::from_secs(10))?;
             println!("  Second transaction committed\n");
 
-            // Verify first topic's message was NOT committed (should be aborted)
-            let topic1_row = client
-                .query_opt("SELECT id FROM kafka.topics WHERE name = $1", &[&topic1])
+            // The first message was produced (and its topic created) before the second
+            // begin, so the topic exists; none of its records may be visible.
+            let row = client
+                .query_one("SELECT id FROM kafka.topics WHERE name = $1", &[&topic1])
                 .await?;
-
-            if let Some(row) = topic1_row {
-                let topic1_id: i32 = row.get(0);
-                let visible: i64 = client
-                    .query_one(
-                        "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state IS NULL",
-                        &[&topic1_id],
-                    )
-                    .await?
-                    .get(0);
-                println!("  First topic visible messages: {visible} (expected 0 - was aborted)");
-            } else {
-                println!("  First topic doesn't exist (transaction aborted before produce)");
-            }
+            let topic1_id: i32 = row.get(0);
+            let visible: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state IS NULL",
+                    &[&topic1_id],
+                )
+                .await?
+                .get(0);
+            println!("  First topic visible messages: {visible} (expected 0 - was aborted)");
+            assert_eq!(
+                visible, 0,
+                "the implicitly aborted transaction's record is visible"
+            );
         }
         Err(e) => {
-            // This is also valid behavior - rejecting concurrent transaction
+            // librdkafka refuses a begin inside a transaction; the first transaction is
+            // then still open and is aborted here.
             println!("  Second transaction rejected: {e}");
-            println!("  This is expected behavior for concurrent transaction prevention\n");
-
-            // Clean up first transaction
             producer.abort_transaction(Duration::from_secs(10))?;
         }
     }
+
+    // Either way the first transaction ended aborted: its record is aborted and invisible,
+    // and the producer goes on to commit a new transaction.
+    let state: Option<String> = client
+        .query_one(
+            "SELECT m.txn_state FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1",
+            &[&topic1],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        state.as_deref(),
+        Some("aborted"),
+        "the first transaction's record"
+    );
+    if producer.begin_transaction().is_ok() {
+        producer
+            .send(
+                FutureRecord::to(&topic2).payload("after").key("key3"),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|(e, _)| e)?;
+        producer.commit_transaction(Duration::from_secs(10))?;
+    }
+    let committed: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1 AND m.txn_state IS NULL",
+            &[&topic2],
+        )
+        .await?
+        .get(0);
+    assert!(
+        committed >= 1,
+        "a later transaction of the producer commits"
+    );
 
     println!("Concurrent transactions same producer test PASSED\n");
     Ok(())
@@ -233,7 +269,7 @@ pub async fn test_concurrent_transactions_same_producer() -> TestResult {
 /// This test verifies:
 /// 1. Producer A (epoch 0) has an ongoing transaction
 /// 2. Producer B with same transactional_id calls InitProducerId (bumps epoch)
-/// 3. Producer A's subsequent operations should fail with PRODUCER_FENCED
+/// 3. Producer A's open transaction is aborted and its commit fails
 pub async fn test_producer_fencing_mid_transaction() -> TestResult {
     println!("=== Test: Producer Fencing Mid-Transaction ===\n");
 
@@ -318,48 +354,31 @@ pub async fn test_producer_fencing_mid_transaction() -> TestResult {
     assert!(epoch2 > epoch1, "Epoch should be bumped");
     println!("  Epoch bumped: {epoch1} -> {epoch2} (fencing confirmed)\n");
 
-    // Try to commit the fenced producer's transaction (should fail)
+    // The fenced producer's commit must fail: its epoch is no longer the transaction's.
     println!("Attempting to commit with fenced producer...");
     let commit_result = producer1.commit_transaction(Duration::from_secs(10));
+    println!("  commit: {commit_result:?}");
+    assert!(
+        commit_result.is_err(),
+        "a fenced producer's commit must fail"
+    );
 
-    match commit_result {
-        Ok(()) => {
-            // If commit somehow succeeded, verify the message is still not visible
-            // (because the transaction was from the old epoch)
-            println!("  Commit returned Ok (checking if message visible)...");
-
-            let topic_row = client
-                .query_opt("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
-                .await?;
-
-            if let Some(row) = topic_row {
-                let topic_id: i32 = row.get(0);
-                let visible: i64 = client
-                    .query_one(
-                        "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state IS NULL",
-                        &[&topic_id],
-                    )
-                    .await?
-                    .get(0);
-                println!("  Visible messages: {visible} (fenced messages may not be visible)");
-            }
-        }
-        Err(e) => {
-            let err_str = e.to_string().to_lowercase();
-            println!("  Commit failed (expected): {e}");
-
-            let is_fencing_error = err_str.contains("fenced")
-                || err_str.contains("epoch")
-                || err_str.contains("abort")
-                || err_str.contains("invalid");
-
-            if is_fencing_error {
-                println!("  Producer fencing confirmed!\n");
-            } else {
-                println!("  Transaction was invalidated\n");
-            }
-        }
-    }
+    // The second producer's InitProducerId aborted the first producer's open transaction,
+    // as Kafka's coordinator does: its record is aborted, and nothing of it is visible.
+    let state: Option<String> = client
+        .query_one(
+            "SELECT m.txn_state FROM kafka.messages m JOIN kafka.topics t ON t.id = m.topic_id
+             WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        state.as_deref(),
+        Some("aborted"),
+        "the fenced transaction's record must be aborted"
+    );
+    println!("  Producer fencing confirmed: commit refused, record aborted\n");
 
     println!("Producer fencing mid-transaction test PASSED\n");
     Ok(())
@@ -726,112 +745,82 @@ pub async fn test_abort_transaction_discards_pending_offsets() -> TestResult {
     Ok(())
 }
 
-/// Test transaction partial failure atomicity
-///
-/// This test verifies:
-/// 1. Produce to partition 0 (succeeds)
-/// 2. Produce to non-existent partition (fails)
-/// 3. Attempt to commit
-/// 4. Verify first message is NOT visible (entire txn rolled back)
+/// The `(partition, txn_state)` of every stored record of `topic`.
+async fn record_states(
+    db: &tokio_postgres::Client,
+    topic: &str,
+) -> Result<Vec<(i32, Option<String>)>, Box<dyn std::error::Error>> {
+    let rows = db
+        .query(
+            "SELECT m.partition_id, m.txn_state FROM kafka.messages m
+             JOIN kafka.topics t ON t.id = m.topic_id WHERE t.name = $1",
+            &[&topic],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+}
+
+/// A transaction is all or nothing across a failed write. One transactional Produce
+/// request writes partition 0 of a one-partition topic and partition 9999, which the
+/// broker refuses UNKNOWN_TOPIC_OR_PARTITION (spoken on the wire: librdkafka would refuse
+/// partition 9999 itself and never send it): partition 0's record is written pending, and
+/// the abort that follows the failure, as a client aborts on an error, leaves nothing of the
+/// transaction visible, partition 0's record included.
 pub async fn test_transaction_partial_failure_atomicity() -> TestResult {
     println!("=== Test: Transaction Partial Failure Atomicity ===\n");
 
+    let ctx = TestContext::new().await?;
+    let topic = topic_with_partitions(&ctx, "txn-partial", 1).await?;
     let txn_id = format!("txn-partial-{}", Uuid::new_v4());
-    let topic = format!("txn-partial-test-{}", Uuid::new_v4());
+    let mut w = Wire::connect().await?;
 
-    println!("Connecting to PostgreSQL...");
-    let client = create_db_client().await?;
-    println!("  Connected to database\n");
+    let (err, pid, epoch) = w.init_producer_id(Some(&txn_id), 60_000).await?;
+    assert_eq!(err, error_codes::NONE);
+    let added = w
+        .add_partitions(&txn_id, pid, epoch, &[(&topic, &[0])])
+        .await?;
+    assert_eq!(added[0].2, error_codes::NONE, "{added:?}");
 
-    // Create transactional producer
-    println!("Creating transactional producer...");
-    let producer = create_transactional_producer(&txn_id)?;
-    producer.init_transactions(Duration::from_secs(10))?;
-    println!("  Producer initialized\n");
-
-    // Begin transaction
-    println!("Beginning transaction...");
-    producer.begin_transaction()?;
-    println!("  Transaction started\n");
-
-    // Produce first message to partition 0 (should succeed)
-    println!("Producing to partition 0...");
-    let result1 = producer
-        .send(
-            FutureRecord::to(&topic)
-                .payload("message to partition 0")
-                .key("key1")
-                .partition(0),
-            Duration::from_secs(5),
+    println!("Step 1: one Produce to partitions 0 and 9999...");
+    let answers = w
+        .produce_many(
+            &[(
+                topic.as_str(),
+                vec![
+                    (0, batch(&["kept?"], pid, epoch, 0, true, None)),
+                    (9999, batch(&["refused"], pid, epoch, 0, true, None)),
+                ],
+            )],
+            Some(&txn_id),
         )
-        .await;
+        .await?;
+    println!("  answers: {answers:?}");
+    let code_of = |partition: i32| {
+        answers
+            .iter()
+            .find(|(_, p, _, _)| *p == partition)
+            .map(|(_, _, code, _)| *code)
+    };
+    assert_eq!(code_of(0), Some(error_codes::NONE));
+    assert_eq!(code_of(9999), Some(error_codes::UNKNOWN_TOPIC_OR_PARTITION));
+    assert_eq!(
+        record_states(ctx.db(), &topic).await?,
+        vec![(0, Some("pending".to_string()))],
+        "partition 0's record is written, pending; nothing of partition 9999"
+    );
 
-    let first_success = result1.is_ok();
-    if first_success {
-        let (_, offset) = result1.unwrap();
-        println!("  First message sent to offset {offset}\n");
-    } else {
-        println!("  First message failed (unexpected): {:?}\n", result1.err());
-    }
+    println!("Step 2: the client aborts after the failure...");
+    assert_eq!(
+        w.end_txn(&txn_id, pid, epoch, false).await?,
+        error_codes::NONE
+    );
+    assert_eq!(
+        record_states(ctx.db(), &topic).await?,
+        vec![(0, Some("aborted".to_string()))],
+        "the abort takes partition 0's record with it"
+    );
 
-    // Attempt to produce to an invalid partition (9999)
-    println!("Producing to invalid partition 9999...");
-    let result2 = producer
-        .send(
-            FutureRecord::to(&topic)
-                .payload("message to invalid partition")
-                .key("key2")
-                .partition(9999),
-            Duration::from_secs(5),
-        )
-        .await;
-
-    let second_failed = result2.is_err();
-    if second_failed {
-        let (err, _) = result2.err().unwrap();
-        println!("  Second message failed as expected: {err}\n");
-    } else {
-        println!("  Second message unexpectedly succeeded\n");
-    }
-
-    // Try to commit - may fail if partition error is fatal
-    println!("Attempting to commit transaction...");
-    let commit_result = producer.commit_transaction(Duration::from_secs(10));
-
-    match commit_result {
-        Ok(()) => {
-            println!("  Transaction committed\n");
-
-            // Even if commit succeeded, check if first message is visible
-            let topic_row = client
-                .query_opt("SELECT id FROM kafka.topics WHERE name = $1", &[&topic])
-                .await?;
-
-            if let Some(row) = topic_row {
-                let topic_id: i32 = row.get(0);
-                let visible: i64 = client
-                    .query_one(
-                        "SELECT COUNT(*) FROM kafka.messages WHERE topic_id = $1 AND txn_state IS NULL",
-                        &[&topic_id],
-                    )
-                    .await?
-                    .get(0);
-                println!("  Visible messages: {visible}");
-
-                // If the second produce failed before commit, first might be visible
-                // This tests whether the error propagates to transaction abort
-                if second_failed && visible == 1 {
-                    println!("  Note: First message visible (error didn't abort entire txn)");
-                    println!("  This is acceptable - rdkafka may not propagate partition errors");
-                }
-            }
-        }
-        Err(e) => {
-            println!("  Transaction commit failed: {e}\n");
-            println!("  This indicates atomicity - partial failure aborted entire txn\n");
-        }
-    }
-
+    ctx.cleanup().await?;
     println!("Transaction partial failure atomicity test PASSED\n");
     Ok(())
 }
@@ -962,16 +951,29 @@ pub async fn test_transaction_boundary_isolation() -> TestResult {
     tpl.add_partition_offset(&topic, 0, rdkafka::Offset::Beginning)?;
     consumer.assign(&tpl)?;
 
-    // Poll for messages
-    let mut received = 0;
-    for _ in 0..5 {
-        match consumer.poll(Duration::from_secs(1)) {
-            Some(Ok(_msg)) => received += 1,
-            Some(Err(_)) | None => break,
+    // The first polls return nothing until the consumer has fetched, so poll until the
+    // committed message arrives, then a while longer: the pending one must never arrive.
+    let mut received: Vec<(i64, Option<Vec<u8>>)> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut quiet_until: Option<std::time::Instant> = None;
+    while std::time::Instant::now() < quiet_until.unwrap_or(deadline) {
+        match consumer.poll(Duration::from_millis(500)) {
+            Some(Ok(msg)) => {
+                received.push((msg.offset(), msg.payload().map(<[u8]>::to_vec)));
+                quiet_until
+                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(3));
+            }
+            Some(Err(e)) => return Err(format!("read_committed consumer error: {e}").into()),
+            None => {}
         }
     }
 
-    println!("  Consumer received: {received} message(s)");
+    println!("  Consumer received: {} message(s)", received.len());
+    assert_eq!(
+        received,
+        vec![(offset1, Some(b"committed message".to_vec()))],
+        "read_committed should receive the committed message only"
+    );
 
     // Clean up - abort second transaction
     println!("\nCleaning up - aborting second transaction...");

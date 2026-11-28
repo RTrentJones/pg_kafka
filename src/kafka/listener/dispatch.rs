@@ -7,10 +7,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 use super::long_poll::LongPoll;
-use crate::kafka::api::RequestBody;
+use super::response_budget::ReplyCharge;
+use crate::kafka::api::{FetchRequestData, RequestBody};
 use crate::kafka::constants::MAX_LONG_POLLS_PER_CONNECTION;
 use crate::kafka::messages::{KafkaRequest, RequestLanes};
 use crate::kafka::pending_fetches::PendingFetchRegistry;
+use crate::kafka::protocol::DecodedCharge;
 
 /// How long a full request channel is waited on before the next try.
 const FULL_CHANNEL_BACKOFF: Duration = Duration::from_millis(1);
@@ -20,51 +22,132 @@ const FULL_CHANNEL_BACKOFF: Duration = Duration::from_millis(1);
 pub(super) struct Dispatcher {
     pub(super) request_lanes: RequestLanes,
     pub(super) registry: Arc<PendingFetchRegistry>,
-    /// The safety-net re-fetch interval of a long poll (`pg_kafka.fetch_poll_interval_ms`),
+    /// The safety-net re-check interval of a long poll (`pg_kafka.fetch_poll_interval_ms`),
     /// or `None` when long polling is disabled.
     pub(super) long_poll_interval: Option<Duration>,
+    /// The configuration snapshot: `pg_kafka.fetch_max_bytes` is read from it per Fetch, so a
+    /// reload applies to the requests read after it.
+    pub(super) runtime_context: Arc<crate::kafka::RuntimeContext>,
+}
+
+/// Kafka's broker-side limits on a consumer Fetch (`KafkaApis.handleFetchRequest`): the
+/// response holds at most `fetch_max_bytes` whatever the request's `max_bytes`, and
+/// `min_bytes` is lowered to that, so a long poll never waits for more than it may return.
+/// Each partition still reads up to its `partition_max_bytes` within what is left, and the
+/// first record of the first partition with data is returned even when larger (KIP-74).
+pub(super) fn cap_fetch(fetch: &mut FetchRequestData, fetch_max_bytes: i32) {
+    fetch.max_bytes = fetch.max_bytes.min(fetch_max_bytes);
+    fetch.min_bytes = fetch.min_bytes.min(fetch.max_bytes);
+}
+
+/// Where [`Dispatcher::route`] sends a request.
+pub(super) enum Route {
+    /// A Fetch that may wait: run it as a long poll ([`Dispatcher::spawn_long_poll`]).
+    LongPoll(LongPollJob),
+    /// Anything else: straight to its lane ([`Dispatcher::send`]).
+    Lane(KafkaRequest),
+}
+
+/// A Fetch admitted as a long poll, with its per-connection long-poll slot.
+pub(super) struct LongPollJob {
+    long_poll: LongPoll,
+    permit: OwnedSemaphorePermit,
+    decode_charge: DecodedCharge,
+    poll_interval: Duration,
 }
 
 impl Dispatcher {
-    /// Hand one parsed request to the DB thread: a Fetch with `max_wait_ms > 0` goes to a
-    /// long-poll task while the connection's `long_poll_permits` allow, everything else
-    /// straight to its lane. Returns false when the worker channel is gone.
+    /// Hand one parsed request to the DB thread ([`Self::route`], then the long poll or the
+    /// lane), reserving nothing of the connection's response budget beyond what the long poll
+    /// reserves itself. Returns false when the worker channel is gone.
+    #[cfg(test)]
     pub(super) async fn dispatch(
         &self,
         request: KafkaRequest,
         long_poll_permits: &Arc<Semaphore>,
+        reply: ReplyCharge,
     ) -> bool {
-        let request = match (self.long_poll_slot(&request, long_poll_permits), request) {
+        match self.route(request, long_poll_permits) {
+            Route::LongPoll(job) => {
+                self.spawn_long_poll(job, reply);
+                true
+            }
+            Route::Lane(request) => self.send(request).await,
+        }
+    }
+
+    /// Cap a Fetch ([`cap_fetch`]) and decide where the request goes: a Fetch with
+    /// `max_wait_ms > 0` and at least one partition to a long-poll task while the
+    /// connection's `long_poll_permits` allow, everything else straight to its lane.
+    pub(super) fn route(
+        &self,
+        mut request: KafkaRequest,
+        long_poll_permits: &Arc<Semaphore>,
+    ) -> Route {
+        if let RequestBody::Fetch(fetch) = &mut request.body {
+            cap_fetch(fetch, self.fetch_max_bytes());
+        }
+        match (self.long_poll_slot(&request, long_poll_permits), request) {
             (
                 Some((permit, poll_interval)),
                 KafkaRequest {
                     header,
                     body: RequestBody::Fetch(fetch),
                     response_tx,
+                    decode_charge,
                 },
-            ) => {
-                let long_poll =
-                    LongPoll::new(header, fetch, self.request_lanes.main.clone(), response_tx);
-                let registry = Arc::clone(&self.registry);
-                tokio::spawn(async move {
-                    // Hold the per-connection slot for the task's lifetime.
-                    let _slot = permit;
-                    if let Err(e) = long_poll.run(&registry, poll_interval).await {
-                        warn!("Long poll handler error: {e}");
-                    }
-                });
-                return true;
+            ) => Route::LongPoll(LongPollJob {
+                long_poll: LongPoll::new(
+                    header,
+                    fetch,
+                    self.request_lanes.main.clone(),
+                    response_tx,
+                ),
+                permit,
+                decode_charge,
+                poll_interval,
+            }),
+            (_, request) => Route::Lane(request),
+        }
+    }
+
+    /// Run a long poll in a detached task; `reply` is what its response may hold of the
+    /// connection's response budget.
+    pub(super) fn spawn_long_poll(&self, job: LongPollJob, reply: ReplyCharge) {
+        let registry = Arc::clone(&self.registry);
+        let LongPollJob {
+            long_poll,
+            permit,
+            decode_charge,
+            poll_interval,
+        } = job;
+        tokio::spawn(async move {
+            // Hold the per-connection slot, and the decoded request's share of the
+            // decoded-request budget (the task holds the request), for the task's
+            // lifetime.
+            let _slot = permit;
+            let _held = decode_charge;
+            if let Err(e) = long_poll.run(&registry, poll_interval, &reply).await {
+                warn!("Long poll handler error: {e}");
             }
-            (_, request) => request,
-        };
-        // Heartbeat goes to the liveness lane, everything else to the main lane, so
-        // group liveness never queues behind heavy work.
+        });
+    }
+
+    /// Hand a request to its lane: Heartbeat to the liveness lane, everything else to the
+    /// main lane, so group liveness never queues behind heavy work. Returns false when the
+    /// worker channel is gone.
+    pub(super) async fn send(&self, request: KafkaRequest) -> bool {
         let lane = self.request_lanes.route(&request);
         send_with_backpressure(lane, request).await
     }
 
+    /// The current `pg_kafka.fetch_max_bytes`.
+    pub(super) fn fetch_max_bytes(&self) -> i32 {
+        self.runtime_context.config().fetch_max_bytes
+    }
+
     /// A long-poll slot and the safety-net interval, when `request` is a Fetch that may
-    /// wait. A connection holds at most [`MAX_LONG_POLLS_PER_CONNECTION`] long polls; a
+    /// wait: `max_wait_ms > 0` and at least one partition. A connection holds at most [`MAX_LONG_POLLS_PER_CONNECTION`] long polls; a
     /// Fetch over the cap is served by the immediate path, a valid (possibly empty)
     /// response, so the degradation is latency, never an error.
     fn long_poll_slot(
@@ -76,7 +159,10 @@ impl Dispatcher {
         let RequestBody::Fetch(fetch) = &request.body else {
             return None;
         };
-        if fetch.max_wait_ms <= 0 {
+        // A Fetch of no partitions (no topics, or only empty partition lists) has nothing
+        // to wait for: Kafka 3.7 answers it at once, so it goes straight to the worker,
+        // unregistered. O(topics in the request).
+        if fetch.max_wait_ms <= 0 || fetch.topic_data.iter().all(|t| t.partitions.is_empty()) {
             return None;
         }
         let Ok(permit) = Arc::clone(long_poll_permits).try_acquire_owned() else {
@@ -118,6 +204,138 @@ pub(super) async fn send_with_backpressure<T>(tx: &Sender<T>, mut item: T) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fetch(max_bytes: i32, min_bytes: i32) -> FetchRequestData {
+        FetchRequestData {
+            max_wait_ms: 500,
+            min_bytes,
+            max_bytes,
+            isolation_level: 0,
+            topic_data: Vec::new(),
+            whole_first_record: true,
+        }
+    }
+
+    #[test]
+    fn test_cap_fetch_applies_kafkas_fetch_max_bytes() {
+        let cap = crate::config::DEFAULT_FETCH_MAX_BYTES;
+        // A request that asks for everything gets at most the cap, and waits for no more.
+        let mut f = fetch(i32::MAX, i32::MAX);
+        cap_fetch(&mut f, cap);
+        assert_eq!((f.max_bytes, f.min_bytes), (cap, cap));
+        // Below the cap the request is unchanged.
+        let mut f = fetch(1 << 20, 1);
+        cap_fetch(&mut f, cap);
+        assert_eq!((f.max_bytes, f.min_bytes), (1 << 20, 1));
+        // min_bytes above max_bytes is lowered to it, as Kafka does.
+        let mut f = fetch(1000, 5000);
+        cap_fetch(&mut f, cap);
+        assert_eq!((f.max_bytes, f.min_bytes), (1000, 1000));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_caps_every_fetch() {
+        // Both the immediate path and a long poll get the capped request.
+        let (main, main_rx) = crossbeam_channel::bounded(4);
+        let (liveness, _liveness_rx) = crossbeam_channel::bounded(4);
+        let mut config = crate::config::Config::load();
+        config.fetch_max_bytes = 4096;
+        let dispatcher = Dispatcher {
+            request_lanes: RequestLanes { main, liveness },
+            registry: Arc::new(PendingFetchRegistry::new()),
+            long_poll_interval: None,
+            runtime_context: Arc::new(crate::kafka::RuntimeContext::new(config)),
+        };
+        let (response_tx, _responses) = tokio::sync::mpsc::unbounded_channel();
+        let request = KafkaRequest {
+            header: crate::kafka::api::RequestHeader {
+                api_key: crate::kafka::constants::API_KEY_FETCH,
+                api_version: 4,
+                correlation_id: 1,
+                client_id: None,
+            },
+            body: RequestBody::Fetch(fetch(i32::MAX, 1)),
+            response_tx,
+            decode_charge: DecodedCharge::default(),
+        };
+        let permits = Arc::new(Semaphore::new(MAX_LONG_POLLS_PER_CONNECTION));
+        let reply = ReplyCharge::new(
+            super::super::response_budget::ResponseBudget::new(1 << 20),
+            0,
+        );
+        assert!(dispatcher.dispatch(request, &permits, reply).await);
+        let RequestBody::Fetch(sent) = main_rx.try_recv().unwrap().body else {
+            panic!("a Fetch");
+        };
+        assert_eq!(sent.max_bytes, 4096);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_of_no_partitions_is_not_a_long_poll() {
+        use crate::kafka::messages::{PartitionFetchData, TopicFetchData};
+        // Kafka 3.7 answers a waiting Fetch that names no partition at once: it goes
+        // straight to the main lane, holding no long-poll slot and registering nothing.
+        let (main, main_rx) = crossbeam_channel::bounded(4);
+        let (liveness, _liveness_rx) = crossbeam_channel::bounded(4);
+        let dispatcher = Dispatcher {
+            request_lanes: RequestLanes { main, liveness },
+            registry: Arc::new(PendingFetchRegistry::new()),
+            long_poll_interval: Some(Duration::from_secs(1)),
+            runtime_context: Arc::new(crate::kafka::RuntimeContext::new(
+                crate::config::Config::load(),
+            )),
+        };
+        let permits = Arc::new(Semaphore::new(MAX_LONG_POLLS_PER_CONNECTION));
+        let request = |topic_data: Vec<TopicFetchData>| {
+            let (response_tx, _responses) = tokio::sync::mpsc::unbounded_channel();
+            KafkaRequest {
+                header: crate::kafka::api::RequestHeader {
+                    api_key: crate::kafka::constants::API_KEY_FETCH,
+                    api_version: 4,
+                    correlation_id: 1,
+                    client_id: None,
+                },
+                body: RequestBody::Fetch(FetchRequestData {
+                    topic_data,
+                    ..fetch(1 << 20, 1)
+                }),
+                response_tx,
+                decode_charge: DecodedCharge::default(),
+            }
+        };
+        let empty_topic = |name: &str| TopicFetchData {
+            name: name.to_string(),
+            partitions: Vec::new(),
+        };
+        for topic_data in [Vec::new(), vec![empty_topic("a"), empty_topic("b")]] {
+            match dispatcher.route(request(topic_data), &permits) {
+                Route::Lane(request) => assert!(dispatcher.send(request).await),
+                Route::LongPoll(_) => panic!("a Fetch of no partitions must not long-poll"),
+            }
+            assert!(main_rx.try_recv().is_ok(), "sent to the main lane");
+            assert_eq!(
+                permits.available_permits(),
+                MAX_LONG_POLLS_PER_CONNECTION,
+                "no long-poll slot taken"
+            );
+        }
+        // One partition anywhere in the request makes it a long poll.
+        let one = vec![
+            empty_topic("a"),
+            TopicFetchData {
+                name: "b".to_string(),
+                partitions: vec![PartitionFetchData {
+                    partition_index: 0,
+                    fetch_offset: 0,
+                    partition_max_bytes: 1024,
+                }],
+            },
+        ];
+        assert!(matches!(
+            dispatcher.route(request(one), &permits),
+            Route::LongPoll(_)
+        ));
+    }
 
     #[tokio::test]
     async fn test_send_with_backpressure_succeeds_once_room_frees() {

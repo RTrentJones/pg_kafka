@@ -33,7 +33,7 @@ We use a three-tier testing strategy that works around these constraints:
 
 ### Tier 1: Unit Tests (No Database Required)
 
-**Location:** `#[cfg(test)]` modules throughout `src/` (e.g. `src/kafka/handlers/tests.rs`,
+**Location:** `#[cfg(test)]` modules throughout `src/` (e.g. `src/kafka/handlers/tests/`,
 `src/kafka/storage/tests.rs`, `src/kafka/protocol/decoding.rs`). Mocks live in `src/testing/mocks.rs`.
 
 **Key Pattern:** Dependency injection via the `KafkaStore` trait.
@@ -81,7 +81,7 @@ pub fn handle_produce(
     // Business logic here - testable without database
 }
 
-// Test with mock (src/kafka/handlers/tests.rs)
+// Test with mock (src/kafka/handlers/tests/)
 #[test]
 fn test_handle_produce_success() {
     let mut mock = MockKafkaStore::new();
@@ -107,10 +107,14 @@ cargo test --features pg14 --lib
 
 ### Tier 2: Protocol and Property Tests (No Database Required)
 
-**Location:** the unit-test modules in `src/kafka/protocol/` (`decoding.rs`, `encoding.rs`,
-`recordbatch.rs`, including proptest fuzz harnesses that assert the parsers never panic or abort on
-arbitrary bytes), plus the integration target `tests/property_tests.rs` (proptest invariants for
-header fields, ports, node ids, partition indices, API version ranges, and topic-name lengths).
+**Location:** the unit-test modules of `src/kafka/protocol/` (`decoding/tests.rs` and
+`decoding/tests/`, `decode_budget/tests.rs`, `decode_meter/tests.rs`, and the inline `tests`
+modules of `encoding.rs`, `framing.rs` and `recordbatch.rs`; `decoding/tests.rs` and
+`recordbatch.rs` hold proptest fuzz harnesses that assert the parsers never panic or abort on
+arbitrary bytes), plus the integration target `tests/property_tests.rs`, which round-trips
+arbitrary values through the kafka-protocol crate's encodings pg_kafka relies on (header fields,
+ports, node ids, partition indices, API version ranges, topic-name lengths) and exercises no
+pg_kafka code.
 
 These test wire protocol encoding/decoding without database interaction:
 
@@ -294,8 +298,8 @@ The `Test Suite` job in `.github/workflows/ci.yml` handles the PGC_POSTMASTER co
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Project Coverage | 80%+ | Testable code only |
-| Patch Coverage | 90%+ | New/modified code |
+| Project Coverage | 80% (gate 78%) | Testable code only; `codecov.yml` threshold 2% |
+| Patch Coverage | 90% (gate 85%) | New/modified code; threshold 5% |
 | Handler Tests | 95%+ | Aspirational; not enforced by `codecov.yml` |
 
 Files in `codecov.yml` ignore list are excluded from these targets. The `spi-e2e-guard` CI job

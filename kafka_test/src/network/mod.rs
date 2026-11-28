@@ -5,7 +5,8 @@
 //! read deadlines, the pre-auth deadline from accept, the SASL lookup rate limit, SCRAM
 //! enumeration, decompression, record-count and header bombs, large zstd windows, partition
 //! data that is not one RecordBatch v2, batches read with Kafka's grammar and header checks,
-//! an acks=0 Produce at an unsupported version, a saturated large-decode path), each
+//! an acks=0 Produce at an unsupported version, a saturated large-decode path and the frames
+//! waiting for it, requests that decode to many times their frame, clients that stop reading their responses), each
 //! checking that ordinary rdkafka clients keep working while the attack runs.
 //!
 //! `hostile_clients` run against the default configuration. `limits` reconfigure the listener
@@ -15,11 +16,15 @@
 //! source addresses (127.0.0.2, ...) so their per-IP accounting is separate from the
 //! well-behaved clients on 127.0.0.1. All tests are `parallel_safe: false`.
 
+pub mod decode_memory;
 pub mod decode_work;
 pub mod fanout;
+pub mod fetch_bounds;
+pub mod fetch_limits;
 pub mod hostile_clients;
 pub mod large_decodes;
 pub mod produce_decoding;
+pub mod stalled_writers;
 
 use crate::common::DynResult;
 use crate::wire::{correlation_of, read_frame_within, request_frame};
@@ -167,6 +172,14 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         // setup first, teardown last).
         hostile_clients::test_partial_frames_cannot_exhaust_the_frame_budget: sequential,
         hostile_clients::test_response_larger_than_the_request_limit_is_delivered: sequential,
+        fetch_limits::test_fetch_responses_are_capped_by_fetch_max_bytes: sequential,
+        fetch_bounds::test_fetch_limits_count_uncompressed_and_header_bytes: sequential,
+        fetch_bounds::test_long_poll_min_bytes_counts_each_partition_up_to_its_limit: sequential,
+        fetch_bounds::test_pipelined_responses_stay_within_the_connection_budget: sequential,
+        fetch_bounds::test_fetch_reads_no_first_record_a_partition_cannot_return: sequential,
+        fetch_bounds::test_fetch_reads_no_first_record_header_a_partition_cannot_return: sequential,
+        fetch_bounds::test_fetch_limits_count_records_alone_in_their_batch: sequential,
+        fetch_bounds::test_gap_batches_count_against_max_bytes: sequential,
         hostile_clients::test_pipelined_requests_are_not_delayed_by_nagle: sequential,
         hostile_clients::test_acks0_produce_error_closes_connection: sequential,
         hostile_clients::test_invalid_acks_rejected_and_nothing_written: sequential,
@@ -182,6 +195,9 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         produce_decoding::test_the_decode_limit_refuses_partitions_on_their_own: sequential,
         produce_decoding::test_transactional_batches_need_a_transactional_id: sequential,
         large_decodes::test_saturated_large_decodes_wait_instead_of_closing: sequential,
+        large_decodes::test_frames_waiting_to_decode_stay_within_the_frame_budget: sequential,
+        stalled_writers::test_clients_that_stop_reading_do_not_lock_out_others: sequential,
+        decode_memory::test_requests_that_decode_to_many_times_their_frame_are_refused: sequential,
         decode_work::test_refused_partitions_do_not_hold_the_io_threads: sequential,
         decode_work::test_refused_partitions_do_not_monopolize_the_decode_slots: sequential,
         decode_work::test_repeated_partition_entries_are_answered_once: sequential,
@@ -204,17 +220,21 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         fanout::test_delete_topics_of_many_missing_names_is_answered_quickly: sequential,
         fanout::test_create_partitions_of_many_missing_names_is_answered_quickly: sequential,
         fanout::test_describe_configs_of_a_repeated_topic_is_answered_quickly: sequential,
+        fanout::test_describe_configs_of_many_topics_is_answered_quickly: sequential,
         fanout::test_incremental_alter_configs_of_a_repeated_topic_is_answered_quickly: sequential,
         fanout::test_add_partitions_to_txn_of_a_repeated_topic_is_answered_quickly: sequential,
         fanout::test_txn_offset_commit_of_a_repeated_partition_is_answered_quickly: sequential,
         fanout::test_delete_groups_of_many_groups_is_answered_quickly: sequential,
         fanout::test_describe_groups_of_many_groups_is_answered_quickly: sequential,
         fanout::test_fetch_of_a_repeated_partition_is_answered_quickly: sequential,
+        fanout::test_long_poll_of_a_repeated_partition_is_answered_quickly: sequential,
         limits::test_network_limits_setup: sequential,
         limits::test_scram_unknown_user_is_indistinguishable: sequential,
         limits::test_per_ip_connection_limit: sequential,
         limits::test_per_listener_connection_limit: sequential,
         limits::test_idle_and_frame_read_timeouts_close_connections: sequential,
+        limits::test_a_stalled_writer_closes_after_the_idle_timeout: sequential,
+        limits::test_a_non_reading_client_behind_a_long_poll_closes_after_the_idle_timeout: sequential,
         limits::test_pre_auth_deadline_runs_from_accept: sequential,
         limits::test_sasl_credential_lookups_are_rate_limited: sequential,
         limits::test_network_limits_teardown: sequential,

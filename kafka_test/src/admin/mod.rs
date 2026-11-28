@@ -6,8 +6,10 @@
 //! - CreatePartitions (API 37)
 //! - DeleteGroups (API 42)
 
-mod configs;
+pub(crate) mod configs;
 mod create_validation;
+mod delete_cost;
+mod total_partitions;
 
 use crate::common::create_admin_client;
 use crate::common::{create_db_client, DynResult, TestResult};
@@ -681,6 +683,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         configs::test_incremental_alter_configs_retention_roundtrip,
         configs::test_delete_records_truncates_partition,
         configs::test_per_topic_retention_override_enforced_by_sweep: sequential, // Runs the global retention sweep
+        configs::test_config_api_answers_match_kafka,
+        configs::test_incremental_alter_configs_duplicate_keys,
         test_create_multiple_topics,
         test_create_topic_invalid_name,
         test_create_partitions_not_found,
@@ -689,5 +693,8 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         test_create_topic_invalid_partitions,
         create_validation::test_partition_count_above_cap_is_rejected,
         create_validation::test_create_topics_rejects_duplicates_collisions_and_bad_replication,
+        // Sequential: it seeds 2,000,000 rows and times one request on the DB thread.
+        delete_cost::test_delete_topics_cascade_is_indexed: sequential,
+        total_partitions::test_total_partitions_are_capped: sequential, // changes a GUC; counts all topics
     ]
 }

@@ -21,6 +21,7 @@ use super::messages::Record;
 
 mod delegate;
 mod headers;
+mod record_bytes;
 mod sequence;
 
 pub(crate) use delegate::{
@@ -28,6 +29,7 @@ pub(crate) use delegate::{
     delegate_topic_store, delegate_transaction_store,
 };
 pub use headers::{decode_headers_json, encode_headers_json};
+pub use record_bytes::{record_fetch_bytes, HEADER_OVERHEAD, RECORD_OVERHEAD};
 pub use sequence::{
     batch_last_sequence, next_sequence, transactional_epoch_is_stale, validate_sequence,
     validate_unknown_producer, CachedBatch, PartitionSequence, ProducerBatch, SequenceCheck,
@@ -74,6 +76,26 @@ pub struct FetchedMessage {
     pub producer_epoch: Option<i16>,
 }
 
+/// What one fetch of a partition read ([`LogStore::fetch_records_with_isolation`]).
+#[derive(Debug, Clone, Default)]
+pub struct FetchedRecords {
+    /// The records, in offset order.
+    pub messages: Vec<FetchedMessage>,
+    /// The offset of the first visible record from the fetch offset when it was left out
+    /// unread: it is larger than the byte limit and the fetch did not allow it whole.
+    /// `messages` is then empty.
+    pub first_left_out: Option<i64>,
+}
+
+impl From<Vec<FetchedMessage>> for FetchedRecords {
+    fn from(messages: Vec<FetchedMessage>) -> Self {
+        Self {
+            messages,
+            first_left_out: None,
+        }
+    }
+}
+
 /// The producer that owns a transactional id, as InitProducerId judges a presented
 /// producer id and epoch against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +110,27 @@ pub struct TransactionalProducer {
     /// abort), as Kafka's lastProducerEpoch.
     pub previous_epoch: Option<i16>,
 }
+
+/// What one ListGroups entry takes besides its group id, at least: the length prefixes of its
+/// id, protocol type and state, and its tagged fields. The bytes [`OffsetStore::list_offset_groups`]
+/// counts per group, which an entry of a held group never undercuts.
+pub const LISTED_GROUP_OVERHEAD: usize = 8;
+
+/// The groups known by their offsets that a ListGroups may list
+/// ([`OffsetStore::list_offset_groups`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OffsetGroupPage {
+    /// The first ids in byte order, as long as the running total of their lengths plus
+    /// [`LISTED_GROUP_OVERHEAD`] each, before each id, stays within the budget (so the first
+    /// one past the budget is among them).
+    pub ids: Vec<String>,
+    /// Whether a group with offsets follows the last of `ids`: the read stopped at the budget.
+    pub more: bool,
+}
+
+/// One topic's committed offsets of a group, as [`OffsetStore::fetch_all_offsets`] reads
+/// them: the topic's name and its `(partition, offset)` pairs, an offset left out as `None`.
+pub type GroupTopicOffsets = (String, Vec<(i32, Option<CommittedOffset>)>);
 
 /// Committed offset information (internal representation)
 #[derive(Debug, Clone)]
@@ -172,7 +215,8 @@ impl IsolationLevel {
 pub struct PartitionBounds {
     /// Log-end offset; never regresses (BUG-4).
     pub high_watermark: i64,
-    /// Lowest pending transactional offset (ReadCommitted), or the high watermark.
+    /// Lowest pending transactional offset, or the high watermark: reported to every consumer
+    /// as Kafka reports it, whatever its isolation level (a read_committed one reads up to it).
     pub last_stable_offset: i64,
     /// Earliest retained offset: GREATEST(first surviving row, durable log start).
     pub earliest_offset: i64,
@@ -192,16 +236,12 @@ impl PartitionBounds {
         min_offset: Option<i64>,
         max_offset: Option<i64>,
         min_pending_offset: Option<i64>,
-        isolation_level: IsolationLevel,
     ) -> Self {
         let log_start = log_start_offset.unwrap_or(0);
         let high_watermark = next_offset
             .unwrap_or(0)
             .max(max_offset.map_or(0, |m| m.saturating_add(1)));
-        let last_stable_offset = match isolation_level {
-            IsolationLevel::ReadCommitted => min_pending_offset.unwrap_or(high_watermark),
-            IsolationLevel::ReadUncommitted => high_watermark,
-        };
+        let last_stable_offset = min_pending_offset.unwrap_or(high_watermark);
         PartitionBounds {
             high_watermark,
             last_stable_offset,
@@ -245,13 +285,17 @@ pub trait TopicStore {
     /// * `default_partitions` - Number of partitions to create if topic doesn't exist
     ///
     /// # Returns
-    /// Tuple of (topic_id, partition_count) on success, error otherwise
+    /// Tuple of (topic_id, partition_count) on success, error otherwise; `PolicyViolation`
+    /// (nothing created) when creating it would take the partitions of all topics above
+    /// `pg_kafka.max_total_partitions`
     fn get_or_create_topic(&self, name: &str, default_partitions: i32) -> Result<(i32, i32)>;
 
     /// Create each of `names` that does not exist with `partition_count` partitions, in one
     /// statement however many names: the topics of `names` afterwards, created here, before
     /// or concurrently by another session, in no particular order. (A name another session
-    /// commits while the insert waits on it takes a second statement to read.)
+    /// commits while the insert waits on it takes a second statement to read.) When creating
+    /// the missing names would take the partitions of all topics above
+    /// `pg_kafka.max_total_partitions`, none is created and the result is `PolicyViolation`.
     fn get_or_create_topics(
         &self,
         names: &[String],
@@ -323,13 +367,17 @@ pub trait TopicStore {
     /// Ok on success
     fn set_topic_partition_count(&self, name: &str, partition_count: i32) -> Result<()>;
 
-    /// Get a topic's per-topic `retention.ms` override (API 32/44 support).
+    /// The per-topic `retention.ms` override of each of `topic_ids` that exists (API 32
+    /// support), in one statement however many there are.
     ///
     /// # Returns
-    /// `None` when the topic inherits the global
+    /// Per existing topic id, `None` when the topic inherits the global
     /// `pg_kafka.message_retention_hours`; `Some(ms)` when an override is set
-    /// (`ms < 0` = infinite retention for this topic).
-    fn get_topic_retention_ms(&self, topic_id: i32) -> Result<Option<i64>>;
+    /// (`ms < 0` = infinite retention for this topic). A topic that does not exist is absent.
+    fn get_topics_retention_ms(
+        &self,
+        topic_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Option<i64>>>;
 
     /// Set or clear a topic's `retention.ms` override (IncrementalAlterConfigs).
     ///
@@ -342,6 +390,9 @@ pub trait TopicStore {
     /// equal (Kafka's metric-name collision rule), the names themselves included, sorted;
     /// one statement however many names.
     fn colliding_topics(&self, names: &[String]) -> Result<Vec<String>>;
+
+    /// The partitions of all topics together, for `pg_kafka.max_total_partitions`.
+    fn total_partition_count(&self) -> Result<i64>;
 }
 
 /// The message log: append, read (with isolation), offset bounds and truncation.
@@ -385,19 +436,23 @@ pub trait LogStore {
     /// * `topic_id` - Topic ID
     /// * `partition_id` - Partition ID
     /// * `fetch_offset` - Offset to start fetching from
-    /// * `max_bytes` - Maximum bytes to fetch (approximate limit)
+    /// * `max_bytes` - Most bytes the records may add to the response
+    /// * `whole_first_record` - Return the first record even when it alone is larger than
+    ///   `max_bytes` (KIP-74: the first partition of a response with data). Without it such a
+    ///   record is not read at all; `first_left_out` reports its offset
     /// * `isolation_level` - Consumer isolation level
     ///
     /// # Returns
-    /// Vector of fetched messages respecting isolation level
+    /// The fetched messages respecting isolation level
     fn fetch_records_with_isolation(
         &self,
         topic_id: i32,
         partition_id: i32,
         fetch_offset: i64,
         max_bytes: i32,
+        whole_first_record: bool,
         isolation_level: IsolationLevel,
-    ) -> Result<Vec<FetchedMessage>>;
+    ) -> Result<FetchedRecords>;
 
     /// Get high watermark for a topic partition
     ///
@@ -448,9 +503,9 @@ pub trait LogStore {
     fn get_last_stable_offset(&self, topic_id: i32, partition_id: i32) -> Result<i64>;
 
     /// All offset bounds a Fetch response reports for one partition, in one storage
-    /// round trip: high watermark, last stable offset (for `isolation_level`; equal
-    /// to the high watermark for ReadUncommitted), earliest offset and durable log
-    /// start. Each field matches the corresponding single-value method
+    /// round trip: high watermark, last stable offset (the same for both isolation levels, as
+    /// Kafka reports it; `isolation_level` does not change any bound), earliest offset and
+    /// durable log start. Each field matches the corresponding single-value method
     /// (`get_high_watermark`, `get_last_stable_offset`, `get_earliest_offset`,
     /// `get_log_start_offset`).
     ///
@@ -462,13 +517,10 @@ pub trait LogStore {
         &self,
         topic_id: i32,
         partition_id: i32,
-        isolation_level: IsolationLevel,
+        _isolation_level: IsolationLevel,
     ) -> Result<PartitionBounds> {
         let high_watermark = self.get_high_watermark(topic_id, partition_id)?;
-        let last_stable_offset = match isolation_level {
-            IsolationLevel::ReadCommitted => self.get_last_stable_offset(topic_id, partition_id)?,
-            IsolationLevel::ReadUncommitted => high_watermark,
-        };
+        let last_stable_offset = self.get_last_stable_offset(topic_id, partition_id)?;
         let earliest_offset = self.get_earliest_offset(topic_id, partition_id)?;
         let log_start_offset = self.get_log_start_offset(topic_id, partition_id)?;
         Ok(PartitionBounds {
@@ -538,26 +590,33 @@ pub trait OffsetStore {
         metadata: Option<&str>,
     ) -> Result<()>;
 
-    /// Fetch all committed offsets for a consumer group
-    ///
-    /// # Arguments
-    /// * `group_id` - Consumer group ID
-    ///
-    /// # Returns
-    /// Map of (topic_name, partition_id) -> CommittedOffset
-    fn fetch_all_offsets(&self, group_id: &str) -> Result<Vec<(String, i32, CommittedOffset)>>;
+    /// Every committed offset of `group_id` by topic, as `(topic name, [(partition,
+    /// offset)])`, sorted by topic and partition. The offsets whose metadata would take the running total of
+    /// metadata bytes past `max_metadata_bytes` are `None` (read without their offset or
+    /// metadata), except the first: an offset without metadata is always read. So what is
+    /// read is bounded by `max_metadata_bytes` plus one offset's metadata (4096 UTF-16 code
+    /// units, at most 12 KB) plus O(1) per committed partition.
+    fn fetch_all_offsets(
+        &self,
+        group_id: &str,
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<GroupTopicOffsets>>;
 
     /// The committed offsets of `group_id` for `partitions` (`(topic_id, partition_id)`
     /// pairs), as `(topic_id, partition_id, offset)` in no particular order; a partition
-    /// without one is left out. One statement, reading only the requested partitions, so
-    /// OffsetFetch of a few partitions costs the same however many offsets the group has.
+    /// without one is left out, and one past `max_metadata_bytes` (counted in the order of
+    /// `partitions`, as [`Self::fetch_all_offsets`] counts) is `None`. One statement,
+    /// reading only the requested partitions, so OffsetFetch of a few partitions costs the
+    /// same however many offsets the group has.
     fn fetch_offsets(
         &self,
         group_id: &str,
         partitions: &[(i32, i32)],
-    ) -> Result<Vec<(i32, i32, CommittedOffset)>>;
+        max_metadata_bytes: usize,
+    ) -> Result<Vec<(i32, i32, Option<CommittedOffset>)>>;
 
-    /// Delete all committed offsets for a consumer group
+    /// Delete a consumer group's offsets: the committed ones and those pending in open
+    /// transactions (a transaction's commit then stores none for the group).
     ///
     /// # Arguments
     /// * `group_id` - Consumer group ID
@@ -566,12 +625,18 @@ pub trait OffsetStore {
     /// Ok on success
     fn delete_consumer_group_offsets(&self, group_id: &str) -> Result<()>;
 
-    /// The ids of every group that has at least one committed offset (sorted). These groups
-    /// exist for DescribeGroups / ListGroups even when the in-memory coordinator does not know
-    /// them (e.g. after a worker restart), as Kafka reports them as Empty groups.
-    fn list_offset_groups(&self) -> Result<Vec<String>>;
+    /// The ids of the groups that have at least one committed offset or pending
+    /// transactional offset, in byte order, as long as the running total of their lengths
+    /// plus [`LISTED_GROUP_OVERHEAD`] each stays within `max_bytes` before the id (so the
+    /// first id past the budget is included), and whether more follow: what ListGroups may
+    /// list (see `handlers::coordinator::list_groups`). The ids past the page are not read.
+    /// These groups exist for DescribeGroups / ListGroups / DeleteGroups even when the
+    /// in-memory coordinator does not know them (e.g. after a worker restart, or a group only
+    /// a TxnOffsetCommit named), as Kafka reports them as Empty groups.
+    fn list_offset_groups(&self, max_bytes: usize) -> Result<OffsetGroupPage>;
 
-    /// Which of `group_ids` have at least one committed offset, in one statement.
+    /// Which of `group_ids` have at least one committed offset or pending transactional
+    /// offset, in one statement.
     fn groups_with_offsets(&self, group_ids: &[String]) -> Result<HashSet<String>>;
     /// The `(topic name, partition)` pairs of `group_id` that have a transactional
     /// offset commit (TxnOffsetCommit) whose transaction has not ended yet: among
@@ -870,7 +935,19 @@ pub trait TransactionStore {
     /// # Returns
     /// Current transaction state, or None if transactional_id not found
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
+
+    /// The partitions added (AddPartitionsToTxn) to the transactional id's open or last
+    /// transaction, by topic name: the partitions whose last stable offset its end can
+    /// move, so the read_committed long polls to wake when it ends (Kafka writes its
+    /// markers to exactly these). The registry is cleared only when the next transaction
+    /// begins or InitProducerId fences it, so it still holds them right after a commit
+    /// or abort. Cost: one index range read of the id's `kafka.txn_partitions` rows, so
+    /// O(partitions the client added, plus their topic names' bytes) time and memory.
+    fn transaction_partitions(&self, transactional_id: &str) -> Result<TxnPartitions>;
 }
+
+/// Topic-partitions by topic name, each topic once: the partitions a transaction touched.
+pub type TxnPartitions = Vec<(String, Vec<i32>)>;
 
 /// Background maintenance the worker runs between requests.
 pub trait MaintenanceStore {

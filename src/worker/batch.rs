@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 use super::txn::{log_txn_error, run_request_in_subtransaction, worker_transaction};
 use crate::kafka::api::ResponseBody;
 use crate::kafka::auth::CredentialRequest;
-use crate::kafka::constants::{API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE};
+use crate::kafka::constants::API_KEY_PRODUCE;
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::{
     BrokerMetadata, GroupCoordinator, InternalNotification, KafkaRequest, KafkaResponse,
     KafkaStore, PostgresStore,
 };
-use crate::pg_warning;
+use crate::{pg_log, pg_warning};
 
 /// Most requests one top-level transaction carries (group commit).
 ///
@@ -55,6 +55,7 @@ pub(super) fn reject_request(request: KafkaRequest, error_code: i16) {
         header,
         body,
         response_tx,
+        ..
     } = request;
     if !body.expects_response() {
         return;
@@ -108,20 +109,6 @@ pub(super) fn serve_credential_requests(
                 .send(Err("credential lookup unavailable".to_string()));
         }
     }
-}
-
-/// Tell the network thread that transactions ended, so parked read_committed fetches
-/// re-check their last stable offset now. Best effort: a full channel only means the
-/// long-poll safety net picks it up.
-pub(super) fn notify_transaction_ended(notify_tx: &Sender<InternalNotification>) {
-    let _ = notify_tx.try_send(InternalNotification::TransactionEnded);
-}
-
-/// Whether a committed batch ended (or may have ended) transactions other than through
-/// EndTxn, which notifies by itself: InitProducerId fences and aborts the previous
-/// epoch's open transaction.
-fn batch_may_end_transactions(api_keys: &[i16]) -> bool {
-    api_keys.contains(&API_KEY_INIT_PRODUCER_ID)
 }
 
 /// Whether a group-commit batch should take another already-queued request: it stops
@@ -450,9 +437,6 @@ pub(super) fn execute_batch(
     match txn_result {
         Ok(()) => {
             release_committed(pending, env.shadow_store);
-            if batch_may_end_transactions(&api_keys) {
-                notify_transaction_ended(env.notify_tx);
-            }
         }
         Err(err) => {
             // Nothing of the batch committed. Every request gets an API-typed error
@@ -480,7 +464,7 @@ fn log_batch_timing(batch_size: usize, total: Duration, handler_time: Duration) 
     let overhead_pct = (tx_overhead.as_micros() * 100)
         .checked_div(total.as_micros())
         .unwrap_or(0);
-    log!(
+    pg_log!(
         "TIMING: batch={} total={}us handler={}us tx_overhead={}us ({}%)",
         batch_size,
         total.as_micros(),
@@ -496,7 +480,7 @@ mod tests {
     use crate::kafka::api::{
         ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader,
     };
-    use crate::kafka::constants::{API_KEY_API_VERSIONS, API_KEY_FETCH};
+    use crate::kafka::constants::API_KEY_API_VERSIONS;
     use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
 
     #[test]
@@ -594,19 +578,6 @@ mod tests {
         assert_eq!(hb_rx.len(), 2 * MAX_GROUP_COMMIT_REQUESTS);
     }
 
-    #[test]
-    fn test_init_producer_id_batches_notify_transaction_end() {
-        assert!(batch_may_end_transactions(&[
-            API_KEY_PRODUCE,
-            API_KEY_INIT_PRODUCER_ID
-        ]));
-        assert!(!batch_may_end_transactions(&[
-            API_KEY_PRODUCE,
-            API_KEY_FETCH
-        ]));
-        assert!(!batch_may_end_transactions(&[]));
-    }
-
     fn request(
         api_key: i16,
         correlation_id: i32,
@@ -626,6 +597,7 @@ mod tests {
                 },
                 body,
                 response_tx: tx,
+                decode_charge: crate::kafka::protocol::DecodedCharge::default(),
             },
             rx,
         )

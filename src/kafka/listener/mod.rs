@@ -11,6 +11,7 @@
 //! * `tls`: the TLS handshake and the client-certificate principal.
 //! * `connection`: one connection's read loop and how it closes.
 //! * `writer`: the task that writes a connection's responses in request order.
+//! * `response_budget`: what a connection's unwritten responses may hold.
 //! * `sasl`: per-connection authentication state and the SASL frames.
 //! * `dispatch`: handing requests to the DB thread.
 //! * `long_poll`: Fetch long polling.
@@ -19,6 +20,7 @@ mod accept;
 mod connection;
 mod dispatch;
 mod long_poll;
+mod response_budget;
 mod sasl;
 mod thread;
 mod tls;
@@ -128,6 +130,7 @@ pub async fn run(
             long_poll_interval: config
                 .enable_long_polling
                 .then(|| long_poll::poll_interval(config.fetch_poll_interval_ms)),
+            runtime_context: Arc::clone(&runtime_context),
         },
         ip_tracker: IpTracker::new(max_per_ip),
         lookup: ChannelLookup(credential_tx),
@@ -197,6 +200,13 @@ fn spawn_notifier(
                     return;
                 }
             }
+            // A notification dropped on the full channel named partitions no long poll
+            // learns of: wake them all coarsely (at most once per receive, so at most every
+            // NOTIFY_RECV_TIMEOUT while the channel keeps overflowing).
+            if crate::kafka::notifications::take_dropped() {
+                debug!("Notifications were dropped; waking every long poll");
+                registry.notify_coarse().await;
+            }
         }
     })
 }
@@ -204,9 +214,15 @@ fn spawn_notifier(
 /// Wake the long polls one notification concerns.
 async fn wake_waiters(registry: &PendingFetchRegistry, notification: InternalNotification) {
     match notification {
-        InternalNotification::TransactionEnded => {
-            debug!("Notification: transaction ended, waking read_committed waiters");
-            registry.notify_transaction_ended().await;
+        InternalNotification::TransactionEnded { partitions } => {
+            debug!(
+                "Notification: transaction ended, waking its partitions' read_committed waiters"
+            );
+            for (topic_name, partition_ids) in &partitions {
+                registry
+                    .notify_transaction_ended(topic_name, partition_ids)
+                    .await;
+            }
         }
         InternalNotification::NewMessages {
             topic_name,
@@ -222,6 +238,18 @@ async fn wake_waiters(registry: &PendingFetchRegistry, notification: InternalNot
                 .notify_new_data(&topic_name, partition_id, high_watermark)
                 .await;
         }
+        InternalNotification::LogStartMoved {
+            topic_name,
+            partition_id,
+        } => {
+            registry
+                .notify_partition_changed(&topic_name, partition_id)
+                .await;
+        }
+        InternalNotification::TopicDeleted { topic_name } => {
+            registry.notify_topic_changed(&topic_name).await;
+        }
+        InternalNotification::RecordsExpired => registry.notify_coarse().await,
     }
 }
 

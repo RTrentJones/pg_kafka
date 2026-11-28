@@ -223,6 +223,12 @@ pub enum ForwardRequest {
     Record(ForwardRecord),
     /// Hold a sync-mode produce response until its records are delivered.
     Hold(SyncHold),
+    /// The schema the earlier requests came from was dropped (DROP EXTENSION, or
+    /// a re-created extension): the forwarder drops every forward, fence and hold
+    /// they left, and stamps the acks it sends from now on with this schema
+    /// epoch. A re-created extension reuses row keys (`kafka.topics.id` starts
+    /// again), so nothing of the old schema may be matched to a new row.
+    Reset(u64),
 }
 
 /// How one forward attempt ended.
@@ -247,11 +253,19 @@ pub struct ForwardAck {
     pub row: RowKey,
     /// How the attempt ended.
     pub outcome: ForwardOutcome,
+    /// The schema epoch of the last [`ForwardRequest::Reset`] the forwarder
+    /// processed before sending the ack (0 before any). The DB thread ignores an
+    /// ack of another epoch: it answers a forward of a dropped schema.
+    pub epoch: u64,
 }
 
 impl ForwardAck {
     pub fn new(row: RowKey, outcome: ForwardOutcome) -> Self {
-        Self { row, outcome }
+        Self {
+            row,
+            outcome,
+            epoch: 0,
+        }
     }
 }
 

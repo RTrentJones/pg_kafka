@@ -17,8 +17,13 @@ pub struct Wire {
 
 impl Wire {
     pub async fn connect() -> Result<Self> {
-        let addr = crate::common::get_bootstrap_servers();
-        let stream = TcpStream::connect(addr.as_str()).await?;
+        Self::connect_to(&crate::common::get_bootstrap_servers()).await
+    }
+
+    /// A connection to the broker at `addr` (`host:port`), for example the external
+    /// Kafka of the shadow tests.
+    pub async fn connect_to(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         Ok(Self {
             stream,
@@ -251,26 +256,46 @@ impl Wire {
         offset: i64,
         isolation_level: i8,
     ) -> Result<PartitionData> {
-        let mut p = FetchPartition::default();
-        p.partition = partition;
-        p.fetch_offset = offset;
-        p.partition_max_bytes = 1 << 20;
-        p.log_start_offset = -1;
-        p.current_leader_epoch = -1;
-        p.last_fetched_epoch = -1;
+        let parts = self
+            .fetch_partitions(topic, &[(partition, offset)], 1 << 20, isolation_level)
+            .await?;
+        Ok(parts[0].clone())
+    }
+
+    /// Fetch v11 (no wait) of `(partition, offset)`s of one topic, in that order, within
+    /// `max_bytes` (each partition's own limit 1 MiB): the partitions' entries.
+    pub async fn fetch_partitions(
+        &mut self,
+        topic: &str,
+        partitions: &[(i32, i64)],
+        max_bytes: i32,
+        isolation_level: i8,
+    ) -> Result<Vec<PartitionData>> {
         let mut t = FetchTopic::default();
         t.topic = topic_name(topic);
-        t.partitions = vec![p];
+        t.partitions = partitions
+            .iter()
+            .map(|&(partition, offset)| {
+                let mut p = FetchPartition::default();
+                p.partition = partition;
+                p.fetch_offset = offset;
+                p.partition_max_bytes = 1 << 20;
+                p.log_start_offset = -1;
+                p.current_leader_epoch = -1;
+                p.last_fetched_epoch = -1;
+                p
+            })
+            .collect();
         let mut req = FetchRequest::default();
         req.replica_id = BrokerId(-1);
         req.max_wait_ms = 0;
         req.min_bytes = 0;
-        req.max_bytes = 1 << 20;
+        req.max_bytes = max_bytes;
         req.isolation_level = isolation_level;
         req.session_epoch = -1;
         req.topics = vec![t];
         let resp: FetchResponse = self.call(11, &req).await?;
-        Ok(resp.responses[0].partitions[0].clone())
+        Ok(resp.responses[0].partitions.clone())
     }
 
     /// ListOffsets v7: `(error_code, offset, timestamp)`.

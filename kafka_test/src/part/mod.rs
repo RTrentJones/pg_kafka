@@ -2,10 +2,61 @@
 //! (ADR-001).
 
 mod drop_extension;
+pub(crate) use drop_extension::MAINTENANCE_LOCK_KEY;
 mod lock_order;
 mod lock_races;
+mod sweep_budget;
 mod sweep_concurrency;
+mod sweep_cost;
+mod sweep_datestyle;
+mod sweep_isolation;
+mod sweep_liveness;
+mod sweep_races;
 pub mod time_partitions;
+
+/// The past leaves a `pg_kafka_run_retention_sweep(0, 3600)` would drop: not DEFAULT,
+/// nothing pending, and every topic in them with a `retention.ms` the leaf's upper bound
+/// is past (the global window is off). One `kafka.message_partition_contents` probe per
+/// past leaf, as the sweep's own probes.
+const DROPPABLE_LEAVES_SQL: &str = "
+    SELECT p.partition_oid::regclass::text
+    FROM kafka.message_partitions() p
+    CROSS JOIN LATERAL kafka.message_partition_contents(p.partition_oid::regclass) c
+    WHERE NOT p.is_default AND p.upper_bound <= now()
+      AND c.topic_ids IS NOT NULL AND NOT c.has_pending
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest(c.topic_ids) AS u(id)
+          LEFT JOIN kafka.topics t ON t.id = u.id
+          WHERE t.retention_ms IS NULL OR t.retention_ms < 0
+             OR p.upper_bound + t.retention_ms * INTERVAL '1 millisecond' > now())
+    ORDER BY p.upper_bound";
+
+/// Run sweeps until no droppable leaf is left (at most 30 sweeps), before a test makes
+/// the leaves it expects one sweep to drop. Other tests and earlier runs can leave
+/// droppable leaves behind, older than the test's, and a pass ends once a session (any
+/// Produce or Fetch) has waited 100 ms behind its drops: under traffic one call drops a
+/// few leaves, oldest first, and may not reach the test's own. The leaves are queried
+/// before every sweep, so a sweep that dropped nothing (its drop gave up a lock wait,
+/// or it ended early) does not end the draining while some are left.
+pub(crate) async fn drain_droppable_leaves(db: &tokio_postgres::Client) -> Result<(), String> {
+    let mut left = Vec::new();
+    for _ in 0..30 {
+        left = db
+            .query(DROPPABLE_LEAVES_SQL, &[])
+            .await
+            .map_err(|e| format!("listing droppable leaves: {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<String>>();
+        if left.is_empty() {
+            return Ok(());
+        }
+        db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(|e| format!("draining droppable leaves: {e}"))?;
+    }
+    Err(format!("droppable leaves left after 30 sweeps: {left:?}"))
+}
 
 /// The `part` tests, in run order.
 pub fn tests() -> Vec<crate::registry::TestDef> {
@@ -26,5 +77,36 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         drop_extension::test_maintenance_functions_refuse_public: sequential,
         sweep_concurrency::test_concurrent_sweeps_and_maintenance_do_not_deadlock: sequential,
         sweep_concurrency::test_worker_sweep_skips_while_maintenance_lock_held: sequential,
+        sweep_cost::test_sweep_reads_only_what_it_deletes: sequential,
+        sweep_cost::test_sweep_reaps_outbox_rows_of_removed_messages: sequential,
+        sweep_cost::test_sweep_drop_recheck_is_linear_in_the_leaf_topics: sequential,
+        sweep_budget::test_system_guc_guard_restores_on_every_path: sequential,
+        sweep_budget::test_sweep_probe_rotation_reaches_every_leaf: sequential,
+        sweep_budget::test_sweep_drops_bounded_behind_a_held_reader: sequential,
+        sweep_budget::test_sweep_aborted_cleanup_reaches_every_leaf: sequential,
+        sweep_budget::test_sweep_expiry_reaches_the_current_leaf_on_a_spent_budget: sequential,
+        sweep_budget::test_sweep_expiry_keeps_its_share_behind_an_aborted_backlog: sequential,
+        sweep_budget::test_sweep_expiry_items_do_not_grow_with_the_leaves: sequential,
+        sweep_budget::test_sweep_probe_of_many_expired_topics_stays_within_its_budget: sequential,
+        sweep_budget::test_sweep_prunes_producers_within_its_budget: sequential,
+        sweep_budget::test_sweep_trims_reach_every_kept_leaf: sequential,
+        sweep_budget::test_sweep_producer_prune_reads_through_indexes: sequential,
+        sweep_budget::test_sweep_forgets_a_deferred_drop_when_retention_is_raised: sequential,
+        sweep_datestyle::test_sweep_bounds_survive_the_session_datestyle: sequential,
+        sweep_isolation::test_sweep_keeps_rows_committed_during_a_repeatable_read_drop: sequential,
+        sweep_isolation::test_worker_sweep_drops_under_a_repeatable_read_default: sequential,
+        sweep_races::test_sweep_prune_keeps_a_producer_revived_after_its_snapshot: sequential,
+        sweep_races::test_sweep_log_start_never_passes_a_concurrent_produce: sequential,
+        sweep_races::test_sweep_prune_keeps_a_producer_whose_produce_is_open: sequential,
+        sweep_races::test_sweep_prune_then_produce_keeps_producer_state: sequential,
+        sweep_races::test_sweep_never_deadlocks_with_a_batch_writing_two_rows: sequential,
+        sweep_races::test_sweep_never_deadlocks_with_a_batch_holding_a_counter: sequential,
+        sweep_races::test_sweep_reaper_never_deadlocks_with_an_ack_batch: sequential,
+        sweep_liveness::test_sweep_pass_ends_when_a_writer_waits_for_its_drop: sequential,
+        sweep_liveness::test_partition_ddl_ignores_locks_on_other_leaves: sequential,
+        sweep_liveness::test_fresh_session_sweep_drops_what_its_probes_find: sequential,
+        sweep_liveness::test_sweep_second_drop_waits_briefly_for_its_leaf: sequential,
+        sweep_liveness::test_fresh_session_sweep_drops_beside_produce_to_a_trimmed_partition: sequential,
+        sweep_liveness::test_sweep_row_deletes_read_only_their_rows_whatever_the_plan: sequential,
     ]
 }

@@ -134,6 +134,97 @@ impl MemberAssignment {
         })
     }
 
+    /// Parse like [`Self::parse`], keeping only what the sticky assignor can keep of a
+    /// previous assignment: the entries for topics in `topics` with partitions. The result
+    /// keeps the same partitions per topic as `parse` (where a later entry for a topic
+    /// replaces an earlier one, and an empty or null list keeps nothing), and fails where
+    /// `parse` fails; `user_data` is not kept.
+    ///
+    /// A leader's assignments may hold millions of entries naming topics that do not exist
+    /// or listing no partitions, at a few bytes each. Cost: time linear in `bytes`; memory:
+    /// only the kept entries (a copy of each kept topic name and its partitions), nothing
+    /// for the rest and nothing pre-allocated from a declared length.
+    pub fn parse_kept(bytes: &[u8], topics: &HashMap<String, i32>) -> Result<Self> {
+        let mut kept = Self::default();
+        if bytes.is_empty() {
+            return Ok(kept);
+        }
+        let mut buf = bytes;
+        if buf.remaining() < 6 {
+            return Err(KafkaError::CorruptMessage {
+                message: format!(
+                    "MemberAssignment too short: {} bytes (need at least 6)",
+                    buf.remaining()
+                ),
+            });
+        }
+        kept.version = buf.get_i16();
+        let topics_len = buf.get_i32();
+        let topics_len = usize::try_from(topics_len).map_err(|_| KafkaError::CorruptMessage {
+            message: format!("Invalid topic_partitions array length: {topics_len}"),
+        })?;
+        for _ in 0..topics_len {
+            let Some(name) = read_topic_name_str(&mut buf)? else {
+                continue;
+            };
+            let len = read_partitions_len(&mut buf)?;
+            let wanted = topics.contains_key(name);
+            if wanted && len > 0 {
+                let mut partitions = Vec::with_capacity(len);
+                for _ in 0..len {
+                    partitions.push(buf.get_i32());
+                }
+                kept.topic_partitions.insert(name.to_string(), partitions);
+            } else {
+                buf.advance(len * 4);
+                if wanted {
+                    kept.topic_partitions.remove(name);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The work an assignment's bytes take to parse and keep: its topic entries (null
+    /// names included) plus the partitions they list, read from the lengths without
+    /// copying anything, and counted up to just over `limit` (the walk stops there).
+    /// Entries after data [`Self::parse`] would reject are not counted.
+    ///
+    /// Cost: one step per counted entry, at most `limit + 1`; no memory.
+    pub fn work_hint(bytes: &[u8], limit: usize) -> usize {
+        let mut buf = bytes;
+        if buf.remaining() < 6 {
+            return 0;
+        }
+        buf.advance(2);
+        let Ok(topics_len) = usize::try_from(buf.get_i32()) else {
+            return 0;
+        };
+        let mut work = 0_usize;
+        for _ in 0..topics_len {
+            if work > limit || buf.remaining() < 2 {
+                break;
+            }
+            work += 1;
+            let Ok(name_len) = usize::try_from(buf.get_i16()) else {
+                continue;
+            };
+            if buf.remaining() < name_len + 4 {
+                break;
+            }
+            buf.advance(name_len);
+            let Ok(len) = usize::try_from(buf.get_i32()) else {
+                continue;
+            };
+            if buf.remaining() < len * 4 {
+                break;
+            }
+            buf.advance(len * 4);
+            work = work.saturating_add(len);
+        }
+        work
+    }
+
     /// Encode this assignment to bytes for wire format
     ///
     /// # Returns
@@ -164,6 +255,11 @@ impl MemberAssignment {
 
 /// One topic name of the assignment array, or `None` for a null (negative-length) one.
 fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
+    read_topic_name_str(buf).map(|name| name.map(str::to_string))
+}
+
+/// [`read_topic_name`] without copying the name.
+fn read_topic_name_str<'a>(buf: &mut &'a [u8]) -> Result<Option<&'a str>> {
     if buf.remaining() < 2 {
         return Err(KafkaError::CorruptMessage {
             message: "Unexpected end of data reading topic name length".into(),
@@ -181,9 +277,9 @@ fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
             ),
         });
     }
-    let mut str_bytes = vec![0u8; str_len];
-    buf.copy_to_slice(&mut str_bytes);
-    String::from_utf8(str_bytes)
+    let (name, rest) = buf.split_at(str_len);
+    *buf = rest;
+    std::str::from_utf8(name)
         .map(Some)
         .map_err(|e| KafkaError::CorruptMessage {
             message: format!("Invalid UTF-8 in topic name: {e}"),
@@ -192,13 +288,25 @@ fn read_topic_name(buf: &mut &[u8]) -> Result<Option<String>> {
 
 /// One topic's partitions array; a null (negative-length) array is an empty assignment.
 fn read_partitions(buf: &mut &[u8]) -> Result<Vec<i32>> {
+    let partitions_len = read_partitions_len(buf)?;
+    // Capped like the topics array: the declared length is client-controlled.
+    let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
+    for _ in 0..partitions_len {
+        partitions.push(buf.get_i32());
+    }
+    Ok(partitions)
+}
+
+/// The length of one topic's partitions array (0 for a null one), checked against the data
+/// that follows it.
+fn read_partitions_len(buf: &mut &[u8]) -> Result<usize> {
     if buf.remaining() < 4 {
         return Err(KafkaError::CorruptMessage {
             message: "Unexpected end of data reading partitions array length".into(),
         });
     }
     let Ok(partitions_len) = usize::try_from(buf.get_i32()) else {
-        return Ok(Vec::new());
+        return Ok(0);
     };
     if buf.remaining() < partitions_len * 4 {
         return Err(KafkaError::CorruptMessage {
@@ -209,12 +317,7 @@ fn read_partitions(buf: &mut &[u8]) -> Result<Vec<i32>> {
             ),
         });
     }
-    // Capped like the topics array: the declared length is client-controlled.
-    let mut partitions = Vec::with_capacity(partitions_len.min(MAX_PREALLOC_ELEMENTS));
-    for _ in 0..partitions_len {
-        partitions.push(buf.get_i32());
-    }
-    Ok(partitions)
+    Ok(partitions_len)
 }
 
 #[cfg(test)]
@@ -378,5 +481,145 @@ mod tests {
         let bytes = vec![0, 0, 0]; // Only 3 bytes, need at least 6
         let result = MemberAssignment::parse(&bytes);
         assert!(result.is_err());
+    }
+
+    /// An assignment of `entries`: a topic name (`None` for a null one, which carries no
+    /// partitions array) and its partitions (`None` for a null array).
+    type Entry<'a> = (Option<&'a [u8]>, Option<&'a [i32]>);
+
+    fn encoded(entries: &[Entry<'_>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.put_i16(0);
+        bytes.put_i32(i32::try_from(entries.len()).unwrap());
+        for (name, partitions) in entries {
+            let Some(name) = name else {
+                bytes.put_i16(-1);
+                continue;
+            };
+            bytes.put_i16(i16::try_from(name.len()).unwrap());
+            bytes.put_slice(name);
+            match partitions {
+                Some(partitions) => {
+                    bytes.put_i32(i32::try_from(partitions.len()).unwrap());
+                    for &p in *partitions {
+                        bytes.put_i32(p);
+                    }
+                }
+                None => bytes.put_i32(-1),
+            }
+        }
+        bytes.put_i32(-1);
+        bytes
+    }
+
+    fn topics(names: &[&str]) -> HashMap<String, i32> {
+        names.iter().map(|n| ((*n).to_string(), 8)).collect()
+    }
+
+    #[test]
+    fn test_work_hint_counts_entries_and_partitions() {
+        let bytes = encoded(&[
+            (Some(b"a"), Some(&[0, 1])),
+            (None, None),
+            (Some(b"b"), None),
+            (Some(b"c"), Some(&[3])),
+        ]);
+        // Four entries, three partitions.
+        assert_eq!(MemberAssignment::work_hint(&bytes, usize::MAX), 7);
+        // The walk stops once the count passes the limit.
+        assert_eq!(MemberAssignment::work_hint(&bytes, 0), 3);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 3), 4);
+    }
+
+    #[test]
+    fn test_work_hint_of_short_or_malformed_bytes() {
+        assert_eq!(MemberAssignment::work_hint(&[], 10), 0);
+        assert_eq!(MemberAssignment::work_hint(&[0, 0, 0, 0, 0], 10), 0);
+        // A negative topics array length.
+        assert_eq!(
+            MemberAssignment::work_hint(&[0, 0, 0xff, 0xff, 0xff, 0xff], 10),
+            0
+        );
+        // A claimed array longer than the data: only the entries present count.
+        let mut bytes = encoded(&[(Some(b"a"), Some(&[0]))]);
+        bytes.truncate(bytes.len() - 4);
+        bytes[2..6].copy_from_slice(&5_i32.to_be_bytes());
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 2);
+        // A name longer than the data: the walk stops at it, uncounted beyond the entry.
+        let mut bytes = encoded(&[(Some(b"abc"), Some(&[0]))]);
+        bytes.truncate(8);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 1);
+        // A partitions array longer than the data.
+        let mut bytes = encoded(&[(Some(b"a"), Some(&[0, 1, 2]))]);
+        bytes.truncate(bytes.len() - 8);
+        assert_eq!(MemberAssignment::work_hint(&bytes, 10), 1);
+    }
+
+    #[test]
+    fn test_parse_kept_keeps_only_wanted_entries_with_partitions() {
+        let bytes = encoded(&[
+            (Some(b"a"), Some(&[0, 1])),
+            (None, None),
+            (Some(b"gone"), Some(&[5, 6])),
+            (Some(b"b"), Some(&[2])),
+            (Some(b"b"), Some(&[3, 4])),
+            (Some(b"c"), Some(&[7])),
+            (Some(b"c"), Some(&[])),
+            (Some(b"d"), Some(&[1])),
+            (Some(b"d"), None),
+        ]);
+        let wanted = topics(&["a", "b", "c", "d"]);
+        let kept = MemberAssignment::parse_kept(&bytes, &wanted).unwrap();
+        // A later entry replaces an earlier one; an empty or null list keeps nothing.
+        assert_eq!(kept.partitions("a"), vec![0, 1]);
+        assert_eq!(kept.partitions("b"), vec![3, 4]);
+        assert!(!kept.topic_partitions.contains_key("c"));
+        assert!(!kept.topic_partitions.contains_key("d"));
+        assert!(!kept.topic_partitions.contains_key("gone"));
+        assert!(kept.user_data.is_none());
+        // The same partitions as `parse` for the kept topics.
+        let parsed = MemberAssignment::parse(&bytes).unwrap();
+        assert_eq!(parsed.partitions("b"), kept.partitions("b"));
+        assert!(MemberAssignment::parse_kept(&[], &wanted)
+            .unwrap()
+            .topic_partitions
+            .is_empty());
+    }
+
+    #[test]
+    fn test_parse_kept_fails_where_parse_fails() {
+        let wanted = topics(&["a"]);
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![0, 0, 0],                      // too short
+            vec![0, 0, 0xff, 0xff, 0xff, 0xff], // negative topics array length
+        ];
+        // A claimed entry with no data.
+        let mut missing = encoded(&[]);
+        missing.truncate(6);
+        missing[2..6].copy_from_slice(&1_i32.to_be_bytes());
+        cases.push(missing);
+        // A name longer than the data.
+        let mut name = encoded(&[(Some(b"abc"), Some(&[0]))]);
+        name.truncate(8);
+        cases.push(name);
+        // A name that is not UTF-8.
+        cases.push(encoded(&[(Some(&[0xff, 0xfe]), Some(&[0]))]));
+        // No partitions array length after the name.
+        let mut no_len = encoded(&[(Some(b"a"), Some(&[0]))]);
+        no_len.truncate(9);
+        cases.push(no_len);
+        // A partitions array longer than the data, for a kept and an unkept topic.
+        for topic in [b"a", b"z"] {
+            let mut partitions = encoded(&[(Some(topic), Some(&[0, 1, 2]))]);
+            partitions.truncate(partitions.len() - 8);
+            cases.push(partitions);
+        }
+        for (i, bytes) in cases.iter().enumerate() {
+            assert!(MemberAssignment::parse(bytes).is_err(), "case {i}: parse");
+            assert!(
+                MemberAssignment::parse_kept(bytes, &wanted).is_err(),
+                "case {i}: parse_kept"
+            );
+        }
     }
 }

@@ -17,7 +17,12 @@ This document outlines performance benchmarks, tuning recommendations, and archi
 For current figures, see `bench.json` on the `evidence` branch (produce/consume
 throughput, latency percentiles, raw-INSERT floor, shadow-forwarding rates).
 The E2E performance suite (`kafka_test --category performance`) enforces
-regression floors in CI.
+regression bounds in CI, every test of it, each 5-100x from dev-machine measurements so that
+only order-of-magnitude regressions fail: produce and consume throughput floors
+(`throughput.rs`: awaited single sends, consume; `regression.rs`: 1000 concurrent sends and
+their consume), concurrent sends no slower than half the sequential ones, P50/P99 ceilings of
+an awaited produce, a time ceiling for ten producers' first sends, and a ceiling on the
+listener's CPU time while a consumer long-polls an empty topic.
 
 ### Architecture ceiling
 
@@ -321,9 +326,24 @@ layout, uniqueness, least-privilege DDL and upgrade. Costs to keep in mind:
 
 - Fetch/ListOffsets/HWM lookups do not name `created_at`, so they probe every leaf's
   `(topic_id, partition_id, partition_offset)` btree: one descent per leaf. Keep the leaf count
-  modest (retention / width + 4); do not combine a tiny width with a long retention. Planning such a
+  modest (retention / width + 4); do not combine a tiny width with a long retention. Only a
+  retention window bounds it: with the defaults (`pg_kafka.message_retention_hours = 0`, no
+  `retention.ms`) a leaf with rows is never dropped and the count grows by one per width, so
+  set `pg_kafka.message_retention_hours` (or `retention.ms` on every topic) on a long-lived
+  broker. Planning such a
   statement expands every leaf, so the hot read statements run through kept prepared plans
   (`select_cached` in `storage/postgres.rs`).
+- ListOffsets by timestamp and MAX_TIMESTAMP (-3) read through `idx_messages_timestamp`
+  (`topic_id, partition_id, timestamp_ms, partition_offset`, partial on non-aborted rows with a
+  timestamp), so MAX_TIMESTAMP and a lookup past the last timestamp (offsetsForTimes(now)) are
+  one descent per leaf. Timestamps need not grow with offsets, so a lookup that matches then
+  checks the rows below its candidate for an earlier match: it reads the smaller side, as the
+  planner estimates it, of the rows before the answer (through the offset key) and the index
+  entries at or after the timestamp (index-only). That is still linear in the partition for a
+  timestamp in its middle (2M rows: about 30-45 ms around the middle, under 1 ms near either
+  end, against 136-360 ms for each of them without the index); Kafka's per-segment time index
+  answers in O(log n). The index costs every Produce one btree entry per record (about 40
+  bytes; a bulk insert measured about 15% slower).
 - Retention of a leaf is a `DROP TABLE`. On 1M expired rows (PG15 sandbox): 0.35 s and 0.16 MB of WAL
   with 0 dead tuples, versus 2.9 s, 240 MB of WAL and 1M dead tuples (plus a 0.37 s VACUUM) for the
   row-delete sweep, and the table shrinks to the retained data instead of keeping its size.
@@ -371,7 +391,9 @@ CREATE TABLE kafka.consumer_offsets (
 ```sql
 -- Time-based retention for kafka.messages, enforced by the worker's periodic
 -- retention sweep (60s cadence, at most 10,000 rows per DELETE). 0 (default)
--- keeps forever. Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
+-- keeps forever (a topic's retention.ms still applies). The sweep runs either way:
+-- it also cleans up aborted rows and the shadow outbox (see "The sweep's cost"
+-- below). Range 0-87600; reloadable with SIGHUP (pg_reload_conf()).
 pg_kafka.message_retention_hours = 168   -- e.g. 7 days
 
 -- Width of one time partition of kafka.messages (minutes, default 1440 = one day,
@@ -385,12 +407,52 @@ pg_kafka.message_partition_minutes = 1440
 SELECT pg_kafka_run_partition_maintenance();
 
 -- On-demand sweep + report (also reclaims aborted transactional rows and prunes
--- stale producers, terminal transactions, and delivered shadow-outbox rows).
+-- stale producers, terminal transactions, delivered shadow-outbox rows and
+-- outbox rows whose message retention or DeleteRecords removed).
 -- Arguments: message_retention_hours (NULL = use the GUC), aborted_grace_seconds
 -- (default 60). Returns one (category, deleted) row per category, including
 -- dropped_partitions (whole leaves dropped).
 SELECT * FROM pg_kafka_run_retention_sweep();
 ```
+
+### The sweep's cost
+
+The sweep runs on the worker's single DB thread every 60 s, so while it runs no request is
+served (Produce, Fetch, Heartbeats). Its cost therefore follows the work it does, not the
+data stored: the aborted-row cleanup goes through the partial index
+`idx_messages_txn_aborted` leaf by leaf, delivered outbox rows are walked per partition through
+`idx_shadow_tracking_delivered` (only rows a day old are visited), orphaned outbox rows through
+the primary key below each partition's log start, and a past leaf gets the full contents
+probe (one descent per (topic, partition)) only where some topic's window can have expired it
+(at most 64 per pass); other past leaves get one emptiness check. Every step runs bounded
+statements (10,000 rows, one leaf, one probe, one drop): each step with work runs one per pass
+whatever the budget, then the rest of the 1.5 s goes to the steps that still have work,
+least-served first, so a backlog in one step takes what the others leave, never all of it, and
+drains over several passes, each step resuming where the last pass left it (ADR-001, "Cost",
+has the guarantees). The producer and transaction prunes are indexed too (idle producer ids
+through `(last_active_at, producer_id)`, terminal transactions through a partial index on
+`last_updated_at`, the producer ids a batch deletes and their transaction and sequence rows
+through their indexes, named by an array rather than a join, which let the planner hash the
+candidates and read `kafka.producer_ids` and `kafka.transactions` whole every batch: 115 ms a
+batch with 220,000 producer ids): 40,000 idle producer ids with their terminal transactions took
+one 18.6 s statement before (each deleted id's foreign-key check read the whole transactions table),
+and 2,000,000 now drain 10,000 producer ids and up to 190,000 transactions per 1.6-1.8 s pass;
+with 2,000,000 producer ids none of which is idle, a pass takes 2.5 ms (PG17). Measured on PG16 (3,000,000 committed rows
+in one 521 MB leaf, 500,000 recent delivered outbox rows, retention off):
+
+| | before | after |
+|---|---|---|
+| aborted-row cleanup (EXPLAIN ANALYZE) | Seq Scan, 66,667 blocks, 231 ms | partial index, 1 block, 0.15 ms |
+| delivered-outbox reaping | Seq Scan, 4,673 blocks, 58 ms | index walk, 11 blocks, 0.2 ms |
+| whole sweep (`pg_kafka_run_retention_sweep(0, 60)`) | 262 ms | 2.1 ms |
+| worst Metadata round trip, 20 ms probe | 217-308 ms each minute | 24 ms |
+| sweep with 20 past daily leaves of 2,000 partitions each, too | 539 ms | 32-52 ms |
+
+The delivered-row index costs the outbox one btree entry per ack and nothing per claim: its
+key columns never change and its predicate column (`external_offset`) already keys the pending
+indexes, so a claim stays a HOT update. Bulk UPDATEs of 200,000 rows as the outbox issues them
+(PG16, three runs): claims 273-332 ms before, 296-339 ms after, with the same HOT count; acks
+710-779 ms before, 853-989 ms after (about 0.5-1 us per acked row).
 
 Per-topic overrides use Kafka's own config key. `retention.ms` set through
 IncrementalAlterConfigs (API 44) is stored in `kafka.topics.retention_ms` and

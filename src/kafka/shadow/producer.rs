@@ -27,11 +27,14 @@
 use super::config::ShadowConfig;
 use super::error::{ShadowError, ShadowResult};
 use super::ForwardRecord;
+use rdkafka::bindings as rdsys;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::RDKafkaErrorCode;
-use rdkafka::message::{Header, OwnedHeaders};
+use rdkafka::message::{BorrowedHeaders, OwnedHeaders};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer, PurgeConfig};
+use rdkafka::types::RDKafkaRespErr;
 use rdkafka::util::Timeout;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,6 +75,27 @@ pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// queue holds back only the forwarder's later records (see `forwarder_task`).
 const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 
+/// librdkafka's default `retry.backoff.max.ms`, kept unless `retry.backoff.ms`
+/// is larger (see [`build_producer_settings`]).
+const LIBRDKAFKA_RETRY_BACKOFF_MAX_MS: i32 = 1000;
+/// The most librdkafka's own retry backoff (`retry.backoff.ms` and
+/// `retry.backoff.max.ms`) is set to, whatever `shadow_retry_backoff_ms` is:
+/// librdkafka retries inside one delivery attempt, so two retriable errors in a
+/// row (each up to a request timeout plus a backoff, 2 x 40 s) stay well inside
+/// [`DELIVERY_TIMEOUT`]. With the GUC's 60 s maximum applied as is, they took
+/// longer and the attempt timed out with its whole producer generation.
+const LIBRDKAFKA_RETRY_BACKOFF_CAP_MS: i32 = 10_000;
+/// `topic.metadata.refresh.fast.interval.ms`, librdkafka's documented default.
+/// When a partition loses its leader, librdkafka queries metadata at once and
+/// then re-arms the query with an exponential backoff from `retry.backoff.ms` up
+/// to `retry.backoff.max.ms` (`rd_kafka_metadata_leader_query_tmr_cb`); this
+/// setting is only the threshold of a new leader loss: it restarts the query at
+/// once when the next one is more than this far away
+/// (`rd_kafka_metadata_fast_leader_query`). Unset, it follows `retry.backoff.ms`
+/// (up to 10 s here), so a leader loss during a long backoff would wait for the
+/// scheduled query; pinned, it is noticed at once.
+const LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS: &str = "100";
+
 /// Assemble the ordered librdkafka settings for the shadow forwarding producer.
 ///
 /// Pure — no client creation, no IO — so the security/idempotence invariants can
@@ -83,9 +107,18 @@ const PRODUCER_QUEUE_MAX_KBYTES: &str = "65536";
 /// - `shadow_batch_size` (messages) → `batch.num.messages` (librdkafka's
 ///   per-batch message cap; `batch.size` would be bytes);
 /// - `shadow_linger_ms` → `linger.ms`;
-/// - `shadow_retry_backoff_ms` → `retry.backoff.ms` (librdkafka's own retries
-///   inside one delivery attempt; the outbox uses the same base for its re-attempt
-///   backoff, see `ShadowStore`);
+/// - `shadow_retry_backoff_ms` → `retry.backoff.ms`, capped at 10 s
+///   ([`LIBRDKAFKA_RETRY_BACKOFF_CAP_MS`]: librdkafka's own retries inside one
+///   delivery attempt; the outbox uses the uncapped value as the base of its
+///   re-attempt backoff, see `ShadowStore`), and `retry.backoff.max.ms` to the
+///   larger of that and librdkafka's default 1000 ms: librdkafka caps the
+///   backoff at `retry.backoff.max.ms`, so a larger `retry.backoff.ms` alone
+///   would be ignored (with only a configuration warning). The same two
+///   settings space librdkafka's leader queries after a partition loses its
+///   leader; `topic.metadata.refresh.fast.interval.ms`, the threshold at which a
+///   new leader loss restarts that query at once, is pinned to librdkafka's
+///   default instead of following the backoff
+///   ([`LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS`]);
 /// - `shadow_max_retries` is not a librdkafka setting: it is the outbox's
 ///   dead-letter cap (failed delivery attempts per record). Inside one attempt
 ///   librdkafka retries (its default `retries`, which is what idempotence
@@ -125,7 +158,18 @@ pub(crate) fn build_producer_settings(config: &ShadowConfig) -> Vec<(&'static st
     // Producer performance settings (see the GUC mapping above).
     settings.push(("batch.num.messages", config.batch_size.to_string()));
     settings.push(("linger.ms", config.linger_ms.to_string()));
-    settings.push(("retry.backoff.ms", config.retry_backoff_ms.to_string()));
+    let retry_backoff = config.retry_backoff_ms.min(LIBRDKAFKA_RETRY_BACKOFF_CAP_MS);
+    settings.push(("retry.backoff.ms", retry_backoff.to_string()));
+    settings.push((
+        "retry.backoff.max.ms",
+        retry_backoff
+            .max(LIBRDKAFKA_RETRY_BACKOFF_MAX_MS)
+            .to_string(),
+    ));
+    settings.push((
+        "topic.metadata.refresh.fast.interval.ms",
+        LIBRDKAFKA_LEADER_QUERY_THRESHOLD_MS.to_string(),
+    ));
 
     // Compression (use none for maximum compatibility)
     settings.push(("compression.type", "none".to_string()));
@@ -232,7 +276,18 @@ impl ShadowProducer {
     /// (the forwarder keeps many deliveries in flight). The record keeps its key,
     /// value, headers and timestamp; `partition` is left to the partitioner (the
     /// external cluster re-partitions by key).
+    ///
+    /// Every byte of the record comes from a client, so nothing here may panic on
+    /// it: rdkafka converts the topic name and header keys to C strings with an
+    /// `unwrap`, so a topic name holding U+0000 is refused here and header keys go
+    /// through [`owned_headers`], which passes each key's length.
     pub fn enqueue(&self, record: &ForwardRecord) -> Result<DeliveryFuture, EnqueueError> {
+        if record.topic_name.contains('\0') {
+            return Err(EnqueueError::Refused(format!(
+                "the external topic name {:?} holds U+0000",
+                record.topic_name
+            )));
+        }
         let mut future_record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&record.topic_name);
         if let Some(k) = record.key.as_deref() {
             future_record = future_record.key(k);
@@ -244,13 +299,7 @@ impl ShadowProducer {
             future_record = future_record.timestamp(ts);
         }
         if !record.headers.is_empty() {
-            let mut headers = OwnedHeaders::new_with_capacity(record.headers.len());
-            for (key, value) in &record.headers {
-                headers = headers.insert(Header {
-                    key,
-                    value: Some(value.as_slice()),
-                });
-            }
+            let headers = owned_headers(&record.headers).map_err(EnqueueError::Refused)?;
             future_record = future_record.headers(headers);
         }
         self.producer.send_result(future_record).map_err(|(e, _)| {
@@ -285,6 +334,97 @@ impl ShadowProducer {
     }
 }
 
+/// `headers` as librdkafka record headers, in order, each key and value byte for byte.
+///
+/// rdkafka's `OwnedHeaders::insert` passes the key as a C string and panics on a key
+/// holding U+0000, which Kafka allows (a header key is any UTF-8 string, and Kafka
+/// 3.7 stores and serves such keys). librdkafka itself takes the key's length
+/// (`rd_kafka_header_add`), stores that many bytes and writes them to the wire with
+/// that length, so the headers are built in a list of librdkafka's own and copied
+/// into an `OwnedHeaders` (`rd_kafka_headers_copy` re-adds each header with its
+/// stored length).
+pub(crate) fn owned_headers(headers: &[(String, Vec<u8>)]) -> Result<OwnedHeaders, String> {
+    let mut list = NativeHeaders::new(headers.len())?;
+    for (key, value) in headers {
+        list.add(key.as_bytes(), value)?;
+    }
+    Ok(list.to_owned_headers())
+}
+
+/// An `rd_kafka_headers_t` owned by this value and destroyed with it.
+struct NativeHeaders(NonNull<rdsys::rd_kafka_headers_t>);
+
+/// What an empty header key or value points at: librdkafka copies zero bytes from it with
+/// `memcpy`, which needs a valid pointer even for zero bytes (an empty slice's pointer is
+/// dangling), and a non-NULL value pointer keeps the value empty rather than null.
+const EMPTY_BYTES: &[u8] = &[0];
+
+/// A pointer to `bytes` valid for reads of `bytes.len()` bytes, an empty slice's included.
+fn readable_ptr(bytes: &[u8]) -> *const u8 {
+    if bytes.is_empty() {
+        EMPTY_BYTES.as_ptr()
+    } else {
+        bytes.as_ptr()
+    }
+}
+
+impl NativeHeaders {
+    fn new(capacity: usize) -> Result<Self, String> {
+        // SAFETY: `rd_kafka_headers_new` allocates a new, empty list and takes no
+        // pointers; a NULL result (allocation failure) is refused below.
+        let list = unsafe { rdsys::rd_kafka_headers_new(capacity) };
+        NonNull::new(list)
+            .map(Self)
+            .ok_or_else(|| "librdkafka could not allocate the record headers".to_string())
+    }
+
+    fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let too_long = |_| "a record header is too long for librdkafka".to_string();
+        let key_len = isize::try_from(key.len()).map_err(too_long)?;
+        let value_len = isize::try_from(value.len()).map_err(too_long)?;
+        let (key_ptr, value_ptr) = (readable_ptr(key), readable_ptr(value));
+        // SAFETY: `self.0` is a live, writable list owned by `self` (from
+        // `rd_kafka_headers_new`, destroyed only on drop). `key_ptr` and `value_ptr` are
+        // valid for reads of `key_len` and `value_len` bytes for the call (see
+        // `readable_ptr`);
+        // librdkafka copies exactly that many bytes of each (it calls `strlen` only
+        // for a size of -1) and keeps no pointer to them.
+        let err = unsafe {
+            rdsys::rd_kafka_header_add(
+                self.0.as_ptr(),
+                key_ptr.cast(),
+                key_len,
+                value_ptr.cast(),
+                value_len,
+            )
+        };
+        if err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+            Ok(())
+        } else {
+            Err(format!("librdkafka refused a record header: {err:?}"))
+        }
+    }
+
+    /// A copy of the list as rdkafka's `OwnedHeaders`.
+    fn to_owned_headers(&self) -> OwnedHeaders {
+        // SAFETY: `BorrowedHeaders` is rdkafka's zero-sized view of an
+        // `rd_kafka_headers_t`, made by casting the list's pointer (as rdkafka does
+        // for a message's headers). The list is live and not written while the view
+        // exists: `detach` only reads it, copying it with `rd_kafka_headers_copy`,
+        // and the view ends before `self` can be dropped.
+        let borrowed = unsafe { &*self.0.as_ptr().cast::<BorrowedHeaders>() };
+        borrowed.detach()
+    }
+}
+
+impl Drop for NativeHeaders {
+    fn drop(&mut self) {
+        // SAFETY: the list came from `rd_kafka_headers_new`, is owned by `self`
+        // alone (`to_owned_headers` hands out a copy) and is destroyed only here.
+        unsafe { rdsys::rd_kafka_headers_destroy(self.0.as_ptr()) };
+    }
+}
+
 impl std::fmt::Debug for ShadowProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShadowProducer")
@@ -297,6 +437,109 @@ impl std::fmt::Debug for ShadowProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The native list behind `headers` (rdkafka's `BorrowedHeaders` is a cast of it).
+    fn native(headers: &OwnedHeaders) -> *const rdsys::rd_kafka_headers_t {
+        std::ptr::from_ref(headers.as_borrowed()).cast()
+    }
+
+    /// Whether librdkafka finds a header named exactly `name` (it compares the stored
+    /// key length with `strlen(name)`, so `"a"` does not find a key `"a\0b"`), and the
+    /// value of the last one.
+    fn lookup(headers: &OwnedHeaders, name: &str) -> Option<Vec<u8>> {
+        let name = std::ffi::CString::new(name).expect("a test name without NUL");
+        let mut value: *const std::ffi::c_void = std::ptr::null();
+        let mut size = 0usize;
+        // SAFETY: `headers` is a live list; the out pointers are valid locals.
+        let err = unsafe {
+            rdsys::rd_kafka_header_get_last(
+                native(headers),
+                name.as_ptr(),
+                &raw mut value,
+                &raw mut size,
+            )
+        };
+        (err == RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR).then(|| {
+            // SAFETY: librdkafka returned a value of `size` bytes owned by `headers`.
+            unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) }.to_vec()
+        })
+    }
+
+    /// A header key holding U+0000 keeps all its bytes (rdkafka's `insert` panics on
+    /// it); values keep theirs, NUL bytes and empty values included, in order, and an empty
+    /// key is stored empty.
+    #[test]
+    fn owned_headers_keep_a_key_holding_nul() {
+        use rdkafka::message::Headers;
+        let headers = owned_headers(&[
+            ("a\0b".to_string(), b"\0v\0".to_vec()),
+            ("k".to_string(), b"plain".to_vec()),
+            ("e".to_string(), Vec::new()),
+            (String::new(), b"empty key".to_vec()),
+        ])
+        .expect("headers build");
+        assert_eq!(headers.count(), 4);
+        // rdkafka reads a key as a C string, so it shows the key up to its NUL.
+        let first = headers.get(0);
+        assert_eq!((first.key, first.value), ("a", Some(&b"\0v\0"[..])));
+        assert_eq!(
+            lookup(&headers, "a"),
+            None,
+            "the key is stored with all 3 bytes"
+        );
+        assert_eq!(lookup(&headers, "k"), Some(b"plain".to_vec()));
+        assert_eq!(
+            lookup(&headers, "e"),
+            Some(Vec::new()),
+            "an empty value is not null"
+        );
+        assert_eq!(lookup(&headers, ""), Some(b"empty key".to_vec()));
+    }
+
+    /// librdkafka copies a header's key and value with `memcpy`, which needs a valid
+    /// pointer even for zero bytes: an empty key or value is passed as a pointer to a live
+    /// static, not an empty slice's dangling one.
+    #[test]
+    fn empty_header_bytes_are_passed_as_a_valid_pointer() {
+        assert_eq!(readable_ptr(b""), EMPTY_BYTES.as_ptr());
+        assert_eq!(readable_ptr("".as_bytes()), EMPTY_BYTES.as_ptr());
+        assert_eq!(readable_ptr(&Vec::new()), EMPTY_BYTES.as_ptr());
+        let bytes = b"key";
+        assert_eq!(readable_ptr(bytes), bytes.as_ptr());
+    }
+
+    fn record(topic: &str, headers: Vec<(String, Vec<u8>)>) -> ForwardRecord {
+        ForwardRecord {
+            row: super::super::RowKey::new(1, 0, 0),
+            topic_name: topic.to_string(),
+            key: Some(b"k".to_vec()),
+            value: Some(b"v".to_vec()),
+            headers,
+            timestamp_ms: None,
+            restart: true,
+        }
+    }
+
+    /// Nothing a client can put into a record panics in `enqueue`: a header key
+    /// holding U+0000 is queued, a topic name holding one is refused.
+    #[test]
+    fn enqueue_does_not_panic_on_nul_in_a_header_key_or_topic_name() {
+        let producer = ShadowProducer::new(Arc::new(ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "127.0.0.1:1".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            ..Default::default()
+        }))
+        .expect("a producer builds without connecting");
+        let nul_key = record("t", vec![("a\0b".to_string(), b"v".to_vec())]);
+        assert!(producer.enqueue(&nul_key).is_ok());
+        match producer.enqueue(&record("t\0x", Vec::new())) {
+            Err(EnqueueError::Refused(e)) => assert!(e.contains("U+0000"), "{e}"),
+            Ok(_) => panic!("a topic name holding U+0000 was queued"),
+            Err(EnqueueError::QueueFull) => panic!("expected a refusal, got QueueFull"),
+        }
+        producer.purge_outstanding();
+    }
 
     #[test]
     fn test_shadow_producer_not_enabled() {
@@ -495,9 +738,73 @@ mod tests {
         assert!(!has_key(&s, "batch.size"));
         assert!(has(&s, "linger.ms", "25"));
         assert!(has(&s, "retry.backoff.ms", "200"));
+        // librdkafka's default cap, above the backoff.
+        assert!(has(&s, "retry.backoff.max.ms", "1000"));
         assert!(has(&s, "request.timeout.ms", "30000"));
         // Infinite: the forwarder enforces the delivery timeout itself, so a
         // timeout can never fail one record alone.
         assert!(has(&s, "message.timeout.ms", "0"));
+    }
+
+    /// A backoff above librdkafka's default cap raises the cap with it, or
+    /// librdkafka would apply the cap instead; up to its own cap.
+    #[test]
+    fn test_build_producer_settings_applies_a_long_retry_backoff() {
+        let config = ShadowConfig {
+            enabled: true,
+            bootstrap_servers: "a:9092".to_string(),
+            security_protocol: "PLAINTEXT".to_string(),
+            retry_backoff_ms: 3_000,
+            ..Default::default()
+        };
+        let s = build_producer_settings(&config);
+        assert!(has(&s, "retry.backoff.ms", "3000"));
+        assert!(has(&s, "retry.backoff.max.ms", "3000"));
+    }
+
+    /// librdkafka's own retries stay well inside one delivery attempt
+    /// ([`DELIVERY_TIMEOUT`]) whatever `shadow_retry_backoff_ms` is: its retry
+    /// backoff cap (which also caps the spacing of the leader queries after a
+    /// lost leader) is bounded, and the threshold at which a new leader loss
+    /// restarts the leader query at once does not follow the backoff and stays
+    /// within `retry.backoff.max.ms` (above it librdkafka warns and uses the
+    /// maximum). With the GUC's 60 s maximum applied as is, two retriable errors
+    /// in a row (each a request timeout and a backoff) took longer than the
+    /// timeout.
+    #[test]
+    fn test_build_producer_settings_bound_librdkafka_retries() {
+        let ms = |s: &[(&str, String)], key: &str| -> u64 {
+            s.iter()
+                .find(|(k, _)| *k == key)
+                .map_or_else(|| panic!("{key} not set"), |(_, v)| v.parse().unwrap())
+        };
+        for backoff in [
+            crate::kafka::constants::MIN_SHADOW_RETRY_BACKOFF_MS,
+            crate::kafka::constants::DEFAULT_SHADOW_RETRY_BACKOFF_MS,
+            30_000,
+            crate::kafka::constants::MAX_SHADOW_RETRY_BACKOFF_MS,
+        ] {
+            let config = ShadowConfig {
+                enabled: true,
+                bootstrap_servers: "a:9092".to_string(),
+                security_protocol: "PLAINTEXT".to_string(),
+                retry_backoff_ms: backoff,
+                ..Default::default()
+            };
+            let s = build_producer_settings(&config);
+            let (base, max) = (ms(&s, "retry.backoff.ms"), ms(&s, "retry.backoff.max.ms"));
+            let leader_query = ms(&s, "topic.metadata.refresh.fast.interval.ms");
+            let request = ms(&s, "request.timeout.ms");
+            assert!(base <= max && leader_query <= max, "backoff {backoff}");
+            assert!(
+                max <= 10_000,
+                "backoff {backoff}: retry.backoff.max.ms {max}"
+            );
+            let two_retries = 2 * (request + max);
+            assert!(
+                u128::from(two_retries) < DELIVERY_TIMEOUT.as_millis(),
+                "backoff {backoff}: two retries take {two_retries} ms"
+            );
+        }
     }
 }

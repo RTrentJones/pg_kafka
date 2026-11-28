@@ -156,7 +156,8 @@ pub fn get_or_create_valid_topic<S: TopicStore + ?Sized>(
             }),
         };
     }
-    // Never auto-create above pg_kafka.max_partitions_per_topic.
+    // Never auto-create above pg_kafka.max_partitions_per_topic; the store refuses with
+    // PolicyViolation a topic that would take all topics above pg_kafka.max_total_partitions.
     store.get_or_create_topic(
         topic_name,
         crate::kafka::limits::auto_create_partitions(default_partitions),

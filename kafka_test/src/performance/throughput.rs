@@ -155,14 +155,15 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
 
     for i in 0..message_count {
         let value = format!("single-{i}");
-        let _ = producer
+        producer
             .send(
                 FutureRecord::to(&single_topic.name)
                     .payload(&value)
                     .key(&format!("key-{i}")),
                 Duration::from_secs(10),
             )
-            .await;
+            .await
+            .map_err(|(e, _)| e)?;
     }
 
     let single_elapsed = start_single.elapsed();
@@ -214,6 +215,11 @@ pub async fn test_batch_vs_single_performance() -> TestResult {
         batch_elapsed.as_secs_f64(),
         batch_throughput,
         batch_success
+    );
+
+    assert_eq!(
+        batch_success, message_count,
+        "every batch-mode record is acknowledged"
     );
 
     // Calculate speedup

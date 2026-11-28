@@ -121,6 +121,18 @@
 //! serving delivery reports, held-response timeouts, the ack flush and the
 //! settings check meanwhile, so a full queue delays only the records behind it.
 //!
+//! ## Panics
+//!
+//! The task runs detached on the network thread, so a panic in it would end
+//! forwarding for every shadow topic with nothing to notice. Sending a record
+//! (the work that handles what a client put into it) runs under `catch_unwind`:
+//! a panic there fails that record, a counted attempt, and fences its
+//! partition. The loop itself runs supervised: after a panic anywhere else the
+//! records it held (the one whose delivery report was being handled included)
+//! are answered `NotAttempted` and fence their partitions (see
+//! [`ForwarderCore::recover_from_panic`]), its producers are dropped (which
+//! purges them), and it runs again after [`RESTART_BACKOFF`].
+//!
 //! ## Held sync-mode responses
 //!
 //! A [`SyncHold`] carries the buffered response of a committed sync-mode
@@ -129,13 +141,14 @@
 //! only those responses, never the DB thread.
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::producer::{EnqueueError, DELIVERY_TIMEOUT};
 use super::{
@@ -160,6 +173,9 @@ const SETTINGS_CHECK_TICKS: u64 = 25;
 /// Producer generations timed out per hold tick at most (more than one at
 /// once is rare: a producer replaced while it still holds records).
 const MAX_TIMEOUTS_PER_TICK: usize = 8;
+/// Pause before the forwarder loop runs again after a panic, so a panic that
+/// repeats does not spin the network thread.
+const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 
 /// What to do with an incoming record.
 #[derive(Debug, PartialEq)]
@@ -215,17 +231,58 @@ pub(crate) struct ForwarderCore {
     waiting: HashMap<RowKey, Vec<u64>>,
     next_hold: u64,
     /// Acks not yet accepted by the (bounded) ack channel. Never dropped: a lost
-    /// ack would leave the row in flight until the DB thread's eviction.
+    /// ack would leave the row in flight until the DB thread's eviction. (A
+    /// [`Self::reset`] drops them: the DB thread ignores them anyway.)
     pub(crate) acks: VecDeque<ForwardAck>,
+    /// The schema epoch of the last [`ForwardRequest::Reset`]: every ack sent is
+    /// stamped with it.
+    pub(crate) epoch: u64,
+    /// The record whose delivery report [`Self::on_result`] is handling, and how many
+    /// acks were queued when it started: a panic there leaves it untracked (no longer
+    /// outstanding) and possibly unanswered and unfenced, which
+    /// [`Self::recover_from_panic`] repairs.
+    handling: Option<(RowKey, usize)>,
+    /// Test hook: panic once in [`Self::on_result`], after the record was resolved.
+    #[cfg(test)]
+    panic_in_on_result: bool,
 }
 
 impl ForwarderCore {
-    /// Ordering fence check for a record about to be sent.
+    /// The schema the forwards so far came from was dropped
+    /// ([`ForwardRequest::Reset`]): forget every fence, outstanding record,
+    /// timed-out or retired generation and queued ack of it, and release its held
+    /// responses (their records are gone with the schema). A re-created schema
+    /// reuses row keys, so none of this may apply to its rows. Acks sent from now
+    /// on carry `epoch`; the caller drops the backlog and the deliveries of
+    /// records sent before.
+    pub(crate) fn reset(&mut self, epoch: u64) {
+        let holds: Vec<u64> = self.holds.keys().copied().collect();
+        for id in holds {
+            self.finish_hold(id);
+        }
+        *self = Self {
+            next_hold: self.next_hold,
+            epoch,
+            ..Self::default()
+        };
+    }
+
+    /// Ordering fence check for a record about to be sent. A record below the
+    /// fence goes out ahead of the failed record, as it should, but leaves the
+    /// fence in place. The fence is lifted by the failed record's retry, or by
+    /// a partition head (`restart`) above it: the claim's head is the lowest
+    /// pending row, so a head above the fence means the failed record is no
+    /// longer pending (delivered or dead-lettered). A head below it does not:
+    /// a replay can make a lower row due while the failed record still waits
+    /// for its retry, and lifting the fence then would let the later records
+    /// of the same claim overtake that retry.
     pub(crate) fn admit(&mut self, record: &ForwardRecord) -> Admit {
         let part = record.row.partition();
+        let offset = record.row.local_offset;
         match self.fences.get(&part) {
             None => Admit::Send,
-            Some(&fence) if record.restart || record.row.local_offset <= fence => {
+            Some(&fence) if offset < fence => Admit::Send,
+            Some(&fence) if offset == fence || record.restart => {
                 self.fences.remove(&part);
                 Admit::Send
             }
@@ -359,10 +416,69 @@ impl ForwarderCore {
     ) {
         self.expire_backlog(backlog, now, timeout);
         while let Some(queued) = backlog.pop_front() {
-            if let Some(queued) = send(self, queued) {
-                backlog.push_front(queued);
-                return;
+            let key = queued.record.row;
+            // A panic while sending one record (a bug reached by what a client
+            // put into it) fails that record and leaves the forwarder running.
+            match catch_unwind(AssertUnwindSafe(|| send(self, queued))) {
+                Ok(Some(queued)) => {
+                    backlog.push_front(queued);
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => self.send_panicked(key),
             }
+        }
+    }
+
+    /// Sending `key` panicked. If it reached a producer first, its delivery
+    /// report is lost with the panic: it is no longer tracked. It is answered as
+    /// a failed attempt (retried and eventually dead-lettered like any other
+    /// failure, so a record that always panics does not block its partition for
+    /// good) and fences its partition, so no later record overtakes its retry.
+    pub(crate) fn send_panicked(&mut self, key: RowKey) {
+        error!("Shadow forwarder panicked while sending {key:?}; failing the record");
+        // A panic in `on_result` on the send path (a refused enqueue) is answered here: the
+        // record is no longer being handled. Left set, a later panic of the loop would
+        // answer it again from an index into acks that `flush_acks` has since shifted, and
+        // so clear the in-flight entry of its retry.
+        self.handling = None;
+        self.resolved(key);
+        self.fence(key);
+        self.acks.push_back(ForwardAck::new(
+            key,
+            ForwardOutcome::Failed("the shadow forwarder panicked while sending it".to_string()),
+        ));
+    }
+
+    /// The forwarder loop panicked and is about to run again with new producers:
+    /// the old ones (dropped with the loop, which purges them) and their delivery
+    /// reports are gone. Every record the loop held, on a producer, in the
+    /// `backlog` or with its delivery report being handled when the panic hit, is
+    /// answered `NotAttempted` (its row becomes due again, without
+    /// a counted attempt) and fences its partition, so a later record of the
+    /// partition still on its way does not overtake the re-send. The producer
+    /// generations are forgotten (the new loop numbers its producers from the
+    /// start). Fences, held responses and queued acks stay: the DB thread still
+    /// waits for them.
+    pub(crate) fn recover_from_panic(&mut self, backlog: &mut VecDeque<Queued>) {
+        let mut lost: Vec<RowKey> = self.outstanding.keys().copied().collect();
+        lost.extend(backlog.drain(..).map(|queued| queued.record.row));
+        // A panic while handling a delivery report: unless its ack was queued before the
+        // panic, the record is answered and fenced like the others (a delivered one is
+        // then sent again, a duplicate as after any lost ack). O(acks queued since).
+        if let Some((key, acks_before)) = self.handling.take() {
+            if !self.acks.iter().skip(acks_before).any(|ack| ack.row == key) {
+                lost.push(key);
+            }
+        }
+        lost.sort_unstable();
+        self.outstanding.clear();
+        self.by_age.clear();
+        self.timed_out.clear();
+        self.collateral_generations.clear();
+        for key in lost {
+            self.fence(key);
+            self.not_attempted(key, "the shadow forwarder restarted");
         }
     }
 
@@ -454,7 +570,25 @@ impl ForwarderCore {
         result: Result<i64, String>,
         producer_fatal: bool,
     ) {
+        self.handling = Some((key, self.acks.len()));
+        self.handle_result(key, generation, result, producer_fatal);
+        self.handling = None;
+    }
+
+    /// [`Self::on_result`] once the record is marked as being handled.
+    fn handle_result(
+        &mut self,
+        key: RowKey,
+        generation: u64,
+        result: Result<i64, String>,
+        producer_fatal: bool,
+    ) {
         self.resolved(key);
+        #[cfg(test)]
+        assert!(
+            !std::mem::take(&mut self.panic_in_on_result),
+            "injected on_result panic"
+        );
         let timed_out = self.take_timed_out(key, generation);
         match result {
             Ok(external_offset) => {
@@ -488,6 +622,35 @@ impl ForwarderCore {
                 self.acks.push_back(ForwardAck::new(key, outcome));
             }
         }
+    }
+
+    /// No producer could be built for `record` (invalid or unbuildable
+    /// settings, also after the previous producer was retired by a settings
+    /// change or went fatal): a real delivery failure, retried and eventually
+    /// dead-lettered like any other. It is not attributed to a producer
+    /// generation: the record never reached one, and the latest generation may
+    /// be retired already, which would make the failure collateral
+    /// (`NotAttempted`, never counted) and leave the record to be claimed again
+    /// and again without ever reaching the retry cap.
+    ///
+    /// As for a record that runs out of time in the backlog
+    /// ([`Self::expire_backlog`]), only the record its partition waits on is
+    /// charged the attempt: the first record of the partition the fence admits.
+    /// It fences the partition, so the records behind it are answered
+    /// `NotAttempted` (a partition is not charged an attempt for waiting behind
+    /// another) and wait for its retry. Charging every record would dead-letter
+    /// a whole backlog within a few backoffs of one bad setting, and switch
+    /// `external_only` consumers to local reads with it, when the cause is one
+    /// the operator fixes once.
+    pub(crate) fn producer_unavailable(&mut self, record: &ForwardRecord, error: String) {
+        let key = record.row;
+        if self.admit(record) == Admit::Fenced {
+            self.not_attempted(key, "an earlier record of the partition failed");
+            return;
+        }
+        self.fence(key);
+        self.acks
+            .push_back(ForwardAck::new(key, ForwardOutcome::Failed(error)));
     }
 
     /// Register a held response. Released at once if it waits for nothing.
@@ -565,7 +728,8 @@ impl ForwarderCore {
     /// Move queued acks onto the channel until it is full. Returns false when
     /// the DB thread is gone.
     pub(crate) fn flush_acks(&mut self, ack_tx: &Sender<ForwardAck>) -> bool {
-        while let Some(ack) = self.acks.pop_front() {
+        while let Some(mut ack) = self.acks.pop_front() {
+            ack.epoch = self.epoch;
             match ack_tx.try_send(ack) {
                 Ok(()) => {}
                 Err(TrySendError::Full(ack)) => {
@@ -699,6 +863,21 @@ impl ProducerSlot {
 }
 
 impl ProducerSlot {
+    /// The schema of every outstanding record was dropped: purge them from every
+    /// producer (their delivery reports are ignored, see [`Delivery::epoch`]), so
+    /// none waits on a producer forever with no delivery timeout watching it. The
+    /// live producer is dropped, so the next record builds a new generation.
+    fn reset(&mut self) {
+        if let Some(live) = self.live.take() {
+            live.producer.purge_outstanding();
+        }
+        for (_, producer) in self.replaced.drain(..) {
+            if let Some(producer) = producer.upgrade() {
+                producer.purge_outstanding();
+            }
+        }
+    }
+
     /// `generation` ran out of delivery time: fail every record outstanding on
     /// it now (see the module docs). The live producer is dropped, so the next
     /// record builds a new generation.
@@ -759,6 +938,9 @@ fn delivery_timeout(config: &crate::config::Config) -> Duration {
 struct Delivery {
     key: RowKey,
     generation: u64,
+    /// The schema epoch the record was sent in: a report of an earlier epoch
+    /// (the schema was dropped meanwhile) is ignored.
+    epoch: u64,
     result: Result<i64, String>,
     producer: Arc<ShadowProducer>,
 }
@@ -770,6 +952,11 @@ type Deliveries = FuturesUnordered<BoxFuture<'static, Delivery>>;
 /// Reads the configuration through the `RuntimeContext` on every record, so
 /// shadow mode and every producer setting can change at runtime
 /// (ALTER SYSTEM + pg_reload_conf()).
+///
+/// The loop runs supervised: a panic in it (it runs detached, so nothing else
+/// would notice) is caught, the records it held are answered
+/// ([`ForwarderCore::recover_from_panic`]) and the loop runs again, so one bad
+/// record or bug cannot stop forwarding for every shadow topic.
 pub(crate) async fn run_shadow_forwarder(
     forward_rx: Receiver<ForwardRequest>,
     ack_tx: Sender<ForwardAck>,
@@ -779,20 +966,88 @@ pub(crate) async fn run_shadow_forwarder(
 
     // Bridge the DB thread's crossbeam channel into the runtime in batches, on
     // one blocking-pool thread, so the async loop below can wait for new records,
-    // delivery reports and hold timeouts at once.
-    let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<ForwardRequest>>(4);
+    // delivery reports and hold timeouts at once. The bridge outlives a restart of
+    // the loop: it ends when either channel end is gone.
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<Vec<ForwardRequest>>(4);
     tokio::task::spawn_blocking(move || bridge_requests(&forward_rx, &batch_tx));
 
-    let mut core = ForwarderCore::default();
+    supervise(Forwarder::new(batch_rx, ack_tx, runtime_context)).await;
+
+    info!("Shadow forwarder task stopped");
+}
+
+/// What the forwarder loop keeps across a restart after a panic: its inputs and
+/// outputs, the bookkeeping the DB thread's view depends on, and the backlog
+/// (records received and not answered yet). Producers and pending delivery
+/// reports belong to one run of the loop.
+struct Forwarder {
+    batch_rx: tokio::sync::mpsc::Receiver<Vec<ForwardRequest>>,
+    ack_tx: Sender<ForwardAck>,
+    runtime_context: Arc<crate::kafka::RuntimeContext>,
+    core: ForwarderCore,
+    backlog: VecDeque<Queued>,
+    /// Test hook: panic once after taking the next batch.
+    #[cfg(test)]
+    panic_on_next_batch: bool,
+}
+
+impl Forwarder {
+    fn new(
+        batch_rx: tokio::sync::mpsc::Receiver<Vec<ForwardRequest>>,
+        ack_tx: Sender<ForwardAck>,
+        runtime_context: Arc<crate::kafka::RuntimeContext>,
+    ) -> Self {
+        Self {
+            batch_rx,
+            ack_tx,
+            runtime_context,
+            core: ForwarderCore::default(),
+            backlog: VecDeque::new(),
+            #[cfg(test)]
+            panic_on_next_batch: false,
+        }
+    }
+}
+
+/// Run the forwarder loop until it stops, running it again after a panic.
+async fn supervise(mut forwarder: Forwarder) {
+    loop {
+        let run = AssertUnwindSafe(forward(&mut forwarder))
+            .catch_unwind()
+            .await;
+        if run.is_ok() {
+            return;
+        }
+        error!(
+            "Shadow forwarder panicked; answering the records it held as not attempted \
+             and restarting it"
+        );
+        forwarder.core.recover_from_panic(&mut forwarder.backlog);
+        tokio::time::sleep(RESTART_BACKOFF).await;
+    }
+}
+
+/// The forwarder loop (see the module docs). Returns when the DB thread is gone.
+async fn forward(forwarder: &mut Forwarder) {
+    let Forwarder {
+        batch_rx,
+        ack_tx,
+        runtime_context,
+        core,
+        backlog,
+        ..
+    } = forwarder;
+    #[cfg(test)]
+    let panic_on_next_batch = &mut forwarder.panic_on_next_batch;
+    let runtime_context: &crate::kafka::RuntimeContext = runtime_context;
     let mut slot = ProducerSlot::default();
     let mut deliveries = Deliveries::new();
     let mut ticks: u64 = 0;
     let mut tick = tokio::time::interval(HOLD_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut backlog: VecDeque<Queued> = VecDeque::new();
     loop {
-        if !core.flush_acks(&ack_tx) {
+        if !core.flush_acks(ack_tx) {
             info!("Forward ack channel closed, stopping shadow forwarder");
             break;
         }
@@ -809,21 +1064,32 @@ pub(crate) async fn run_shadow_forwarder(
                         ForwardRequest::Record(record) => {
                             backlog.push_back(Queued { record, received_at });
                         }
+                        ForwardRequest::Reset(epoch) => {
+                            info!("Shadow schema dropped; forgetting its forwards");
+                            backlog.clear();
+                            slot.reset();
+                            core.reset(epoch);
+                        }
                     }
                 }
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                #[cfg(test)]
+                assert!(!std::mem::take(panic_on_next_batch), "injected forwarder panic");
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             Some(delivery) = deliveries.next(), if !deliveries.is_empty() => {
                 if let Err(e) = &delivery.result {
                     debug!("Forward FAILED {:?}: {e}", delivery.key);
                 }
-                let fatal = delivery.result.is_err() && delivery.producer.fatal_error().is_some();
-                core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
+                if delivery.epoch == core.epoch {
+                    let fatal =
+                        delivery.result.is_err() && delivery.producer.fatal_error().is_some();
+                    core.on_result(delivery.key, delivery.generation, delivery.result, fatal);
+                }
                 // A delivery frees room in librdkafka's queue.
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             () = tokio::time::sleep(QUEUE_FULL_BACKOFF), if !backlog.is_empty() => {
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
             }
             _ = tick.tick() => {
                 let now = Instant::now();
@@ -835,12 +1101,12 @@ pub(crate) async fn run_shadow_forwarder(
                     let Some(generation) = core.expired_generation(now, timeout) else {
                         break;
                     };
-                    slot.time_out(&mut core, generation, now, timeout);
+                    slot.time_out(core, generation, now, timeout);
                 }
                 // After the generations (`pump` expires the backlog first),
                 // so a record behind a timed-out one of its partition is
                 // collateral, not a second failure.
-                pump(&mut backlog, &runtime_context, &mut core, &mut slot, &mut deliveries);
+                pump(backlog, runtime_context, core, &mut slot, &mut deliveries);
                 // A settings change rebuilds the producer (and purges its
                 // outstanding records) even when no new record arrives to
                 // notice it.
@@ -850,14 +1116,12 @@ pub(crate) async fn run_shadow_forwarder(
                     if config.shadow_mode_enabled && !config.shadow_bootstrap_servers.is_empty() {
                         // A failed rebuild is logged by `current` and retried on the
                         // next record or check.
-                        let _ = slot.current(&mut core, &config);
+                        let _ = slot.current(core, &config);
                     }
                 }
             }
         }
     }
-
-    info!("Shadow forwarder task stopped");
 }
 
 /// Move requests from the DB thread's channel to the async task, up to
@@ -926,9 +1190,7 @@ fn forward_one(
     let (producer, generation) = match slot.current(core, &config) {
         Ok(p) => p,
         Err(e) => {
-            // No producer can be built: a real delivery failure (it is retried
-            // and eventually dead-lettered, like any other).
-            core.on_result(key, slot.generation, Err(e), false);
+            core.producer_unavailable(record, e);
             return None;
         }
     };
@@ -942,10 +1204,12 @@ fn forward_one(
         Ok(future) => {
             core.sent(key, generation, queued.received_at);
             // Test hook (pg_kafka.test_forward_ack_delay_ms, 0 in
-            // production): delay the ack past the outbox retry lease. Only
-            // this delivery's own future waits; the pipeline keeps going.
+            // production): delay the ack, to check that a slow ack is not
+            // re-sent. Only this delivery's own future waits; the pipeline
+            // keeps going.
             let ack_delay =
                 Duration::from_millis(u64::try_from(config.test_forward_ack_delay_ms).unwrap_or(0));
+            let epoch = core.epoch;
             deliveries.push(Box::pin(async move {
                 let result = match future.await {
                     Ok(Ok((_partition, offset))) => Ok(offset),
@@ -958,6 +1222,7 @@ fn forward_one(
                 Delivery {
                     key,
                     generation,
+                    epoch,
                     result,
                     producer,
                 }
@@ -1014,12 +1279,99 @@ mod tests {
     }
 
     #[test]
+    fn unbuildable_producer_charges_only_each_partitions_head() {
+        let mut core = ForwarderCore::default();
+        let failed = |o: &ForwardOutcome| matches!(o, ForwardOutcome::Failed(_));
+        // One claim, two partitions: only the record each partition waits on
+        // has its attempt counted; the rest wait behind it, uncounted.
+        for r in [
+            rec(0, 5, true),
+            rec(0, 6, false),
+            rec(1, 3, true),
+            rec(0, 7, false),
+        ] {
+            core.producer_unavailable(&r, "invalid shadow configuration".into());
+        }
+        let got: Vec<(i32, i64, bool)> = outcomes(&mut core)
+            .iter()
+            .map(|(k, o)| (k.partition_id, k.local_offset, failed(o)))
+            .collect();
+        assert_eq!(
+            got,
+            [(0, 5, true), (0, 6, false), (1, 3, true), (0, 7, false)]
+        );
+        // The retry of 5: charged again; 6 still waits.
+        core.producer_unavailable(&rec(0, 5, true), "x".into());
+        core.producer_unavailable(&rec(0, 6, false), "x".into());
+        let got: Vec<bool> = outcomes(&mut core).iter().map(|(_, o)| failed(o)).collect();
+        assert_eq!(got, [true, false]);
+        // 5 was dead-lettered: 6 is the partition's head and has its turn.
+        core.producer_unavailable(&rec(0, 6, true), "x".into());
+        core.producer_unavailable(&rec(0, 7, false), "x".into());
+        let got: Vec<bool> = outcomes(&mut core).iter().map(|(_, o)| failed(o)).collect();
+        assert_eq!(got, [true, false]);
+        // Once a producer can be built, nothing of the partition overtakes 6.
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
+    }
+
+    #[test]
+    fn reset_forgets_the_dropped_schemas_state_and_stamps_acks() {
+        let mut core = ForwarderCore::default();
+        let released = Arc::new(AtomicUsize::new(0));
+        let r = released.clone();
+        core.add_hold(
+            SyncHold {
+                keys: vec![RowKey::new(1, 0, 5)],
+                timeout: Duration::from_secs(60),
+                release: HeldRelease::new(move || {
+                    r.fetch_add(1, Ordering::SeqCst);
+                }),
+            },
+            Instant::now(),
+        );
+        core.sent(RowKey::new(1, 0, 6), 1, Instant::now());
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("boom".into()), false);
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Fenced);
+        core.reset(2);
+        // The old schema's hold is answered, its fence, outstanding record and
+        // queued acks are gone: offset 7 of the re-created schema goes out.
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(core.held(), 0);
+        assert!(core.acks.is_empty());
+        assert!(core
+            .expired_generation(Instant::now(), Duration::ZERO)
+            .is_none());
+        assert_eq!(core.admit(&rec(0, 7, false)), Admit::Send);
+        // Acks sent from now on carry the new epoch.
+        core.on_result(RowKey::new(1, 0, 7), 3, Ok(1), false);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        assert!(core.flush_acks(&tx));
+        assert_eq!(rx.try_recv().map(|a| a.epoch), Ok(2));
+    }
+
+    #[test]
     fn partition_head_lifts_the_fence_after_a_dead_letter() {
         let mut core = ForwarderCore::default();
         core.on_result(RowKey::new(1, 0, 5), 1, Err("poison".into()), false);
         assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
         // 5 was dead-lettered: the DB marks 6 as the partition's head.
         assert_eq!(core.admit(&rec(0, 6, true)), Admit::Send);
+    }
+
+    #[test]
+    fn a_lower_head_does_not_lift_the_fence_of_a_later_failure() {
+        let mut core = ForwarderCore::default();
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Send);
+        core.on_result(RowKey::new(1, 0, 5), 1, Err("boom".into()), false);
+        // Before the DB thread applies 5's failure, a replay makes 3 due: the
+        // next claim dispatches 3 (now the partition's head) and 6. 3 may go
+        // out, but 6 must not overtake the retry of 5.
+        assert_eq!(core.admit(&rec(0, 3, true)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 6, false)), Admit::Fenced);
+        // 5's retry lifts the fence.
+        assert_eq!(core.admit(&rec(0, 5, true)), Admit::Send);
+        assert_eq!(core.admit(&rec(0, 6, false)), Admit::Send);
     }
 
     #[test]
@@ -1068,6 +1420,126 @@ mod tests {
             core.retire_generation(g);
         }
         assert!(core.collateral_generations.len() <= 64);
+    }
+
+    /// Shadow settings for `forward_one`, with an unreachable bootstrap server
+    /// (building a producer does not connect).
+    fn unreachable_config(security_protocol: &str) -> crate::config::Config {
+        let mut config = crate::config::Config::load();
+        config.shadow_mode_enabled = true;
+        config.shadow_bootstrap_servers = "127.0.0.1:1".into();
+        config.shadow_security_protocol = security_protocol.into();
+        config
+    }
+
+    /// Send `records` of partition 0 through `forward_one` with `config`.
+    fn forward_records(
+        config: crate::config::Config,
+        core: &mut ForwarderCore,
+        slot: &mut ProducerSlot,
+        records: &[(i64, bool)],
+    ) -> Vec<(RowKey, ForwardOutcome)> {
+        let context = crate::kafka::RuntimeContext::new(config);
+        let mut deliveries = Deliveries::new();
+        for &(offset, restart) in records {
+            let queued = Queued {
+                record: rec(0, offset, restart),
+                received_at: Instant::now(),
+            };
+            assert!(forward_one(queued, &context, core, slot, &mut deliveries).is_none());
+        }
+        assert!(deliveries.is_empty(), "nothing may be sent");
+        outcomes(core)
+    }
+
+    /// `got` answers `failed` (offsets of partition 0 that failed with the
+    /// configuration error) and `waiting` (answered `NotAttempted`), in order.
+    fn assert_unbuildable_failures(
+        got: &[(RowKey, ForwardOutcome)],
+        failed: &[i64],
+        waiting: &[i64],
+    ) {
+        let keys: Vec<RowKey> = got.iter().map(|(k, _)| *k).collect();
+        let expected: Vec<RowKey> = failed
+            .iter()
+            .chain(waiting)
+            .map(|&o| RowKey::new(1, 0, o))
+            .collect();
+        assert_eq!(keys, expected);
+        for (i, (key, outcome)) in got.iter().enumerate() {
+            if i < failed.len() {
+                assert!(
+                    matches!(outcome, ForwardOutcome::Failed(e) if e.contains("invalid shadow configuration")),
+                    "{key:?}: {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ForwardOutcome::NotAttempted(_)),
+                    "{key:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Settings no producer can be built from are a delivery failure of the
+    /// record its partition waits on (the records behind it wait, uncounted),
+    /// also right after a settings change has retired the previous producer:
+    /// the failure is not that retired generation's (whose failures are
+    /// collateral and never counted), or the record would be claimed again and
+    /// again and never dead-lettered.
+    #[test]
+    fn an_unbuildable_producer_fails_records_after_a_settings_change() {
+        let mut core = ForwarderCore::default();
+        let mut slot = ProducerSlot::default();
+        slot.current(&mut core, &unreachable_config("PLAINTEXT"))
+            .expect("a producer for valid settings");
+        assert_eq!(slot.generation, 1);
+
+        // The change retires generation 1; no replacement can be built.
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true), (1, false), (2, false)],
+        );
+        assert_unbuildable_failures(&got, &[0], &[1, 2]);
+        // Every later attempt fails the same way.
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true)],
+        );
+        assert_unbuildable_failures(&got, &[0], &[]);
+
+        // Valid settings again: the partition is fenced at its first failed
+        // record, so nothing later goes out ahead of its retry.
+        let got = forward_records(
+            unreachable_config("PLAINTEXT"),
+            &mut core,
+            &mut slot,
+            &[(1, false)],
+        );
+        assert!(
+            matches!(got[0].1, ForwardOutcome::NotAttempted(_)),
+            "{got:?}"
+        );
+        assert_eq!(slot.generation, 2);
+    }
+
+    /// The same settings at a fresh start (no producer ever built) fail the
+    /// same way.
+    #[test]
+    fn an_unbuildable_producer_fails_records_at_a_fresh_start() {
+        let mut core = ForwarderCore::default();
+        let mut slot = ProducerSlot::default();
+        let got = forward_records(
+            unreachable_config("BOGUS"),
+            &mut core,
+            &mut slot,
+            &[(0, true), (1, false)],
+        );
+        assert_unbuildable_failures(&got, &[0], &[1]);
     }
 
     /// A replaced producer's outstanding records fail later; until they do, a
@@ -1842,5 +2314,208 @@ mod tests {
         ] {
             assert_ne!(producer_fingerprint(&changed), f);
         }
+    }
+
+    /// A panic while sending one record fails that record (a counted attempt, so
+    /// a record that always panics is dead-lettered in the end) and fences its
+    /// partition: a later record of that partition is answered NotAttempted, as
+    /// `forward_one` answers a record the fence holds back, while the records of
+    /// other partitions after it are still sent.
+    #[test]
+    fn a_panic_while_sending_fails_only_that_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let mut backlog: VecDeque<Queued> = [rec(0, 1, true), rec(0, 2, false), rec(1, 1, true)]
+            .into_iter()
+            .map(|record| Queued {
+                record,
+                received_at: now,
+            })
+            .collect();
+        core.pump_backlog(&mut backlog, now, TIMEOUT, |core, q| {
+            if core.admit(&q.record) == Admit::Fenced {
+                core.not_attempted(q.record.row, "an earlier record of the partition failed");
+                return None;
+            }
+            core.sent(q.record.row, 1, q.received_at);
+            assert_ne!(q.record.row, RowKey::new(1, 0, 1), "injected panic");
+            None
+        });
+        assert!(backlog.is_empty());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, RowKey::new(1, 0, 1));
+        assert!(matches!(&got[0].1, ForwardOutcome::Failed(e) if e.contains("panicked")));
+        assert_eq!(got[1].0, RowKey::new(1, 0, 2));
+        assert!(matches!(&got[1].1, ForwardOutcome::NotAttempted(e) if e.contains("earlier")));
+        assert_eq!(
+            core.outstanding.keys().copied().collect::<Vec<_>>(),
+            vec![RowKey::new(1, 1, 1)],
+            "only the other partition's record was sent"
+        );
+        assert_eq!(core.admit(&rec(0, 3, false)), Admit::Fenced);
+        assert_eq!(
+            core.admit(&rec(0, 1, false)),
+            Admit::Send,
+            "its retry lifts the fence"
+        );
+    }
+
+    /// Two panics: one in `on_result` on the send path (a refused enqueue), answered by
+    /// `send_panicked`, then, after its ack was flushed and its retry sent, one of the loop.
+    /// Recovery answers the retry once (it is outstanding), not a second time for the first
+    /// panic, which would clear the DB thread's in-flight entry of the retry.
+    #[test]
+    fn a_panic_on_the_send_path_is_not_answered_again_by_recovery() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let key = RowKey::new(1, 0, 1);
+        let mut backlog: VecDeque<Queued> = VecDeque::from([Queued {
+            record: rec(0, 1, true),
+            received_at: now,
+        }]);
+        core.panic_in_on_result = true;
+        core.pump_backlog(&mut backlog, now, TIMEOUT, |core, q| {
+            core.on_result(q.record.row, 1, Err("refused".into()), false);
+            None
+        });
+        assert!(core.handling.is_none());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 1);
+        assert!(matches!(&got[0].1, ForwardOutcome::Failed(e) if e.contains("panicked")));
+        // The retry is sent; the loop then panics.
+        assert_eq!(core.admit(&rec(0, 1, true)), Admit::Send);
+        core.sent(key, 2, now);
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        assert_eq!(
+            got.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![key],
+            "{got:?}"
+        );
+    }
+
+    /// A panic while handling a failed delivery report, after the record was taken off
+    /// the outstanding records and before it was fenced and answered: recovery answers
+    /// it NotAttempted and fences its partition, so a later record of the partition does
+    /// not go out ahead of its re-send. A report whose ack was queued before the panic is
+    /// not answered twice.
+    #[test]
+    fn a_panic_while_handling_a_delivery_report_fences_that_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        core.sent(RowKey::new(1, 0, 1), 1, now);
+        core.sent(RowKey::new(1, 0, 2), 1, now);
+        core.panic_in_on_result = true;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            core.on_result(RowKey::new(1, 0, 1), 1, Err("boom".into()), false);
+        }));
+        assert!(panicked.is_err());
+        assert!(core.acks.is_empty() && !core.outstanding.contains_key(&RowKey::new(1, 0, 1)));
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        let answered: Vec<RowKey> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(answered, vec![RowKey::new(1, 0, 1), RowKey::new(1, 0, 2)]);
+        assert!(got
+            .iter()
+            .all(|(_, o)| matches!(o, ForwardOutcome::NotAttempted(e) if e.contains("restarted"))));
+        assert_eq!(core.admit(&rec(0, 2, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(0, 1, false)), Admit::Send);
+
+        // The ack was queued before the panic: recovery does not answer it again.
+        let mut core = ForwarderCore::default();
+        core.on_result(RowKey::new(1, 0, 3), 1, Ok(9), false);
+        core.handling = Some((RowKey::new(1, 0, 4), core.acks.len()));
+        core.acks.push_back(ForwardAck::new(
+            RowKey::new(1, 0, 4),
+            ForwardOutcome::Delivered(10),
+        ));
+        core.recover_from_panic(&mut VecDeque::new());
+        let got = outcomes(&mut core);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(core.handling.is_none());
+    }
+
+    /// After a panic of the loop, every record it held (on a producer or in the
+    /// backlog) is answered NotAttempted and fences its partition; acks already
+    /// queued, fences and held responses are kept; producer generations are
+    /// forgotten.
+    #[test]
+    fn recovering_from_a_panic_answers_every_held_record() {
+        let mut core = ForwarderCore::default();
+        let now = Instant::now();
+        let released = Arc::new(AtomicUsize::new(0));
+        core.add_hold(
+            counting_hold(vec![RowKey::new(1, 0, 4)], TIMEOUT, &released),
+            now,
+        );
+        core.on_result(RowKey::new(1, 2, 7), 1, Err("boom".into()), false);
+        core.sent(RowKey::new(1, 0, 4), 3, now);
+        core.retire_generation(3);
+        let mut backlog: VecDeque<Queued> = VecDeque::from([Queued {
+            record: rec(1, 9, true),
+            received_at: now,
+        }]);
+        core.recover_from_panic(&mut backlog);
+        assert!(backlog.is_empty());
+        assert!(core.outstanding.is_empty() && core.by_age.is_empty());
+        assert!(core.collateral_generations.is_empty());
+        let got = outcomes(&mut core);
+        assert!(matches!(got[0], (k, ForwardOutcome::Failed(_)) if k == RowKey::new(1, 2, 7)));
+        let lost: Vec<RowKey> = got[1..].iter().map(|(k, _)| *k).collect();
+        assert_eq!(lost, vec![RowKey::new(1, 0, 4), RowKey::new(1, 1, 9)]);
+        assert!(got[1..]
+            .iter()
+            .all(|(_, o)| matches!(o, ForwardOutcome::NotAttempted(e) if e.contains("restarted"))));
+        assert_eq!(core.admit(&rec(0, 5, false)), Admit::Fenced);
+        assert_eq!(core.admit(&rec(2, 8, false)), Admit::Fenced);
+        assert_eq!(core.held(), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+    }
+
+    /// A panic of the forwarder loop does not end forwarding: the records it held
+    /// are answered, and the loop runs again and answers the records after them.
+    /// It stops only when the DB thread's channel is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_forwarder_runs_again_after_a_panic() {
+        let mut config = crate::config::Config::load();
+        config.shadow_mode_enabled = false;
+        let context = Arc::new(crate::kafka::RuntimeContext::new(config));
+        let (forward_tx, forward_rx) = crossbeam_channel::bounded(16);
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(16);
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(4);
+        tokio::task::spawn_blocking(move || bridge_requests(&forward_rx, &batch_tx));
+        let mut forwarder = Forwarder::new(batch_rx, ack_tx, context);
+        forwarder.panic_on_next_batch = true;
+        let task = tokio::spawn(supervise(forwarder));
+
+        let next_ack = || {
+            ack_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("an ack within 10 s")
+        };
+        forward_tx
+            .send(ForwardRequest::Record(rec(0, 1, true)))
+            .expect("the forwarder takes requests");
+        let first = next_ack();
+        assert_eq!(first.row, RowKey::new(1, 0, 1));
+        assert!(
+            matches!(&first.outcome, ForwardOutcome::NotAttempted(e) if e.contains("restarted")),
+            "{first:?}"
+        );
+        forward_tx
+            .send(ForwardRequest::Record(rec(1, 1, true)))
+            .expect("the restarted forwarder takes requests");
+        let second = next_ack();
+        assert_eq!(second.row, RowKey::new(1, 1, 1));
+        assert!(
+            matches!(&second.outcome, ForwardOutcome::NotAttempted(e) if e.contains("not enabled")),
+            "{second:?}"
+        );
+        drop(forward_tx);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the forwarder stops once its channel is gone")
+            .expect("the forwarder task ends without a panic");
     }
 }

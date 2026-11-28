@@ -81,7 +81,8 @@ Generated doc regions (between `gen:` marker comments): the `api-*` ones are own
 
 ## Code Coverage and the QA-1 Rule
 
-Codecov gates project coverage at 80% and patch coverage at 90% (`codecov.yml`).
+Codecov gates project coverage at 78% (target 80% less its 2% threshold) and patch coverage at 85%
+(target 90% less 5%) (`codecov.yml`).
 
 Code that needs a live Postgres (SPI) or the tokio listener is invisible to unit coverage.
 `codecov.yml` lists it: `ignore:` entries (SPI/async/generated through and through) and
@@ -93,7 +94,7 @@ fails a PR that touches one without changing a Rust file under `kafka_test/src/`
 `BackgroundWorker::*`, `#[pg_extern]`) is on neither list. A genuinely test-neutral edit
 (comments, docs, renames) gets the `no-e2e-needed` label. Do **not** add a file to the ignore list
 to route untested logic around the patch gate; extract the pure logic into a testable function
-instead (see `validate_sequence` in `storage/mod.rs`, `build_producer_settings` in
+instead (see `validate_sequence` in `storage/sequence.rs`, `build_producer_settings` in
 `shadow/producer.rs`). When you split or move a listed file, update `codecov.yml` with it.
 
 **Single-DB-thread invariant:** all handlers, the `Arc<RwLock>` coordinator and the `ShadowStore`
@@ -122,16 +123,18 @@ src/
     ├── api/            # One `KafkaApi` impl per API + the kafka_apis! registry (decode, versions,
     │                   # lanes, error responses, dispatch, generated docs)
     ├── protocol/       # Framing (FrameCodec), header decoding, response encoding, RecordBatch parsing
-    ├── listener/       # Network thread: accept and connection caps (accept), TLS (tls), the read
-    │                   # loop (connection), ordered responses (writer), SASL frames (sasl),
-    │                   # hand-off to the DB thread (dispatch), Fetch long polling (long_poll)
+    ├── listener/       # Network thread: its setup (thread), accept and connection caps
+    │                   # (accept), TLS (tls), the read loop (connection), ordered responses
+    │                   # (writer) and what they may hold (response_budget), SASL frames
+    │                   # (sasl), hand-off to the DB thread (dispatch), Fetch long polling
+    │                   # (long_poll)
     ├── conn_limits.rs  # Per-listener / per-IP connection caps, SASL lookup rate limit
     ├── auth/           # TLS config, SASL session state machine, SCRAM/PLAIN, credentials, user SQL
     ├── messages.rs     # KafkaRequest/KafkaResponse envelopes, request lanes
     ├── dispatch.rs     # Handler Err/panic -> error response, RequestOutcome
     ├── handlers/       # handle_* per API, taking &HandlerContext
     ├── handler_context.rs  # Store, coordinator and broker metadata passed to handlers
-    ├── coordinator.rs  # Consumer group coordinator (in-memory group state)
+    ├── coordinator/    # Consumer group coordinator (in-memory group state): mod.rs, group.rs, tests.rs
     ├── assignment/     # Range, RoundRobin, Sticky; subscription/assignment encoding
     ├── limits.rs       # Caps on client-controlled state (partitions, group size, group count)
     ├── storage/        # Storage role traits (mod.rs), delegation macros, retention planning,
@@ -231,14 +234,15 @@ Kafka error code.
 
 ### Consumer Group Coordinator
 
-Group state is in memory (`src/kafka/coordinator.rs`, `Arc<RwLock<..>>`); only committed offsets
+Group state is in memory (`src/kafka/coordinator/`, `Arc<RwLock<..>>`); only committed offsets
 persist. JoinGroup responses are held until the join phase completes (every known member rejoined,
 or the rest left or timed out), as in Kafka; the generation moves when the join completes.
 `GroupCoordinator::join_group` takes a `JoinResponder` it calls exactly once (immediately, or later
 from another member's JoinGroup, a LeaveGroup or the ~1 s `check_and_remove_timed_out_members`
 sweep). JoinGroup and SyncGroup answer on the client's own sender (`KafkaApi::DEFERRED_REPLY`),
-wrapped in `handlers::JoinGroupReply` / `SyncGroupReply`, which answer UNKNOWN_SERVER_ERROR if
-dropped unsent; a follower's SyncGroup waits (`pending_syncs`) until the leader's delivers the
+wrapped in `handlers::JoinGroupReply` / `SyncGroupReply`, which answer the retriable
+COORDINATOR_NOT_AVAILABLE if dropped unsent (a Postgres ERROR in the request, the worker
+exiting); a follower's SyncGroup waits (`pending_syncs`) until the leader's delivers the
 assignment. JoinGroup follows Kafka 3.7's checks (INCONSISTENT_GROUP_PROTOCOL, UNKNOWN_MEMBER_ID for
 an unknown non-empty member id, protocol chosen by member vote) and OffsetCommit its rules
 (`validate_offset_commit`: generation -1 only for an unknown or Empty group). Groups with
@@ -262,7 +266,9 @@ must keep:
   (`kafka.ensure_message_partitions`, `drop_message_partition`, `message_partition_contents`,
   internal `create_message_partition`, and the internal lock helpers `try_maintenance_lock`
   and `lock_message_tables`; `kafka.message_partitions()` lists the leaves), and the
-  drop/trim decisions are pure functions in `storage/retention.rs`. Retention for a window of at
+  drop/trim decisions are pure functions in `storage/retention.rs`. A leaf is dropped only at
+  READ COMMITTED (its re-check needs a snapshot taken after the drop's lock wait; the worker
+  pins its session to that level, and a sweep at another skips its drops). Retention for a window of at
   least one width is leaf-granular; shorter windows and the DEFAULT leaf expire row by row.
   **Never** write an UPDATE that changes `created_at` (it moves rows between leaves), confine a
   ctid-based statement to one leaf (`tableoid`; ctids repeat across leaves), and send hot
@@ -353,7 +359,7 @@ ApiVersions list, the metrics names and the error path; nothing else lists the A
 
 1. Write the handler in `src/kafka/handlers/` taking `&HandlerContext` (its
    `store: &dyn KafkaStore` keeps it testable) and returning the kafka-protocol response or a
-   `KafkaError`. Add unit tests with `MockKafkaStore` (`src/kafka/handlers/tests.rs`).
+   `KafkaError`. Add unit tests with `MockKafkaStore` (`src/kafka/handlers/tests/`).
 2. In the fitting `src/kafka/api/*.rs` file, add a request data struct and `impl KafkaApi`:
    - `type Wire` = the kafka-protocol request type (its `KEY` is the api key, its `Response`
      the response body); `NAME`, `MIN_VERSION`, `MAX_VERSION` (advertised and enforced),
@@ -394,28 +400,28 @@ Per-category counts are in `docs/TEST_STRATEGY.md`; `cargo run --release -- --li
 
 | Category | Purpose |
 |----------|---------|
-| **admin** | CreateTopics (incl. validation and the partition cap), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
+| **admin** | CreateTopics (incl. validation, the per-topic and total partition caps), DeleteTopics, CreatePartitions, DeleteGroups, DescribeConfigs, IncrementalAlterConfigs, DeleteRecords, per-topic retention |
 | **producer** | Basic produce, batch produce, acks=0, ack-implies-committed, timestamp roundtrip |
 | **consumer** | Basic consume, from offset, multiple messages, headers, fetch record batching |
-| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart, a silent follower outliving a slow leader's SyncGroup, a lowered group cap |
-| **offset_management** | Commit/fetch, OffsetCommit generation/member rules, boundary conditions, multi-partition, by-timestamp, ListOffsets isolation, OffsetFetch require_stable, no offset reuse |
+| **consumer_group** | Lifecycle, two-member groups, rebalancing, strategies, JoinGroup protocol and member-id rules, no common assignor, offsets-only groups after a restart, a silent follower outliving a slow leader's SyncGroup, a lowered group cap, server-side assignment computed only for the sync-phase leader and in about linear time (a sticky rebalance of nested subscriptions bounded, a refused sticky assignment not recomputed), member state beyond the memory budget refused (empty groups do not exhaust it, a rejoin priced with the protocol it selects), DescribeGroups of a repeated group bounded and reporting metadata only when Stable, a member that never syncs removed, ListGroups state filter case-sensitive, ListGroups bounded by `pg_kafka.fetch_max_bytes` (reading a few index entries per listed group, listing a byte-order prefix, also with a state filter), a failed read of a server-side assignment's topics answered retriably, FindCoordinator with an unknown key type |
+| **offset_management** | Commit/fetch, OffsetCommit generation/member rules, boundary conditions, multi-partition, by-timestamp, ListOffsets isolation, OffsetFetch require_stable, OffsetFetch bounded by `pg_kafka.fetch_max_bytes`, no offset reuse |
 | **partition** | Multi-partition topics, key routing, distribution |
 | **compression** | gzip, snappy, lz4, zstd, roundtrip, edge cases |
 | **idempotent** | InitProducerId, deduplication, epoch, multi-partition, Kafka's idempotent model (5-batch cache, original offsets, epochs, sequence wrap), producers the broker holds no state for |
 | **transaction** | Transactions, isolation levels, EOS, fencing, atomicity, timeouts (each transaction's own clock, an exhausted epoch fenced), InitProducerId's presented epoch, validation; read_committed consumers past aborted/cleaned-up/DeleteRecords holes and stopping at an open transaction |
-| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure and a delivery timeout, sync-stall bound, GUC reload, per-partition lag view |
-| **long_poll** | Timeout behavior, immediate return, producer wakeup, precision, per-connection task cap, a transaction end waking a read_committed fetch |
-| **error_paths** | Invalid partitions, unknown topics, coordinator errors, protocol/transaction/group regressions |
+| **shadow** | External forwarding, SASL/SSL, topic mapping, replay, dial-up, throughput floor, headers/timestamps, order across a retried failure and a delivery timeout, sync-stall bound, GUC reload, per-partition lag view, a header key holding NUL, a replay held open not stalling the DB thread (the outbox tick's bounded lock waits) |
+| **long_poll** | Timeout behavior, immediate return, a consumer receiving before max wait, sequential produce-consume, min_bytes, precision, consumer disconnect, several consumers of one partition, per-connection task cap, a transaction end waking a read_committed fetch, a Fetch of no partitions answered at once |
+| **error_paths** | Invalid partitions, unknown topics, out-of-range offsets, coordinator errors, protocol/transaction/group regressions, listener regressions (an idle long poll that does not refetch, a Produce or a commit waking a long poll promptly, pipelining beyond the in-flight cap) |
 | **edge_cases** | Empty topics, large messages, boundary values, retention sweep |
-| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, maintenance locking kafka.messages before its leaves, maintenance and sweeps against a concurrent DROP EXTENSION, EndTxn during the default-leaf move, offsets kept after retention empties a partition, concurrent sweeps against maintenance, the worker's sweep skipping while the maintenance lock is held, least privilege |
+| **part** | Time partitions of kafka.messages: whole-leaf retention drops, row-delete fallback, pending-transaction blocking, maintenance and its lock waits, maintenance locking kafka.messages before its leaves, maintenance and sweeps against a concurrent DROP EXTENSION, EndTxn during the default-leaf move, offsets kept after retention empties a partition, concurrent sweeps against maintenance, the worker's sweep skipping while the maintenance lock is held, the sweep reading only what it deletes (indexed aborted-row and outbox cleanup), outbox rows of removed messages reaped, budget-limited passes still reaching every leaf (each step with work takes a turn every pass, found trims and drops kept until done), the stale-producer prune reading through its indexes, leaf drops bounded behind a reader holding a lock, a drop's re-check linear in the leaf's topics, expiry items not growing with the leaves, a probe finding a trim per topic within the budget, an on-demand sweep racing worker writes (a producer revived after the prune's snapshot or with its Produce open kept, the log start never passing a concurrent Produce) and never closing a lock cycle with a batch (two producer or transaction rows, a held offset counter) or the forwarder's ack batch, least privilege |
 | **concurrent** | Multi-producer, multi-consumer, request pipelining, races, heartbeat liveness lane, heartbeats inside group-commit batches |
 | **negative** | Connection refused, timeouts, expected failures, superuser-only SASL password GUC |
 | **performance** | Throughput baselines, latency percentiles, scaling |
 | **metadata** | Metadata refresh, all topics, nonexistent topic, a corrupt stored partition count |
 | **protocol** | ApiVersions negotiation, correlation ID, unknown API, pipelining, response ordering |
 | **auth** | SASL_PLAINTEXT (PLAIN, SCRAM-SHA-256/512), SSL (+ untrusted CA, mutual TLS), SASL_SSL, wrong passwords, pre-auth gating and pre-auth ApiVersions on the network thread, advertised addresses, user SQL. Sequential: generates certs with the `openssl` CLI, adds listeners 19093-19095 via ALTER SYSTEM and restarts the worker; the last test resets them. Needs the DB host's filesystem and superuser |
-| **network** | Hostile clients at the network edge: frame-budget lockout, >100 MB response, Nagle, acks=0 close / invalid acks, response before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM, decompression bombs, acks=0 Produce at an unsupported version, a saturated large-decode path, a long topic name over many partitions (Produce, long-polling Fetch). Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
-| **worker** | Worker lifecycle and robustness: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, commit failure. Sequential; needs superuser and the DB host's filesystem |
+| **network** | Hostile clients at the network edge: frame-budget lockout, >100 MB response, Nagle, acks=0 close / invalid acks, response before close, per-IP and per-listener caps, idle and frame-read deadlines, pre-auth deadline from accept, SASL lookup rate limit, unknown-user SCRAM, decompression bombs, acks=0 Produce at an unsupported version, a saturated large-decode path, requests that decode to many times their frame (Metadata, DeleteGroups), a long topic name over many partitions (Produce, long-polling Fetch), clients that stop reading their responses (no hold on the decoded-request budget, a stalled writer or one behind a long poll closed after the idle timeout), Fetch responses capped by `pg_kafka.fetch_max_bytes`, frames waiting to decode charged to the frame budget, repeated or many request entries answered once and quickly (Metadata, ListOffsets, OffsetCommit, OffsetFetch, DeleteRecords, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs, IncrementalAlterConfigs, AddPartitionsToTxn, TxnOffsetCommit, DeleteGroups, DescribeGroups, Fetch and long-polling Fetch). Sequential; the `limits` tests add listeners 19096-19098 via ALTER SYSTEM, connect from 127.0.0.x source addresses and need `openssl` |
+| **worker** | Worker lifecycle and robustness: DROP/CREATE/ALTER EXTENSION under load, old 0.0.0 schema, SIGTERM in a lock wait, worker lock_timeout, commit failure, `pg_debug!` lines logged once DEBUG1 is, a `pg_cancel_backend()` of the listener neither restarting it nor failing the next requests. Sequential; needs superuser and the DB host's filesystem |
 
 ### Running E2E Tests with CLI Options
 

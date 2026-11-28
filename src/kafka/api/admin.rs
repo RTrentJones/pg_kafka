@@ -18,6 +18,7 @@ use super::{ApiEnv, ApiSchema, Call, KafkaApi, Rejection, RequestHeader};
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::handlers;
 use crate::kafka::messages::{CreatePartitionsTopicRequest, CreateTopicRequest};
+use crate::kafka::notifications::{send_best_effort, InternalNotification};
 
 fn topic_name(name: &str) -> TopicName {
     TopicName(name.to_string().into())
@@ -182,7 +183,27 @@ impl KafkaApi for DeleteTopicsApi {
     fn handle(request: Self::Request, call: Call<Self>, env: &ApiEnv<'_>) -> RequestOutcome {
         call.run(request, |r, _| {
             handlers::handle_delete_topics(&env.ctx, r.topic_names)
+                .inspect(|response| emit_topic_deleted_notifications(response, env.notify_tx))
         })
+    }
+}
+
+/// Wake the long polls of each deleted topic: they are answered UNKNOWN_TOPIC_OR_PARTITION
+/// now rather than at their deadline. One notification per topic deleted without error,
+/// O(the response).
+fn emit_topic_deleted_notifications(
+    response: &DeleteTopicsResponse,
+    notify_tx: &crossbeam_channel::Sender<InternalNotification>,
+) {
+    for topic in response.responses.iter().filter(|t| t.error_code == 0) {
+        if let Some(name) = &topic.name {
+            send_best_effort(
+                notify_tx,
+                InternalNotification::TopicDeleted {
+                    topic_name: name.0.to_string(),
+                },
+            );
+        }
     }
 }
 
@@ -264,5 +285,44 @@ impl KafkaApi for CreatePartitionsApi {
         call.run(request, |r, _| {
             handlers::handle_create_partitions(&env.ctx, r.topics, r.validate_only)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deleted(name: &str, error_code: i16) -> DeletableTopicResult {
+        let mut topic = DeletableTopicResult::default();
+        topic.name = Some(topic_name(name));
+        topic.error_code = error_code;
+        topic
+    }
+
+    #[test]
+    fn only_topics_deleted_without_error_notify() {
+        let mut response = DeleteTopicsResponse::default();
+        response.responses = vec![deleted("a", 0), deleted("b", 3), deleted("c", 0)];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        emit_topic_deleted_notifications(&response, &tx);
+        let named: Vec<String> = rx
+            .try_iter()
+            .map(|n| match n {
+                InternalNotification::TopicDeleted { topic_name } => topic_name,
+                other => panic!("unexpected notification {other:?}"),
+            })
+            .collect();
+        assert_eq!(named, ["a", "c"]);
+    }
+
+    #[test]
+    fn a_topic_without_a_name_does_not_notify() {
+        let mut response = DeleteTopicsResponse::default();
+        let mut unnamed = DeletableTopicResult::default();
+        unnamed.name = None;
+        response.responses = vec![unnamed];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        emit_topic_deleted_notifications(&response, &tx);
+        assert_eq!(rx.try_iter().count(), 0);
     }
 }

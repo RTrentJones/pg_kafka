@@ -19,7 +19,8 @@ use super::helpers::{resolve_topics, validate_topic_name};
 use crate::kafka::constants::{
     ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICATION_FACTOR,
     ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_NON_EMPTY_GROUP,
-    ERROR_TOPIC_ALREADY_EXISTS, ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_POLICY_VIOLATION, ERROR_TOPIC_ALREADY_EXISTS, ERROR_UNKNOWN_SERVER_ERROR,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
@@ -36,7 +37,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 ///   INVALID_PARTITIONS (-1 means `pg_kafka.default_partitions`, capped at the maximum);
 /// - `replication_factor` other than 1 or -1 (the default): INVALID_REPLICATION_FACTOR, since
 ///   this is a single-broker cluster;
-/// - an existing topic: TOPIC_ALREADY_EXISTS.
+/// - an existing topic: TOPIC_ALREADY_EXISTS;
+/// - a topic that would take the partitions of all topics, with the ones the request creates
+///   before it (or, with `validate_only`, would create), above `pg_kafka.max_total_partitions`:
+///   POLICY_VIOLATION.
 pub fn handle_create_topics(
     ctx: &HandlerContext,
     topics: Vec<CreateTopicRequest>,
@@ -63,6 +67,7 @@ pub fn handle_create_topics(
             .map_err(|e| format!("Error checking topic: {e}"))
     };
     let mut reported = HashSet::new();
+    let mut budget = PartitionBudget::new(ctx.store);
 
     let mut results = Vec::new();
     for topic in topics {
@@ -76,7 +81,14 @@ pub fn handle_create_topics(
                 "Duplicate topic name.".to_string(),
             )
         } else {
-            create_topic_result(ctx, &topic, max_partitions, validate_only, &mut existing)
+            create_topic_result(
+                ctx,
+                &topic,
+                max_partitions,
+                validate_only,
+                &mut existing,
+                &mut budget,
+            )
         });
     }
 
@@ -93,8 +105,11 @@ fn create_topic_result(
     max_partitions: i32,
     validate_only: bool,
     existing: &mut std::result::Result<ExistingTopics, String>,
+    budget: &mut PartitionBudget<'_>,
 ) -> CreatableTopicResult {
-    let num_partitions = match validate_new_topic(ctx, topic, max_partitions, existing) {
+    let num_partitions = match validate_new_topic(ctx, topic, max_partitions, existing)
+        .and_then(|n| budget.take(n).map(|()| n))
+    {
         Ok(num_partitions) => num_partitions,
         Err((code, message)) => return failed_topic(&topic.name, code, message),
     };
@@ -170,6 +185,45 @@ fn validate_new_topic(
     Ok(num_partitions)
 }
 
+/// What `pg_kafka.max_total_partitions` leaves to an admin request: the partitions of all
+/// topics, read once (on the first topic that needs it), plus the ones the request has taken
+/// so far. All topic creation runs on the worker's single DB thread, inside the request's
+/// transaction, so nothing else adds partitions between the read and the creates.
+struct PartitionBudget<'a> {
+    store: &'a dyn crate::kafka::storage::KafkaStore,
+    max: i64,
+    /// The total so far; `None` until read, `Err` with its message if the read failed.
+    total: Option<std::result::Result<i64, String>>,
+}
+
+impl<'a> PartitionBudget<'a> {
+    fn new(store: &'a dyn crate::kafka::storage::KafkaStore) -> Self {
+        Self {
+            store,
+            max: crate::kafka::limits::max_total_partitions(),
+            total: None,
+        }
+    }
+
+    /// Take `adding` partitions, or the error code and message that refuse them.
+    fn take(&mut self, adding: i32) -> std::result::Result<(), (i16, String)> {
+        let store = self.store;
+        let total = self.total.get_or_insert_with(|| {
+            store
+                .total_partition_count()
+                .map_err(|e| format!("Error counting partitions: {e}"))
+        });
+        let current = *total
+            .as_ref()
+            .map_err(|message| (ERROR_UNKNOWN_SERVER_ERROR, message.clone()))?;
+        let adding = i64::from(adding);
+        crate::kafka::limits::check_total_partitions(current, adding, self.max)
+            .map_err(|message| (ERROR_POLICY_VIOLATION, message))?;
+        *total = Ok(current + adding.max(0));
+        Ok(())
+    }
+}
+
 /// The existing topics a CreateTopics request's names equal or collide with (once '.' and
 /// '_' are treated as equal), with the topics the request creates added as it goes.
 struct ExistingTopics {
@@ -240,11 +294,13 @@ fn failed_topic(name: &str, error_code: i16, message: String) -> CreatableTopicR
 }
 
 /// A CreateTopics result for a topic that is (or, with validate_only, would be) created;
-/// the replication factor is always 1 on this single-node broker.
+/// the replication factor is always 1 on this single-node broker. Its error message is
+/// null, as Kafka 3.7 sends it (the generated default is the empty string).
 fn created_topic(name: &str, num_partitions: i32) -> CreatableTopicResult {
     let mut result = CreatableTopicResult::default();
     result.name = TopicName(StrBytes::from_string(name.to_string()));
     result.error_code = ERROR_NONE;
+    result.error_message = None;
     result.num_partitions = num_partitions;
     result.replication_factor = 1;
     result
@@ -331,7 +387,9 @@ pub fn handle_delete_topics(
 /// Handle CreatePartitions request
 ///
 /// Increases the partition count for existing topics.
-/// Cannot decrease partition count.
+/// Cannot decrease partition count, and refuses growth above `pg_kafka.max_partitions_per_topic`
+/// (INVALID_PARTITIONS) or that would take the partitions of all topics above
+/// `pg_kafka.max_total_partitions` (POLICY_VIOLATION).
 pub fn handle_create_partitions(
     ctx: &HandlerContext,
     topics: Vec<CreatePartitionsTopicRequest>,
@@ -343,6 +401,7 @@ pub fn handle_create_partitions(
     // Every topic in one lookup however many the request names.
     let found = resolve_topics(store, topics.iter().map(|t| t.name.as_str()));
     let mut reported = HashSet::new();
+    let mut budget = PartitionBudget::new(ctx.store);
 
     for topic in topics {
         if !reported.insert(topic.name.clone()) {
@@ -383,6 +442,10 @@ pub fn handle_create_partitions(
                 ) {
                     // The per-topic partition cap applies to growth too.
                     result.error_code = ERROR_INVALID_PARTITIONS;
+                    result.error_message = Some(StrBytes::from_string(msg));
+                } else if let Err((code, msg)) = budget.take(topic.count - current_count) {
+                    // So does the cap on all topics' partitions.
+                    result.error_code = code;
                     result.error_message = Some(StrBytes::from_string(msg));
                 } else if validate_only {
                     // Validation passed
@@ -434,8 +497,8 @@ pub fn handle_delete_groups(
     let store = ctx.store;
     let coordinator = ctx.coordinator;
     let mut results = Vec::new();
-    // Which of the groups the coordinator does not hold have committed offsets, in one
-    // lookup however many groups the request names.
+    // Which of the groups the coordinator does not hold have offsets (committed, or pending
+    // in an open transaction), in one lookup however many groups the request names.
     let unheld: Vec<String> = group_names
         .iter()
         .filter(|g| !coordinator.has_group(g))
@@ -477,9 +540,11 @@ pub fn handle_delete_groups(
                 }
             }
             None => {
-                // A group the coordinator does not hold exists only through its
-                // committed offsets (an Empty group, as DescribeGroups/ListGroups report it).
-                // Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka answers.
+                // A group the coordinator does not hold exists only through its offsets,
+                // committed or pending in an open transaction (an Empty group, as
+                // DescribeGroups/ListGroups report it; Kafka 3.7's TxnOffsetCommit creates
+                // the group). Without any, it does not exist: GROUP_ID_NOT_FOUND, as Kafka
+                // answers.
                 match &with_offsets {
                     Ok(groups) if !groups.contains(&group_name) => {
                         result.error_code = ERROR_GROUP_ID_NOT_FOUND;
@@ -524,6 +589,7 @@ mod tests {
     #[test]
     fn test_create_topics_success() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store.expect_create_topic().returning(|_, _| Ok(1));
 
@@ -542,6 +608,8 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.topics.len(), 1);
         assert_eq!(response.topics[0].error_code, ERROR_NONE);
+        // Kafka 3.7 sends a null error message for a created topic, not "".
+        assert_eq!(response.topics[0].error_message, None);
     }
 
     #[test]
@@ -568,6 +636,7 @@ mod tests {
         // num_partitions = -1 means "broker default" (pg_kafka.default_partitions);
         // 0 is not a valid partition count.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
@@ -606,6 +675,7 @@ mod tests {
     #[test]
     fn test_create_topics_validate_only() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         // create_topic should NOT be called when validate_only is true
 
@@ -623,11 +693,13 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.topics[0].error_code, ERROR_NONE);
+        assert_eq!(response.topics[0].error_message, None);
     }
 
     #[test]
     fn test_create_topics_already_exists() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store
             .expect_colliding_topics()
             .returning(|names| Ok(names.to_vec()));
@@ -651,6 +723,7 @@ mod tests {
     #[test]
     fn test_delete_topics_success() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store.expect_delete_topic().returning(|_| Ok(()));
 
@@ -668,6 +741,7 @@ mod tests {
     #[test]
     fn test_delete_topics_not_found() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(None));
 
         let coordinator = crate::kafka::GroupCoordinator::new();
@@ -686,6 +760,7 @@ mod tests {
     #[test]
     fn test_create_partitions_success() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store
             .expect_set_topic_partition_count()
@@ -710,6 +785,7 @@ mod tests {
     #[test]
     fn test_create_partitions_cannot_decrease() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 5))));
 
         let topics = vec![CreatePartitionsTopicRequest {
@@ -732,6 +808,7 @@ mod tests {
         // Increasing to the current count is a no-op and must be rejected with
         // INVALID_PARTITIONS, not silently succeed.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 3))));
 
         let topics = vec![CreatePartitionsTopicRequest {
@@ -768,6 +845,7 @@ mod tests {
         // A group absent from the coordinator but holding committed offsets is an Empty
         // group: its offsets are deleted and the result is NONE.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store
             .expect_groups_with_offsets()
             .returning(|groups| Ok(groups.iter().cloned().collect()));
@@ -807,6 +885,7 @@ mod tests {
     #[test]
     fn test_delete_groups_answers_a_repeated_group_once() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store
             .expect_groups_with_offsets()
             .withf(|groups| groups == ["gdup", "nosuchg"])
@@ -840,6 +919,7 @@ mod tests {
     fn test_delete_groups_nonexistent_group_is_not_found() {
         // Kafka answers GROUP_ID_NOT_FOUND for a group that has neither members nor offsets.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store
             .expect_groups_with_offsets()
             .returning(|_| Ok(HashSet::new()));
@@ -856,6 +936,7 @@ mod tests {
         // A huge partition count is refused before anything is stored; stored, it would make
         // every Metadata request allocate for it.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
@@ -891,6 +972,7 @@ mod tests {
     #[test]
     fn test_create_topics_minus_one_default_is_capped() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
@@ -913,6 +995,7 @@ mod tests {
     #[test]
     fn test_create_topics_replication_factor() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store.expect_create_topic().times(2).returning(|_, _| Ok(1));
         let coordinator = crate::kafka::GroupCoordinator::new();
@@ -953,6 +1036,7 @@ mod tests {
         // Kafka: one INVALID_REQUEST result for the repeated name, nothing created for it;
         // the other topics are unaffected.
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store.expect_colliding_topics().returning(|_| Ok(vec![]));
         store
             .expect_create_topic()
@@ -977,6 +1061,7 @@ mod tests {
     #[test]
     fn test_create_topics_name_collision() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         store
             .expect_colliding_topics()
             .returning(|_| Ok(vec!["a.b".to_string()]));
@@ -995,6 +1080,7 @@ mod tests {
     #[test]
     fn test_create_partitions_over_cap_rejected() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store.expect_set_topic_partition_count().times(0);
         let coordinator = crate::kafka::GroupCoordinator::new();
@@ -1017,6 +1103,7 @@ mod tests {
     #[test]
     fn test_delete_topics_repeated_name_is_one_invalid_request() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |name| Ok(Some((i32::from(name == "x"), 1))));
         store
             .expect_delete_topic()
@@ -1049,11 +1136,77 @@ mod tests {
         );
     }
 
+    /// `pg_kafka.max_total_partitions` bounds the partitions of all topics together: with
+    /// the default cap and 10,000 partitions already there, a CreateTopics of topics at the
+    /// per-topic maximum creates them only while the total fits, counting the request's own
+    /// topics (validate_only too), and CreatePartitions grows a topic only within it. Without
+    /// the total cap one CreateTopics of 10,000 such topics made 1e8 partitions, and every
+    /// all-topics Metadata then allocated one entry per partition.
+    #[test]
+    fn test_total_partition_cap() {
+        let max = crate::kafka::limits::max_total_partitions();
+        let per_topic = crate::kafka::limits::max_partitions_per_topic();
+        let existing = 10_000_i64;
+        let fit = usize::try_from((max - existing) / i64::from(per_topic)).unwrap();
+        for validate_only in [false, true] {
+            let mut store = MockKafkaStore::new();
+            store
+                .expect_total_partition_count()
+                .times(1)
+                .returning(move || Ok(existing));
+            store.expect_colliding_topics().returning(|_| Ok(vec![]));
+            store
+                .expect_create_topic()
+                .times(if validate_only { 0 } else { fit })
+                .returning(|_, _| Ok(1));
+            let coordinator = crate::kafka::GroupCoordinator::new();
+            let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+            let ctx = ctx_for(&store, &coordinator, &broker);
+            let topics = (0..fit + 2)
+                .map(|i| topic(&format!("t{i}"), per_topic, 1))
+                .collect();
+            let response = handle_create_topics(&ctx, topics, validate_only).unwrap();
+            let codes: Vec<i16> = response.topics.iter().map(|t| t.error_code).collect();
+            assert_eq!(codes[..fit], vec![ERROR_NONE; fit][..], "{validate_only}");
+            assert_eq!(codes[fit..], [ERROR_POLICY_VIOLATION; 2], "{validate_only}");
+            let message = response.topics[fit].error_message.as_ref().unwrap();
+            assert!(
+                message.contains("pg_kafka.max_total_partitions"),
+                "{message}"
+            );
+        }
+
+        // CreatePartitions: growth that fits is applied, growth that does not is refused.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_total_partition_count()
+            .times(1)
+            .returning(move || Ok(max - 5));
+        crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
+        store
+            .expect_set_topic_partition_count()
+            .withf(|name, count| name == "a" && *count == 4)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let coordinator = crate::kafka::GroupCoordinator::new();
+        let broker = crate::kafka::BrokerMetadata::new("localhost".to_string(), 9092);
+        let ctx = ctx_for(&store, &coordinator, &broker);
+        let grow = |name: &str, count| CreatePartitionsTopicRequest {
+            name: name.to_string(),
+            count,
+        };
+        let response =
+            handle_create_partitions(&ctx, vec![grow("a", 4), grow("b", 4)], false).unwrap();
+        let codes: Vec<i16> = response.results.iter().map(|r| r.error_code).collect();
+        assert_eq!(codes, [ERROR_NONE, ERROR_POLICY_VIOLATION]);
+    }
+
     /// Kafka 3.7 answers a CreatePartitions name given more than once with one
     /// INVALID_REQUEST entry and changes nothing for it.
     #[test]
     fn test_create_partitions_repeated_name_is_one_invalid_request() {
         let mut store = MockKafkaStore::new();
+        store.expect_total_partition_count().returning(|| Ok(0));
         crate::testing::expect_topics(&mut store, |_| Ok(Some((1, 1))));
         store
             .expect_set_topic_partition_count()
