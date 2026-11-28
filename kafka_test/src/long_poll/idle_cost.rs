@@ -20,9 +20,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 /// Long polls on one connection (its long-poll cap).
-const LONG_POLLS: usize = 64;
+pub(super) const LONG_POLLS: usize = 64;
 /// Partitions each long poll names.
-const PARTITIONS: i32 = 1_000;
+pub(super) const PARTITIONS: i32 = 1_000;
 /// Long enough that no long poll reaches its deadline while the test measures.
 const MAX_WAIT_MS: i32 = 60_000;
 /// Produces timed in each phase.
@@ -30,8 +30,9 @@ const PRODUCES: usize = 20;
 /// How long the idle phase is watched for Fetch attempts.
 const WATCH: Duration = Duration::from_secs(3);
 
-/// A Fetch v4 of every partition of `topic` from offset 0, waiting for one byte.
-fn long_poll_frame(correlation_id: i32, topic: &str) -> Vec<u8> {
+/// A Fetch v4 of every partition of `topic` from offset 0, waiting for one byte, at
+/// `isolation_level` (0 read_uncommitted, 1 read_committed).
+pub(super) fn long_poll_frame(correlation_id: i32, topic: &str, isolation_level: i8) -> Vec<u8> {
     let partitions = (0..PARTITIONS)
         .map(|partition| {
             FetchPartition::default()
@@ -48,13 +49,13 @@ fn long_poll_frame(correlation_id: i32, topic: &str) -> Vec<u8> {
         .with_max_wait_ms(MAX_WAIT_MS)
         .with_min_bytes(1)
         .with_max_bytes(1 << 20)
-        .with_isolation_level(0)
+        .with_isolation_level(isolation_level)
         .with_topics(vec![fetch_topic]);
     request_frame(4, correlation_id, &request)
 }
 
 /// Fetch requests the worker has executed (`kafka.api_metrics`, published once a second).
-async fn fetches_executed(ctx: &TestContext) -> Result<i64, Box<dyn std::error::Error>> {
+pub(super) async fn fetches_executed(ctx: &TestContext) -> Result<i64, Box<dyn std::error::Error>> {
     Ok(ctx
         .db()
         .query_opt(
@@ -66,7 +67,7 @@ async fn fetches_executed(ctx: &TestContext) -> Result<i64, Box<dyn std::error::
 }
 
 /// The median of `PRODUCES` sequential one-record Produce round trips to `topic`.
-async fn median_produce_latency(
+pub(super) async fn median_produce_latency(
     producer: &rdkafka::producer::FutureProducer,
     topic: &str,
 ) -> Result<Duration, Box<dyn std::error::Error>> {
@@ -109,7 +110,7 @@ pub async fn test_idle_long_polls_leave_the_db_thread_free() -> TestResult {
     let mut stream = TcpStream::connect(get_bootstrap_servers()).await?;
     for i in 0..LONG_POLLS {
         stream
-            .write_all(&long_poll_frame(i32::try_from(i)?, &watched))
+            .write_all(&long_poll_frame(i32::try_from(i)?, &watched, 0))
             .await?;
     }
     stream.flush().await?;

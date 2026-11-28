@@ -95,5 +95,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         kafka_parity::test_offset_commit_generation_for_offsets_only_group,
         kafka_parity::test_refused_offset_commit_answers_unknown_partitions,
         kafka_parity::test_group_member_checks_match_kafka,
+        kafka_parity::test_negative_partition_max_bytes_is_unknown_server_error,
+        kafka_parity::test_create_topics_success_has_a_null_error_message,
     ]
 }

@@ -691,19 +691,25 @@ algorithm; see "Server-side sticky assignment" below)
 - ✅ Long polling (max_wait_ms/min_bytes support), as Kafka's `DelayedFetch`: a waiting
   fetch is re-checked when a partition it watches changes, and only that partition is
   re-read: a Produce to it, DeleteRecords of it, DeleteTopics of its topic, or, for
-  `read_committed`, any transaction end (EndTxn, an abort by fencing InitProducerId or by
-  the transaction timeout; every partition is re-read, the end not naming its partitions).
+  `read_committed`, the end of a transaction that added it (EndTxn, an abort by fencing
+  InitProducerId or by the transaction timeout; as Kafka's transaction markers, which
+  complete only the fetches watching the partitions they are written to). An
+  InitProducerId that aborts no open transaction wakes nothing.
   Once the bytes available reach `min_bytes`, or a re-read partition has an error, the
   whole fetch is read once more and answered. At `max_wait_ms` it is read once more, or,
-  when nothing changed since a read that returned no records, that read is answered. A
-  re-check no notification asks for (the safety-net interval `pg_kafka.fetch_poll_interval_ms`,
-  default 1000 ms; a retention sweep that removed records; a dropped notification) reads
-  every partition and runs only within an allowance of 256 partitions per interval shared
-  by all long polls, so a long poll of more partitions sees such a change (an on-demand
-  `pg_kafka_run_retention_sweep()` in another session, say) at `max_wait_ms` only. An idle
-  long poll therefore costs one read of its partitions per request, as an immediate fetch
-  does. A fetch that names no partition (no topics, or only empty partition lists) has
-  nothing to wait for and is answered at once, as in Kafka 3.7
+  when nothing was notified since a read of every partition that returned no records and
+  started less than one `pg_kafka.fetch_poll_interval_ms` (default 1000 ms) before, that
+  read is answered. A re-check no notification asks for (the safety-net interval; a
+  retention sweep that removed records; a dropped notification) reads every partition and
+  runs only within an allowance of 256 partitions per interval shared by all long polls.
+  So a change no notification names (an on-demand `pg_kafka_run_retention_sweep()` in
+  another session, DROP EXTENSION) is in a long poll's answer once it is one interval old
+  (Kafka reads again at the deadline, so it answers any change made before it). An idle
+  long poll costs one read of its partitions per request when `max_wait_ms` is shorter
+  than the interval, and otherwise at most two (Kafka's two: on arrival and at expiry)
+  plus the safety-net re-checks the shared allowance grants it. A fetch that names no
+  partition (no topics, or only empty partition lists) has nothing to wait for and is
+  answered at once, as in Kafka 3.7
 
 **What's Missing:**
 - ❌ Fetch sessions (always uses fetch session ID 0)

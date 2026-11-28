@@ -4,7 +4,7 @@
 use super::helpers::{merge_by_partition, resolve_topics};
 use crate::kafka::constants::{
     ERROR_INVALID_REQUEST, ERROR_KAFKA_STORAGE_ERROR, ERROR_NONE, ERROR_OFFSET_OUT_OF_RANGE,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
@@ -579,6 +579,15 @@ fn fetch_partition(
         return offset_out_of_range(partition_id);
     }
 
+    // Kafka 3.7 refuses a negative partition_max_bytes once it reads the log
+    // (LogSegment.read's IllegalArgumentException): UNKNOWN_SERVER_ERROR, no bounds and no
+    // records. At or past the readable end it reads nothing and answers as for any limit.
+    if partition_fetch.partition_max_bytes < 0
+        && fetch_offset < readable_end(&bounds, isolation_level)
+    {
+        return outside_log(partition_id, ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
     // Once the request-level max_bytes is spent, later partitions report their bounds
     // but no records.
     let Some(limit) = partition_fetch_limit(
@@ -616,10 +625,7 @@ fn read_partition(
         isolation_level,
         compression,
     } = settings;
-    let readable_end = match isolation_level {
-        IsolationLevel::ReadCommitted => bounds.last_stable_offset,
-        IsolationLevel::ReadUncommitted => bounds.high_watermark,
-    };
+    let readable_end = readable_end(bounds, isolation_level);
     // Nothing is readable from the readable end on (for read_committed, the last stable
     // offset: a consumer waiting behind an open transaction), and a gap batch covers no
     // offset there, so there is nothing to read. Kafka reads only up to it. Every long-poll
@@ -748,9 +754,24 @@ fn partition_error(partition_id: i32, error_code: i16) -> PartitionData {
 /// -1") before it reads the error code, so a null here would leave the consumer
 /// refetching the same offset without ever applying its auto.offset.reset policy.
 fn offset_out_of_range(partition_id: i32) -> PartitionData {
-    let mut partition_data = partition_error(partition_id, ERROR_OFFSET_OUT_OF_RANGE);
+    outside_log(partition_id, ERROR_OFFSET_OUT_OF_RANGE)
+}
+
+/// The entry of a partition whose log read failed with `error_code`, as Kafka 3.7 answers
+/// one (see [`offset_out_of_range`]).
+fn outside_log(partition_id: i32, error_code: i16) -> PartitionData {
+    let mut partition_data = partition_error(partition_id, error_code);
     partition_data.aborted_transactions = None;
     partition_data
+}
+
+/// Where a Fetch at `isolation_level` stops reading: the last stable offset for
+/// read_committed, the high watermark otherwise (Kafka's fetch upper bound).
+fn readable_end(bounds: &PartitionBounds, isolation_level: IsolationLevel) -> i64 {
+    match isolation_level {
+        IsolationLevel::ReadCommitted => bounds.last_stable_offset,
+        IsolationLevel::ReadUncommitted => bounds.high_watermark,
+    }
 }
 
 /// A successful partition entry with its bounds and no records. Empty bytes rather than
@@ -1554,6 +1575,44 @@ mod tests {
         assert_eq!(parts[1].error_code, ERROR_NONE);
         assert_eq!(parts[1].high_watermark, 3);
         assert!(parts[1].records.as_ref().unwrap().is_empty());
+    }
+
+    /// A negative partition_max_bytes is refused as Kafka 3.7 refuses it: a partition with
+    /// records to read answers UNKNOWN_SERVER_ERROR with no bounds, no records and null
+    /// aborted transactions, without reading; one fetched at its end answers its bounds.
+    #[test]
+    fn a_negative_partition_max_bytes_is_unknown_server_error() {
+        // No fetch_records expectation: a read fails the test.
+        let mock = mock_with_two_partitions();
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let mut request = two_partition_request();
+        request[0].partitions[0].partition_max_bytes = -1;
+        request[0].partitions[1].partition_max_bytes = i32::MIN;
+        request[0].partitions[1].fetch_offset = 3;
+        for isolation in [
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+        ] {
+            let response =
+                handle_fetch_with_max_bytes(&ctx, request.clone(), isolation, 1 << 20, true)
+                    .unwrap();
+            let parts = &response.responses[0].partitions;
+            assert_eq!(parts[0].error_code, ERROR_UNKNOWN_SERVER_ERROR);
+            assert_eq!(
+                (
+                    parts[0].high_watermark,
+                    parts[0].last_stable_offset,
+                    parts[0].log_start_offset
+                ),
+                (-1, -1, -1)
+            );
+            assert!(parts[0].records.as_ref().unwrap().is_empty());
+            assert!(parts[0].aborted_transactions.is_none());
+            assert_eq!(parts[1].error_code, ERROR_NONE);
+            assert_eq!(parts[1].high_watermark, 3);
+            assert!(parts[1].records.as_ref().unwrap().is_empty());
+        }
     }
 
     #[test]

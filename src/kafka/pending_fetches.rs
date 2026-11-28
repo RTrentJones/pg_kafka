@@ -43,8 +43,6 @@ struct Changes {
     marked: Vec<bool>,
     /// The slots marked since the last take, each once.
     slots: Vec<usize>,
-    /// Every slot may have changed (a transaction ended, for a read_committed long poll).
-    all: bool,
     /// Something may have changed that no notification names (see
     /// [`PendingFetchRegistry::notify_coarse`]).
     coarse: bool,
@@ -55,8 +53,6 @@ struct Changes {
 pub struct Taken {
     /// The slots a notification named, each once.
     pub slots: Vec<usize>,
-    /// Every slot may have changed.
-    pub all: bool,
     /// Something may have changed that no notification names.
     pub coarse: bool,
 }
@@ -90,17 +86,11 @@ impl Wake {
     fn mark(&self, slot: usize) {
         {
             let mut changes = self.changes();
-            if !changes.all && changes.marked.get(slot) == Some(&false) {
+            if changes.marked.get(slot) == Some(&false) {
                 changes.marked[slot] = true;
                 changes.slots.push(slot);
             }
         }
-        self.notify.notify_one();
-    }
-
-    /// Mark every slot as changed and wake the long poll.
-    fn mark_all(&self) {
-        self.changes().all = true;
         self.notify.notify_one();
     }
 
@@ -119,10 +109,8 @@ impl Wake {
         }
         let taken = Taken {
             slots,
-            all: changes.all,
             coarse: changes.coarse,
         };
-        changes.all = false;
         changes.coarse = false;
         taken
     }
@@ -147,14 +135,14 @@ struct PendingFetch {
     /// The offset the long poll fetches from: new data is relevant when the high watermark
     /// passes it.
     fetch_offset: i64,
+    /// Whether the long poll reads committed records only (a transaction end concerns it).
+    read_committed: bool,
 }
 
 #[derive(Debug, Default)]
 struct Waiters {
     /// Topic name -> partition -> the long polls waiting on it.
     by_topic: HashMap<String, TopicWaiters>,
-    /// The `read_committed` long polls, each once, woken when a transaction ends.
-    read_committed: HashMap<FetchId, Arc<Wake>>,
     /// Every long poll, each once.
     all: HashMap<FetchId, Arc<Wake>>,
 }
@@ -242,15 +230,13 @@ impl PendingFetchRegistry {
                         wake: Arc::clone(wake),
                         slot,
                         fetch_offset,
+                        read_committed,
                     },
                 );
                 slot += 1;
             }
         }
         wake.set_slots(slot);
-        if read_committed {
-            waiters.read_committed.insert(id, Arc::clone(wake));
-        }
         waiters.all.insert(id, Arc::clone(wake));
         id
     }
@@ -294,17 +280,27 @@ impl PendingFetchRegistry {
         }
     }
 
-    /// Wake every waiting `read_committed` fetch because a transaction ended.
-    ///
-    /// EndTxn (commit or abort) can advance the last stable offset of any partition the
-    /// transaction wrote to; the notification does not say which, so every `read_committed`
-    /// waiter is woken once with all its partitions marked. `read_uncommitted` waiters are
-    /// left alone. Cost: one step per `read_committed` long poll, however many partitions
-    /// each waits on.
-    pub async fn notify_transaction_ended(&self) {
+    /// A transaction that added `partitions` of `topic_name` ended: wake the
+    /// `read_committed` long polls waiting on any of them, marking those partitions only
+    /// (the end can move their last stable offset, whatever the offset a long poll reads
+    /// from: an open transaction holds back what it may read). `read_uncommitted` long
+    /// polls saw the records when they were produced and are left alone; a long poll's
+    /// other partitions are not marked, as Kafka's transaction markers complete only the
+    /// `DelayedFetch`es watching the partitions they are written to. Cost: one step per
+    /// long poll waiting on each named partition, as for a Produce to them.
+    pub async fn notify_transaction_ended(&self, topic_name: &str, partitions: &[i32]) {
         let guard = self.inner.read().await;
-        for wake in guard.read_committed.values() {
-            wake.mark_all();
+        let Some(topic) = guard.by_topic.get(topic_name) else {
+            return;
+        };
+        for pending in partitions
+            .iter()
+            .filter_map(|partition_id| topic.get(partition_id))
+            .flat_map(HashMap::values)
+        {
+            if pending.read_committed {
+                pending.wake.mark(pending.slot);
+            }
         }
     }
 
@@ -357,7 +353,6 @@ impl PendingFetchRegistry {
     {
         let mut guard = self.inner.write().await;
         let waiters = &mut *guard;
-        waiters.read_committed.remove(&id);
         waiters.all.remove(&id);
         for (topic_name, partitions) in topics {
             let Some(topic) = waiters.by_topic.get_mut(topic_name) else {
@@ -393,7 +388,7 @@ impl PendingFetchRegistry {
     #[cfg(test)]
     pub async fn is_empty(&self) -> bool {
         let guard = self.inner.read().await;
-        guard.by_topic.is_empty() && guard.read_committed.is_empty() && guard.all.is_empty()
+        guard.by_topic.is_empty() && guard.all.is_empty()
     }
 }
 
@@ -625,10 +620,10 @@ mod tests {
             .register([("topic-a", [(0, 0)])], &committed, true)
             .await;
         registry
-            .register([("topic-b", [(3, 7)])], &uncommitted, false)
+            .register([("topic-a", [(0, 7)])], &uncommitted, false)
             .await;
 
-        registry.notify_transaction_ended().await;
+        registry.notify_transaction_ended("topic-a", &[0]).await;
 
         let woke = timeout(Duration::from_millis(100), committed.notified()).await;
         assert!(woke.is_ok(), "read_committed waiter must wake on EndTxn");
@@ -687,8 +682,8 @@ mod tests {
     /// A notification marks the slot of the partition it names, once however often it
     /// repeats before the long poll takes the marks; a deleted topic marks every partition
     /// of it the long poll watches; a log-start move marks the partition whatever the
-    /// offset; a transaction end marks a read_committed long poll's every slot; a coarse
-    /// wake marks none.
+    /// offset; a transaction end marks the slots of its partitions only; a coarse wake
+    /// marks none.
     #[tokio::test]
     async fn notifications_mark_the_slots_they_name() {
         let registry = PendingFetchRegistry::new();
@@ -717,8 +712,15 @@ mod tests {
         let mut taken = wake.take();
         taken.slots.sort_unstable();
         assert_eq!(taken.slots, vec![0, 2, 3]);
-        registry.notify_transaction_ended().await;
-        assert!(wake.take().all);
+        registry.notify_transaction_ended("a", &[1, 9]).await;
+        registry.notify_transaction_ended("c", &[0]).await;
+        assert_eq!(
+            wake.take(),
+            Taken {
+                slots: vec![1],
+                ..Taken::default()
+            }
+        );
         registry.notify_coarse().await;
         assert_eq!(
             wake.take(),
@@ -742,5 +744,43 @@ mod tests {
         assert!(!registry.take_safety_net(1, interval));
         std::thread::sleep(interval);
         assert!(registry.take_safety_net(allowance, interval));
+    }
+
+    /// A transaction end costs one step per long poll waiting on its partitions and marks
+    /// only those partitions' slots: the end of a one-partition transaction, against 200
+    /// read_committed long polls of 1,000 other partitions each (and of that one), marks one
+    /// slot of each, 200 in all. Marking every slot of every read_committed long poll marks
+    /// 200,200, and the long polls then re-read every partition.
+    #[tokio::test]
+    async fn a_transaction_end_marks_only_its_partitions() {
+        const POLLS: usize = 200;
+        const PARTITIONS: i32 = 1_000;
+        let registry = PendingFetchRegistry::new();
+        let mut wakes = Vec::new();
+        for _ in 0..POLLS {
+            let wake = Arc::new(Wake::new());
+            registry
+                .register(
+                    [
+                        (
+                            "watched",
+                            (0..PARTITIONS).map(|p| (p, 0)).collect::<Vec<_>>(),
+                        ),
+                        ("txn", vec![(0, 0)]),
+                    ],
+                    &wake,
+                    true,
+                )
+                .await;
+            wakes.push(wake);
+        }
+        for _ in 0..100 {
+            registry.notify_transaction_ended("txn", &[0]).await;
+        }
+        let marked: usize = wakes.iter().map(|wake| wake.take().slots.len()).sum();
+        assert_eq!(marked, POLLS);
+        for wake in &wakes {
+            assert_eq!(wake.take(), Taken::default());
+        }
     }
 }

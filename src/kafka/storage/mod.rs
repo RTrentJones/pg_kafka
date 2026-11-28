@@ -935,7 +935,19 @@ pub trait TransactionStore {
     /// # Returns
     /// Current transaction state, or None if transactional_id not found
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>>;
+
+    /// The partitions added (AddPartitionsToTxn) to the transactional id's open or last
+    /// transaction, by topic name: the partitions whose last stable offset its end can
+    /// move, so the read_committed long polls to wake when it ends (Kafka writes its
+    /// markers to exactly these). The registry is cleared only when the next transaction
+    /// begins or InitProducerId fences it, so it still holds them right after a commit
+    /// or abort. Cost: one index range read of the id's `kafka.txn_partitions` rows, so
+    /// O(partitions the client added, plus their topic names' bytes) time and memory.
+    fn transaction_partitions(&self, transactional_id: &str) -> Result<TxnPartitions>;
 }
+
+/// Topic-partitions by topic name, each topic once: the partitions a transaction touched.
+pub type TxnPartitions = Vec<(String, Vec<i32>)>;
 
 /// Background maintenance the worker runs between requests.
 pub trait MaintenanceStore {

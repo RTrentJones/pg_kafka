@@ -3,7 +3,7 @@
 use crate::kafka::constants::{ERROR_CONCURRENT_TRANSACTIONS, ERROR_NONE, ERROR_PRODUCER_FENCED};
 use crate::kafka::error::Result;
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::storage::{TransactionState, TransactionalProducer};
+use crate::kafka::storage::{TransactionState, TransactionalProducer, TxnPartitions};
 use kafka_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use kafka_protocol::messages::ProducerId;
 use pgrx::GucSetting;
@@ -93,6 +93,26 @@ pub fn handle_init_producer_id(
     presented: Option<(i64, i16)>,
     client_id: Option<&str>,
 ) -> Result<InitProducerIdResponse> {
+    init_producer(
+        ctx,
+        transactional_id,
+        transaction_timeout_ms,
+        presented,
+        client_id,
+    )
+    .map(|(response, _)| response)
+}
+
+/// [`handle_init_producer_id`], also returning the partitions of the open transaction it
+/// aborted (none unless it aborted one), the partitions whose read_committed long polls
+/// to wake.
+pub fn init_producer(
+    ctx: &HandlerContext,
+    transactional_id: Option<&str>,
+    transaction_timeout_ms: i32,
+    presented: Option<(i64, i16)>,
+    client_id: Option<&str>,
+) -> Result<(InitProducerIdResponse, TxnPartitions)> {
     // The GUC is read only for a transactional producer (the bound does not apply to
     // idempotent ones, as in Kafka).
     let max_timeout_ms = if transactional_id.is_some() {
@@ -119,7 +139,7 @@ fn init_error(error_code: i16) -> InitProducerIdResponse {
     response
 }
 
-/// [`handle_init_producer_id`] with an explicit `transaction.max.timeout.ms`.
+/// [`init_producer`] with an explicit `transaction.max.timeout.ms`.
 pub(crate) fn init_producer_id_bounded(
     ctx: &HandlerContext,
     transactional_id: Option<&str>,
@@ -127,7 +147,7 @@ pub(crate) fn init_producer_id_bounded(
     presented: Option<(i64, i16)>,
     client_id: Option<&str>,
     max_timeout_ms: i32,
-) -> Result<InitProducerIdResponse> {
+) -> Result<(InitProducerIdResponse, TxnPartitions)> {
     let store = ctx.store;
     let mut response = InitProducerIdResponse::default();
 
@@ -136,8 +156,9 @@ pub(crate) fn init_producer_id_bounded(
         // Validate the timeout first, as Kafka does (the producer is not
         // touched, so an existing transaction is not fenced by a bad request).
         if !transaction_timeout_is_valid(transaction_timeout_ms, max_timeout_ms) {
-            return Ok(init_error(
-                crate::kafka::constants::ERROR_INVALID_TRANSACTION_TIMEOUT,
+            return Ok((
+                init_error(crate::kafka::constants::ERROR_INVALID_TRANSACTION_TIMEOUT),
+                TxnPartitions::new(),
             ));
         }
         let current = if presented.is_some() {
@@ -154,16 +175,21 @@ pub(crate) fn init_producer_id_bounded(
             // CONCURRENT_TRANSACTIONS, never handing out that epoch: a retry presenting the
             // same epoch is then fenced, and one presenting none gets the next epoch. The
             // abort and the fence are the bump below; the bump is not remembered as asked
-            // for by the producer, so no presented epoch counts as a retry of it.
+            // for by the producer, so no presented epoch counts as a retry of it. The
+            // aborted transaction's partitions are read first: the bump clears them.
+            let aborted = store.transaction_partitions(txn_id)?;
             store.get_or_create_transactional_producer(
                 txn_id,
                 transaction_timeout_ms,
                 client_id,
             )?;
-            return Ok(init_error(ERROR_CONCURRENT_TRANSACTIONS));
+            return Ok((init_error(ERROR_CONCURRENT_TRANSACTIONS), aborted));
         }
+        // No transaction is open (or the request is fenced): nothing ends, nothing to wake.
         let (producer_id, epoch) = match decision {
-            TxnInit::Fenced => return Ok(init_error(ERROR_PRODUCER_FENCED)),
+            TxnInit::Fenced => {
+                return Ok((init_error(ERROR_PRODUCER_FENCED), TxnPartitions::new()));
+            }
             TxnInit::Current { producer_id, epoch } => (producer_id, epoch),
             TxnInit::Bump { requested_by } => {
                 // Either creates a new producer id and transaction record (a new
@@ -184,7 +210,7 @@ pub(crate) fn init_producer_id_bounded(
         response.producer_id = ProducerId(producer_id);
         response.producer_epoch = epoch;
 
-        return Ok(response);
+        return Ok((response, TxnPartitions::new()));
     }
 
     // Idempotent-only producer: as in Kafka, always a fresh producer id at epoch 0,
@@ -197,7 +223,7 @@ pub(crate) fn init_producer_id_bounded(
     response.producer_id = ProducerId(producer_id);
     response.producer_epoch = epoch;
 
-    Ok(response)
+    Ok((response, TxnPartitions::new()))
 }
 
 #[cfg(test)]
@@ -218,6 +244,7 @@ mod tests {
             crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
         )
         .unwrap()
+        .0
     }
 
     #[test]
@@ -318,6 +345,7 @@ mod tests {
             crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
         )
         .unwrap()
+        .0
     }
 
     #[test]
@@ -379,13 +407,18 @@ mod tests {
                 .withf(|id| id == "tx")
                 .returning(|_| Ok(Some(TransactionState::Ongoing)));
             store
+                .expect_transaction_partitions()
+                .withf(|id| id == "tx")
+                .times(1)
+                .returning(|_| Ok(vec![("t".to_string(), vec![2])]));
+            store
                 .expect_get_or_create_transactional_producer()
                 .times(1)
                 .returning(|_, _, _| Ok((7, 4)));
             store.expect_remember_previous_epoch().never();
             let env = TestEnv::new();
             let ctx = env.ctx(&store);
-            let r = init_producer_id_bounded(
+            let (r, aborted) = init_producer_id_bounded(
                 &ctx,
                 Some("tx"),
                 60_000,
@@ -399,6 +432,7 @@ mod tests {
                 (ERROR_CONCURRENT_TRANSACTIONS, -1, -1),
                 "{presented:?}"
             );
+            assert_eq!(aborted, vec![("t".to_string(), vec![2])], "{presented:?}");
         }
         // A fenced request does not touch the open transaction.
         let mut store = MockKafkaStore::new();
@@ -411,5 +445,52 @@ mod tests {
             run_presented(&store, (7, 1)).error_code,
             ERROR_PRODUCER_FENCED
         );
+    }
+
+    /// Only an InitProducerId that aborts an open transaction names partitions to wake:
+    /// an idempotent producer's, a new transactional id's, a bump of a finished
+    /// transaction's and a refused one's end no transaction, and read no registry.
+    #[test]
+    fn only_an_aborting_init_names_partitions_to_wake() {
+        let env = TestEnv::new();
+        // transaction_partitions has no expectation: any call fails the test.
+        let mut store = MockKafkaStore::new();
+        store
+            .expect_allocate_producer_id()
+            .returning(|_, _| Ok((9, 0)));
+        let ctx = env.ctx(&store);
+        for _ in 0..3 {
+            let (r, woken) = init_producer(&ctx, None, 60_000, None, None).unwrap();
+            assert_eq!((r.error_code, r.producer_id.0), (ERROR_NONE, 9));
+            assert_eq!(woken, TxnPartitions::new());
+        }
+        for state in [None, Some(TransactionState::CompleteCommit)] {
+            let mut store = MockKafkaStore::new();
+            let current = state.clone();
+            store
+                .expect_get_transaction_state()
+                .returning(move |_| Ok(current.clone()));
+            store
+                .expect_get_or_create_transactional_producer()
+                .returning(|_, _, _| Ok((7, 1)));
+            let ctx = env.ctx(&store);
+            let (r, woken) = init_producer_id_bounded(
+                &ctx,
+                Some("tx"),
+                60_000,
+                None,
+                None,
+                crate::kafka::constants::DEFAULT_TRANSACTION_MAX_TIMEOUT_MS,
+            )
+            .unwrap();
+            assert_eq!(r.error_code, ERROR_NONE, "{state:?}");
+            assert_eq!(woken, TxnPartitions::new(), "{state:?}");
+        }
+        let store = MockKafkaStore::new();
+        let ctx = env.ctx(&store);
+        let (r, woken) =
+            init_producer_id_bounded(&ctx, Some("tx"), -1, None, None, 60_000).unwrap();
+        assert_ne!(r.error_code, ERROR_NONE);
+        assert_eq!(woken, TxnPartitions::new());
     }
 }

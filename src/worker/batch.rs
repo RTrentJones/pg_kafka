@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use super::txn::{log_txn_error, run_request_in_subtransaction, worker_transaction};
 use crate::kafka::api::ResponseBody;
 use crate::kafka::auth::CredentialRequest;
-use crate::kafka::constants::{API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE};
+use crate::kafka::constants::API_KEY_PRODUCE;
 use crate::kafka::dispatch::RequestOutcome;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::{
@@ -109,23 +109,6 @@ pub(super) fn serve_credential_requests(
                 .send(Err("credential lookup unavailable".to_string()));
         }
     }
-}
-
-/// Tell the network thread that transactions ended, so parked read_committed fetches
-/// re-check their last stable offset now. Best effort: a full channel records the drop,
-/// and the network thread then wakes every long poll coarsely.
-pub(super) fn notify_transaction_ended(notify_tx: &Sender<InternalNotification>) {
-    crate::kafka::notifications::send_best_effort(
-        notify_tx,
-        InternalNotification::TransactionEnded,
-    );
-}
-
-/// Whether a committed batch ended (or may have ended) transactions other than through
-/// EndTxn, which notifies by itself: InitProducerId fences and aborts the previous
-/// epoch's open transaction.
-fn batch_may_end_transactions(api_keys: &[i16]) -> bool {
-    api_keys.contains(&API_KEY_INIT_PRODUCER_ID)
 }
 
 /// Whether a group-commit batch should take another already-queued request: it stops
@@ -454,9 +437,6 @@ pub(super) fn execute_batch(
     match txn_result {
         Ok(()) => {
             release_committed(pending, env.shadow_store);
-            if batch_may_end_transactions(&api_keys) {
-                notify_transaction_ended(env.notify_tx);
-            }
         }
         Err(err) => {
             // Nothing of the batch committed. Every request gets an API-typed error
@@ -500,7 +480,7 @@ mod tests {
     use crate::kafka::api::{
         ApiVersionsRequestData, ProduceRequestData, RequestBody, RequestHeader,
     };
-    use crate::kafka::constants::{API_KEY_API_VERSIONS, API_KEY_FETCH};
+    use crate::kafka::constants::API_KEY_API_VERSIONS;
     use crate::kafka::ERROR_KAFKA_STORAGE_ERROR;
 
     #[test]
@@ -596,19 +576,6 @@ mod tests {
         let served = serve_liveness_in_batch(&hb_rx, |_| {});
         assert_eq!(served, MAX_GROUP_COMMIT_REQUESTS);
         assert_eq!(hb_rx.len(), 2 * MAX_GROUP_COMMIT_REQUESTS);
-    }
-
-    #[test]
-    fn test_init_producer_id_batches_notify_transaction_end() {
-        assert!(batch_may_end_transactions(&[
-            API_KEY_PRODUCE,
-            API_KEY_INIT_PRODUCER_ID
-        ]));
-        assert!(!batch_may_end_transactions(&[
-            API_KEY_PRODUCE,
-            API_KEY_FETCH
-        ]));
-        assert!(!batch_may_end_transactions(&[]));
     }
 
     fn request(

@@ -9,7 +9,7 @@ use crate::kafka::constants::{
 };
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::handler_context::HandlerContext;
-use crate::kafka::storage::KafkaStore;
+use crate::kafka::storage::{KafkaStore, TxnPartitions};
 use kafka_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
 use kafka_protocol::messages::add_partitions_to_txn_response::{
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
@@ -215,6 +215,26 @@ pub fn handle_end_txn(
     producer_epoch: i16,
     committed: bool,
 ) -> Result<EndTxnResponse> {
+    end_txn(
+        ctx,
+        transactional_id,
+        producer_id,
+        producer_epoch,
+        committed,
+    )
+    .map(|(response, _)| response)
+}
+
+/// [`handle_end_txn`], also returning the partitions of the transaction it committed or
+/// aborted (none when it ended nothing: a retry answered from the finished state, or an
+/// error), the partitions whose read_committed long polls to wake.
+pub fn end_txn(
+    ctx: &HandlerContext,
+    transactional_id: &str,
+    producer_id: i64,
+    producer_epoch: i16,
+    committed: bool,
+) -> Result<(EndTxnResponse, TxnPartitions)> {
     let store = ctx.store;
     // Validate the transaction state
     store.validate_transaction(transactional_id, producer_id, producer_epoch)?;
@@ -233,10 +253,10 @@ pub fn handle_end_txn(
         // NONE; INVALID_TXN_STATE would be fatal to the client for a commit that did
         // succeed. The opposite outcome is still an invalid transition.
         Some(crate::kafka::storage::TransactionState::CompleteCommit) if committed => {
-            return Ok(EndTxnResponse::default());
+            return Ok((EndTxnResponse::default(), TxnPartitions::new()));
         }
         Some(crate::kafka::storage::TransactionState::CompleteAbort) if !committed => {
-            return Ok(EndTxnResponse::default());
+            return Ok((EndTxnResponse::default(), TxnPartitions::new()));
         }
         Some(other) => {
             return Err(KafkaError::invalid_txn_state(
@@ -257,9 +277,11 @@ pub fn handle_end_txn(
         store.abort_transaction(transactional_id, producer_id, producer_epoch)?;
     }
 
+    let ended = store.transaction_partitions(transactional_id)?;
+
     let mut response = EndTxnResponse::default();
     response.error_code = ERROR_NONE;
-    Ok(response)
+    Ok((response, ended))
 }
 
 /// Handle TxnOffsetCommit request
