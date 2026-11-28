@@ -95,7 +95,7 @@ EXTENSION pg_kafka` has run, without a restart.
 ## A 0.1.0 schema made by an earlier build of 0.1.0
 
 0.1.0 has not been released; its schema changed while it was developed, and `ALTER
-EXTENSION pg_kafka UPDATE` changes nothing between two builds of the same version. Two
+EXTENSION pg_kafka UPDATE` changes nothing between two builds of the same version. These
 changes matter for a database whose 0.1.0 schema an earlier build created:
 
 - `GRANT SELECT, UPDATE, DELETE ON kafka.messages_default TO pgkafka_worker`: the
@@ -112,10 +112,32 @@ changes matter for a database whose 0.1.0 schema an earlier build created:
   run the definitions of `kafka.lock_message_tables`, `kafka.create_message_partition` and
   `kafka.drop_message_partition` (and their REVOKE) from `sql/bootstrap.sql` as the
   extension owner.
+- `kafka.ensure_message_partitions(int, int)` without a `SET lock_timeout` clause: an
+  earlier schema's definition sets `lock_timeout = '2s'` for its own run, which replaces
+  the 200 ms the worker's partition maintenance sets, so each leaf it creates behind a
+  session holding `kafka.messages` (an open reader, autovacuum on the DEFAULT leaf) can
+  stop the DB thread, and every client, for 2 s instead of 200 ms. Run its definition
+  (and its REVOKE and GRANT) from `sql/bootstrap.sql` as the extension owner, with the
+  other partition functions above.
+- `group_id` of `kafka.consumer_offsets` and `kafka.txn_pending_offsets` in byte order:
+  ListGroups walks the distinct group ids of both tables in byte order (`COLLATE "C"`),
+  which their primary-key indexes serve only when the columns have that collation. In a
+  database whose default collation is not `C`, an earlier schema's columns have the
+  default one, and each step of the walk reads and sorts every offset row instead of one
+  index entry (seconds instead of a millisecond per ListGroups, on the DB thread). Run, as the
+  extension owner:
+
+  ```sql
+  ALTER TABLE kafka.consumer_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+  ALTER TABLE kafka.txn_pending_offsets ALTER COLUMN group_id TYPE TEXT COLLATE "C";
+  ```
+
+  Each rewrites its table and indexes under ACCESS EXCLUSIVE (offset commits and fetches
+  wait meanwhile).
 
 Re-creating the extension (`DROP EXTENSION pg_kafka CASCADE; CREATE EXTENSION pg_kafka`,
 which deletes its data) applies every such change at once. A 0.0.0 schema upgraded with
-this build's `ALTER EXTENSION pg_kafka UPDATE` has both.
+this build's `ALTER EXTENSION pg_kafka UPDATE` has them all.
 
 ## 0.0.0 -> 0.1.0
 
