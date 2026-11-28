@@ -134,6 +134,130 @@ fn run_pass_turns_budget_and_fair_shares() {
     }
 }
 
+/// A pass context that records which step took each turn.
+#[derive(Default)]
+struct LogClock {
+    now: Duration,
+    /// (step, cost) of each turn, in order.
+    log: Vec<(usize, Duration)>,
+}
+
+impl PassClock for LogClock {
+    fn elapsed(&self) -> Duration {
+        self.now
+    }
+}
+
+/// A step with a fixed list of turn costs that logs its turns.
+struct LogStep {
+    id: usize,
+    costs: VecDeque<Duration>,
+}
+
+impl PassStep<LogClock, ()> for LogStep {
+    fn has_work(&self, _: &LogClock) -> bool {
+        !self.costs.is_empty()
+    }
+
+    fn turn(&mut self, ctx: &mut LogClock) -> Result<(), ()> {
+        if let Some(cost) = self.costs.pop_front() {
+            ctx.now += cost;
+            ctx.log.push((self.id, cost));
+        }
+        Ok(())
+    }
+}
+
+/// Phase 0 of [`run_pass_led`] on random passes: no step after the lead takes a turn
+/// before every lead step has run out of work or the lead has spent its share; every
+/// step with work still takes a turn; the pass ends by `max(budget + one turn, share +
+/// one turn per step)`, under the budget only when no step has work; and a step busy all
+/// pass gets at least `budget / steps - one turn`, lead or not.
+#[test]
+fn run_pass_led_runs_the_lead_first_and_keeps_the_guarantees() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for case in 0..5_000 {
+        let n = 1 + rng.count_below(8);
+        let lead = rng.count_below(n + 1);
+        let budget = Duration::from_millis(match rng.below(4) {
+            0 => 0,
+            1 => rng.below(10),
+            _ => rng.below(500),
+        });
+        let mut steps: Vec<LogStep> = (0..n)
+            .map(|id| {
+                let turns = match rng.below(4) {
+                    0 => 0,
+                    1 => 1_000,
+                    _ => rng.count_below(40),
+                };
+                LogStep {
+                    id,
+                    costs: (0..turns)
+                        .map(|_| Duration::from_millis(1 + rng.below(30)))
+                        .collect(),
+                }
+            })
+            .collect();
+        let had_work: Vec<bool> = steps.iter().map(|s| !s.costs.is_empty()).collect();
+        let lead_turns: Vec<usize> = steps[..lead].iter().map(|s| s.costs.len()).collect();
+        let max_turn = steps
+            .iter()
+            .flat_map(|s| s.costs.iter())
+            .max()
+            .copied()
+            .unwrap_or_default();
+        let share = lead_share(budget, lead, n);
+        let mut ctx = LogClock::default();
+        let mut refs: Vec<&mut dyn PassStep<LogClock, ()>> = steps
+            .iter_mut()
+            .map(|s| s as &mut dyn PassStep<LogClock, ()>)
+            .collect();
+        let report =
+            run_pass_led(&mut refs, &mut ctx, budget, lead).unwrap_or_else(|()| unreachable!());
+        let elapsed = ctx.now;
+        let msg = format!("case {case}: lead {lead}/{n}, budget {budget:?}, {report:?}");
+
+        for i in 0..n {
+            assert_eq!(report.turns[i] > 0, had_work[i], "{msg}: step {i}");
+        }
+        if let Some(at) = ctx.log.iter().position(|&(id, _)| id >= lead) {
+            let spent: Duration = ctx.log[..at].iter().map(|&(_, c)| c).sum();
+            let turns_before = |j: usize| ctx.log[..at].iter().filter(|&&(id, _)| id == j).count();
+            for (j, &turns) in lead_turns.iter().enumerate() {
+                assert!(
+                    turns == 0 || turns_before(j) > 0,
+                    "{msg}: lead step {j} had no turn before the others"
+                );
+            }
+            let lead_done = (0..lead).all(|j| turns_before(j) == lead_turns[j]);
+            assert!(
+                spent >= share || lead_done,
+                "{msg}: the others ran after the lead spent {spent:?} of its {share:?} share"
+            );
+        }
+        assert!(
+            elapsed
+                <= (budget + max_turn).max(share + max_turn * u32::try_from(n).unwrap_or(u32::MAX)),
+            "{msg}: elapsed {elapsed:?} over its bound"
+        );
+        let still_busy: Vec<usize> = (0..n).filter(|&i| !steps[i].costs.is_empty()).collect();
+        if elapsed < budget {
+            assert!(
+                still_busy.is_empty(),
+                "{msg}: idle budget, {still_busy:?} busy"
+            );
+        }
+        for &i in &still_busy {
+            assert!(
+                (report.service[i] + max_turn) * u32::try_from(n).unwrap_or(u32::MAX) >= budget,
+                "{msg}: step {i} got {:?}",
+                report.service[i]
+            );
+        }
+    }
+}
+
 /// A pass context that ends the pass once a step's turn sets `end`.
 #[derive(Default)]
 struct EndingClock {

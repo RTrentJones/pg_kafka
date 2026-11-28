@@ -18,17 +18,29 @@
 //! 2. then, while the pass is within its budget and some step has work, the step with
 //!    work that has spent the least time this pass takes the next turn.
 //!
+//! [`run_pass_led`] puts a phase 0 before them: the first steps of the list (the *lead*)
+//! take their phase 1 turns and then more, least-served first, until they have no work
+//! or have spent their share of the budget (`budget * lead / steps`); phase 1 then gives
+//! the other steps their turn, and phase 2 counts the lead's phase 0 time, so every
+//! guarantee below holds as for [`run_pass`].
+//!
 //! A turn that finds a row another transaction keeps (an offset counter it cannot skip),
 //! or after which another session waits for a lock the pass holds, ends the pass in
-//! either phase ([`PassClock::ended`], [`PassClock::after_turn`]); the guarantees below
+//! any phase ([`PassClock::ended`], [`PassClock::after_turn`]); the guarantees below
 //! hold for the passes no other transaction cuts short this way, and a cut pass leaves
 //! every step's items and cursor where they were, so it only delays them by one pass.
 //!
 //! In `PostgresStore::run_retention_sweep` the other transaction is a session that has
-//! waited 100 ms for a lock of the pass, and the leaf drops come last in phase 1: a drop
-//! holds kafka.messages until the pass commits, so under steady traffic a pass ends soon
-//! after its first drop, and every other step takes its phase 1 turn before that.
-
+//! waited 100 ms for a lock of the pass. The contents probes (reads only) are the lead,
+//! so the drops they find are known before any step holds a row, and the leaf drops come
+//! first in phase 1: a drop waits for kafka.messages, which no transaction that waits
+//! for a row of the pass may hold, and a pass that holds a row a Produce waits for (the
+//! offset counter of a partition it trimmed) can drop nothing more. After the first
+//! drop the pass holds kafka.messages, so no worker statement can wait for one of its
+//! rows, and the steps after it take their phase 1 turns while a writer waits at most
+//! the 100 ms grace; under steady traffic a pass that drops may end before the last of
+//! them, which the next pass (with no leaf left to drop) then serves.
+//!
 //! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
 //! through a [`Lap`]: the items in key order, starting after the key of the last item
 //! the step served ([`KeyCursor`]), wrapping, each item served until caught up. Probes
@@ -58,7 +70,8 @@
 //!    [`RETENTION_DELETE_BATCH`] idle ids.
 //! 2. **A pass costs at most the budget plus one turn per step.** Phase 1 is one turn per
 //!    step; phase 2 starts a turn only within the budget, so a pass ends by
-//!    `max(budget + one turn, one turn per step)`. (Plus the pass's fixed setup reads, a
+//!    `max(budget + one turn, one turn per step)` (with a lead, phase 0 takes at most its
+//!    share plus one turn: `max(budget + one turn, share + one turn per step)`). (Plus the pass's fixed setup reads, a
 //!    few statements; a turn that deletes rows includes their log-start update, which
 //!    polls a counter another transaction holds for at most 1 s.) The planning between the
 //!    statements is O(n log n) in what the pass reads and holds (topics, leaves, found
@@ -183,11 +196,47 @@ pub fn run_pass<C: PassClock, E>(
     ctx: &mut C,
     budget: Duration,
 ) -> Result<PassReport, E> {
+    run_pass_led(steps, ctx, budget, 0)
+}
+
+/// [`run_pass`] with the first `lead` steps run before the others (phase 0 in the module
+/// docs): each of them with work takes one turn, then, least-served first, more turns
+/// while one has work and together they have spent less than their share of the budget,
+/// `budget * lead / steps`. Phase 1 then gives one turn to each of the other steps with
+/// work, and phase 2 runs over all of them as in [`run_pass`], counting the time the
+/// lead steps spent in phase 0, so the shares come out as without a lead. With `lead`
+/// 0 this is [`run_pass`].
+///
+/// Cost: phase 0 picks each turn by one scan of the `lead` steps, phases 1 and 2 as in
+/// [`run_pass`] (one scan of all steps a turn); the turns themselves are the steps'.
+pub fn run_pass_led<C: PassClock, E>(
+    steps: &mut [&mut dyn PassStep<C, E>],
+    ctx: &mut C,
+    budget: Duration,
+    lead: usize,
+) -> Result<PassReport, E> {
     let mut report = PassReport {
         turns: vec![0; steps.len()],
         service: vec![Duration::ZERO; steps.len()],
     };
-    for i in 0..steps.len() {
+    let lead = lead.min(steps.len());
+    for i in 0..lead {
+        if ctx.ended() {
+            return Ok(report);
+        }
+        if steps[i].has_work(ctx) {
+            take_turn(i, steps, ctx, &mut report)?;
+        }
+    }
+    let share = lead_share(budget, lead, steps.len());
+    while !ctx.ended() && report.service[..lead].iter().sum::<Duration>() < share {
+        let next = (0..lead)
+            .filter(|&i| steps[i].has_work(ctx))
+            .min_by_key(|&i| (report.service[i], i));
+        let Some(i) = next else { break };
+        take_turn(i, steps, ctx, &mut report)?;
+    }
+    for i in lead..steps.len() {
         if ctx.ended() {
             return Ok(report);
         }
@@ -203,6 +252,16 @@ pub fn run_pass<C: PassClock, E>(
         take_turn(i, steps, ctx, &mut report)?;
     }
     Ok(report)
+}
+
+/// The share of `budget` that `lead` of `steps` steps get in phase 0 of
+/// [`run_pass_led`]: `budget * lead / steps`.
+fn lead_share(budget: Duration, lead: usize, steps: usize) -> Duration {
+    let Some(steps) = u32::try_from(steps).ok().filter(|&n| n > 0) else {
+        return Duration::ZERO;
+    };
+    let lead = u32::try_from(lead).unwrap_or(steps).min(steps);
+    (budget / steps).saturating_mul(lead)
 }
 
 /// Step `i` takes one turn; its time goes to its service.

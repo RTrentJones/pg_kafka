@@ -171,33 +171,38 @@ pub struct AcksApplied {
 /// Lock the outbox rows of a batch of acks (`$1`-`$3`, their keys) and report what it
 /// found: the ctids and keys of the pending rows it locked (one primary-key probe per
 /// ack), and the keys of the pending rows another transaction holds (`held_*`: a
-/// primary-key probe for each ack it did not lock, usually none). It never waits for a
-/// row (`SKIP LOCKED`): the tick waiting for one stopped the DB thread, and a held row
-/// failed the whole batch of acks, every topic's. The probes are LATERAL subqueries
-/// (cut at one row for `held`), not joins or `EXISTS` the planner could turn into a
-/// scan of the outbox, and they name the full primary key and nothing else: with
-/// `external_offset IS NULL` in their WHERE the planner took the partial pending index
-/// (`topic_id, partition_id, dead, local_offset`), whose key cannot be matched without
-/// `dead`, so every probe walked its partition's whole backlog (8 192 acks behind a
-/// 250 000-row partition: 30 s, the DB thread stopped meanwhile). A row found delivered
-/// is locked but left alone; the `pending` test runs outside the materialized `probed`,
-/// where the planner cannot push it back into the probe. The rows are then changed by
-/// ctid in a statement of their own ([`ack_update_by_tid`]).
+/// primary-key probe for each ack whose row the first probe did not lock, usually none).
+/// It never waits for a row (`SKIP LOCKED`): the tick waiting for one stopped the DB
+/// thread, and a held row failed the whole batch of acks, every topic's. The probes are
+/// LATERAL subqueries (cut at one row for `held`), not joins or `EXISTS` the planner
+/// could turn into a scan of the outbox, and they name the full primary key and nothing
+/// else: with `external_offset IS NULL` in their WHERE the planner took the partial
+/// pending index (`topic_id, partition_id, dead, local_offset`), whose key cannot be
+/// matched without `dead`, so every probe walked its partition's whole backlog (8 192
+/// acks behind a 250 000-row partition: 30 s, the DB thread stopped meanwhile). A row
+/// found delivered is locked but left alone; the `pending` test runs outside the
+/// materialized `probed`, where the planner cannot push it back into the probe. The rows
+/// are then changed by ctid in a statement of their own ([`ack_update_by_tid`]).
+///
+/// The acks the first probe locked nothing for are the rows of `probed` without a ctid
+/// (its probe is a LEFT JOIN LATERAL), not the acks `NOT IN` the locked rows: such a
+/// `NOT IN` is a hashed subplan only while the locked rows fit in `work_mem`, and past
+/// that Postgres compared every ack with every locked row (8 192 acks at a 64 kB
+/// `work_mem`: 3 s, the DB thread stopped meanwhile). Cost: two primary-key probes per
+/// ack at most, and arrays of the acks' size, whatever `work_mem`.
 const LOCK_ACK_ROWS_SQL: &str = "
     WITH a AS (SELECT * FROM unnest($1::int4[], $2::int4[], $3::int8[]) AS a(t, p, o)),
     probed AS MATERIALIZED (
-        SELECT k.* FROM a CROSS JOIN LATERAL (
-            SELECT st.topic_id AS t, st.partition_id AS p, st.local_offset AS o,
-                   st.ctid AS row_ctid, st.external_offset IS NULL AS pending
+        SELECT a.t, a.p, a.o, k.row_ctid, k.pending FROM a LEFT JOIN LATERAL (
+            SELECT st.ctid AS row_ctid, st.external_offset IS NULL AS pending
             FROM kafka.shadow_tracking st
             WHERE st.topic_id = a.t AND st.partition_id = a.p AND st.local_offset = a.o
-            FOR UPDATE OF st SKIP LOCKED) k
+            FOR UPDATE OF st SKIP LOCKED) k ON true
     ),
     lk AS (SELECT t, p, o, row_ctid FROM probed WHERE pending),
     held AS (
         SELECT u.t, u.p, u.o
-        FROM (SELECT * FROM a
-              WHERE (a.t, a.p, a.o) NOT IN (SELECT lk.t, lk.p, lk.o FROM lk)) u
+        FROM (SELECT * FROM probed WHERE row_ctid IS NULL) u
         CROSS JOIN LATERAL (
             SELECT st.external_offset IS NULL AS pending FROM kafka.shadow_tracking st
             WHERE st.topic_id = u.t AND st.partition_id = u.p AND st.local_offset = u.o
@@ -223,10 +228,9 @@ const LOCK_ACK_ROWS_SQL: &str = "
 /// estimate of one pending row the planner rescanned the values for every row it
 /// updated (8 192 x 8 192 comparisons, 9 s per ack batch); a hash or merge join on the
 /// ctid is linear (n log n). Only the
-/// UPDATE of the outbox runs under them: a statement that fires a foreign-key check (the
-/// `kafka.shadow_metrics` upsert checks `kafka.topics`) would plan that check under them,
-/// and Postgres keeps such a plan for the session, so it would scan `kafka.topics` on
-/// every later check.
+/// UPDATE of the outbox runs under them: any other statement planned under them would
+/// get its plan with index scans off (a foreign-key check among them, whose plan
+/// Postgres keeps for the session, so every later check would read its table whole).
 const ACK_SCAN_SETTINGS_SQL: &str = "
     SELECT ARRAY[o.tid, o.seq, o.bitmap, o.idx, o.ios, o.nl] AS saved,
            set_config('enable_tidscan', 'on', true),
@@ -293,9 +297,11 @@ fn ack_update_by_tid<T>(
         .first()
         .get_by_name("saved")?
         .unwrap_or_default();
-    let out = update(client)?;
+    // Restored before an error of `update` propagates: a caller that handles it (the
+    // tick goes on with its other acks) must not run its later statements under them.
+    let out = update(client);
     client.update(RESTORE_ACK_SCAN_SETTINGS_SQL, None, &[saved.into()])?;
-    Ok(out)
+    out
 }
 
 /// For each locked row (in order), the payload of the first ack of its key.
@@ -1165,6 +1171,9 @@ impl ShadowDb for SpiShadowDb {
                     &[ctids.into(), external.into()],
                 )?)
             })?;
+            // The upsert cannot skip a row another session holds: it waits for it (the
+            // tick's lock_timeout) and then fails, and these acks of every topic with it
+            // (docs/SHADOW_MODE_FLOW_DIAGRAM.md, "A held kafka.shadow_metrics row").
             if metrics && !done.is_empty() {
                 let keys: KeyColumns = done.iter().collect();
                 client.update(

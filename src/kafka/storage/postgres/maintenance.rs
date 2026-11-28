@@ -359,30 +359,33 @@ impl PostgresStore {
             let mut orphaned = BatchStep::new(Batch::OrphanedShadowRows);
 
             let mut pass = SweepPass::new(client, pass_start, &mut found);
-            // Phase 1 order: the probes (reads only) first; terminal transactions before
-            // the producer prune (their foreign key on producer_ids keeps those
-            // producers); the orphaned outbox rows after the row deletes whose log starts
-            // they read; the drops last. A drop takes ACCESS EXCLUSIVE on kafka.messages
-            // until the pass commits, and the pass ends once a session has waited
-            // [`WAITER_GRACE`] for it ([`SweepPass::after_turn`]): under steady traffic
-            // that is soon after the first drop, so every other step takes its phase 1
-            // turn before it. A drop also runs after the pass holds rows, then gated on
-            // no session waiting for it and with one short lock attempt ([`DropStep`]),
-            // so the drops this pass's probes find are done in this pass (an on-demand
-            // pass in a fresh session has no later pass that remembers them).
-            retention::run_pass(
+            // The probes (reads only) lead (phase 0, their share of the budget), so the
+            // drops they find are known before any step holds a row. Phase 1 order: the
+            // drops first, while the pass holds no row: a pass that holds one (an offset
+            // counter of a partition it trimmed, which a Produce then waits for while it
+            // holds ROW EXCLUSIVE on kafka.messages) can take no drop's lock until it
+            // commits, and an on-demand pass in a fresh session has no later pass that
+            // remembers what its probes found. After the first drop the pass holds
+            // kafka.messages, so no worker statement waits for its rows and later drops
+            // keep their gate open ([`DropStep`]); the pass ends once a session has
+            // waited [`WAITER_GRACE`] for it ([`SweepPass::after_turn`]). Then terminal
+            // transactions before the producer prune (their foreign key on producer_ids
+            // keeps those producers); the orphaned outbox rows after the row deletes
+            // whose log starts they read.
+            retention::run_pass_led(
                 &mut [
                     &mut probes,
+                    &mut drops,
                     &mut aborted,
                     &mut expiry,
                     &mut terminal,
                     &mut producers,
                     &mut delivered,
                     &mut orphaned,
-                    &mut drops,
                 ],
                 &mut pass,
                 pass_budget(),
+                1,
             )?;
             Ok(Some(pass.stats))
         })
@@ -659,13 +662,16 @@ struct SweepPass<'p, 'conn> {
     new_trims: Vec<ExpiryItem>,
     new_drops: Vec<(i64, retention::FoundDrop)>,
     /// A turn deleted or locked a row: another transaction may now wait for this one,
-    /// so no drop (which queues for its table locks) runs in the rest of the pass.
+    /// so a drop (which queues for its table locks) runs in the rest of the pass only
+    /// with one short attempt and while no session waits for a row of the pass
+    /// ([`DropStep`]).
     holds_rows: bool,
     /// A log start moved since the orphaned-outbox reaper's last turn.
     log_start_moved: bool,
     /// A turn gave up on a row another transaction holds: the pass ends.
     contended: bool,
-    /// The pass dropped a leaf: it holds ACCESS EXCLUSIVE on kafka.messages.
+    /// The pass dropped a leaf: it holds ACCESS EXCLUSIVE on kafka.messages and the
+    /// counters of the leaf's partitions, so later drops run as with [`Self::holds_rows`].
     dropped: bool,
     /// A session waits for a lock the pass holds: the pass ends.
     waited_for: bool,
@@ -1295,28 +1301,37 @@ const RESTORE_TID_DELETE_SETTINGS_SQL: &str = "
 /// droppable again.
 ///
 /// A drop queues for its table locks (in attempts of 50 ms, `kafka.lock_message_tables`).
-/// Once the pass holds a row another transaction could be waiting for
-/// ([`SweepPass::holds_rows`]), a transaction that holds ROW EXCLUSIVE on kafka.messages
-/// and waits for that row closes a cycle with a drop waiting for kafka.messages. So a
-/// drop of a pass that holds rows runs only when no session waits for the pass
-/// ([`waiting_for_pass`]; one that does ends the drops of this pass), with a
-/// transaction-local `lock_timeout` of [`DROP_LOCK_ATTEMPT_WHILE_HOLDING`]: one attempt
-/// (`kafka.drop_message_partition` takes the caller's lock_timeout when it is below its
-/// 2 s), so a transaction that starts waiting for the pass during the attempt has the
-/// attempt over long before its deadlock check (deadlock_timeout, 1 s by default), and
-/// the wait cannot close a cycle that check would see (as in [`poll_without_waiting`]).
-/// After the first drop the pass holds kafka.messages itself, so later drops of the
-/// pass do not wait for other sessions' locks on it; once a session has waited
-/// [`WAITER_GRACE`] for it, the pass ends ([`SweepPass::after_turn`]). The log start of
+/// Once the pass holds a row another transaction could be waiting for (it deleted or
+/// locked one, [`SweepPass::holds_rows`], or it dropped a leaf, which locked the
+/// counters of the leaf's partitions, [`SweepPass::dropped`]), a transaction that holds
+/// ROW EXCLUSIVE on kafka.messages and waits for that row closes a cycle with a drop
+/// waiting for kafka.messages. So such a drop runs only when no session waits for a row
+/// of the pass ([`waiting_for_pass`]; one that does ends the drops of this pass), with
+/// a transaction-local `lock_timeout` of [`DROP_LOCK_ATTEMPT_WHILE_HOLDING`]: one
+/// attempt (`kafka.drop_message_partition` takes the caller's lock_timeout when it is
+/// below its 2 s), so a transaction that starts waiting for the pass during the attempt
+/// has the attempt over long before its deadlock check (deadlock_timeout, 1 s by
+/// default), and the wait cannot close a cycle that check would see (as in
+/// [`poll_without_waiting`]). After a drop the pass also holds kafka.messages itself,
+/// and every write and read through it waits for the pass: a later drop's attempt can
+/// still wait for a session that holds its leaf (a reader that names the leaf,
+/// autovacuum, pg_dump), and with one attempt that writer waits at most 50 ms longer, not
+/// the 2 s of a drop that holds nothing. The drops come first in a pass, before any step
+/// holds a row ([`PostgresStore::run_retention_sweep`]); once a session has waited
+/// [`WAITER_GRACE`] for the pass, it ends ([`SweepPass::after_turn`]). The log start of
 /// the dropped leaf's partitions moves in the drop's own subtransaction
 /// ([`SweepPass::remove_and_advance`]): if a counter stays held, the drop is rolled back
 /// and the pass ends.
+///
+/// Cost per turn: one read of pg_locks when the pass holds something, one call of
+/// `kafka.drop_message_partition` (its contents re-check is linear in the leaf's
+/// (topic, partition) pairs), and the log-start update of those partitions.
 struct DropStep {
     lap: Lap<'static, i64, retention::FoundDrop>,
     blocked: bool,
 }
 
-/// The `lock_timeout` of a drop while the pass holds rows: one attempt of
+/// The `lock_timeout` of a drop while the pass holds rows or a dropped leaf: one attempt of
 /// `kafka.lock_message_tables`, far below deadlock_timeout (see [`DropStep`]).
 const DROP_LOCK_ATTEMPT_WHILE_HOLDING: &str = "50ms";
 
@@ -1333,7 +1348,9 @@ impl PassStep<SweepPass<'_, '_>, KafkaError> for DropStep {
             return Ok(());
         };
         let expired_topics = found.expired_topics;
-        let holding = ctx.holds_rows;
+        // A pass that dropped a leaf holds it, kafka.messages and the counters of its
+        // partitions, just as a pass that deleted rows holds them.
+        let holding = ctx.holds_rows || ctx.dropped;
         if holding && waiting_for_pass(ctx.client, Duration::ZERO, Waits::RowLocks)? {
             // A session waits for a row of the pass: no drop may wait for it now. The
             // leaf stays found for the next pass.

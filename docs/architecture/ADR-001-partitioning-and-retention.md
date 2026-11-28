@@ -354,12 +354,21 @@ and every worker transaction (whose extension lock queues behind the DROP) with 
   counter stays held, or a session waits for the sweep (it may hold the counter until it
   gets a row the sweep holds), the turn's delete is rolled back with it and the pass ends,
   so its commit frees what that session waits for. Drops queue for their table locks
-  (above): once the pass holds a row, a drop runs only when no session waits for the pass,
-  with a `lock_timeout` of 50 ms (one attempt, far below `deadlock_timeout`), so it cannot
-  close a cycle with a session that holds `kafka.messages` and waits for that row; the
-  drops the probes find are done in the same call (which matters for an on-demand call
-  from a fresh session: what a pass found dies with its session). The drops come last in
-  a pass's first round of turns. After every turn that left the pass holding rows or a
+  (above): once the pass holds a row or a dropped leaf, a drop runs only when no session
+  waits for a row of the pass, with a `lock_timeout` of 50 ms (one attempt, far below
+  `deadlock_timeout`), so it cannot close a cycle with a session that holds
+  `kafka.messages` and waits for that row, and a writer queued behind the pass's earlier
+  drop waits at most that attempt for a session holding the next leaf (a reader naming the
+  leaf, autovacuum), not 2 s. The contents probes run first (their share of the pass
+  budget), and the drops come first in the pass's first round of turns, before any step
+  holds a row: a pass holding the offset counter of a partition it trimmed makes the next
+  Produce to that partition wait for it while holding ROW EXCLUSIVE on `kafka.messages`, and
+  no drop can then take its lock until the pass commits. So the drops the probes find are
+  done in the same call under any traffic (which matters for an on-demand call from a fresh
+  session: what a pass found dies with its session); after the first drop the pass holds
+  `kafka.messages`, no worker statement can wait for one of its rows, and the other steps
+  take their first-round turns while a writer waits at most the 100 ms grace below (a pass
+  ended by it leaves the rest to the next pass, which has no leaf left to drop). After every turn that left the pass holding rows or a
   dropped leaf's ACCESS EXCLUSIVE lock on `kafka.messages`, the pass checks `pg_locks` and
   ends (commits) once another session has waited 100 ms for one of its locks (other than
   the maintenance lock, which a queued sweep waits for by design): a worker statement

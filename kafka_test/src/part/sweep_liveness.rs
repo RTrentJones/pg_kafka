@@ -83,6 +83,110 @@ async fn delete_topics(db: &Client, ids: &[i32]) -> SendResult<()> {
     Ok(())
 }
 
+/// This session's backend pid.
+async fn backend_pid(db: &Client) -> SendResult<i32> {
+    Ok(db
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Whether `pid` holds ACCESS EXCLUSIVE on kafka.messages (a pass that dropped a leaf
+/// holds it until it commits).
+async fn holds_messages_exclusively(db: &Client, pid: i32) -> SendResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                            WHERE pid = $1 AND granted AND mode = 'AccessExclusiveLock'
+                              AND locktype = 'relation'
+                              AND relation = 'kafka.messages'::regclass)",
+            &[&pid],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Whether `waiter` waits for a lock `holder` holds.
+async fn waits_for(db: &Client, waiter: i32, holder: i32) -> SendResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT $2 = ANY (pg_blocking_pids($1))",
+            &[&waiter, &holder],
+        )
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// Poll every 2 ms, for at most `within`, until `sweeper` holds ACCESS EXCLUSIVE on
+/// kafka.messages (its pass dropped a leaf and has not committed); false if it never did
+/// while `sweep` ran.
+async fn wait_for_drop_lock(
+    db: &Client,
+    sweeper: i32,
+    sweep: &tokio::task::JoinHandle<SendResult<(Vec<tokio_postgres::Row>, Duration)>>,
+    within: Duration,
+) -> SendResult<bool> {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline && !sweep.is_finished() {
+        if holds_messages_exclusively(db, sweeper).await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    Ok(false)
+}
+
+/// One `pg_kafka_run_retention_sweep(0, 0)` from `sweeper`, in a task: its rows and how
+/// long it took.
+fn spawn_sweep(
+    sweeper: Client,
+) -> tokio::task::JoinHandle<SendResult<(Vec<tokio_postgres::Row>, Duration)>> {
+    tokio::spawn(async move {
+        let t = Instant::now();
+        let rows = sweeper
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+            .await
+            .map_err(boxed)?;
+        SendResult::Ok((rows, t.elapsed()))
+    })
+}
+
+/// An INSERT into kafka.messages from a session of its own, in a task, and whether
+/// (polled every 2 ms) it was seen waiting for `holder`: how long it took, and that.
+async fn timed_insert(
+    db: &Client,
+    holder: i32,
+    topic_id: i32,
+    offset: i64,
+) -> SendResult<(Duration, bool)> {
+    let writer = session().await?;
+    let writer_pid = backend_pid(&writer).await?;
+    let t = Instant::now();
+    let insert = tokio::spawn(async move {
+        writer
+            .execute(
+                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
+                 VALUES ($1, 0, $2, 'w')",
+                &[&topic_id, &offset],
+            )
+            .await
+            .map_err(boxed)?;
+        SendResult::Ok(t.elapsed())
+    });
+    let mut waited = false;
+    while !insert.is_finished() {
+        if !waited && waits_for(db, writer_pid, holder).await? {
+            waited = true;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let took = insert.await.map_err(boxed)??;
+    Ok((took, waited))
+}
+
 /// Aborted rows that keep an on-demand pass busy for its whole budget after its drop.
 const BUSY_ABORTED_ROWS: i64 = 1_000_000;
 /// The longest a write through kafka.messages may wait for an on-demand pass that
@@ -97,9 +201,11 @@ const WRITER_WAIT_CEILING: Duration = Duration::from_millis(700);
 /// thread) waited for it.
 ///
 /// Asserts: with an expired leaf to drop and 1 000 000 aborted rows to delete in another,
-/// a session's INSERT into kafka.messages issued 300 ms into an on-demand pass finishes
-/// within 700 ms (the pass ends at its next turn once someone waits), the pass dropped
-/// the leaf, and a later pass deletes the rest of the aborted rows.
+/// a session's INSERT into kafka.messages, issued once the on-demand pass holds its
+/// drop's lock and seen waiting for it, finishes within 700 ms (the pass ends at its next
+/// turn once someone has waited 100 ms), the pass dropped the leaf, and a later pass
+/// deletes the rest of the aborted rows. A run in which the INSERT never waited for the
+/// pass fails (it would prove nothing).
 pub async fn test_sweep_pass_ends_when_a_writer_waits_for_its_drop() -> TestResult {
     into_test_result(writer_waits_for_drop().await)
 }
@@ -126,33 +232,32 @@ async fn writer_waits_for_drop() -> SendResult<()> {
         println!("Step 1: {droppable} to drop, {BUSY_ABORTED_ROWS} aborted rows in {busy}");
 
         let sweeper = session().await?;
-        let sweep = tokio::spawn(async move {
-            let t = Instant::now();
-            let rows = sweeper
-                .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
-                .await
-                .map_err(boxed)?;
-            SendResult::Ok((rows, t.elapsed()))
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let writer = session().await?;
-        let t = Instant::now();
-        writer
-            .execute(
-                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-                 VALUES ($1, 0, $2, 'w')",
-                &[&forever, &(BUSY_ABORTED_ROWS + 10)],
-            )
-            .await
-            .map_err(boxed)?;
-        let waited = t.elapsed();
+        let sweeper_pid = backend_pid(&sweeper).await?;
+        let sweep = spawn_sweep(sweeper);
+        if !wait_for_drop_lock(&db, sweeper_pid, &sweep, Duration::from_secs(30)).await? {
+            return Err(
+                "the pass never held the lock of a drop: nothing for a writer to wait \
+                        for, so the test proves nothing"
+                    .into(),
+            );
+        }
+        let (waited, blocked) =
+            timed_insert(&db, sweeper_pid, forever, BUSY_ABORTED_ROWS + 10).await?;
         let (rows, took) = sweep.await.map_err(boxed)??;
         let dropped = category(&rows, "dropped_partitions");
         let aborted = category(&rows, "aborted_messages");
         println!(
-            "Step 2: the INSERT waited {waited:?}; the pass took {took:?}, dropped {dropped} \
-             leaf(s) and deleted {aborted} aborted row(s)"
+            "Step 2: issued while the pass held its drop's lock, the INSERT waited {waited:?} \
+             (seen waiting for the pass: {blocked}); the pass took {took:?}, dropped \
+             {dropped} leaf(s) and deleted {aborted} aborted row(s)"
         );
+        if !blocked {
+            return Err(
+                "the INSERT was never seen waiting for the pass that held its drop's \
+                        lock: the test proves nothing"
+                    .into(),
+            );
+        }
         if leaf_exists(&db, &droppable).await? {
             return Err(format!("the pass did not drop {droppable}").into());
         }
@@ -396,6 +501,253 @@ async fn fresh_session_drops() -> SendResult<()> {
     delete_topics(&db, &[expired, forever]).await?;
     outcome?;
     println!("✅ the pass dropped the leaf its own probe found");
+    Ok(())
+}
+
+/// The longest a write through kafka.messages may wait for an on-demand pass whose second
+/// drop finds its leaf held: one 50 ms attempt of that drop, the commit and slack; the
+/// drop of a pass that had not deleted a row waited its 2 s lock_timeout.
+const SECOND_DROP_WRITER_CEILING: Duration = Duration::from_millis(700);
+/// The longest such a pass may take.
+const SECOND_DROP_PASS_CEILING: Duration = Duration::from_millis(1000);
+
+/// A drop holds ACCESS EXCLUSIVE on kafka.messages until the pass commits, and the next
+/// drop of the pass locks its own leaf too. A pass that had dropped a leaf but deleted no
+/// row ran that next drop like the first, with its 2 s lock_timeout: with a session
+/// holding the second leaf (a reader that names the leaf, autovacuum, pg_dump), every
+/// write and read through kafka.messages (the worker's Produce and Fetch, so every client
+/// of the DB thread) waited those 2 s behind the pass.
+///
+/// Asserts: with two expired leaves and a session holding ACCESS SHARE on the second,
+/// one on-demand pass drops the first, gives the second up within 1 s, and an INSERT into
+/// kafka.messages issued while the pass holds the first drop's lock finishes within
+/// 700 ms; once the holder ends, a sweep drops the second leaf.
+pub async fn test_sweep_second_drop_waits_briefly_for_its_leaf() -> TestResult {
+    into_test_result(second_drop_behind_leaf_holder().await)
+}
+
+/// Run `pg_kafka_run_retention_sweep(0, 0)` until a call removes nothing (at most 10
+/// calls): the prunes and reapers then have no due row, so a test's own sweep right after
+/// does only what the test set up.
+async fn quiesce_sweeps(db: &Client) -> SendResult<()> {
+    for _ in 0..10 {
+        let removed: i64 = db
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
+            .await
+            .map_err(boxed)?
+            .iter()
+            .map(|r| r.get::<_, i64>(1))
+            .sum();
+        if removed == 0 {
+            return Ok(());
+        }
+    }
+    Err("sweeps kept removing rows after 10 calls".into())
+}
+
+async fn second_drop_behind_leaf_holder() -> SendResult<()> {
+    println!("=== Test: a pass's second drop waits briefly for a held leaf ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '60s'")
+        .await
+        .map_err(boxed)?;
+    drain_droppable_leaves(&db).await?;
+    // Nothing else for the test's pass to delete: it holds no row when it reaches the drops.
+    quiesce_sweeps(&db).await?;
+    // A window longer than a leaf: its rows go with their leaves, never row by row.
+    let expired = create_topic(&db, &unique("second-drop-expired"), 86_400_000).await?;
+    let hour = random_hour(&db).await?;
+    let first = hour_leaf(&db, hour).await?;
+    let second = hour_leaf(&db, hour + 1).await?;
+    let holder = session().await?;
+    let outcome = async {
+        fill_leaf(&db, expired, hour, 0, 5).await?;
+        fill_leaf(&db, expired, hour + 1, 5, 5).await?;
+        holder
+            .batch_execute(&format!("BEGIN; SELECT count(*) FROM {second}"))
+            .await
+            .map_err(boxed)?;
+        println!("Step 1: {first} and {second} to drop; a session holds ACCESS SHARE on {second}");
+
+        let sweeper = session().await?;
+        let sweeper_pid = backend_pid(&sweeper).await?;
+        let sweep = spawn_sweep(sweeper);
+        let locked = wait_for_drop_lock(&db, sweeper_pid, &sweep, Duration::from_secs(30)).await?;
+        let writer = if locked {
+            Some(timed_insert(&db, sweeper_pid, expired, 1_000_000).await?)
+        } else {
+            None
+        };
+        let (rows, took) = sweep.await.map_err(boxed)??;
+        let removed: Vec<(String, i64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+        println!(
+            "Step 2: the pass took {took:?} ({removed:?}); an INSERT issued while it held its \
+             first drop's lock: {writer:?} (time, seen waiting)"
+        );
+        if leaf_exists(&db, &first).await? {
+            return Err(format!("the pass did not drop {first}").into());
+        }
+        if !leaf_exists(&db, &second).await? {
+            return Err(format!("the pass dropped {second} through a session's lock on it").into());
+        }
+        if took >= SECOND_DROP_PASS_CEILING {
+            return Err(format!(
+                "the pass took {took:?}: its second drop waited out the lock on {second}"
+            )
+            .into());
+        }
+        if let Some((waited, _)) = writer {
+            if waited >= SECOND_DROP_WRITER_CEILING {
+                return Err(format!(
+                    "an INSERT into kafka.messages waited {waited:?} behind a pass whose \
+                     second drop waited for a held leaf"
+                )
+                .into());
+            }
+        }
+        holder.batch_execute("ROLLBACK").await.map_err(boxed)?;
+        db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        if leaf_exists(&db, &second).await? {
+            return Err(format!("{second} was not dropped once its holder ended").into());
+        }
+        println!("Step 3: with the holder gone, a sweep dropped {second}");
+        SendResult::Ok(())
+    }
+    .await;
+    holder.batch_execute("ROLLBACK").await.ok();
+    db.execute(
+        "DELETE FROM kafka.messages WHERE topic_id = $1 AND partition_offset = 1000000",
+        &[&expired],
+    )
+    .await
+    .map_err(boxed)?;
+    force_drop(&db, &first).await?;
+    force_drop(&db, &second).await?;
+    delete_topics(&db, &[expired]).await?;
+    outcome?;
+    println!("✅ the second drop gave up its held leaf after one short attempt");
+    Ok(())
+}
+
+/// A pass that has trimmed a partition holds its offset counter until it commits, and a
+/// Produce to that partition waits for it while holding ROW EXCLUSIVE on kafka.messages:
+/// no drop can take its lock then. The drops came after the row deletes, and a drop of a
+/// pass that holds rows is refused while a session waits for one of them, so an on-demand
+/// pass in a fresh session under steady Produce traffic to a partition it trimmed dropped
+/// nothing its probes found, and the session took what they found with it.
+///
+/// Asserts: with an older leaf to trim (a topic with a 1 s window beside an
+/// infinite-retention one) and a newer leaf of only that topic, and a producer writing to
+/// the topic all along (its records expire too, row by row), one
+/// `pg_kafka_run_retention_sweep()` call from a fresh session drops the newer leaf, and
+/// calls from fresh sessions trim the older one.
+pub async fn test_fresh_session_sweep_drops_beside_produce_to_a_trimmed_partition() -> TestResult {
+    into_test_result(drops_beside_produce().await)
+}
+
+async fn drops_beside_produce() -> SendResult<()> {
+    use rdkafka::producer::FutureRecord;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    println!("=== Test: a fresh-session sweep drops beside Produce to a trimmed partition ===\n");
+    let db = session().await?;
+    db.batch_execute("SET statement_timeout = '60s'")
+        .await
+        .map_err(boxed)?;
+    drain_droppable_leaves(&db).await?;
+    let topic = unique("produce-trim");
+    let short = create_topic(&db, &topic, 1000).await?;
+    let forever = create_topic(&db, &unique("produce-trim-forever"), -1).await?;
+    let hour = random_hour(&db).await?;
+    let trimmed = hour_leaf(&db, hour).await?;
+    let droppable = hour_leaf(&db, hour + 1).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let produced = Arc::new(AtomicU64::new(0));
+    let producer = crate::worker::quick_producer("20000")?;
+    let traffic = {
+        let (stop, produced, topic) = (stop.clone(), produced.clone(), topic.clone());
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                producer
+                    .send(
+                        FutureRecord::<(), _>::to(&topic).payload("p").partition(0),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .map_err(|(e, _)| boxed(e))?;
+                produced.fetch_add(1, Ordering::Relaxed);
+            }
+            SendResult::Ok(())
+        })
+    };
+    let outcome = async {
+        fill_leaf(&db, short, hour, 0, 5).await?;
+        fill_leaf(&db, forever, hour, 0, 1).await?;
+        fill_leaf(&db, short, hour + 1, 5, 5).await?;
+        // The producer's records are older than the 1 s window when the sweep runs.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let before = produced.load(Ordering::Relaxed);
+        if before == 0 || traffic.is_finished() {
+            return Err("the producer did not produce".into());
+        }
+        println!("Step 1: {trimmed} to trim, {droppable} to drop; {before} records produced");
+
+        let fresh = session().await?;
+        let rows = fresh
+            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(boxed)?;
+        let during = produced.load(Ordering::Relaxed) - before;
+        println!(
+            "Step 2: one call from a fresh session: {} expired row(s), {} leaf(s) dropped; \
+             {during} records produced meanwhile",
+            category(&rows, "expired_messages"),
+            category(&rows, "dropped_partitions")
+        );
+        if leaf_exists(&db, &droppable).await? {
+            return Err(format!(
+                "a fresh-session pass under Produce traffic to a trimmed partition did not \
+                 drop {droppable}, which its probes found"
+            )
+            .into());
+        }
+        let mut left: i64 = -1;
+        for _ in 0..10 {
+            let fresh = session().await?;
+            fresh
+                .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+                .await
+                .map_err(boxed)?;
+            left = db
+                .query_one(
+                    "SELECT count(*) FROM kafka.messages
+                     WHERE topic_id = $1 AND created_at < timestamptz '2002-01-01 00:00+00'",
+                    &[&short],
+                )
+                .await
+                .map_err(boxed)?
+                .get(0);
+            if left == 0 {
+                break;
+            }
+        }
+        if left != 0 {
+            return Err(format!("{left} expired rows left in {trimmed}").into());
+        }
+        println!("Step 3: calls from fresh sessions trimmed {trimmed}");
+        SendResult::Ok(())
+    }
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    let traffic = traffic.await.map_err(boxed)?;
+    force_drop(&db, &trimmed).await?;
+    force_drop(&db, &droppable).await?;
+    delete_topics(&db, &[short, forever]).await?;
+    outcome?;
+    traffic?;
+    println!("✅ the pass dropped the leaf beside a Produce waiting for its trimmed partition");
     Ok(())
 }
 

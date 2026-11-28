@@ -213,6 +213,7 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         cancel::test_cancel_does_not_restart_the_worker: sequential, // signals the listener
         background_waits::test_metrics_flush_skips_held_rows: sequential,
         background_waits::test_worker_maintenance_waits_briefly_behind_a_reader: sequential,
+        background_waits::test_metrics_rewritten_after_extension_recreated: sequential,
     ]
 }
 
