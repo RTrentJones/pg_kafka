@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->1167<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->1171<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest round-trips of the kafka-protocol crate's header and field encodings that pg_kafka relies on (no pg_kafka code) |
-| E2E Tests | <!--gen:tests-e2e-->508<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1685<!--/gen-->** | |
+| E2E Tests | <!--gen:tests-e2e-->509<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
+| **Total** | **<!--gen:tests-total-->1690<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 
@@ -87,8 +87,8 @@ Generated from `kafka_test --list` (what each category covers: CLAUDE.md, "Test 
 | `part` | 43 |
 | `auth` | 16 |
 | `network` | 68 |
-| `worker` | 10 |
-| **Total** | **508** |
+| `worker` | 11 |
+| **Total** | **509** |
 <!--/gen-->
 
 ### Running E2E Tests
