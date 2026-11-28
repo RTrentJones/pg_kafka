@@ -1382,34 +1382,43 @@ impl GroupCoordinator {
     ///
     /// This is used by DeleteGroups to remove empty groups.
     /// Should only be called after confirming the group has no active members; any
-    /// JoinGroup still held for the group is answered UNKNOWN_MEMBER_ID.
+    /// JoinGroup still held for the group (or SyncGroup parked) is answered UNKNOWN_MEMBER_ID.
+    ///
+    /// The held answers are found from the removed group's own members (an entry of
+    /// `pending_joins` / `pending_syncs` exists exactly while its member's `awaiting_join` /
+    /// `awaiting_sync` is set): O(members of the group) lookups, none for an Empty group,
+    /// whatever the other groups hold.
     pub fn remove_group(&self, group_id: &str) {
         let mut orphaned_joins: Vec<(String, JoinResponder)> = Vec::new();
         let mut orphaned_syncs: Vec<(String, SyncResponder)> = Vec::new();
         if let Ok(mut groups) = self.groups.write() {
-            groups.remove(group_id);
+            let Some(group) = groups.remove(group_id) else {
+                return;
+            };
             pg_log!("Removed group '{}' from coordinator", shown(group_id));
-            let mut pending = self.lock_pending();
-            let keys: Vec<(String, String)> = pending
-                .keys()
-                .filter(|(g, _)| g == group_id)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(r) = pending.remove(&key) {
-                    orphaned_joins.push((key.1, r));
+            let waiting = || {
+                group
+                    .members
+                    .values()
+                    .filter(|m| m.awaiting_join || m.awaiting_sync)
+            };
+            if waiting().next().is_some() {
+                let mut joins = self.lock_pending();
+                for m in waiting().filter(|m| m.awaiting_join) {
+                    count_work(1);
+                    let key = (group_id.to_string(), m.member_id.clone());
+                    if let Some(r) = joins.remove(&key) {
+                        orphaned_joins.push((key.1, r));
+                    }
                 }
-            }
-            drop(pending);
-            let mut pending = self.lock_pending_syncs();
-            let keys: Vec<(String, String)> = pending
-                .keys()
-                .filter(|(g, _)| g == group_id)
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(r) = pending.remove(&key) {
-                    orphaned_syncs.push((key.1, r));
+                drop(joins);
+                let mut syncs = self.lock_pending_syncs();
+                for m in waiting().filter(|m| m.awaiting_sync) {
+                    count_work(1);
+                    let key = (group_id.to_string(), m.member_id.clone());
+                    if let Some(r) = syncs.remove(&key) {
+                        orphaned_syncs.push((key.1, r));
+                    }
                 }
             }
         }

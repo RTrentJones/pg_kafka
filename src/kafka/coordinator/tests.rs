@@ -2591,3 +2591,43 @@ fn test_protocol_checks_cost_what_the_joiner_sends() {
         "{selected} units at completion"
     );
 }
+
+#[test]
+fn test_remove_group_looks_only_at_its_own_pending_answers() {
+    // The review's shape: DeleteGroups of many Empty groups while other groups hold many
+    // JoinGroups. Each removal scanned every held JoinGroup and parked SyncGroup (23 s for 50 000
+    // deletes beside 32 000 held), although an Empty group holds none.
+    let c = GroupCoordinator::new();
+    c.set_limits(10_000, 5_000);
+    let first = joined(&join(&c, "busy", None)).member_id;
+    let held: Vec<Slot> = (0..2_000).map(|_| join(&c, "busy", None)).collect();
+    assert!(held.iter().all(is_pending));
+    assert_eq!(c.pending_join_count(), 2_000);
+    c.add_empty_groups("empty-", 500);
+    take_work();
+    for i in 0..500 {
+        c.remove_group(&format!("empty-{i}"));
+    }
+    let work = take_work();
+    assert!(
+        work <= 500,
+        "{work} pending answers looked at for 500 Empty groups"
+    );
+    assert_eq!(
+        c.pending_join_count(),
+        2_000,
+        "the other group's answers are kept"
+    );
+
+    // A group removed with held answers (a non-empty group) still answers them.
+    let mut leaver = c.get_group_state("busy").unwrap().members.into_keys();
+    assert!(leaver.any(|m| m != first));
+    c.remove_group("busy");
+    assert_eq!(c.pending_join_count(), 0);
+    for slot in &held {
+        assert_eq!(
+            join_error_code(slot),
+            crate::kafka::constants::ERROR_UNKNOWN_MEMBER_ID
+        );
+    }
+}
