@@ -201,9 +201,11 @@ const WRITER_WAIT_CEILING: Duration = Duration::from_millis(700);
 /// thread) waited for it.
 ///
 /// Asserts: with an expired leaf to drop and 1 000 000 aborted rows to delete in another,
-/// a session's INSERT into kafka.messages issued 300 ms into an on-demand pass finishes
-/// within 700 ms (the pass ends at its next turn once someone waits), the pass dropped
-/// the leaf, and a later pass deletes the rest of the aborted rows.
+/// a session's INSERT into kafka.messages, issued once the on-demand pass holds its
+/// drop's lock and seen waiting for it, finishes within 700 ms (the pass ends at its next
+/// turn once someone has waited 100 ms), the pass dropped the leaf, and a later pass
+/// deletes the rest of the aborted rows. A run in which the INSERT never waited for the
+/// pass fails (it would prove nothing).
 pub async fn test_sweep_pass_ends_when_a_writer_waits_for_its_drop() -> TestResult {
     into_test_result(writer_waits_for_drop().await)
 }
@@ -230,33 +232,32 @@ async fn writer_waits_for_drop() -> SendResult<()> {
         println!("Step 1: {droppable} to drop, {BUSY_ABORTED_ROWS} aborted rows in {busy}");
 
         let sweeper = session().await?;
-        let sweep = tokio::spawn(async move {
-            let t = Instant::now();
-            let rows = sweeper
-                .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 0)", &[])
-                .await
-                .map_err(boxed)?;
-            SendResult::Ok((rows, t.elapsed()))
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let writer = session().await?;
-        let t = Instant::now();
-        writer
-            .execute(
-                "INSERT INTO kafka.messages (topic_id, partition_id, partition_offset, value)
-                 VALUES ($1, 0, $2, 'w')",
-                &[&forever, &(BUSY_ABORTED_ROWS + 10)],
-            )
-            .await
-            .map_err(boxed)?;
-        let waited = t.elapsed();
+        let sweeper_pid = backend_pid(&sweeper).await?;
+        let sweep = spawn_sweep(sweeper);
+        if !wait_for_drop_lock(&db, sweeper_pid, &sweep, Duration::from_secs(30)).await? {
+            return Err(
+                "the pass never held the lock of a drop: nothing for a writer to wait \
+                        for, so the test proves nothing"
+                    .into(),
+            );
+        }
+        let (waited, blocked) =
+            timed_insert(&db, sweeper_pid, forever, BUSY_ABORTED_ROWS + 10).await?;
         let (rows, took) = sweep.await.map_err(boxed)??;
         let dropped = category(&rows, "dropped_partitions");
         let aborted = category(&rows, "aborted_messages");
         println!(
-            "Step 2: the INSERT waited {waited:?}; the pass took {took:?}, dropped {dropped} \
-             leaf(s) and deleted {aborted} aborted row(s)"
+            "Step 2: issued while the pass held its drop's lock, the INSERT waited {waited:?} \
+             (seen waiting for the pass: {blocked}); the pass took {took:?}, dropped \
+             {dropped} leaf(s) and deleted {aborted} aborted row(s)"
         );
+        if !blocked {
+            return Err(
+                "the INSERT was never seen waiting for the pass that held its drop's \
+                        lock: the test proves nothing"
+                    .into(),
+            );
+        }
         if leaf_exists(&db, &droppable).await? {
             return Err(format!("the pass did not drop {droppable}").into());
         }
