@@ -248,6 +248,7 @@ The `shadow` category's tests are listed in `tests()` in `kafka_test/src/shadow/
 | `test_shadow_claims_stay_fast_with_a_full_in_flight_window` | The claim's in-flight exclusion is hashed: filling the 8 192-row in-flight window takes well under a second |
 | `test_shadow_claims_stay_fast_behind_a_large_backlog` | A claim's cost does not grow with a 150 000-row backlog (ordered LATERAL probe, not a hash semi join) |
 | `test_shadow_claims_stay_fast_with_a_tiny_work_mem` | The claim raises `work_mem` for itself, so a tiny server `work_mem` does not make it rescan the in-flight list per row |
+| `test_shadow_acks_stay_fast_with_a_tiny_work_mem` | Applying a full in-flight window of acks (8 192) does not grow with the acks squared at a tiny `work_mem`: a Metadata request waits at most twice as long as at the default |
 | `test_shadow_claims_are_not_jit_compiled` | The claim turns JIT off for itself, so low JIT thresholds do not slow it (skipped without llvmjit) |
 | `test_shadow_worker_stays_idle_beside_a_blocked_partition` | A backing-off head of a 200 000-row backlog does not make each tick read the partition's backlog: the idle worker's CPU stays within 3 points |
 | `test_shadow_worker_stays_idle_beside_dead_letters` | 200 000 dead letters are skipped by the dead flag: the idle worker's CPU stays within bounds |
