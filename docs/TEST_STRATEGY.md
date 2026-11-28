@@ -14,10 +14,10 @@ they match the commit they are in.
 
 | Suite | Count | Coverage |
 |-------|-------|----------|
-| Unit Tests | <!--gen:tests-unit-->1178<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
+| Unit Tests | <!--gen:tests-unit-->1181<!--/gen--> | Core logic, handlers, storage, protocol, shadow (`src/`, includes in-module proptest fuzz harnesses) |
 | Property Tests | <!--gen:tests-property-->10<!--/gen--> | `tests/property_tests.rs`: proptest round-trips of the kafka-protocol crate's header and field encodings that pg_kafka relies on (no pg_kafka code) |
 | E2E Tests | <!--gen:tests-e2e-->517<!--/gen--> | Full protocol integration (`kafka_test/`, per category [below](#e2e-test-categories)) |
-| **Total** | **<!--gen:tests-total-->1705<!--/gen-->** | |
+| **Total** | **<!--gen:tests-total-->1708<!--/gen-->** | |
 
 The generator counts with (none of these needs a running broker):
 

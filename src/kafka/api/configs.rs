@@ -315,3 +315,37 @@ impl KafkaApi for IncrementalAlterConfigsApi {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn partition(index: i32, error_code: i16) -> DeleteRecordsPartitionResult {
+        let mut partition = DeleteRecordsPartitionResult::default();
+        partition.partition_index = index;
+        partition.error_code = error_code;
+        partition
+    }
+
+    #[test]
+    fn only_partitions_answered_without_error_notify() {
+        let mut topic = DeleteRecordsTopicResult::default();
+        topic.name = TopicName("t".to_string().into());
+        topic.partitions = vec![partition(0, 0), partition(1, 1), partition(2, 0)];
+        let mut response = DeleteRecordsResponse::default();
+        response.topics = vec![topic];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        emit_log_start_notifications(&response, &tx);
+        let moved: Vec<(String, i32)> = rx
+            .try_iter()
+            .map(|n| match n {
+                InternalNotification::LogStartMoved {
+                    topic_name,
+                    partition_id,
+                } => (topic_name, partition_id),
+                other => panic!("unexpected notification {other:?}"),
+            })
+            .collect();
+        assert_eq!(moved, [("t".to_string(), 0), ("t".to_string(), 2)]);
+    }
+}
