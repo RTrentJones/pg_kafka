@@ -275,6 +275,8 @@ impl MainLoop<'_> {
         reapply_worker_role();
         // The old outbox is gone and a re-created one reuses its row keys.
         self.env.shadow_store.forget_dropped_schema();
+        // The re-created broker tables are empty: the next flush writes every API.
+        self.metrics_flusher.forget_published();
         self.schema = SchemaState::default();
         refresh_schema_state(&mut self.schema);
         self.resume_on_current_schema();

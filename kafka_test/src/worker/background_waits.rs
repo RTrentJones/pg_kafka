@@ -259,3 +259,79 @@ async fn maintenance_behind_reader() -> SendResult<()> {
     );
     Ok(())
 }
+
+/// The rows of kafka.broker_api_stats.
+async fn api_stats_rows(db: &tokio_postgres::Client) -> SendResult<i64> {
+    Ok(db
+        .query_one("SELECT count(*) FROM kafka.broker_api_stats", &[])
+        .await
+        .map_err(boxed)?
+        .get(0))
+}
+
+/// The metrics flush writes only the APIs whose counters moved since its last write;
+/// the first flush after the worker starts writes every known API. DROP/CREATE EXTENSION
+/// re-creates the broker tables empty, and the worker went on diffing against what it
+/// had written into the old ones: the new kafka.broker_api_stats got only the APIs
+/// called after the re-creation, and every other API's counters were missing until each
+/// was called again.
+///
+/// Asserts: after DROP EXTENSION and CREATE EXTENSION under a running worker, once the
+/// worker serves and has flushed a Metadata request, kafka.broker_api_stats has a row
+/// for every API it had before (every known API).
+pub async fn test_metrics_rewritten_after_extension_recreated() -> TestResult {
+    into_test_result(metrics_after_recreate().await)
+}
+
+async fn metrics_after_recreate() -> SendResult<()> {
+    use crate::worker::wait_for_serving_listener;
+    println!("=== Test: the metrics flush writes every API after DROP/CREATE EXTENSION ===\n");
+    let db = session().await?;
+    let mut wire = Wire::connect().await.map_err(|e| boxed(e.to_string()))?;
+    let metadata = MetadataRequest::default();
+    wire.call(9, &metadata)
+        .await
+        .map_err(|e| boxed(e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while metrics_requests(&db).await? == 0 {
+        if Instant::now() >= deadline {
+            return Err("the metrics flush never wrote kafka.broker_api_stats".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let before = api_stats_rows(&db).await?;
+    println!("Step 1: kafka.broker_api_stats has {before} rows");
+
+    db.batch_execute("DROP EXTENSION pg_kafka CASCADE")
+        .await
+        .map_err(boxed)?;
+    // Long enough for the worker to find the schema gone.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    db.batch_execute("CREATE EXTENSION pg_kafka")
+        .await
+        .map_err(boxed)?;
+    wait_for_serving_listener(&db, None, Duration::from_secs(30)).await?;
+    let mut wire = Wire::connect().await.map_err(|e| boxed(e.to_string()))?;
+    wire.call(9, &metadata)
+        .await
+        .map_err(|e| boxed(e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while metrics_requests(&db).await? == 0 {
+        if Instant::now() >= deadline {
+            return Err("no flush wrote the re-created kafka.broker_api_stats".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The flush that wrote Metadata wrote everything it was going to.
+    let after = api_stats_rows(&db).await?;
+    println!("Step 2: after the re-creation, kafka.broker_api_stats has {after} rows");
+    if after < before {
+        return Err(format!(
+            "after DROP/CREATE EXTENSION the metrics flush wrote {after} of the {before} API \
+             rows: only the APIs called since"
+        )
+        .into());
+    }
+    println!("✅ the first flush into the new tables wrote every API");
+    Ok(())
+}

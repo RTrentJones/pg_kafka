@@ -28,7 +28,9 @@
 //! successful flush, returns a [`FlushBatch`] that [`write_batch`] writes with ONE statement
 //! (a writable CTE upserting both tables from `unnest()`ed arrays). The first flush after
 //! worker start writes every known API (zeros included) so a restart resets the published
-//! values left by the previous worker; later flushes write only the APIs whose counters moved.
+//! values left by the previous worker, and so does the first one after the worker finds the
+//! schema again after DROP/CREATE EXTENSION ([`MetricsFlusher::forget_published`]: the new
+//! tables start empty); later flushes write only the APIs whose counters moved.
 //! Counters are cumulative since worker start.
 
 use crate::kafka::messages::KafkaResponse;
@@ -422,6 +424,14 @@ impl<'a> MetricsFlusher<'a> {
         build_batch(self.published.as_ref(), snapshot)
     }
 
+    /// Forget the published baseline: the next flush writes every known API, as the first
+    /// one after worker start does. For a schema found again after DROP/CREATE EXTENSION,
+    /// whose broker tables start empty: a flush of only the changed slots would leave out
+    /// every API whose counters did not move since the drop.
+    pub fn forget_published(&mut self) {
+        self.published = None;
+    }
+
     /// Hook for the worker loop: report the outcome of writing `batch`. On success the batch's
     /// snapshot becomes the published baseline; on failure it is not, so the next poll retries.
     /// Returns a message to log for the first failure in a run of failures.
@@ -773,6 +783,24 @@ mod tests {
         let b = f.poll_at(t0 + Duration::from_secs(7), 3, 0).unwrap();
         assert_eq!(b.api_rows, Vec::new());
         assert_eq!(b.snapshot.gauges.request_queue_depth, 3);
+    }
+
+    #[test]
+    fn a_forgotten_baseline_writes_every_known_api_again() {
+        let m = BrokerMetrics::new();
+        let mut f = MetricsFlusher::with_registry(&m, Duration::from_secs(1));
+        let t0 = Instant::now();
+        m.record_request(0, Duration::from_micros(4), false);
+        let b = f.poll_at(t0, 0, 0).unwrap();
+        assert_eq!(f.finish(b, Ok(())), None);
+        m.record_request(3, Duration::from_micros(4), false);
+        f.forget_published();
+        let b = f.poll_at(t0 + Duration::from_secs(2), 0, 0).unwrap();
+        assert_eq!(b.api_rows.len(), crate::kafka::api::APIS.len());
+        let produce = b.api_rows.iter().find(|r| r.api_key == 0).unwrap();
+        assert_eq!(produce.stats.requests, 1);
+        assert_eq!(f.finish(b, Ok(())), None);
+        assert!(f.poll_at(t0 + Duration::from_secs(4), 0, 0).is_none());
     }
 
     #[test]
