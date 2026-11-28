@@ -203,7 +203,7 @@ gucs! {
     /// Safety-net re-check interval of a waiting (long-poll) fetch.
     int FETCH_POLL_INTERVAL_MS = DEFAULT_FETCH_POLL_INTERVAL_MS => c"pg_kafka.fetch_poll_interval_ms" {
         short: c"Polling interval for long polling fallback (milliseconds)",
-        long: c"A waiting FetchRequest re-reads the partitions a change notification names (Produce, DeleteRecords, DeleteTopics, a transaction end) and reads once more at max_wait_ms; this interval is the safety-net re-check for a change no notification names, which re-reads every partition of a waiting fetch and runs only within an allowance of 256 partitions per interval for all waiting fetches together. Default: 1000ms.",
+        long: c"A waiting FetchRequest re-reads the partitions a change notification names (Produce, DeleteRecords, DeleteTopics, the end of a transaction that added them) and reads once more at max_wait_ms, unless nothing was notified and its last read of every partition is younger than this interval. This interval is also the safety-net re-check for a change no notification names, which re-reads every partition of a waiting fetch and runs only within an allowance of 256 partitions per interval for all waiting fetches together; such a change is in a fetch's answer once it is one interval old. Default: 1000ms.",
         context: Postmaster,
         range: (MIN_FETCH_POLL_INTERVAL_MS, MAX_FETCH_POLL_INTERVAL_MS),
     }

@@ -14,7 +14,9 @@
 //!
 //! What a Fetch answers can also change outside the worker (an on-demand
 //! `pg_kafka_run_retention_sweep()` in another session, DROP EXTENSION); a long poll sees
-//! that at its deadline or safety-net re-check.
+//! that at a safety-net re-check, or at its deadline once the change is one
+//! `pg_kafka.fetch_poll_interval_ms` old (the deadline reads again unless its last read of
+//! every partition is younger than that).
 //!
 //! Notifications are sent from inside the request's transaction, i.e. before its
 //! commit. That is safe because the woken fetch is re-submitted to the same single DB

@@ -22,15 +22,21 @@
 //!    the safety net's allowance: [`SAFETY_NET_PARTITIONS_PER_INTERVAL`] partitions per
 //!    interval for all long polls together ([`PendingFetchRegistry::take_safety_net`]).
 //! 5. At the deadline the whole Fetch is read once more and answered; when nothing was
-//!    marked since a read that returned no records, that read's response is answered as is.
+//!    marked since a read of every partition that returned no records and started less than
+//!    a safety-net interval before the deadline, that read's response is answered as is. So
+//!    the answer holds every notified change, and every other change made at least one
+//!    safety-net interval before the deadline.
 //!
 //! Cost on the DB thread, for a long poll of P partitions: one read of P at the start and at
-//! most one at the end; one read of the marked partitions per wake-up (each partition at most
+//! most one at the end (as Kafka's `DelayedFetch`, which reads when the Fetch arrives and
+//! again when it expires); one read of the marked partitions per wake-up (each partition at most
 //! once per wake-up, so the reads a Produce causes are one per long poll waiting on each
 //! partition it wrote, as Kafka's `DelayedFetch` checks each watcher; a transaction end
 //! likewise re-reads, in each `read_committed` long poll, only those of its partitions the
 //! long poll watches); and the safety net's shared allowance. An idle long poll of a
-//! caught-up consumer therefore costs one read of its partitions per request.
+//! caught-up consumer therefore costs one read of its partitions per request when its
+//! `max_wait_ms` is shorter than the safety-net interval, and otherwise at most two plus the
+//! safety-net re-checks the shared allowance grants it.
 
 use bytes::Bytes;
 use crossbeam_channel::Sender;
@@ -317,9 +323,9 @@ impl LongPoll {
         } = waiting;
         let slots = Slots::new(&self.fetch);
         let mut tally = Tally::new(slots.len());
-        // The response of the last read of every partition, while it holds no records and
-        // nothing was marked since.
-        let mut unchanged: Option<KafkaResponse> = None;
+        // The response of the last read of every partition and when it started, while it
+        // holds no records and nothing was marked since.
+        let mut unchanged: Option<(KafkaResponse, Instant)> = None;
         let mut next = Check::Full;
         let mut safety_net_at = Instant::now() + poll_interval;
         loop {
@@ -328,6 +334,7 @@ impl LongPoll {
                     let Some((charge, alone)) = self.reserve(reply).await else {
                         return Ok(());
                     };
+                    let read_at = Instant::now();
                     let response = self.fetch_once(None, alone).await?;
                     tally = Tally::new(slots.len());
                     slots.count(&self.fetch, &response, read_committed, |slot, bytes| {
@@ -349,7 +356,7 @@ impl LongPoll {
                         return Ok(());
                     }
                     drop(charge);
-                    unchanged = (!response_has_records(&response)).then_some(response);
+                    unchanged = (!response_has_records(&response)).then_some((response, read_at));
                 }
                 Check::Some(marked) => {
                     unchanged = None;
@@ -390,9 +397,14 @@ impl LongPoll {
             if now >= deadline {
                 debug!("Long poll: timeout reached, answering");
                 // Anything marked since the last read (a coarse mark included: records may
-                // have expired) is read again.
-                return match unchanged.filter(|_| changed == Taken::default()) {
-                    Some(response) => self.answer(response, reply).await,
+                // have expired) is read again, and so is a read a safety-net interval old or
+                // more: a change no notification names (an on-demand retention sweep or
+                // DROP EXTENSION in another session) is answered at most one interval late.
+                let fresh = |&(_, read_at): &(KafkaResponse, Instant)| {
+                    changed == Taken::default() && now.duration_since(read_at) < poll_interval
+                };
+                return match unchanged.filter(fresh) {
+                    Some((response, _)) => self.answer(response, reply).await,
                     None => self.answer_full(reply).await,
                 };
             }
@@ -1101,12 +1113,13 @@ mod tests {
     }
 
     /// 64 idle long polls of 1,000 partitions each, with a 10 ms safety-net interval and a
-    /// 500 ms max wait, cost the DB thread one read of their partitions each (64,000
+    /// 500 ms max wait, cost the DB thread two reads of their partitions each (128,000
     /// partition reads), however short the interval: a long poll of more partitions than the
-    /// safety net's allowance never takes it, and nothing changed, so each answers its first
-    /// read at the deadline. A re-read per interval costs 64 x 1,000 x 50 = 3.2 million.
+    /// safety net's allowance never takes it, and reads only at the start and, its first
+    /// read being older than an interval, at the deadline. A re-read per interval costs
+    /// 64 x 1,000 x 50 = 3.2 million.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn idle_long_polls_cost_one_read_whatever_the_safety_net_interval() {
+    async fn idle_long_polls_cost_two_reads_whatever_the_safety_net_interval() {
         const POLLS: usize = 64;
         const PARTITIONS: i32 = 1_000;
         let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(1024);
@@ -1138,7 +1151,7 @@ mod tests {
         let read: usize = attempts.iter().sum();
         assert_eq!(
             read,
-            POLLS * 1_000,
+            2 * POLLS * 1_000,
             "partitions read by {} attempts",
             attempts.len()
         );
@@ -1177,8 +1190,9 @@ mod tests {
     }
 
     /// Long polls whose safety net fires every 10 ms re-read within the shared allowance
-    /// only: 3,000 idle long polls of one partition over 100 ms read their first reads plus
-    /// at most the allowance per interval. A re-read per interval each costs about 33,000.
+    /// only: 3,000 idle long polls of one partition over 100 ms read their first and
+    /// deadline reads plus at most the allowance per interval. A re-read per interval each
+    /// costs about 33,000.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn safety_net_rereads_share_one_allowance() {
         use crate::kafka::pending_fetches::SAFETY_NET_PARTITIONS_PER_INTERVAL;
@@ -1213,10 +1227,10 @@ mod tests {
         let read = u64::try_from(attempts.lock().unwrap().iter().sum::<usize>()).unwrap();
         let polls = u64::try_from(POLLS).unwrap();
         assert!(
-            read <= polls + intervals * SAFETY_NET_PARTITIONS_PER_INTERVAL,
+            read <= 2 * polls + intervals * SAFETY_NET_PARTITIONS_PER_INTERVAL,
             "{read} partition reads in {intervals} intervals"
         );
-        assert!(read > polls, "the safety net re-read some");
+        assert!(read > polls, "the deadline or the safety net re-read some");
     }
 
     /// A long poll of more partitions than the safety net's allowance, woken coarsely (a
@@ -1298,5 +1312,38 @@ mod tests {
             "{read} partition reads for {ENDS} transaction ends"
         );
         assert!(registry.is_empty().await);
+    }
+
+    /// A long poll of more partitions than the safety net's allowance answers at its
+    /// deadline from a read less than one safety-net interval old: its first read when the
+    /// whole wait is shorter than the interval, a new read otherwise, so a change no
+    /// notification names (another session's retention sweep, DROP EXTENSION) is in the
+    /// answer once it is an interval old. Answering the first read 300 ms later would hide
+    /// such a change for the whole wait.
+    #[tokio::test]
+    async fn a_deadline_answer_is_less_than_one_interval_old() {
+        for (interval_ms, reads) in [(50, vec![300, 300]), (10_000, vec![300])] {
+            let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(16);
+            let attempts = spawn_counting_worker(request_rx, |_| false);
+            let registry = Arc::new(PendingFetchRegistry::new());
+            let (final_tx, mut final_rx) = tokio::sync::mpsc::unbounded_channel();
+            long_poll(
+                300,
+                1,
+                0,
+                vec![many_partitions("t", 300)],
+                request_tx,
+                final_tx,
+            )
+            .run(&registry, Duration::from_millis(interval_ms), &test_reply())
+            .await
+            .unwrap();
+            assert!(final_rx.try_recv().is_ok());
+            assert_eq!(
+                *attempts.lock().unwrap(),
+                reads,
+                "interval {interval_ms} ms"
+            );
+        }
     }
 }

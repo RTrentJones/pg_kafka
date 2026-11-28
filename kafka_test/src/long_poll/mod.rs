@@ -6,6 +6,7 @@
 //! - Producer wakeup: Waiting consumers wake when data arrives
 //! - Edge cases: Timeout precision, disconnect handling, multiple waiters, auto-commit
 
+mod deadline;
 mod edge_cases;
 mod idle_cost;
 mod task_cap;
@@ -31,5 +32,6 @@ pub fn tests() -> Vec<crate::registry::TestDef> {
         transaction_end::test_transaction_end_wakes_parked_read_committed_fetch: sequential,
         idle_cost::test_idle_long_polls_leave_the_db_thread_free: sequential, // Reads the broker's Fetch counter and times Produce
         txn_end_cost::test_transaction_ends_wake_only_their_partitions: sequential, // Reads the broker's Fetch counter and times Produce
+        deadline::test_deadline_answer_sees_an_unnotified_change: sequential, // Runs the broker's retention sweep; times the answer
     ]
 }
