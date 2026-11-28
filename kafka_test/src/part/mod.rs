@@ -14,26 +14,48 @@ mod sweep_liveness;
 mod sweep_races;
 pub mod time_partitions;
 
-/// Run sweeps until one drops no leaf (at most 20), before a test makes the leaves it
-/// expects one sweep to drop. Other tests and earlier runs can leave droppable leaves
-/// behind, older than the test's, and a pass ends once a session (any Produce or Fetch)
-/// has waited 100 ms behind its drops: under traffic one call drops a few leaves, oldest
-/// first, and may not reach the test's own.
+/// The past leaves a `pg_kafka_run_retention_sweep(0, 3600)` would drop: not DEFAULT,
+/// nothing pending, and every topic in them with a `retention.ms` the leaf's upper bound
+/// is past (the global window is off). One `kafka.message_partition_contents` probe per
+/// past leaf, as the sweep's own probes.
+const DROPPABLE_LEAVES_SQL: &str = "
+    SELECT p.partition_oid::regclass::text
+    FROM kafka.message_partitions() p
+    CROSS JOIN LATERAL kafka.message_partition_contents(p.partition_oid::regclass) c
+    WHERE NOT p.is_default AND p.upper_bound <= now()
+      AND c.topic_ids IS NOT NULL AND NOT c.has_pending
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest(c.topic_ids) AS u(id)
+          LEFT JOIN kafka.topics t ON t.id = u.id
+          WHERE t.retention_ms IS NULL OR t.retention_ms < 0
+             OR p.upper_bound + t.retention_ms * INTERVAL '1 millisecond' > now())
+    ORDER BY p.upper_bound";
+
+/// Run sweeps until no droppable leaf is left (at most 30 sweeps), before a test makes
+/// the leaves it expects one sweep to drop. Other tests and earlier runs can leave
+/// droppable leaves behind, older than the test's, and a pass ends once a session (any
+/// Produce or Fetch) has waited 100 ms behind its drops: under traffic one call drops a
+/// few leaves, oldest first, and may not reach the test's own. The leaves are queried
+/// before every sweep, so a sweep that dropped nothing (its drop gave up a lock wait,
+/// or it ended early) does not end the draining while some are left.
 pub(crate) async fn drain_droppable_leaves(db: &tokio_postgres::Client) -> Result<(), String> {
-    for _ in 0..20 {
-        let rows = db
-            .query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+    let mut left = Vec::new();
+    for _ in 0..30 {
+        left = db
+            .query(DROPPABLE_LEAVES_SQL, &[])
             .await
-            .map_err(|e| format!("draining droppable leaves: {e}"))?;
-        let dropped = rows
+            .map_err(|e| format!("listing droppable leaves: {e}"))?
             .iter()
-            .find(|r| r.get::<_, String>(0) == "dropped_partitions")
-            .map_or(0, |r| r.get::<_, i64>(1));
-        if dropped == 0 {
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<String>>();
+        if left.is_empty() {
             return Ok(());
         }
+        db.query("SELECT * FROM pg_kafka_run_retention_sweep(0, 3600)", &[])
+            .await
+            .map_err(|e| format!("draining droppable leaves: {e}"))?;
     }
-    Err("leftover droppable leaves were not drained in 20 sweeps".to_string())
+    Err(format!("droppable leaves left after 30 sweeps: {left:?}"))
 }
 
 /// The `part` tests, in run order.
