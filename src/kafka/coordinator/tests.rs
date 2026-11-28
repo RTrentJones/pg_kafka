@@ -2378,7 +2378,8 @@ impl Rng {
     }
 }
 
-/// The running totals and Empty-group index agree with a recount from every group.
+/// The running totals, the Empty-group index and the id index agree with a recount from every
+/// group.
 fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
     let groups = c.groups.read().unwrap();
     let (running, running_empty) = groups.running();
@@ -2388,6 +2389,7 @@ fn assert_totals_exact(c: &GroupCoordinator, step: usize, op: usize) {
         running_empty, counted_empty,
         "Empty index after step {step} (op {op})"
     );
+    assert!(groups.ids_exact(), "id index after step {step} (op {op})");
 }
 
 #[test]

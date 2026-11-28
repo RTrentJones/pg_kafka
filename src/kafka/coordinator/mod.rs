@@ -1238,6 +1238,17 @@ impl GroupCoordinator {
             .and_then(|groups| groups.get(group_id).map(|g| g.members.is_empty()))
     }
 
+    /// Hold `count` Empty groups named `{prefix}{i}`, for tests that need many groups without
+    /// a JoinGroup each.
+    #[cfg(test)]
+    pub fn add_empty_groups(&self, prefix: &str, count: usize) {
+        let mut groups = self.groups.write().unwrap();
+        for i in 0..count {
+            let id = format!("{prefix}{i}");
+            groups.insert(id.clone(), ConsumerGroup::new(id));
+        }
+    }
+
     /// A snapshot of a group's state, for tests: it copies the whole group.
     #[cfg(test)]
     pub fn get_group_state(&self, group_id: &str) -> Option<ConsumerGroup> {
@@ -1680,6 +1691,29 @@ fn current_member<'a>(
         ));
     }
     Ok(group)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Work units [`count_work`] recorded on this thread, for the cost tests.
+    static WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record `units` of work (groups walked, pending answers looked at, protocol-name bytes
+/// compared or hashed) for the cost tests, which bound it by what a request names; nothing
+/// outside unit tests.
+#[inline]
+pub(crate) fn count_work(units: usize) {
+    #[cfg(test)]
+    WORK.with(|w| w.set(w.get().saturating_add(units)));
+    #[cfg(not(test))]
+    let _ = units;
+}
+
+/// The work [`count_work`] recorded on this thread since the last call, for the cost tests.
+#[cfg(test)]
+pub(crate) fn take_work() -> usize {
+    WORK.with(|w| w.replace(0))
 }
 
 /// The most bytes of a client string (a group or member id) a log line carries.
