@@ -1171,6 +1171,9 @@ impl ShadowDb for SpiShadowDb {
                     &[ctids.into(), external.into()],
                 )?)
             })?;
+            // The upsert cannot skip a row another session holds: it waits for it (the
+            // tick's lock_timeout) and then fails, and these acks of every topic with it
+            // (docs/SHADOW_MODE_FLOW_DIAGRAM.md, "A held kafka.shadow_metrics row").
             if metrics && !done.is_empty() {
                 let keys: KeyColumns = done.iter().collect();
                 client.update(

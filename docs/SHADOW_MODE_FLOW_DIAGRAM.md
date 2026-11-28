@@ -359,6 +359,15 @@ when the outbox recovers. The tick cannot stay in a lock cycle with a session th
 same rows in another order: its wait ends within the timeout, long before that session's deadlock
 check.
 
+A held `kafka.shadow_metrics` row stops more than its own partition. Each kind of ack (delivered,
+failed, not attempted) is applied for every topic by one set of statements in one subtransaction,
+and the metrics upsert, which cannot skip a row, is part of it: while another session holds one
+partition's metrics row (an operator's `SELECT ... FOR UPDATE` or `UPDATE` in an open
+transaction), every tick's delivery acks time out on it and are rolled back, every topic's. Their
+rows stay in flight, so forwarding goes on until the worker's in-flight window (8 192 rows) is full
+and then stops for every topic, until that transaction ends; the next tick then applies them all.
+Do not hold `kafka.shadow_metrics` rows open; read them without a locking clause.
+
 ```sql
 SELECT kafka.replay_shadow_messages(
     (SELECT id FROM kafka.topics WHERE name = 'orders'), 0, NULL);
