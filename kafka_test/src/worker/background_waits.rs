@@ -113,8 +113,9 @@ async fn metrics_flush_skips_held_rows() -> SendResult<()> {
     Ok(())
 }
 
-/// The slowest worker start the test accepts with two leaves to create behind a reader:
-/// the start itself, two 200 ms lock waits and slack; at 2 s per leaf it took over 4 s.
+/// The slowest worker start the test accepts with two leaves to create behind a reader,
+/// from the new worker's appearance to its first Metadata answer: the start itself, two
+/// 200 ms lock waits and slack; at 2 s per leaf it took over 4 s.
 const START_CEILING: Duration = Duration::from_millis(2500);
 
 /// The worker's partition maintenance (at start, and before every retention sweep) and
@@ -126,16 +127,39 @@ const START_CEILING: Duration = Duration::from_millis(2500);
 /// The worker now runs them with a 200 ms lock_timeout, which the functions honour when
 /// it is lower than their 2 s.
 ///
-/// Asserts: with the two future leaves dropped and a reader holding ACCESS SHARE on
-/// kafka.messages, a restarted worker answers its first Produce within 2.5 s of
-/// starting; once the reader ends, maintenance makes the leaves again.
+/// Asserts: with the future leaves dropped (each drop asserted) and a reader holding
+/// ACCESS SHARE on kafka.messages, a restarted worker answers its first Metadata request
+/// (a raw connection, retried from the moment the new worker appears, so no client
+/// start-up is timed) within 2.5 s of appearing; once the reader ends, maintenance makes
+/// the leaves again.
 pub async fn test_worker_maintenance_waits_briefly_behind_a_reader() -> TestResult {
     into_test_result(maintenance_behind_reader().await)
 }
 
+/// Retry a raw Metadata request until the listener answers one, for at most `within`:
+/// when it answered.
+async fn first_metadata_answer(within: Duration) -> SendResult<Instant> {
+    let deadline = Instant::now() + within;
+    let metadata = MetadataRequest::default();
+    loop {
+        let wire = Wire::connect().await.ok();
+        if let Some(mut wire) = wire {
+            let answered = wire.call(9, &metadata).await.is_ok();
+            if answered {
+                return Ok(Instant::now());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("the new worker answered no Metadata request within {within:?}").into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn maintenance_behind_reader() -> SendResult<()> {
-    use crate::worker::{listener_pid, quick_producer};
-    use rdkafka::producer::FutureRecord;
+    use crate::worker::listener_pid;
     println!("=== Test: the worker's maintenance waits briefly behind a reader ===\n");
     let db = session().await?;
     let minutes: String = db
@@ -155,13 +179,25 @@ async fn maintenance_behind_reader() -> SendResult<()> {
         .iter()
         .map(|r| r.get(0))
         .collect();
+    if future.is_empty() {
+        return Err("no future leaf to drop: the worker would create none at start".into());
+    }
     for leaf in &future {
-        db.query(
-            "SELECT dropped FROM kafka.drop_message_partition($1::text::regclass, ARRAY[]::int4[])",
-            &[leaf],
-        )
-        .await
-        .map_err(boxed)?;
+        let row = db
+            .query_one(
+                "SELECT dropped, lock_timed_out
+                 FROM kafka.drop_message_partition($1::text::regclass, ARRAY[]::int4[])",
+                &[leaf],
+            )
+            .await
+            .map_err(boxed)?;
+        let (dropped, timed_out): (bool, bool) = (row.get(0), row.get(1));
+        if !dropped {
+            return Err(format!(
+                "could not drop the future leaf {leaf} (lock_timed_out={timed_out})"
+            )
+            .into());
+        }
     }
     println!("Step 1: dropped the future leaves {future:?}");
     let reader = session().await?;
@@ -188,18 +224,11 @@ async fn maintenance_behind_reader() -> SendResult<()> {
                 _ => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         };
-        let producer = quick_producer("20000")?;
-        producer
-            .send(
-                FutureRecord::<(), _>::to(&format!("worker-start-probe-{}", std::process::id()))
-                    .payload("probe")
-                    .partition(0),
-                Duration::from_secs(20),
-            )
-            .await
-            .map_err(|(e, _)| boxed(e))?;
-        let took = started.elapsed();
-        println!("Step 2: the restarted worker answered its first Produce {took:?} after starting");
+        let answered = first_metadata_answer(Duration::from_secs(20)).await?;
+        let took = answered.duration_since(started);
+        println!(
+            "Step 2: the restarted worker answered its first Metadata {took:?} after appearing"
+        );
         if took >= START_CEILING {
             return Err(format!(
                 "the worker took {took:?} to serve after starting behind an open reader"
