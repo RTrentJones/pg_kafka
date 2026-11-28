@@ -1150,3 +1150,78 @@ pub async fn test_group_member_checks_match_kafka() -> TestResult {
     println!("✅ Test PASSED\n");
     Ok(())
 }
+
+/// Fetch v11 of partition 0 of `topic` from `offset` with `partition_max_bytes`.
+async fn fetch_with_partition_max(
+    wire: &mut Wire,
+    topic: &str,
+    offset: i64,
+    partition_max_bytes: i32,
+) -> crate::common::DynResult<kafka_protocol::messages::fetch_response::PartitionData> {
+    use kafka_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
+    use kafka_protocol::messages::fetch_response::FetchResponse;
+    let partition = FetchPartition::default()
+        .with_partition(0)
+        .with_fetch_offset(offset)
+        .with_partition_max_bytes(partition_max_bytes)
+        .with_log_start_offset(-1)
+        .with_current_leader_epoch(-1)
+        .with_last_fetched_epoch(-1);
+    let request = FetchRequest::default()
+        .with_replica_id(kafka_protocol::messages::BrokerId(-1))
+        .with_max_bytes(1 << 20)
+        .with_session_epoch(-1)
+        .with_topics(vec![FetchTopic::default()
+            .with_topic(TopicName(StrBytes::from_string(topic.to_string())))
+            .with_partitions(vec![partition])]);
+    let response: FetchResponse = wire.call(11, &request).await?;
+    Ok(response.responses[0].partitions[0].clone())
+}
+
+/// A Fetch with a negative `partition_max_bytes` of a partition with records to read is
+/// answered as Kafka 3.7 answers it: UNKNOWN_SERVER_ERROR, high watermark, last stable
+/// offset and log start -1, no records. Fetched at the log end, nothing is read and the
+/// partition answers its bounds.
+pub async fn test_negative_partition_max_bytes_is_unknown_server_error() -> TestResult {
+    use crate::error_codes::UNKNOWN_SERVER_ERROR;
+    println!("=== Test: A negative partition_max_bytes is UNKNOWN_SERVER_ERROR ===\n");
+    let ctx = TestContext::new().await?;
+    let topic = TestTopicBuilder::new(&ctx, "parity-neg-pmax")
+        .build()
+        .await?
+        .name;
+    let mut wire = Wire::connect().await?;
+    assert_eq!(
+        produce_v8(&mut wire, &topic, &["a", "b", "c"]).await?.0,
+        NONE
+    );
+
+    for limit in [-1, i32::MIN] {
+        let p = fetch_with_partition_max(&mut wire, &topic, 0, limit).await?;
+        println!(
+            "   limit {limit}: error {}, hwm {}, records {:?}",
+            p.error_code,
+            p.high_watermark,
+            p.records.as_ref().map(bytes::Bytes::len)
+        );
+        assert_eq!(p.error_code, UNKNOWN_SERVER_ERROR, "limit {limit}");
+        assert_eq!(
+            (p.high_watermark, p.last_stable_offset, p.log_start_offset),
+            (-1, -1, -1),
+            "limit {limit}"
+        );
+        assert!(p.records.as_ref().is_none_or(bytes::Bytes::is_empty));
+    }
+    let at_end = fetch_with_partition_max(&mut wire, &topic, 3, -1).await?;
+    assert_eq!((at_end.error_code, at_end.high_watermark), (NONE, 3));
+    assert!(at_end.records.as_ref().is_none_or(bytes::Bytes::is_empty));
+    // A positive limit still reads the records.
+    let read = fetch_with_partition_max(&mut wire, &topic, 0, 1 << 20).await?;
+    assert_eq!(read.error_code, NONE);
+    assert!(read.records.as_ref().is_some_and(|r| !r.is_empty()));
+
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
+
