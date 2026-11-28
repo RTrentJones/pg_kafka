@@ -298,9 +298,11 @@ fn ack_update_by_tid<T>(
         .first()
         .get_by_name("saved")?
         .unwrap_or_default();
-    let out = update(client)?;
+    // Restored before an error of `update` propagates: a caller that handles it (the
+    // tick goes on with its other acks) must not run its later statements under them.
+    let out = update(client);
     client.update(RESTORE_ACK_SCAN_SETTINGS_SQL, None, &[saved.into()])?;
-    Ok(out)
+    out
 }
 
 /// For each locked row (in order), the payload of the first ack of its key.
