@@ -556,7 +556,8 @@ algorithm; see "Server-side sticky assignment" below)
   `__consumer_offsets` record), beyond which JoinGroup gets INVALID_REQUEST; and
   `pg_kafka.max_group_memory` (default 128MB) bounds the member state of all groups together
   (member ids, protocols and their metadata, assignments and the copies kept for the sticky
-  assignor; a group's copies of its leader's id and of its protocol name count as the longest
+  assignor; each protocol name counts twice, for the copy the group's per-name member counts
+  may keep, as Kafka's `supportedProtocols`; a group's copies of its leader's id and of its protocol name count as the longest
   id and protocol name of its members, since a leave can make any of them the leader or
   complete a join phase with any of their protocols, and nothing is refused then). Kafka has no such bound (its heap is the limit), but without it the caps above
   still allowed about 1e14 bytes, held up to the 30-minute session timeout by members that
