@@ -294,11 +294,13 @@ fn failed_topic(name: &str, error_code: i16, message: String) -> CreatableTopicR
 }
 
 /// A CreateTopics result for a topic that is (or, with validate_only, would be) created;
-/// the replication factor is always 1 on this single-node broker.
+/// the replication factor is always 1 on this single-node broker. Its error message is
+/// null, as Kafka 3.7 sends it (the generated default is the empty string).
 fn created_topic(name: &str, num_partitions: i32) -> CreatableTopicResult {
     let mut result = CreatableTopicResult::default();
     result.name = TopicName(StrBytes::from_string(name.to_string()));
     result.error_code = ERROR_NONE;
+    result.error_message = None;
     result.num_partitions = num_partitions;
     result.replication_factor = 1;
     result
@@ -606,6 +608,8 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.topics.len(), 1);
         assert_eq!(response.topics[0].error_code, ERROR_NONE);
+        // Kafka 3.7 sends a null error message for a created topic, not "".
+        assert_eq!(response.topics[0].error_message, None);
     }
 
     #[test]
@@ -689,6 +693,7 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.topics[0].error_code, ERROR_NONE);
+        assert_eq!(response.topics[0].error_message, None);
     }
 
     #[test]

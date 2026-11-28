@@ -1225,3 +1225,32 @@ pub async fn test_negative_partition_max_bytes_is_unknown_server_error() -> Test
     Ok(())
 }
 
+/// A topic CreateTopics creates is answered with a null error message, as Kafka 3.7 answers
+/// it (the field is nullable at every version), not the empty string.
+pub async fn test_create_topics_success_has_a_null_error_message() -> TestResult {
+    use kafka_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
+    use kafka_protocol::messages::create_topics_response::CreateTopicsResponse;
+    println!("=== Test: CreateTopics success has a null error message ===\n");
+    let ctx = TestContext::new().await?;
+    let mut wire = Wire::connect().await?;
+    for version in [2, 3, 4, 5] {
+        let name = ctx.unique_topic("parity-create-null").await;
+        let request = CreateTopicsRequest::default()
+            .with_topics(vec![CreatableTopic::default()
+                .with_name(TopicName(StrBytes::from_string(name.clone())))
+                .with_num_partitions(1)
+                .with_replication_factor(1)])
+            .with_timeout_ms(10_000);
+        let response: CreateTopicsResponse = wire.call(version, &request).await?;
+        let topic = &response.topics[0];
+        println!(
+            "   v{version}: error {}, message {:?}",
+            topic.error_code, topic.error_message
+        );
+        assert_eq!(topic.error_code, NONE, "v{version}");
+        assert_eq!(topic.error_message, None, "v{version}");
+    }
+    ctx.cleanup().await?;
+    println!("✅ Test PASSED\n");
+    Ok(())
+}
