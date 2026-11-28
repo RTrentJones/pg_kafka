@@ -489,6 +489,10 @@ algorithm; see "Server-side sticky assignment" below)
   Kafka 3.7 (`resetAndPropagateAssignmentError`) answers every parked member with the error and
   starts a new join phase, so every member rejoins and the generation moves; here the leader's
   retry completes the same generation without a rebalance.
+- ✅ A leader that sends empty assignments for a group whose selected protocol is not one of
+  the server's assignors (range, roundrobin, sticky, cooperative-sticky) has them stored as
+  sent and gets NONE, as Kafka 3.7 stores whatever the leader sends: every member gets an
+  empty assignment and the group is Stable. Nothing is read for it.
 - ✅ FindCoordinator answers a `key_type` other than 0 (group) and 1 (transaction)
   INVALID_REQUEST (42), as Kafka 3.7 does.
 

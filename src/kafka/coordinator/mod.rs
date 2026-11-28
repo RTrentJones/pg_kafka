@@ -1258,6 +1258,18 @@ impl GroupCoordinator {
             .and_then(|groups| groups.get(group_id).cloned())
     }
 
+    /// Whether the server can compute assignments for `group_id`'s selected protocol (or
+    /// "range" if none is selected): one of its assignors ([`server_assignor_known`]). A leader
+    /// of a group with another assignor that sends empty assignments has them stored as sent,
+    /// as Kafka 3.7 stores what the leader sends. O(1) plus the name's length.
+    pub fn assigns_server_side(&self, group_id: &str) -> bool {
+        self.groups.read().is_ok_and(|groups| {
+            groups.get(group_id).is_some_and(|g| {
+                server_assignor_known(g.protocol_name.as_deref().unwrap_or("range"))
+            })
+        })
+    }
+
     /// Compute partition assignments for all members in a group
     ///
     /// This is called when the leader sends an empty SyncGroup request,
@@ -1319,7 +1331,7 @@ impl GroupCoordinator {
         pg_log!(
             "Computed assignments for group {} using strategy {}: {} members",
             shown(group_id),
-            strategy_name,
+            shown(strategy_name),
             encoded.len()
         );
 
@@ -1536,6 +1548,14 @@ fn check_assignment_work(group_id: &str, entries: usize) -> Result<()> {
     Ok(())
 }
 
+/// Whether [`run_assignor`] has an assignor for `strategy_name`. O(name length); a name too
+/// long to be one of the assignors is not lowercased.
+fn server_assignor_known(strategy_name: &str) -> bool {
+    const LONGEST_NAME: usize = "cooperative-sticky".len();
+    strategy_name.contains("sticky")
+        || (strategy_name.len() <= LONGEST_NAME * 4 && create_strategy(strategy_name).is_some())
+}
+
 /// Run the assignor `strategy_name` over `input` for `group_id`. The sticky assignor starts
 /// from `previous`, the group's previous assignments, and is refused with POLICY_VIOLATION
 /// once it has spent `sticky_steps` steps: how long its balancing runs depends on how the
@@ -1565,8 +1585,12 @@ fn run_assignor(
                 }
             });
     }
+    // The caller asks `assigns_server_side` first, so this is not reached for an unknown name.
     let strategy = create_strategy(strategy_name).ok_or_else(|| {
-        KafkaError::Internal(format!("Unknown assignment strategy: {strategy_name}"))
+        KafkaError::Internal(format!(
+            "Unknown assignment strategy: {}",
+            shown(strategy_name)
+        ))
     })?;
     Ok(strategy.assign(input))
 }

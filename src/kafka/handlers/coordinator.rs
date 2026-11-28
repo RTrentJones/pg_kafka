@@ -566,8 +566,9 @@ pub fn handle_sync_group<F>(
 type MemberAssignmentBytes = (String, Vec<u8>);
 
 /// The assignments the server computes for `group_id` with the group's assignor over the
-/// topics its members subscribe to: `None` when there is nothing to assign (no member
-/// subscribes to a topic, or no subscribed topic exists); a `PolicyViolation` when the
+/// topics its members subscribe to: `None` when there is nothing to assign (the group's
+/// assignor is not one the server implements, no member subscribes to a topic, or no
+/// subscribed topic exists); a `PolicyViolation` when the
 /// computation would exceed [`crate::kafka::limits::MAX_ASSIGNMENT_WORK`]; any other `Err`
 /// when it failed (the topics could not be read, the assignments not encoded), which the
 /// caller answers as retriable.
@@ -576,6 +577,15 @@ fn server_side_assignments(
     group_id: &str,
 ) -> Result<Option<Vec<MemberAssignmentBytes>>> {
     let coordinator = ctx.coordinator;
+    // An assignor the server does not implement: the leader's empty assignments are stored as
+    // sent (Kafka 3.7 computes nothing), and nothing is read.
+    if !coordinator.assigns_server_side(group_id) {
+        crate::pg_debug!(
+            "SyncGroup: group {} uses an assignor the server does not implement; storing the leader's empty assignments",
+            crate::kafka::coordinator::shown(group_id)
+        );
+        return Ok(None);
+    }
     let topics = coordinator.get_subscribed_topics(group_id)?;
     if topics.is_empty() {
         return Ok(None);
@@ -1669,6 +1679,32 @@ mod tests {
         let again = take_sync(&f.sync("g", &member, generation, empty())).unwrap();
         assert_eq!(again.error_code, ERROR_NONE);
         assert_eq!(again.assignment, synced.assignment);
+    }
+
+    /// A leader whose group selected an assignor the server does not implement, and that sends
+    /// empty assignments, gets NONE and an empty assignment, and the group becomes Stable: Kafka
+    /// 3.7 computes nothing server-side and stores what the leader sent. Answering the retriable
+    /// COORDINATOR_NOT_AVAILABLE instead made the leader rejoin and retry forever, each retry
+    /// logging the whole protocol name (up to 1 MiB). Nothing is read for it.
+    #[test]
+    fn test_sync_group_with_an_unknown_assignor_stores_the_empty_assignments() {
+        let mut f = Fixture::new();
+        f.store.expect_get_topic_metadata().times(0);
+        let metadata = crate::kafka::assignment::MemberSubscription::new(vec!["t".to_string()])
+            .encode()
+            .unwrap();
+        let name = format!("custom-{}", "x".repeat(100_000));
+        let join = take(&f.join_protocol("g", "", 30_000, &name, metadata)).unwrap();
+        let member = join.member_id.to_string();
+        let empty = vec![SyncGroupAssignment {
+            member_id: member.clone(),
+            assignment: vec![],
+        }];
+        let synced = take_sync(&f.sync("g", &member, join.generation_id, empty)).unwrap();
+        assert_eq!(synced.error_code, ERROR_NONE);
+        assert!(synced.assignment.is_empty());
+        let group = f.coordinator.get_group_state("g").unwrap();
+        assert_eq!(group.state, crate::kafka::coordinator::GroupState::Stable);
     }
 
     /// A Postgres ERROR while the leader's SyncGroup reads its subscribed topics (a lock
