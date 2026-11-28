@@ -28,7 +28,7 @@
 //! waited 100 ms for a lock of the pass, and the leaf drops come last in phase 1: a drop
 //! holds kafka.messages until the pass commits, so under steady traffic a pass ends soon
 //! after its first drop, and every other step takes its phase 1 turn before that.
-
+//!
 //! The steps that walk a list of items (leaves, (topic, leaf) pairs, queued drops) do so
 //! through a [`Lap`]: the items in key order, starting after the key of the last item
 //! the step served ([`KeyCursor`]), wrapping, each item served until caught up. Probes
