@@ -228,10 +228,9 @@ const LOCK_ACK_ROWS_SQL: &str = "
 /// estimate of one pending row the planner rescanned the values for every row it
 /// updated (8 192 x 8 192 comparisons, 9 s per ack batch); a hash or merge join on the
 /// ctid is linear (n log n). Only the
-/// UPDATE of the outbox runs under them: a statement that fires a foreign-key check (the
-/// `kafka.shadow_metrics` upsert checks `kafka.topics`) would plan that check under them,
-/// and Postgres keeps such a plan for the session, so it would scan `kafka.topics` on
-/// every later check.
+/// UPDATE of the outbox runs under them: any other statement planned under them would
+/// get its plan with index scans off (a foreign-key check among them, whose plan
+/// Postgres keeps for the session, so every later check would read its table whole).
 const ACK_SCAN_SETTINGS_SQL: &str = "
     SELECT ARRAY[o.tid, o.seq, o.bitmap, o.idx, o.ios, o.nl] AS saved,
            set_config('enable_tidscan', 'on', true),
