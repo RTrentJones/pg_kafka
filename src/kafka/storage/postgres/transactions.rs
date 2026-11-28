@@ -6,7 +6,7 @@ use super::producers::{bump_producer_epoch, insert_producer_id, reset_producer_s
 use super::{internal, internal_unless, is_txn_error, PostgresStore};
 use crate::kafka::error::{KafkaError, Result};
 use crate::kafka::messages::Record;
-use crate::kafka::storage::TransactionState;
+use crate::kafka::storage::{TransactionState, TxnPartitions};
 use pgrx::prelude::*;
 use pgrx::spi::{SpiClient, SpiError};
 
@@ -548,6 +548,40 @@ impl PostgresStore {
             Ok(TransactionState::parse(&state))
         })
         .map_err(internal("get_transaction_state"))
+    }
+
+    /// See [`crate::kafka::storage::TransactionStore::transaction_partitions`]. The rows come
+    /// in primary-key order (topic id, then partition), so each topic's partitions are
+    /// consecutive and its name is kept once; no row lock is taken.
+    pub(super) fn transaction_partitions(transactional_id: &str) -> Result<TxnPartitions> {
+        Spi::connect(|client| {
+            let table = client.select(
+                "SELECT r.topic_id, t.name, r.partition_id
+                 FROM kafka.txn_partitions r
+                 JOIN kafka.topics t ON t.id = r.topic_id
+                 WHERE r.transactional_id = $1
+                 ORDER BY r.topic_id, r.partition_id",
+                None,
+                &[transactional_id.into()],
+            )?;
+            let mut partitions: TxnPartitions = Vec::new();
+            let mut last_topic = None;
+            for row in table {
+                // NOT NULL columns of rows that exist: the fallbacks are unreachable.
+                let topic_id: i32 = row.get_by_name("topic_id")?.unwrap_or(0);
+                let partition_id: i32 = row.get_by_name("partition_id")?.unwrap_or(0);
+                if last_topic != Some(topic_id) {
+                    let name: String = row.get_by_name("name")?.unwrap_or_default();
+                    partitions.push((name, Vec::new()));
+                    last_topic = Some(topic_id);
+                }
+                if let Some((_, ids)) = partitions.last_mut() {
+                    ids.push(partition_id);
+                }
+            }
+            Ok(partitions)
+        })
+        .map_err(internal("transaction_partitions"))
     }
 }
 

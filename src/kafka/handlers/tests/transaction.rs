@@ -309,17 +309,23 @@ fn test_end_txn_commit_success() {
     mock.expect_commit_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
+    mock.expect_transaction_partitions()
+        .withf(|id| id == "txn-1")
+        .times(1)
+        .returning(|_| Ok(vec![("t".to_string(), vec![0, 3])]));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = transaction::handle_end_txn(
+    let (response, ended) = transaction::end_txn(
         &ctx, "txn-1", 1000, 0, true, // committed
     )
     .unwrap();
 
     assert_eq!(response.error_code, ERROR_NONE);
+    // The transaction's partitions, whose read_committed long polls the end wakes.
+    assert_eq!(ended, vec![("t".to_string(), vec![0, 3])]);
 }
 
 #[test]
@@ -333,17 +339,23 @@ fn test_end_txn_abort_success() {
     mock.expect_abort_transaction()
         .times(1)
         .returning(|_, _, _| Ok(()));
+    mock.expect_transaction_partitions()
+        .withf(|id| id == "txn-1")
+        .times(1)
+        .returning(|_| Ok(vec![("t".to_string(), vec![0, 3])]));
 
     // Create HandlerContext AFTER setting expectations
     let env = TestEnv::new();
     let ctx = env.ctx(&mock);
 
-    let response = transaction::handle_end_txn(
+    let (response, ended) = transaction::end_txn(
         &ctx, "txn-1", 1000, 0, false, // abort
     )
     .unwrap();
 
     assert_eq!(response.error_code, ERROR_NONE);
+    // The transaction's partitions, whose read_committed long polls the end wakes.
+    assert_eq!(ended, vec![("t".to_string(), vec![0, 3])]);
 }
 
 #[test]
@@ -968,4 +980,25 @@ fn test_txn_offset_commit_metadata_too_large() {
         codes,
         [ERROR_NONE, ERROR_OFFSET_METADATA_TOO_LARGE, ERROR_NONE]
     );
+}
+
+/// A retried EndTxn answered from the finished state ends nothing: it names no
+/// partitions to wake and reads no registry (no expectation for it).
+#[test]
+fn test_end_txn_retry_names_no_partitions() {
+    for (state, committed) in [
+        (TransactionState::CompleteCommit, true),
+        (TransactionState::CompleteAbort, false),
+    ] {
+        let mut mock = MockKafkaStore::new();
+        mock.expect_validate_transaction()
+            .returning(|_, _, _| Ok(()));
+        mock.expect_get_transaction_state()
+            .returning(move |_| Ok(Some(state.clone())));
+        let env = TestEnv::new();
+        let ctx = env.ctx(&mock);
+        let (response, ended) = transaction::end_txn(&ctx, "txn-1", 1000, 0, committed).unwrap();
+        assert_eq!(response.error_code, ERROR_NONE);
+        assert_eq!(ended, crate::kafka::storage::TxnPartitions::new());
+    }
 }

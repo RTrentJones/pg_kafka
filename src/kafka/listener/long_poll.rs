@@ -13,8 +13,8 @@
 //!    each partition has available are kept.
 //! 3. The long poll waits for a wake-up, its deadline, or its safety-net interval
 //!    (`pg_kafka.fetch_poll_interval_ms`). A wake-up names the partitions that changed
-//!    (Produce, DeleteRecords, DeleteTopics; every partition of a `read_committed` long poll
-//!    when a transaction ends) and only those are re-read. When the bytes available reach
+//!    (Produce, DeleteRecords, DeleteTopics; for a `read_committed` long poll, the partitions
+//!    of a transaction that ended) and only those are re-read. When the bytes available reach
 //!    `min_bytes`, or a re-read partition has an error, the whole Fetch is read once more and
 //!    answered.
 //! 4. A re-check that no notification names (the safety-net interval, a retention sweep or
@@ -27,9 +27,10 @@
 //! Cost on the DB thread, for a long poll of P partitions: one read of P at the start and at
 //! most one at the end; one read of the marked partitions per wake-up (each partition at most
 //! once per wake-up, so the reads a Produce causes are one per long poll waiting on each
-//! partition it wrote, as Kafka's `DelayedFetch` checks each watcher); P per transaction end
-//! for a `read_committed` long poll; and the safety net's shared allowance. An idle long poll
-//! of a caught-up consumer therefore costs one read of its partitions per request.
+//! partition it wrote, as Kafka's `DelayedFetch` checks each watcher; a transaction end
+//! likewise re-reads, in each `read_committed` long poll, only those of its partitions the
+//! long poll watches); and the safety net's shared allowance. An idle long poll of a
+//! caught-up consumer therefore costs one read of its partitions per request.
 
 use bytes::Bytes;
 use crossbeam_channel::Sender;
@@ -402,7 +403,7 @@ impl LongPoll {
             if safety_net_due {
                 safety_net_at = now + poll_interval;
             }
-            next = if changed.all || changed.slots.len() >= slots.len() {
+            next = if changed.slots.len() >= slots.len() {
                 Check::Full
             } else if (changed.coarse || safety_net_due)
                 && registry.take_safety_net(slots.len(), poll_interval)
@@ -1021,7 +1022,7 @@ mod tests {
                     let reg = reg.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(150)).await;
-                        reg.notify_transaction_ended().await;
+                        reg.notify_transaction_ended("t", &[0]).await;
                     });
                     false
                 } else {
@@ -1246,5 +1247,56 @@ mod tests {
         notifier.await.unwrap();
         assert!(final_rx.try_recv().is_ok());
         assert_eq!(*attempts.lock().unwrap(), vec![300, 300]);
+    }
+
+    /// The end of a one-partition transaction costs each read_committed long poll watching
+    /// that partition a read of it alone: 16 long polls of 1,000 partitions plus that one,
+    /// with 20 such ends (a producer committing every few milliseconds), read their
+    /// partitions at the start and at the deadline and the transaction's partition once
+    /// per wake-up, at most 16 x (2 x 1,001 + 20) partition reads. Re-reading every
+    /// partition per transaction end costs 16 x 20 x 1,001 more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transaction_end_re_reads_only_its_partitions() {
+        const POLLS: usize = 16;
+        const ENDS: usize = 20;
+        let (request_tx, request_rx) = crossbeam_channel::bounded::<KafkaRequest>(1024);
+        let attempts = spawn_counting_worker(request_rx, |_| false);
+        let registry = Arc::new(PendingFetchRegistry::new());
+        let mut polls = Vec::new();
+        for _ in 0..POLLS {
+            let (final_tx, final_rx) = tokio::sync::mpsc::unbounded_channel();
+            let poll = long_poll(
+                600,
+                1,
+                1,
+                vec![
+                    many_partitions("watched", 1_000),
+                    one_partition_topic("txn"),
+                ],
+                request_tx.clone(),
+                final_tx,
+            );
+            let registry = registry.clone();
+            polls.push(tokio::spawn(async move {
+                poll.run(&registry, Duration::from_millis(10_000), &test_reply())
+                    .await
+                    .unwrap();
+                final_rx
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..ENDS {
+            registry.notify_transaction_ended("txn", &[0]).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for poll in polls {
+            assert!(poll.await.unwrap().try_recv().is_ok(), "every poll answers");
+        }
+        let read: usize = attempts.lock().unwrap().iter().sum();
+        assert!(
+            read <= POLLS * (2 * 1_001 + ENDS),
+            "{read} partition reads for {ENDS} transaction ends"
+        );
+        assert!(registry.is_empty().await);
     }
 }

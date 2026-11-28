@@ -214,9 +214,15 @@ fn spawn_notifier(
 /// Wake the long polls one notification concerns.
 async fn wake_waiters(registry: &PendingFetchRegistry, notification: InternalNotification) {
     match notification {
-        InternalNotification::TransactionEnded => {
-            debug!("Notification: transaction ended, waking read_committed waiters");
-            registry.notify_transaction_ended().await;
+        InternalNotification::TransactionEnded { partitions } => {
+            debug!(
+                "Notification: transaction ended, waking its partitions' read_committed waiters"
+            );
+            for (topic_name, partition_ids) in &partitions {
+                registry
+                    .notify_transaction_ended(topic_name, partition_ids)
+                    .await;
+            }
         }
         InternalNotification::NewMessages {
             topic_name,

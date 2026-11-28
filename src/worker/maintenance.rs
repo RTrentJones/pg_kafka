@@ -10,18 +10,18 @@ use crossbeam_channel::Sender;
 use pgrx::prelude::*;
 use std::time::{Duration, Instant};
 
-use super::batch::notify_transaction_ended;
 use super::network::Inbox;
 use super::txn::{
     log_txn_error, run_in_subtransaction, run_maintenance_task, run_request_in_subtransaction,
     worker_transaction, TaskNames, TxnError,
 };
+use crate::kafka::api::emit_txn_end_notification;
 use crate::kafka::metrics::MetricsFlusher;
 use crate::kafka::shadow::store::TickOutcome;
 use crate::kafka::shadow::ShadowStore;
 use crate::kafka::storage::postgres::ABORTED_MESSAGE_GRACE;
 use crate::kafka::storage::retention::MaintenanceLockWait;
-use crate::kafka::storage::MaintenanceStore;
+use crate::kafka::storage::{MaintenanceStore, TransactionStore};
 use crate::kafka::{GroupCoordinator, InternalNotification, PostgresStore};
 use crate::{pg_log, pg_warning};
 
@@ -282,9 +282,10 @@ pub(super) fn check_member_timeouts(coordinator: &GroupCoordinator) {
 /// The `lock_timeout` of a transaction-timeout check.
 const TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS: i32 = 100;
 
-/// Abort transactions that outlived their timeout. An abort ends transactions, so
-/// parked read_committed fetches are woken now (their LSO moved) rather than on the
-/// long-poll safety net. The shadow store keeps nothing for an open transaction (a
+/// Abort transactions that outlived their timeout. An abort ends transactions, so the
+/// read_committed long polls of each aborted transaction's partitions are woken now (their
+/// LSO moved) rather than at their deadline; reading those partitions costs one index range
+/// read per aborted transaction, O(the partitions it added), and takes no row lock. The shadow store keeps nothing for an open transaction (a
 /// commit enqueues its records into the outbox from kafka.messages), so an abort
 /// leaves it nothing to undo.
 ///
@@ -304,7 +305,7 @@ pub(super) fn check_transaction_timeouts(
         task: "Transaction-timeout check",
         panic: "Transaction-timeout maintenance",
     };
-    let mut aborted_any = false;
+    let mut ended = Vec::new();
     let ran = run_maintenance_task(names, || {
         bound_lock_waits(
             TXN_TIMEOUT_CHECK_LOCK_TIMEOUT_MS,
@@ -312,16 +313,25 @@ pub(super) fn check_transaction_timeouts(
         );
         match shadow_store.abort_timed_out_transactions(DEFAULT_TRANSACTION_TIMEOUT) {
             Ok(aborted) => {
-                aborted_any = !aborted.is_empty();
                 for txn_id in aborted {
                     pg_log!("Transaction timeout: Aborted timed-out transaction '{txn_id}'");
+                    // The abort leaves the transaction's partition registry in place.
+                    match shadow_store.transaction_partitions(&txn_id) {
+                        Ok(partitions) => ended.push(partitions),
+                        Err(e) => pg_warning!(
+                            "Transaction timeout: partitions of '{txn_id}' unknown, its \
+                             read_committed long polls see the abort at their deadline: {e}"
+                        ),
+                    }
                 }
             }
             Err(e) => pg_warning!("Failed to check transaction timeouts: {e}"),
         }
     });
-    if ran && aborted_any {
-        notify_transaction_ended(notify_tx);
+    if ran {
+        for partitions in ended {
+            emit_txn_end_notification(notify_tx, partitions);
+        }
     }
 }
 

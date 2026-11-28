@@ -55,6 +55,7 @@ use crate::kafka::storage::{
     delegate_maintenance_store, delegate_offset_store, delegate_producer_store,
     delegate_topic_store, FetchedMessage, FetchedRecords, IsolationLevel, KafkaStore, LogStore,
     MaintenanceStore, OffsetStore, ProducerStore, TopicStore, TransactionState, TransactionStore,
+    TxnPartitions,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1310,6 +1311,10 @@ impl<S: KafkaStore, D: ShadowDb> TransactionStore for ShadowStore<S, D> {
 
     fn get_transaction_state(&self, transactional_id: &str) -> Result<Option<TransactionState>> {
         self.inner.get_transaction_state(transactional_id)
+    }
+
+    fn transaction_partitions(&self, transactional_id: &str) -> Result<TxnPartitions> {
+        self.inner.transaction_partitions(transactional_id)
     }
 }
 

@@ -767,6 +767,12 @@ macro_rules! delegate_transaction_store {
         ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
             $via::get_transaction_state(transactional_id)
         }
+        fn transaction_partitions(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::TxnPartitions> {
+            $via::transaction_partitions(transactional_id)
+        }
     };
     ($via:ident, $field:ident) => {
         fn get_or_create_transactional_producer(
@@ -868,6 +874,12 @@ macro_rules! delegate_transaction_store {
             transactional_id: &str,
         ) -> $crate::kafka::error::Result<Option<$crate::kafka::storage::TransactionState>> {
             $via::get_transaction_state(&self.$field, transactional_id)
+        }
+        fn transaction_partitions(
+            &self,
+            transactional_id: &str,
+        ) -> $crate::kafka::error::Result<$crate::kafka::storage::TxnPartitions> {
+            $via::transaction_partitions(&self.$field, transactional_id)
         }
     };
 }

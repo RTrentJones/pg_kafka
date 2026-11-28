@@ -686,8 +686,10 @@ algorithm; see "Server-side sticky assignment" below)
 - ✅ Long polling (max_wait_ms/min_bytes support), as Kafka's `DelayedFetch`: a waiting
   fetch is re-checked when a partition it watches changes, and only that partition is
   re-read: a Produce to it, DeleteRecords of it, DeleteTopics of its topic, or, for
-  `read_committed`, any transaction end (EndTxn, an abort by fencing InitProducerId or by
-  the transaction timeout; every partition is re-read, the end not naming its partitions).
+  `read_committed`, the end of a transaction that added it (EndTxn, an abort by fencing
+  InitProducerId or by the transaction timeout; as Kafka's transaction markers, which
+  complete only the fetches watching the partitions they are written to). An
+  InitProducerId that aborts no open transaction wakes nothing.
   Once the bytes available reach `min_bytes`, or a re-read partition has an error, the
   whole fetch is read once more and answered. At `max_wait_ms` it is read once more, or,
   when nothing changed since a read that returned no records, that read is answered. A
